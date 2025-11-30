@@ -1,2 +1,2 @@
-(fn main (x)
-  (* (* x 2) 3))
+(fn main (x y)
+  (+ (* x 2) y))

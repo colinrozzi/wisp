@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -25,7 +26,7 @@ enum SExpr {
 #[derive(Debug)]
 enum Expr {
     Int(i32),
-    Var, // only "x"
+    Var(String),
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
@@ -34,6 +35,7 @@ enum Expr {
 /// A parsed program: one function main(x) = body
 #[derive(Debug)]
 struct Program {
+    params: Vec<String>,
     body: Expr,
 }
 
@@ -66,7 +68,7 @@ fn main() {
 
     // 2) generate WAT + WIT
     let wat = generate_wat(&prog);
-    let wit = generate_wit();
+    let wit = generate_wit(&prog.params);
 
     // 3) turn WAT into binary wasm
     let wasm_bytes =
@@ -186,34 +188,40 @@ fn parse_program(sexpr: SExpr) -> Program {
                 SExpr::Sym(s) if s == "main" => {}
                 _ => panic!("Only 'main' function is supported"),
             }
-            // params: (x)
-            match &items[2] {
+            // params: (x y ...)
+            let params = match &items[2] {
                 SExpr::List(params) => {
-                    if params.len() != 1 {
-                        panic!("Only one parameter 'x' is supported");
+                    if params.is_empty() {
+                        panic!("Function must take at least one parameter");
                     }
-                    match &params[0] {
-                        SExpr::Sym(s) if s == "x" => {}
-                        _ => panic!("Parameter must be named 'x'"),
-                    }
+                    params
+                        .iter()
+                        .map(|p| match p {
+                            SExpr::Sym(name) => name.clone(),
+                            _ => panic!("Parameters must be symbols"),
+                        })
+                        .collect::<Vec<_>>()
                 }
-                _ => panic!("Expected parameter list (x)"),
-            }
+                _ => panic!("Expected parameter list (x y ...)"),
+            };
 
-            let body_expr = parse_expr(&items[3]);
-            Program { body: body_expr }
+            let body_expr = parse_expr(&items[3], &params);
+            Program {
+                params,
+                body: body_expr,
+            }
         }
         _ => panic!("Top-level form must be a list"),
     }
 }
 
 /// Convert an S-expression into our Expr AST.
-fn parse_expr(sexpr: &SExpr) -> Expr {
+fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
     match sexpr {
         SExpr::Num(n) => Expr::Int(*n),
         SExpr::Sym(s) => {
-            if s == "x" {
-                Expr::Var
+            if vars.iter().any(|name| name == s) {
+                Expr::Var(s.clone())
             } else {
                 panic!("Unknown symbol: {}", s);
             }
@@ -229,8 +237,8 @@ fn parse_expr(sexpr: &SExpr) -> Expr {
                     if items.len() != 3 {
                         panic!("Operator {} expects exactly 2 operands", sym);
                     }
-                    let lhs = parse_expr(&items[1]);
-                    let rhs = parse_expr(&items[2]);
+                    let lhs = parse_expr(&items[1], vars);
+                    let rhs = parse_expr(&items[2], vars);
                     match sym.as_str() {
                         "+" => Expr::Add(Box::new(lhs), Box::new(rhs)),
                         "-" => Expr::Sub(Box::new(lhs), Box::new(rhs)),
@@ -251,8 +259,16 @@ fn parse_expr(sexpr: &SExpr) -> Expr {
 fn generate_wat(prog: &Program) -> String {
     let mut out = String::new();
     out.push_str("(module\n");
-    out.push_str("  (func $main (param $x i32) (result i32)\n");
-    gen_expr(&prog.body, &mut out, 4);
+    out.push_str("  (func $main ");
+    for param in &prog.params {
+        out.push_str(&format!("(param ${} i32) ", param));
+    }
+    out.push_str("(result i32)\n");
+    let mut var_map = HashMap::new();
+    for (idx, name) in prog.params.iter().enumerate() {
+        var_map.insert(name.clone(), idx as u32);
+    }
+    gen_expr(&prog.body, &mut out, 4, &var_map);
     out.push_str("  )\n");
     out.push_str("  (export \"run\" (func $main))\n");
     out.push_str(")\n");
@@ -261,29 +277,31 @@ fn generate_wat(prog: &Program) -> String {
 
 /// Recursively generate WAT instructions for an Expr.
 /// `indent` is the number of spaces to indent.
-fn gen_expr(expr: &Expr, out: &mut String, indent: usize) {
+fn gen_expr(expr: &Expr, out: &mut String, indent: usize, vars: &HashMap<String, u32>) {
     let pad = " ".repeat(indent);
     match expr {
         Expr::Int(n) => {
             out.push_str(&format!("{}i32.const {}\n", pad, n));
         }
-        Expr::Var => {
-            // param $x is local index 0
-            out.push_str(&format!("{}local.get 0\n", pad));
+        Expr::Var(name) => {
+            let idx = vars
+                .get(name)
+                .unwrap_or_else(|| panic!("Codegen missing variable {}", name));
+            out.push_str(&format!("{}local.get {}\n", pad, idx));
         }
         Expr::Add(a, b) => {
-            gen_expr(a, out, indent);
-            gen_expr(b, out, indent);
+            gen_expr(a, out, indent, vars);
+            gen_expr(b, out, indent, vars);
             out.push_str(&format!("{}i32.add\n", pad));
         }
         Expr::Sub(a, b) => {
-            gen_expr(a, out, indent);
-            gen_expr(b, out, indent);
+            gen_expr(a, out, indent, vars);
+            gen_expr(b, out, indent, vars);
             out.push_str(&format!("{}i32.sub\n", pad));
         }
         Expr::Mul(a, b) => {
-            gen_expr(a, out, indent);
-            gen_expr(b, out, indent);
+            gen_expr(a, out, indent, vars);
+            gen_expr(b, out, indent, vars);
             out.push_str(&format!("{}i32.mul\n", pad));
         }
     }
@@ -291,11 +309,18 @@ fn gen_expr(expr: &Expr, out: &mut String, indent: usize) {
 
 /// Generate a minimal WIT interface that matches the function:
 /// world tiny { export run: func(x: s32) -> s32 }
-fn generate_wit() -> String {
+fn generate_wit(params: &[String]) -> String {
     let mut out = String::new();
     out.push_str("package example:tiny\n\n");
     out.push_str("world tiny {\n");
-    out.push_str("  export run: func(x: s32) -> s32\n");
+    out.push_str("  export run: func(");
+    for (i, param) in params.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("{}: s32", param));
+    }
+    out.push_str(") -> s32\n");
     out.push_str("}\n");
     out
 }
