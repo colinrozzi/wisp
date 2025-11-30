@@ -52,5 +52,8 @@
     local.get 0
     call $factorial
   )
+  (export "double" (func $double))
+  (export "smaller" (func $smaller))
+  (export "factorial" (func $factorial))
   (export "run" (func $main))
 )

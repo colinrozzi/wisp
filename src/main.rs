@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -67,10 +67,17 @@ struct Function {
     body: Expr,
 }
 
+struct PendingFunction {
+    name: String,
+    params: Vec<String>,
+    body: SExpr,
+}
+
 /// A parsed program: a set of functions that must include `main`.
 #[derive(Debug)]
 struct Program {
     functions: Vec<Function>,
+    exports: Vec<String>,
 }
 
 fn main() {
@@ -209,30 +216,97 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
 }
 
 fn parse_program(forms: Vec<SExpr>) -> Program {
-    let mut signatures = HashMap::new();
-    for form in &forms {
-        let (name, params) = parse_fn_signature(form);
-        if signatures.insert(name.clone(), params.len()).is_some() {
-            panic!("Duplicate function '{}'", name);
+    let mut pending = Vec::new();
+    let mut defined = HashSet::new();
+    let mut exports = Vec::new();
+    let mut export_set = HashSet::new();
+
+    for form in forms {
+        match form {
+            SExpr::List(items) => {
+                if items.is_empty() {
+                    panic!("Top-level list cannot be empty");
+                }
+                match &items[0] {
+                    SExpr::Sym(sym) if sym == "fn" => {
+                        let func = parse_fn_form(SExpr::List(items));
+                        if !defined.insert(func.name.clone()) {
+                            panic!("Duplicate function '{}'", func.name);
+                        }
+                        pending.push(func);
+                    }
+                    SExpr::Sym(sym) if sym == "export" => {
+                        if items.len() != 2 {
+                            panic!("export expects exactly one argument");
+                        }
+                        match &items[1] {
+                            SExpr::Sym(name) => {
+                                if export_set.insert(name.clone()) {
+                                    exports.push(name.clone());
+                                }
+                            }
+                            SExpr::List(_) => {
+                                let func = parse_fn_form(items[1].clone());
+                                if !defined.insert(func.name.clone()) {
+                                    panic!("Duplicate function '{}'", func.name);
+                                }
+                                if export_set.insert(func.name.clone()) {
+                                    exports.push(func.name.clone());
+                                }
+                                pending.push(func);
+                            }
+                            _ => panic!("export argument must be a symbol or (fn ...)"),
+                        }
+                    }
+                    _ => panic!("Unknown top-level form"),
+                }
+            }
+            _ => panic!("Top-level forms must be lists"),
         }
     }
 
-    if !signatures.contains_key("main") {
+    if !defined.contains("main") {
         panic!("Program must define a main function");
     }
 
-    let mut functions = Vec::new();
-    for form in forms {
-        functions.push(parse_function(form, &signatures));
+    if !export_set.contains("main") {
+        export_set.insert("main".to_string());
+        exports.push("main".to_string());
     }
 
-    Program { functions }
+    let mut signatures = HashMap::new();
+    for func in &pending {
+        if signatures
+            .insert(func.name.clone(), func.params.len())
+            .is_some()
+        {
+            panic!("Duplicate function '{}'", func.name);
+        }
+    }
+
+    for export in &exports {
+        if !signatures.contains_key(export) {
+            panic!("Cannot export undefined function '{}'", export);
+        }
+    }
+
+    let mut functions = Vec::new();
+    for func in pending {
+        let body_expr = parse_expr(&func.body, &func.params, &signatures);
+        functions.push(Function {
+            name: func.name,
+            params: func.params,
+            body: body_expr,
+        });
+    }
+
+    Program { functions, exports }
 }
 
-fn parse_fn_signature(form: &SExpr) -> (String, Vec<String>) {
+fn parse_fn_form(form: SExpr) -> PendingFunction {
     let items = match form {
         SExpr::List(items) => items,
-        _ => panic!("Top-level form must be a list"),
+        _ => panic!("Function definition must be a list"),
     };
     if items.len() != 4 {
         panic!("Function definitions must look like (fn name (params...) body)");
@@ -255,20 +329,10 @@ fn parse_fn_signature(form: &SExpr) -> (String, Vec<String>) {
             .collect::<Vec<_>>(),
         _ => panic!("Expected parameter list"),
     };
-    (name, params)
-}
-
-fn parse_function(form: SExpr, functions: &HashMap<String, usize>) -> Function {
-    let (name, params) = parse_fn_signature(&form);
-    let items = match form {
-        SExpr::List(items) => items,
-        _ => unreachable!(),
-    };
-    let body_expr = parse_expr(&items[3], &params, functions);
-    Function {
+    PendingFunction {
         name,
         params,
-        body: body_expr,
+        body: items[3].clone(),
     }
 }
 
@@ -414,7 +478,17 @@ fn generate_wat(prog: &Program) -> String {
         out.push_str(&body);
         out.push_str("  )\n");
     }
-    out.push_str("  (export \"run\" (func $main))\n");
+    for export in &prog.exports {
+        let export_name = if export == "main" {
+            "run".to_string()
+        } else {
+            export.clone()
+        };
+        out.push_str(&format!(
+            "  (export \"{}\" (func ${}))\n",
+            export_name, export
+        ));
+    }
     out.push_str(")\n");
     out
 }
@@ -535,22 +609,32 @@ impl CodegenEnv {
 
 /// Generate a minimal WIT interface that matches the `main` function signature.
 fn generate_wit(prog: &Program) -> String {
-    let main_fn = prog
-        .functions
-        .iter()
-        .find(|f| f.name == "main")
-        .expect("main function missing during WIT generation");
     let mut out = String::new();
     out.push_str("package example:tiny\n\n");
     out.push_str("world tiny {\n");
-    out.push_str("  export run: func(");
-    for (i, param) in main_fn.params.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
+    for export in &prog.exports {
+        let func = find_function(prog, export);
+        let export_name = if export == "main" {
+            "run".to_string()
+        } else {
+            export.clone()
+        };
+        out.push_str(&format!("  export {}: func(", export_name));
+        for (i, param) in func.params.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("{}: s32", param));
         }
-        out.push_str(&format!("{}: s32", param));
+        out.push_str(") -> s32\n");
     }
-    out.push_str(") -> s32\n");
     out.push_str("}\n");
     out
+}
+
+fn find_function<'a>(prog: &'a Program, name: &str) -> &'a Function {
+    prog.functions
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("Function '{}' not found during codegen", name))
 }
