@@ -29,11 +29,25 @@ enum Expr {
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
+    Cmp {
+        op: CmpOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     Let {
         name: String,
         value: Box<Expr>,
         body: Box<Expr>,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CmpOp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// A parsed program: one function main(x) = body
@@ -249,6 +263,28 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                         _ => unreachable!(),
                     }
                 }
+                SExpr::Sym(sym)
+                    if sym == "=" || sym == "<" || sym == "<=" || sym == ">" || sym == ">=" =>
+                {
+                    if items.len() != 3 {
+                        panic!("Operator {} expects exactly 2 operands", sym);
+                    }
+                    let lhs = parse_expr(&items[1], vars);
+                    let rhs = parse_expr(&items[2], vars);
+                    let op = match sym.as_str() {
+                        "=" => CmpOp::Eq,
+                        "<" => CmpOp::Lt,
+                        "<=" => CmpOp::Le,
+                        ">" => CmpOp::Gt,
+                        ">=" => CmpOp::Ge,
+                        _ => unreachable!(),
+                    };
+                    Expr::Cmp {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }
                 SExpr::Sym(sym) if sym == "let" => {
                     if items.len() != 3 {
                         panic!("let expects binding and body");
@@ -332,6 +368,18 @@ fn gen_expr(expr: &Expr, out: &mut String, indent: usize, env: &mut CodegenEnv) 
             gen_expr(a, out, indent, env);
             gen_expr(b, out, indent, env);
             out.push_str(&format!("{}i32.mul\n", pad));
+        }
+        Expr::Cmp { op, lhs, rhs } => {
+            gen_expr(lhs, out, indent, env);
+            gen_expr(rhs, out, indent, env);
+            let instr = match op {
+                CmpOp::Eq => "i32.eq",
+                CmpOp::Lt => "i32.lt_s",
+                CmpOp::Le => "i32.le_s",
+                CmpOp::Gt => "i32.gt_s",
+                CmpOp::Ge => "i32.ge_s",
+            };
+            out.push_str(&format!("{}{}\n", pad, instr));
         }
         Expr::Let { name, value, body } => {
             gen_expr(value, out, indent, env);
