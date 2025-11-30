@@ -1,5 +1,8 @@
 use std::env;
 use std::fs;
+use std::path::Path;
+
+use wat::parse_str;
 
 /// Tokens for a tiny S-expression tokenizer.
 #[derive(Debug, Clone)]
@@ -36,15 +39,21 @@ struct Program {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <source-file>", args[0]);
+    if args.len() != 3 {
+        eprintln!(
+            "Usage: {} <source-file> <out-stem>\n\nExample:\n  {} prog.lisp tiny",
+            args[0], args[0]
+        );
         std::process::exit(1);
     }
 
-    let src = fs::read_to_string(&args[1]).expect("failed to read source file");
+    let src_path = &args[1];
+    let out_stem = &args[2];
 
+    let src = fs::read_to_string(src_path).expect("failed to read source file");
+
+    // 1) tokenize + parse
     let tokens = tokenize(&src);
-    // Parse exactly one top-level S-expression
     let (sexpr, next) = parse_sexpr(&tokens, 0);
     if next != tokens.len() {
         eprintln!(
@@ -55,14 +64,27 @@ fn main() {
 
     let prog = parse_program(sexpr);
 
+    // 2) generate WAT + WIT
     let wat = generate_wat(&prog);
     let wit = generate_wit();
 
-    println!(";; ---- Generated WAT (WebAssembly Text) ----");
-    println!("{}", wat);
-    println!();
-    println!(";; ---- Generated WIT (Component Interface) ----");
-    println!("{}", wit);
+    // 3) turn WAT into binary wasm
+    let wasm_bytes =
+        parse_str(&wat).expect("failed to convert generated WAT to wasm (wat::parse_str)");
+
+    // 4) write files: <stem>.wat, <stem>.wasm, <stem>.wit
+    let wat_path = format!("{}.wat", out_stem);
+    let wasm_path = format!("{}.wasm", out_stem);
+    let wit_path = format!("{}.wit", out_stem);
+
+    fs::write(&wat_path, wat).expect("failed to write .wat file");
+    fs::write(&wasm_path, wasm_bytes).expect("failed to write .wasm file");
+    fs::write(&wit_path, wit).expect("failed to write .wit file");
+
+    println!("Wrote:");
+    println!("  {}", Path::new(&wat_path).display());
+    println!("  {}", Path::new(&wasm_path).display());
+    println!("  {}", Path::new(&wit_path).display());
 }
 
 /// Turn source into a list of tokens.
