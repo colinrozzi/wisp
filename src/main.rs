@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -30,6 +29,11 @@ enum Expr {
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
+    Let {
+        name: String,
+        value: Box<Expr>,
+        body: Box<Expr>,
+    },
 }
 
 /// A parsed program: one function main(x) = body
@@ -230,7 +234,6 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
             if items.is_empty() {
                 panic!("Empty list is not a valid expression");
             }
-            // Expect form like (+ a b), (- a b), (* a b)
             let op = &items[0];
             match op {
                 SExpr::Sym(sym) if sym == "+" || sym == "-" || sym == "*" => {
@@ -246,8 +249,33 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                         _ => unreachable!(),
                     }
                 }
+                SExpr::Sym(sym) if sym == "let" => {
+                    if items.len() != 3 {
+                        panic!("let expects binding and body");
+                    }
+                    let binding = match &items[1] {
+                        SExpr::List(parts) => parts,
+                        _ => panic!("let binding must be a list (name value)"),
+                    };
+                    if binding.len() != 2 {
+                        panic!("let binding must have exactly a name and value");
+                    }
+                    let name = match &binding[0] {
+                        SExpr::Sym(s) => s.clone(),
+                        _ => panic!("let binding name must be a symbol"),
+                    };
+                    let value_expr = parse_expr(&binding[1], vars);
+                    let mut next_vars = vars.to_vec();
+                    next_vars.push(name.clone());
+                    let body_expr = parse_expr(&items[2], &next_vars);
+                    Expr::Let {
+                        name,
+                        value: Box::new(value_expr),
+                        body: Box::new(body_expr),
+                    }
+                }
                 _ => {
-                    panic!("Only +, -, * are supported as list operators");
+                    panic!("Only +, -, *, and let are supported as list operators");
                 }
             }
         }
@@ -257,6 +285,10 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
 /// Generate WAT module with a single function:
 /// (func (param i32) (result i32) ... )
 fn generate_wat(prog: &Program) -> String {
+    let mut body = String::new();
+    let mut env = CodegenEnv::new(&prog.params);
+    gen_expr(&prog.body, &mut body, 4, &mut env);
+
     let mut out = String::new();
     out.push_str("(module\n");
     out.push_str("  (func $main ");
@@ -264,11 +296,10 @@ fn generate_wat(prog: &Program) -> String {
         out.push_str(&format!("(param ${} i32) ", param));
     }
     out.push_str("(result i32)\n");
-    let mut var_map = HashMap::new();
-    for (idx, name) in prog.params.iter().enumerate() {
-        var_map.insert(name.clone(), idx as u32);
+    for _ in 0..env.local_count {
+        out.push_str("    (local i32)\n");
     }
-    gen_expr(&prog.body, &mut out, 4, &var_map);
+    out.push_str(&body);
     out.push_str("  )\n");
     out.push_str("  (export \"run\" (func $main))\n");
     out.push_str(")\n");
@@ -277,33 +308,82 @@ fn generate_wat(prog: &Program) -> String {
 
 /// Recursively generate WAT instructions for an Expr.
 /// `indent` is the number of spaces to indent.
-fn gen_expr(expr: &Expr, out: &mut String, indent: usize, vars: &HashMap<String, u32>) {
+fn gen_expr(expr: &Expr, out: &mut String, indent: usize, env: &mut CodegenEnv) {
     let pad = " ".repeat(indent);
     match expr {
         Expr::Int(n) => {
             out.push_str(&format!("{}i32.const {}\n", pad, n));
         }
         Expr::Var(name) => {
-            let idx = vars
-                .get(name)
-                .unwrap_or_else(|| panic!("Codegen missing variable {}", name));
+            let idx = env.lookup(name);
             out.push_str(&format!("{}local.get {}\n", pad, idx));
         }
         Expr::Add(a, b) => {
-            gen_expr(a, out, indent, vars);
-            gen_expr(b, out, indent, vars);
+            gen_expr(a, out, indent, env);
+            gen_expr(b, out, indent, env);
             out.push_str(&format!("{}i32.add\n", pad));
         }
         Expr::Sub(a, b) => {
-            gen_expr(a, out, indent, vars);
-            gen_expr(b, out, indent, vars);
+            gen_expr(a, out, indent, env);
+            gen_expr(b, out, indent, env);
             out.push_str(&format!("{}i32.sub\n", pad));
         }
         Expr::Mul(a, b) => {
-            gen_expr(a, out, indent, vars);
-            gen_expr(b, out, indent, vars);
+            gen_expr(a, out, indent, env);
+            gen_expr(b, out, indent, env);
             out.push_str(&format!("{}i32.mul\n", pad));
         }
+        Expr::Let { name, value, body } => {
+            gen_expr(value, out, indent, env);
+            let idx = env.declare_local();
+            out.push_str(&format!("{}local.set {}\n", pad, idx));
+            env.push_binding(name.clone(), idx);
+            gen_expr(body, out, indent, env);
+            env.pop_binding();
+        }
+    }
+}
+
+struct CodegenEnv {
+    bindings: Vec<(String, u32)>,
+    param_count: u32,
+    local_count: u32,
+}
+
+impl CodegenEnv {
+    fn new(params: &[String]) -> Self {
+        let mut bindings = Vec::new();
+        for (idx, name) in params.iter().enumerate() {
+            bindings.push((name.clone(), idx as u32));
+        }
+        Self {
+            bindings,
+            param_count: params.len() as u32,
+            local_count: 0,
+        }
+    }
+
+    fn declare_local(&mut self) -> u32 {
+        let idx = self.param_count + self.local_count;
+        self.local_count += 1;
+        idx
+    }
+
+    fn push_binding(&mut self, name: String, idx: u32) {
+        self.bindings.push((name, idx));
+    }
+
+    fn pop_binding(&mut self) {
+        self.bindings.pop();
+    }
+
+    fn lookup(&self, name: &str) -> u32 {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, idx)| *idx)
+            .unwrap_or_else(|| panic!("Codegen missing variable {}", name))
     }
 }
 

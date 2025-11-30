@@ -1,2 +1,3 @@
 (fn main (x y)
-  (+ (* x 2) y))
+  (let (double (* x 2))
+    (+ double y)))
