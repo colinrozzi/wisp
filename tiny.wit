@@ -1,5 +1,5 @@
 package example:tiny
 
 world tiny {
-  export run: func(x: s32, y: s32) -> s32
+  export run: func(x: s32) -> s32
 }

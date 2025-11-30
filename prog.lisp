@@ -1,5 +1,20 @@
-(fn main (x y)
-  (let (double (* x 2))
-    (if (> double y)
-        double
-        y)))
+(fn double (x)
+  (* x 2))
+
+(fn bigger (a b)
+  (if (> a b)
+      a
+      b))
+
+(fn smaller (a b)
+    (if (< a b)
+        a
+        b))
+
+(fn factorial (n)
+  (if (= n 0)
+      1
+      (* n (factorial (- n 1)))))
+
+(fn main (x)
+    (factorial x))

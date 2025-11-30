@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -29,6 +30,10 @@ enum Expr {
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
     Cmp {
         op: CmpOp,
         lhs: Box<Expr>,
@@ -55,11 +60,17 @@ enum CmpOp {
     Ge,
 }
 
-/// A parsed program: one function main(x) = body
 #[derive(Debug)]
-struct Program {
+struct Function {
+    name: String,
     params: Vec<String>,
     body: Expr,
+}
+
+/// A parsed program: a set of functions that must include `main`.
+#[derive(Debug)]
+struct Program {
+    functions: Vec<Function>,
 }
 
 fn main() {
@@ -79,19 +90,23 @@ fn main() {
 
     // 1) tokenize + parse
     let tokens = tokenize(&src);
-    let (sexpr, next) = parse_sexpr(&tokens, 0);
-    if next != tokens.len() {
-        eprintln!(
-            "Extra tokens after first top-level form (this compiler expects exactly one form)."
-        );
+    let mut forms = Vec::new();
+    let mut pos = 0;
+    while pos < tokens.len() {
+        let (sexpr, next) = parse_sexpr(&tokens, pos);
+        forms.push(sexpr);
+        pos = next;
+    }
+    if forms.is_empty() {
+        eprintln!("No function definitions found in source.");
         std::process::exit(1);
     }
 
-    let prog = parse_program(sexpr);
+    let prog = parse_program(forms);
 
     // 2) generate WAT + WIT
     let wat = generate_wat(&prog);
-    let wit = generate_wit(&prog.params);
+    let wit = generate_wit(&prog);
 
     // 3) turn WAT into binary wasm
     let wasm_bytes =
@@ -193,53 +208,72 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
     }
 }
 
-/// Parse the top-level program:
-/// (fn main (x) <expr>)
-fn parse_program(sexpr: SExpr) -> Program {
-    match sexpr {
-        SExpr::List(items) => {
-            if items.len() != 4 {
-                panic!("Expected (fn main (x) <expr>)");
-            }
-            // (fn ...
-            match &items[0] {
-                SExpr::Sym(s) if s == "fn" => {}
-                _ => panic!("Program must start with (fn ...)"),
-            }
-            // name: main
-            match &items[1] {
-                SExpr::Sym(s) if s == "main" => {}
-                _ => panic!("Only 'main' function is supported"),
-            }
-            // params: (x y ...)
-            let params = match &items[2] {
-                SExpr::List(params) => {
-                    if params.is_empty() {
-                        panic!("Function must take at least one parameter");
-                    }
-                    params
-                        .iter()
-                        .map(|p| match p {
-                            SExpr::Sym(name) => name.clone(),
-                            _ => panic!("Parameters must be symbols"),
-                        })
-                        .collect::<Vec<_>>()
-                }
-                _ => panic!("Expected parameter list (x y ...)"),
-            };
-
-            let body_expr = parse_expr(&items[3], &params);
-            Program {
-                params,
-                body: body_expr,
-            }
+fn parse_program(forms: Vec<SExpr>) -> Program {
+    let mut signatures = HashMap::new();
+    for form in &forms {
+        let (name, params) = parse_fn_signature(form);
+        if signatures.insert(name.clone(), params.len()).is_some() {
+            panic!("Duplicate function '{}'", name);
         }
+    }
+
+    if !signatures.contains_key("main") {
+        panic!("Program must define a main function");
+    }
+
+    let mut functions = Vec::new();
+    for form in forms {
+        functions.push(parse_function(form, &signatures));
+    }
+
+    Program { functions }
+}
+
+fn parse_fn_signature(form: &SExpr) -> (String, Vec<String>) {
+    let items = match form {
+        SExpr::List(items) => items,
         _ => panic!("Top-level form must be a list"),
+    };
+    if items.len() != 4 {
+        panic!("Function definitions must look like (fn name (params...) body)");
+    }
+    match &items[0] {
+        SExpr::Sym(s) if s == "fn" => {}
+        _ => panic!("Function definition must start with (fn ...)"),
+    }
+    let name = match &items[1] {
+        SExpr::Sym(name) => name.clone(),
+        _ => panic!("Function name must be a symbol"),
+    };
+    let params = match &items[2] {
+        SExpr::List(params) => params
+            .iter()
+            .map(|p| match p {
+                SExpr::Sym(name) => name.clone(),
+                _ => panic!("Parameters must be symbols"),
+            })
+            .collect::<Vec<_>>(),
+        _ => panic!("Expected parameter list"),
+    };
+    (name, params)
+}
+
+fn parse_function(form: SExpr, functions: &HashMap<String, usize>) -> Function {
+    let (name, params) = parse_fn_signature(&form);
+    let items = match form {
+        SExpr::List(items) => items,
+        _ => unreachable!(),
+    };
+    let body_expr = parse_expr(&items[3], &params, functions);
+    Function {
+        name,
+        params,
+        body: body_expr,
     }
 }
 
 /// Convert an S-expression into our Expr AST.
-fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
+fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, usize>) -> Expr {
     match sexpr {
         SExpr::Num(n) => Expr::Int(*n),
         SExpr::Sym(s) => {
@@ -259,8 +293,8 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                     if items.len() != 3 {
                         panic!("Operator {} expects exactly 2 operands", sym);
                     }
-                    let lhs = parse_expr(&items[1], vars);
-                    let rhs = parse_expr(&items[2], vars);
+                    let lhs = parse_expr(&items[1], vars, functions);
+                    let rhs = parse_expr(&items[2], vars, functions);
                     match sym.as_str() {
                         "+" => Expr::Add(Box::new(lhs), Box::new(rhs)),
                         "-" => Expr::Sub(Box::new(lhs), Box::new(rhs)),
@@ -274,8 +308,8 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                     if items.len() != 3 {
                         panic!("Operator {} expects exactly 2 operands", sym);
                     }
-                    let lhs = parse_expr(&items[1], vars);
-                    let rhs = parse_expr(&items[2], vars);
+                    let lhs = parse_expr(&items[1], vars, functions);
+                    let rhs = parse_expr(&items[2], vars, functions);
                     let op = match sym.as_str() {
                         "=" => CmpOp::Eq,
                         "<" => CmpOp::Lt,
@@ -294,9 +328,9 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                     if items.len() != 4 {
                         panic!("if expects condition, then, else");
                     }
-                    let cond = parse_expr(&items[1], vars);
-                    let then_branch = parse_expr(&items[2], vars);
-                    let else_branch = parse_expr(&items[3], vars);
+                    let cond = parse_expr(&items[1], vars, functions);
+                    let then_branch = parse_expr(&items[2], vars, functions);
+                    let else_branch = parse_expr(&items[3], vars, functions);
                     Expr::If {
                         cond: Box::new(cond),
                         then_branch: Box::new(then_branch),
@@ -318,10 +352,10 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                         SExpr::Sym(s) => s.clone(),
                         _ => panic!("let binding name must be a symbol"),
                     };
-                    let value_expr = parse_expr(&binding[1], vars);
+                    let value_expr = parse_expr(&binding[1], vars, functions);
                     let mut next_vars = vars.to_vec();
                     next_vars.push(name.clone());
-                    let body_expr = parse_expr(&items[2], &next_vars);
+                    let body_expr = parse_expr(&items[2], &next_vars, functions);
                     Expr::Let {
                         name,
                         value: Box::new(value_expr),
@@ -329,7 +363,30 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                     }
                 }
                 _ => {
-                    panic!("Only +, -, *, and let are supported as list operators");
+                    if let SExpr::Sym(sym) = op {
+                        if let Some(expected) = functions.get(sym) {
+                            if items.len() - 1 != *expected {
+                                panic!(
+                                    "Function '{}' expects {} arguments, got {}",
+                                    sym,
+                                    expected,
+                                    items.len() - 1
+                                );
+                            }
+                            let mut args = Vec::new();
+                            for arg in &items[1..] {
+                                args.push(parse_expr(arg, vars, functions));
+                            }
+                            Expr::Call {
+                                name: sym.clone(),
+                                args,
+                            }
+                        } else {
+                            panic!("Unknown operator or function: {}", sym);
+                        }
+                    } else {
+                        panic!("List does not start with a symbol");
+                    }
                 }
             }
         }
@@ -339,22 +396,24 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
 /// Generate WAT module with a single function:
 /// (func (param i32) (result i32) ... )
 fn generate_wat(prog: &Program) -> String {
-    let mut body = String::new();
-    let mut env = CodegenEnv::new(&prog.params);
-    gen_expr(&prog.body, &mut body, 4, &mut env);
-
     let mut out = String::new();
     out.push_str("(module\n");
-    out.push_str("  (func $main ");
-    for param in &prog.params {
-        out.push_str(&format!("(param ${} i32) ", param));
+    for func in &prog.functions {
+        let mut body = String::new();
+        let mut env = CodegenEnv::new(&func.params);
+        gen_expr(&func.body, &mut body, 4, &mut env);
+
+        out.push_str(&format!("  (func ${} ", func.name));
+        for param in &func.params {
+            out.push_str(&format!("(param ${} i32) ", param));
+        }
+        out.push_str("(result i32)\n");
+        for _ in 0..env.local_count {
+            out.push_str("    (local i32)\n");
+        }
+        out.push_str(&body);
+        out.push_str("  )\n");
     }
-    out.push_str("(result i32)\n");
-    for _ in 0..env.local_count {
-        out.push_str("    (local i32)\n");
-    }
-    out.push_str(&body);
-    out.push_str("  )\n");
     out.push_str("  (export \"run\" (func $main))\n");
     out.push_str(")\n");
     out
@@ -386,6 +445,12 @@ fn gen_expr(expr: &Expr, out: &mut String, indent: usize, env: &mut CodegenEnv) 
             gen_expr(a, out, indent, env);
             gen_expr(b, out, indent, env);
             out.push_str(&format!("{}i32.mul\n", pad));
+        }
+        Expr::Call { name, args } => {
+            for arg in args {
+                gen_expr(arg, out, indent, env);
+            }
+            out.push_str(&format!("{}call ${}\n", pad, name));
         }
         Expr::If {
             cond,
@@ -468,14 +533,18 @@ impl CodegenEnv {
     }
 }
 
-/// Generate a minimal WIT interface that matches the function:
-/// world tiny { export run: func(x: s32) -> s32 }
-fn generate_wit(params: &[String]) -> String {
+/// Generate a minimal WIT interface that matches the `main` function signature.
+fn generate_wit(prog: &Program) -> String {
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.name == "main")
+        .expect("main function missing during WIT generation");
     let mut out = String::new();
     out.push_str("package example:tiny\n\n");
     out.push_str("world tiny {\n");
     out.push_str("  export run: func(");
-    for (i, param) in params.iter().enumerate() {
+    for (i, param) in main_fn.params.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
