@@ -34,6 +34,11 @@ enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    If {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
     Let {
         name: String,
         value: Box<Expr>,
@@ -285,6 +290,19 @@ fn parse_expr(sexpr: &SExpr, vars: &[String]) -> Expr {
                         rhs: Box::new(rhs),
                     }
                 }
+                SExpr::Sym(sym) if sym == "if" => {
+                    if items.len() != 4 {
+                        panic!("if expects condition, then, else");
+                    }
+                    let cond = parse_expr(&items[1], vars);
+                    let then_branch = parse_expr(&items[2], vars);
+                    let else_branch = parse_expr(&items[3], vars);
+                    Expr::If {
+                        cond: Box::new(cond),
+                        then_branch: Box::new(then_branch),
+                        else_branch: Box::new(else_branch),
+                    }
+                }
                 SExpr::Sym(sym) if sym == "let" => {
                     if items.len() != 3 {
                         panic!("let expects binding and body");
@@ -368,6 +386,21 @@ fn gen_expr(expr: &Expr, out: &mut String, indent: usize, env: &mut CodegenEnv) 
             gen_expr(a, out, indent, env);
             gen_expr(b, out, indent, env);
             out.push_str(&format!("{}i32.mul\n", pad));
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            gen_expr(cond, out, indent, env);
+            out.push_str(&format!("{}(if (result i32)\n", pad));
+            out.push_str(&format!("{}  (then\n", pad));
+            gen_expr(then_branch, out, indent + 4, env);
+            out.push_str(&format!("{}  )\n", pad));
+            out.push_str(&format!("{}  (else\n", pad));
+            gen_expr(else_branch, out, indent + 4, env);
+            out.push_str(&format!("{}  )\n", pad));
+            out.push_str(&format!("{})\n", pad));
         }
         Expr::Cmp { op, lhs, rhs } => {
             gen_expr(lhs, out, indent, env);

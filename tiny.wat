@@ -7,7 +7,15 @@
     local.set 2
     local.get 2
     local.get 1
-    i32.add
+    i32.gt_s
+    (if (result i32)
+      (then
+        local.get 2
+      )
+      (else
+        local.get 1
+      )
+    )
   )
   (export "run" (func $main))
 )
