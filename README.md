@@ -25,7 +25,7 @@ Everything is an `s32`. The current surface includes:
 | Form | Description |
 | ---- | ----------- |
 | `(fn name (params...) body)` | Function definition. All functions return `s32`. |
-| `(export name)` / `(export (fn ...))` | Mark a function for export. `main` is always exported as `run`. |
+| `(export name)` / `(export (fn ...))` | Mark a function for export; list form defines and exports in one go. |
 | Literals (`42`) | Signed 32-bit integers. |
 | Variables | Function parameters and `let` bindings (lexically scoped). |
 | Arithmetic | `(+ a b)`, `(- a b)`, `(* a b)` |
@@ -54,7 +54,7 @@ Everything is an `s32`. The current surface includes:
   (factorial (double x)))
 ```
 
-Compiling it yields WAT/WIT with both `double` and `factorial` exported alongside the default `run` entry point. You can then call any export with the built-in runner:
+Compiling it yields WAT/WIT with `double` and `factorial` exported (based on the explicit `export` forms). You can then call any export with the built-in runner:
 
 ```
 $ cargo run -- run wisp.wasm factorial 5

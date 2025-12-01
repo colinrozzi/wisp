@@ -52,8 +52,12 @@
     local.get 0
     call $factorial
   )
+  (func $run (param $x i32) (result i32)
+    local.get 0
+    call $main
+  )
   (export "double" (func $double))
   (export "smaller" (func $smaller))
   (export "factorial" (func $factorial))
-  (export "run" (func $main))
+  (export "run" (func $run))
 )

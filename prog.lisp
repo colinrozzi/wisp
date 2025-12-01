@@ -22,3 +22,6 @@
 
 (fn main (x)
   (factorial x))
+
+(export (fn run (x)
+            (main x)))

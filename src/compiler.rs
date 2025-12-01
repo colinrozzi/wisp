@@ -278,15 +278,6 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
         }
     }
 
-    if !defined.contains("main") {
-        panic!("Program must define a main function");
-    }
-
-    if !export_set.contains("main") {
-        export_set.insert("main".to_string());
-        exports.push("main".to_string());
-    }
-
     let mut signatures = HashMap::new();
     for func in &pending {
         if signatures
@@ -489,14 +480,9 @@ fn generate_wat(prog: &Program) -> String {
         out.push_str("  )\n");
     }
     for export in &prog.exports {
-        let export_name = if export == "main" {
-            "run".to_string()
-        } else {
-            export.clone()
-        };
         out.push_str(&format!(
             "  (export \"{}\" (func ${}))\n",
-            export_name, export
+            export, export
         ));
     }
     out.push_str(")\n");
@@ -621,12 +607,7 @@ fn generate_wit(prog: &Program) -> String {
     out.push_str("world wisp {\n");
     for export in &prog.exports {
         let func = find_function(prog, export);
-        let export_name = if export == "main" {
-            "run".to_string()
-        } else {
-            export.clone()
-        };
-        out.push_str(&format!("  export {}: func(", export_name));
+        out.push_str(&format!("  export {}: func(", export));
         for (i, param) in func.params.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
