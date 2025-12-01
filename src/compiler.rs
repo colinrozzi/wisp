@@ -617,8 +617,8 @@ impl CodegenEnv {
 
 fn generate_wit(prog: &Program) -> String {
     let mut out = String::new();
-    out.push_str("package example:tiny;\n\n");
-    out.push_str("world tiny {\n");
+    out.push_str("package example:wisp;\n\n");
+    out.push_str("world wisp {\n");
     for export in &prog.exports {
         let func = find_function(prog, export);
         let export_name = if export == "main" {

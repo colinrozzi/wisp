@@ -12,7 +12,7 @@ use wasmtime::{
 use crate::compiler::CompileArtifacts;
 
 #[derive(Parser)]
-#[command(name = "tinyc", version, about = "Tiny Lisp-to-Wasm compiler")]
+#[command(name = "wisp", version, about = "Tiny Lisp-to-Wasm compiler")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

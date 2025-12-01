@@ -1,17 +1,17 @@
-# tinyc
+# wisp
 
-`tinyc` is a deliberately tiny Lisp-like compiler that lowers a handful of S-expression forms to WebAssembly text/binary plus a matching WIT world. It is meant as an educational scaffold for experimenting with WebAssembly components and compiler pipelines.
+`wisp` is a deliberately tiny Lisp-like compiler that lowers a handful of S-expression forms to WebAssembly text/binary plus a matching WIT world. It is meant as an educational scaffold for experimenting with WebAssembly components and compiler pipelines.
 
 ## Workflow
 
 ```
-$ cargo run -- compile prog.lisp tiny
+$ cargo run -- compile prog.lisp wisp
 Wrote:
-  tiny.wat
-  tiny.wasm
-  tiny.wit
+  wisp.wat
+  wisp.wasm
+  wisp.wit
 
-$ cargo run -- run tiny.wasm double 7
+$ cargo run -- run wisp.wasm double 7
 14
 ```
 
@@ -57,7 +57,7 @@ Everything is an `s32`. The current surface includes:
 Compiling it yields WAT/WIT with both `double` and `factorial` exported alongside the default `run` entry point. You can then call any export with the built-in runner:
 
 ```
-$ cargo run -- run tiny.wasm factorial 5
+$ cargo run -- run wisp.wasm factorial 5
 120
 ```
 
