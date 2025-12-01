@@ -5,18 +5,18 @@
 ## Workflow
 
 ```
-$ cargo run -- prog.lisp tiny
+$ cargo run -- compile prog.lisp tiny
 Wrote:
   tiny.wat
   tiny.wasm
   tiny.wit
 
-$ wasmtime --invoke run tiny.wasm 5
-120
+$ cargo run -- run tiny.wasm double 7
+14
 ```
 
-1. **Compile** – `cargo run -- <source.lisp> <out-stem>` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and then converts the WAT to `out-stem.wasm` via the `wat` crate.
-2. **Run** – use the Wasmtime CLI (`wasmtime --invoke run out-stem.wasm <args…>`) to call the exported `run` function, or import the WIT world into your own component host.
+1. **Compile** – `cargo run -- compile <source.lisp> <out-stem>` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and encodes `out-stem.wasm` as a WebAssembly component (with embedded WIT).
+2. **Run** – `cargo run -- run out-stem.wasm <export> <args…>` instantiates the component via Wasmtime and calls the chosen export. You can also import the WIT world into your own host.
 
 ## Language Features
 
@@ -54,17 +54,14 @@ Everything is an `s32`. The current surface includes:
   (factorial (double x)))
 ```
 
-Compiling it yields WAT/WIT with both `double` and `factorial` exported alongside the default `run` entry point. You can then call any export via Wasmtime:
+Compiling it yields WAT/WIT with both `double` and `factorial` exported alongside the default `run` entry point. You can then call any export with the built-in runner:
 
 ```
-$ wasmtime --invoke double tiny.wasm 7
-14
-$ wasmtime --invoke factorial tiny.wasm 5
+$ cargo run -- run tiny.wasm factorial 5
 120
 ```
 
 ## Next Ideas
 
 - Broaden the surface language (multiple `let` bindings, boolean ops, structured types).
-- Emit true components via `wasm-tools component new …` so hosts can bind through the component model directly.
 - Add regression tests (e.g., compile golden programs and diff the output) so new features don’t regress existing codegen.
