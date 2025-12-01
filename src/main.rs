@@ -2,11 +2,11 @@ mod compiler;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use wasmtime::{
     Engine, Store,
-    component::{Component, Linker, Type, Val},
+    component::{Component, Linker, Type, Val, types::ComponentItem},
 };
 
 use crate::compiler::CompileArtifacts;
@@ -40,6 +40,9 @@ enum Command {
         /// Integer arguments to pass to the function.
         #[arg(value_name = "ARGS")]
         args: Vec<i32>,
+        /// Optional dependency to satisfy imports, in the form `module=path.wasm`.
+        #[arg(long = "dep", value_name = "MOD=PATH")]
+        dep: Option<String>,
     },
 }
 
@@ -52,7 +55,8 @@ fn main() -> Result<()> {
             component,
             func,
             args,
-        } => run_component(&component, &func, &args)?,
+            dep,
+        } => run_component(&component, &func, &args, dep.as_deref())?,
     }
 
     Ok(())
@@ -84,12 +88,39 @@ fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("  {}", artifacts.wit.display());
 }
 
-fn run_component(component_path: &Path, func: &str, args: &[i32]) -> Result<()> {
+fn run_component(component_path: &Path, func: &str, args: &[i32], dep: Option<&str>) -> Result<()> {
     let engine = Engine::default();
     let component = Component::from_file(&engine, component_path)
         .with_context(|| format!("failed to load component {}", component_path.display()))?;
     let mut store = Store::new(&engine, ());
-    let linker = Linker::new(&engine);
+    let mut linker = Linker::new(&engine);
+
+    if let Some(dep) = dep {
+        let (module, path) = parse_dep_arg(dep)?;
+        let dep_component = Component::from_file(&engine, &path)
+            .with_context(|| format!("failed to load dependency {}", path.display()))?;
+        let dep_instance = Linker::new(&engine)
+            .instantiate(&mut store, &dep_component)
+            .with_context(|| format!("failed to instantiate dependency {}", path.display()))?;
+
+        let mut ns = linker
+            .instance(&module)
+            .with_context(|| format!("failed to create namespace '{}'", module))?;
+
+        for (name, item) in dep_component.component_type().exports(&engine) {
+            if matches!(item, ComponentItem::ComponentFunc(_)) {
+                let func_ref = dep_instance
+                    .get_func(&mut store, name)
+                    .with_context(|| format!("dependency export '{}' not found", name))?;
+                let func_clone = func_ref.clone();
+                ns.func_new(name, move |mut cx, params, results| {
+                    func_clone.call(&mut cx, params, results)
+                })
+                .with_context(|| format!("failed to wire dependency export '{}'", name))?;
+            }
+        }
+    }
+
     let instance = linker
         .instantiate(&mut store, &component)
         .context("failed to instantiate component")?;
@@ -146,4 +177,17 @@ fn encode_params(param_types: &[Type], args: &[i32], func: &str) -> Result<Vec<V
         }
     }
     Ok(params)
+}
+
+fn parse_dep_arg(dep: &str) -> Result<(String, PathBuf)> {
+    let (module, path) = dep
+        .split_once('=')
+        .ok_or_else(|| anyhow!("--dep expects format module=path.wasm"))?;
+    if module.is_empty() {
+        bail!("--dep module name cannot be empty");
+    }
+    if path.is_empty() {
+        bail!("--dep path cannot be empty");
+    }
+    Ok((module.to_string(), PathBuf::from(path)))
 }

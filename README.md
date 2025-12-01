@@ -16,7 +16,7 @@ $ cargo run -- run wisp.wasm double 7
 ```
 
 1. **Compile** – `cargo run -- compile <source.lisp> [out-stem]` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and encodes `out-stem.wasm` as a WebAssembly component (with embedded WIT). If `out-stem` is omitted, it defaults to the source filename stem (e.g., `prog` for `prog.lisp`).
-2. **Run** – `cargo run -- run out-stem.wasm <export> <args…>` instantiates the component via Wasmtime and calls the chosen export. You can also import the WIT world into your own host.
+2. **Run** – `cargo run -- run out-stem.wasm <export> <args…> [--dep mod=dep.wasm]` instantiates the component via Wasmtime and calls the chosen export. The optional `--dep` registers a single dependency component under the given module name to satisfy imports.
 
 ## Language Features
 
@@ -25,6 +25,7 @@ Everything is an `s32`. The current surface includes:
 | Form | Description |
 | ---- | ----------- |
 | `(fn name (params...) body)` | Function definition. All functions return `s32`. |
+| `(import mod fn (params…) s32)` | Declare an imported function; params/results are `s32` only. |
 | `(export name)` / `(export (fn ...))` | Mark a function for export; list form defines and exports in one go. |
 | Literals (`42`) | Signed 32-bit integers. |
 | Variables | Function parameters and `let` bindings (lexically scoped). |
@@ -59,6 +60,24 @@ Compiling it yields WAT/WIT with `double` and `factorial` exported (based on the
 ```
 $ cargo run -- run wisp.wasm factorial 5
 120
+```
+
+To link two components, declare imports and supply a dependency at runtime:
+
+```lisp
+; math.lisp
+(export (fn double (x) (* x 2)))
+
+; user.lisp
+(import math double (x) s32)
+(export (fn run (x) (double x)))
+```
+
+```
+$ cargo run -- compile math.lisp math
+$ cargo run -- compile user.lisp user
+$ cargo run -- run user.wasm run 5 --dep math=math.wasm
+10
 ```
 
 ## Next Ideas

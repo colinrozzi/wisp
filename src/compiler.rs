@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -139,6 +139,13 @@ struct Function {
     body: Expr,
 }
 
+#[derive(Debug, Clone)]
+struct Import {
+    module: String,
+    name: String,
+    params: Vec<String>,
+}
+
 struct PendingFunction {
     name: String,
     params: Vec<String>,
@@ -148,6 +155,7 @@ struct PendingFunction {
 #[derive(Debug)]
 struct Program {
     functions: Vec<Function>,
+    imports: Vec<Import>,
     exports: Vec<String>,
 }
 
@@ -231,6 +239,8 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
 fn parse_program(forms: Vec<SExpr>) -> Program {
     let mut pending = Vec::new();
     let mut defined = HashSet::new();
+    let mut imports = Vec::new();
+    let mut imported = HashSet::new();
     let mut exports = Vec::new();
     let mut export_set = HashSet::new();
 
@@ -271,6 +281,19 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
                             _ => panic!("export argument must be a symbol or (fn ...)"),
                         }
                     }
+                    SExpr::Sym(sym) if sym == "import" => {
+                        let import = parse_import_form(&items);
+                        if defined.contains(&import.name) {
+                            panic!(
+                                "Function '{}' is already defined and cannot be imported",
+                                import.name
+                            );
+                        }
+                        if !imported.insert(import.name.clone()) {
+                            panic!("Duplicate import '{}'", import.name);
+                        }
+                        imports.push(import);
+                    }
                     _ => panic!("Unknown top-level form"),
                 }
             }
@@ -288,9 +311,21 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
         }
     }
 
+    for import in &imports {
+        if signatures
+            .insert(import.name.clone(), import.params.len())
+            .is_some()
+        {
+            panic!("Duplicate function '{}'", import.name);
+        }
+    }
+
     for export in &exports {
         if !signatures.contains_key(export) {
             panic!("Cannot export undefined function '{}'", export);
+        }
+        if imported.contains(export) {
+            panic!("Cannot export imported function '{}'", export);
         }
     }
 
@@ -304,7 +339,11 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
         });
     }
 
-    Program { functions, exports }
+    Program {
+        functions,
+        imports,
+        exports,
+    }
 }
 
 fn parse_fn_form(form: SExpr) -> PendingFunction {
@@ -337,6 +376,42 @@ fn parse_fn_form(form: SExpr) -> PendingFunction {
         name,
         params,
         body: items[3].clone(),
+    }
+}
+
+fn parse_import_form(items: &[SExpr]) -> Import {
+    if items.len() != 5 {
+        panic!("Imports must look like (import module name (params...) result)");
+    }
+
+    let module = match &items[1] {
+        SExpr::Sym(s) => s.clone(),
+        _ => panic!("Import module must be a symbol"),
+    };
+    let name = match &items[2] {
+        SExpr::Sym(s) => s.clone(),
+        _ => panic!("Import name must be a symbol"),
+    };
+    let params = match &items[3] {
+        SExpr::List(params) => params
+            .iter()
+            .map(|p| match p {
+                SExpr::Sym(name) => name.clone(),
+                _ => panic!("Import parameters must be symbols"),
+            })
+            .collect::<Vec<_>>(),
+        _ => panic!("Import parameters must be a list"),
+    };
+
+    match &items[4] {
+        SExpr::Sym(s) if s == "s32" => {}
+        _ => panic!("Only s32 return types are supported for imports"),
+    }
+
+    Import {
+        module,
+        name,
+        params,
     }
 }
 
@@ -463,6 +538,16 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, usize>
 fn generate_wat(prog: &Program) -> String {
     let mut out = String::new();
     out.push_str("(module\n");
+    for import in &prog.imports {
+        out.push_str(&format!(
+            "  (import \"{}\" \"{}\" (func ${} ",
+            import.module, import.name, import.name
+        ));
+        for param in &import.params {
+            out.push_str(&format!("(param ${} i32) ", param));
+        }
+        out.push_str("(result i32)))\n");
+    }
     for func in &prog.functions {
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
@@ -480,10 +565,7 @@ fn generate_wat(prog: &Program) -> String {
         out.push_str("  )\n");
     }
     for export in &prog.exports {
-        out.push_str(&format!(
-            "  (export \"{}\" (func ${}))\n",
-            export, export
-        ));
+        out.push_str(&format!("  (export \"{}\" (func ${}))\n", export, export));
     }
     out.push_str(")\n");
     out
@@ -605,6 +687,27 @@ fn generate_wit(prog: &Program) -> String {
     let mut out = String::new();
     out.push_str("package example:wisp;\n\n");
     out.push_str("world wisp {\n");
+    let mut imports_by_module: BTreeMap<&str, Vec<&Import>> = BTreeMap::new();
+    for import in &prog.imports {
+        imports_by_module
+            .entry(import.module.as_str())
+            .or_default()
+            .push(import);
+    }
+    for (module, imports) in imports_by_module {
+        out.push_str(&format!("  import {}: interface {{\n", module));
+        for import in imports {
+            out.push_str(&format!("    {}: func(", import.name));
+            for (i, param) in import.params.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{}: s32", param));
+            }
+            out.push_str(") -> s32;\n");
+        }
+        out.push_str("  }\n");
+    }
     for export in &prog.exports {
         let func = find_function(prog, export);
         out.push_str(&format!("  export {}: func(", export));

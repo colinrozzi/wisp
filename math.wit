@@ -1,0 +1,5 @@
+package example:wisp;
+
+world wisp {
+  export double: func(x: s32) -> s32;
+}

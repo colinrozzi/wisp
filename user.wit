@@ -1,0 +1,8 @@
+package example:wisp;
+
+world wisp {
+  import math: interface {
+    double: func(x: s32) -> s32;
+  }
+  export run: func(x: s32) -> s32;
+}
