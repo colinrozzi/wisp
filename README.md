@@ -15,7 +15,7 @@ $ cargo run -- run wisp.wasm double 7
 14
 ```
 
-1. **Compile** – `cargo run -- compile <source.lisp> <out-stem>` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and encodes `out-stem.wasm` as a WebAssembly component (with embedded WIT).
+1. **Compile** – `cargo run -- compile <source.lisp> [out-stem]` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and encodes `out-stem.wasm` as a WebAssembly component (with embedded WIT). If `out-stem` is omitted, it defaults to the source filename stem (e.g., `prog` for `prog.lisp`).
 2. **Run** – `cargo run -- run out-stem.wasm <export> <args…>` instantiates the component via Wasmtime and calls the chosen export. You can also import the WIT world into your own host.
 
 ## Language Features

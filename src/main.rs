@@ -25,9 +25,9 @@ enum Command {
         /// Path to the input Lisp file.
         #[arg(value_name = "SOURCE")]
         source: PathBuf,
-        /// Basename for the generated artifacts.
+        /// Basename for the generated artifacts (defaults to source stem).
         #[arg(value_name = "OUT_STEM")]
-        out: String,
+        out: Option<String>,
     },
     /// Run a function exported from a compiled WebAssembly component.
     Run {
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Compile { source, out } => run_compile(&source, &out)?,
+        Command::Compile { source, out } => run_compile(&source, out.as_deref())?,
         Command::Run {
             component,
             func,
@@ -58,10 +58,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_compile(source: &Path, out: &str) -> Result<()> {
-    let artifacts = compiler::compile(source, out)?;
+fn run_compile(source: &Path, out: Option<&str>) -> Result<()> {
+    let out_stem = match out {
+        Some(stem) => stem.to_string(),
+        None => derive_out_stem(source)?,
+    };
+
+    let artifacts = compiler::compile(source, &out_stem)?;
     print_artifacts(&artifacts);
     Ok(())
+}
+
+fn derive_out_stem(source: &Path) -> Result<String> {
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("{} has no valid file stem", source.display()))?;
+    Ok(stem.to_string())
 }
 
 fn print_artifacts(artifacts: &CompileArtifacts) {
