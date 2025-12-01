@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use wasmtime::{Engine, Instance, Module, Store, Val, ValType};
+use wasmtime::{
+    Engine, Store,
+    component::{Component, Linker, Type, Val},
+};
 
 use crate::compiler::CompileArtifacts;
 
@@ -26,11 +29,11 @@ enum Command {
         #[arg(value_name = "OUT_STEM")]
         out: String,
     },
-    /// Run a function exported from a compiled wasm module.
+    /// Run a function exported from a compiled WebAssembly component.
     Run {
-        /// Path to the wasm module produced by `tinyc compile`.
+        /// Path to the wasm component produced by `tinyc compile`.
         #[arg(value_name = "WASM")]
-        module: PathBuf,
+        component: PathBuf,
         /// Name of the exported function to invoke.
         #[arg(value_name = "FUNC")]
         func: String,
@@ -45,7 +48,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Compile { source, out } => run_compile(&source, &out)?,
-        Command::Run { module, func, args } => run_module(&module, &func, &args)?,
+        Command::Run {
+            component,
+            func,
+            args,
+        } => run_component(&component, &func, &args)?,
     }
 
     Ok(())
@@ -60,53 +67,70 @@ fn run_compile(source: &Path, out: &str) -> Result<()> {
 fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("Wrote:");
     println!("  {}", artifacts.wat.display());
-    println!("  {}", artifacts.wasm.display());
+    println!("  {}", artifacts.component.display());
     println!("  {}", artifacts.wit.display());
 }
 
-fn run_module(module_path: &Path, func: &str, args: &[i32]) -> Result<()> {
+fn run_component(component_path: &Path, func: &str, args: &[i32]) -> Result<()> {
     let engine = Engine::default();
-    let module = Module::from_file(&engine, module_path)
-        .with_context(|| format!("failed to load module {}", module_path.display()))?;
+    let component = Component::from_file(&engine, component_path)
+        .with_context(|| format!("failed to load component {}", component_path.display()))?;
     let mut store = Store::new(&engine, ());
-    let instance =
-        Instance::new(&mut store, &module, &[]).context("failed to instantiate wasm module")?;
+    let linker = Linker::new(&engine);
+    let instance = linker
+        .instantiate(&mut store, &component)
+        .context("failed to instantiate component")?;
     let func_ref = instance
         .get_func(&mut store, func)
         .with_context(|| format!("export '{}' not found", func))?;
-    let ty = func_ref.ty(&store);
-
-    if ty.params().len() != args.len() {
+    let param_types = func_ref.params(&store);
+    if param_types.len() != args.len() {
         bail!(
             "function '{}' expects {} arguments but {} were provided",
             func,
-            ty.params().len(),
+            param_types.len(),
             args.len()
         );
     }
-    if ty.results().len() > 1 {
+    let params = encode_params(&param_types, args, func)?;
+    let result_types = func_ref.results(&store);
+    if result_types.len() > 1 {
         bail!("functions with more than one result are not supported yet");
     }
-
-    let mut wasm_args = Vec::new();
-    for (arg, param_ty) in args.iter().zip(ty.params()) {
-        match param_ty {
-            ValType::I32 => wasm_args.push(Val::I32(*arg)),
-            other => bail!("unsupported parameter type {:?} in '{}'", other, func),
-        }
-    }
-
-    let mut results = vec![Val::I32(0); ty.results().len()];
+    let mut results = vec![Val::Bool(false); result_types.len()];
     func_ref
-        .call(&mut store, &wasm_args, &mut results)
+        .call(&mut store, &params, &mut results)
         .with_context(|| format!("failed to invoke '{}'", func))?;
+    func_ref
+        .post_return(&mut store)
+        .context("failed to complete component call cleanup")?;
 
-    if let Some(result) = results.first() {
-        match result {
-            Val::I32(n) => println!("{}", n),
-            other => bail!("unsupported return type {:?} from '{}'", other, func),
+    if let Some((ty, value)) = result_types.into_vec().into_iter().zip(results).next() {
+        match (ty, value) {
+            (Type::S32, Val::S32(n)) => println!("{}", n),
+            (other_ty, other_val) => bail!(
+                "unsupported return combination {:?} / {:?} from '{}'",
+                other_ty,
+                other_val,
+                func
+            ),
         }
     }
 
     Ok(())
+}
+
+fn encode_params(param_types: &[Type], args: &[i32], func: &str) -> Result<Vec<Val>> {
+    let mut params = Vec::with_capacity(args.len());
+    for (ty, value) in param_types.iter().zip(args.iter()) {
+        match ty {
+            Type::S32 => params.push(Val::S32(*value)),
+            other => bail!(
+                "unsupported parameter type {:?} encountered while calling '{}'",
+                other,
+                func
+            ),
+        }
+    }
+    Ok(params)
 }

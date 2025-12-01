@@ -1,8 +1,8 @@
-package example:tiny
+package example:tiny;
 
 world tiny {
-  export double: func(x: s32) -> s32
-  export smaller: func(a: s32, b: s32) -> s32
-  export factorial: func(n: s32) -> s32
-  export run: func(x: s32) -> s32
+  export double: func(x: s32) -> s32;
+  export smaller: func(a: s32, b: s32) -> s32;
+  export factorial: func(n: s32) -> s32;
+  export run: func(x: s32) -> s32;
 }

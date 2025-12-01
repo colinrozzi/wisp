@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use wat::parse_str;
+use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
+use wit_parser::Resolve;
 
 #[derive(Debug)]
 pub struct CompileArtifacts {
     pub wat: PathBuf,
-    pub wasm: PathBuf,
     pub wit: PathBuf,
+    pub component: PathBuf,
 }
 
 pub fn compile(source_path: &Path, out_stem: &str) -> Result<CompileArtifacts> {
@@ -32,21 +34,50 @@ pub fn compile(source_path: &Path, out_stem: &str) -> Result<CompileArtifacts> {
     let wat = generate_wat(&prog);
     let wit = generate_wit(&prog);
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
+    let component_bytes = encode_component(&wasm_bytes, &wit)?;
 
     let wat_path = PathBuf::from(format!("{}.wat", out_stem));
-    let wasm_path = PathBuf::from(format!("{}.wasm", out_stem));
+    let component_path = PathBuf::from(format!("{}.wasm", out_stem));
     let wit_path = PathBuf::from(format!("{}.wit", out_stem));
 
     fs::write(&wat_path, wat).with_context(|| format!("failed to write {}", wat_path.display()))?;
-    fs::write(&wasm_path, wasm_bytes)
-        .with_context(|| format!("failed to write {}", wasm_path.display()))?;
+    fs::write(&component_path, component_bytes)
+        .with_context(|| format!("failed to write {}", component_path.display()))?;
     fs::write(&wit_path, wit).with_context(|| format!("failed to write {}", wit_path.display()))?;
 
     Ok(CompileArtifacts {
         wat: wat_path,
-        wasm: wasm_path,
         wit: wit_path,
+        component: component_path,
     })
+}
+
+fn encode_component(module: &[u8], wit_source: &str) -> Result<Vec<u8>> {
+    let mut resolve = Resolve::new();
+    let pkg_id = resolve
+        .push_str(Path::new("generated.wit"), wit_source)
+        .context("failed to parse generated WIT")?;
+    let world_id = resolve.packages[pkg_id]
+        .worlds
+        .values()
+        .next()
+        .copied()
+        .context("generated WIT is missing a world declaration")?;
+    let mut module_with_metadata = module.to_vec();
+    embed_component_metadata(
+        &mut module_with_metadata,
+        &resolve,
+        world_id,
+        StringEncoding::UTF8,
+    )
+    .context("failed to embed component metadata")?;
+    let bytes = ComponentEncoder::default()
+        .module(&module_with_metadata)
+        .context("failed to prepare module for component encoding")?
+        .validate(true)
+        .encode()
+        .context("failed to encode component")?;
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -586,7 +617,7 @@ impl CodegenEnv {
 
 fn generate_wit(prog: &Program) -> String {
     let mut out = String::new();
-    out.push_str("package example:tiny\n\n");
+    out.push_str("package example:tiny;\n\n");
     out.push_str("world tiny {\n");
     for export in &prog.exports {
         let func = find_function(prog, export);
@@ -602,7 +633,7 @@ fn generate_wit(prog: &Program) -> String {
             }
             out.push_str(&format!("{}: s32", param));
         }
-        out.push_str(") -> s32\n");
+        out.push_str(") -> s32;\n");
     }
     out.push_str("}\n");
     out
