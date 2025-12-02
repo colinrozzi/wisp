@@ -22,7 +22,7 @@ pub struct CompileArtifacts {
     pub component: PathBuf,
 }
 
-pub fn compile(source_path: &Path, out_stem: &str) -> Result<CompileArtifacts> {
+pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> {
     let src = fs::read_to_string(source_path)
         .with_context(|| format!("failed to read source file {}", source_path.display()))?;
 
@@ -43,9 +43,12 @@ pub fn compile(source_path: &Path, out_stem: &str) -> Result<CompileArtifacts> {
     type_check(&prog, &signatures)?;
     let wat = generate_wat(&prog, &signatures);
     let wit = generate_wit(&prog);
-    let wat_path = PathBuf::from(format!("{}.wat", out_stem));
-    let component_path = PathBuf::from(format!("{}.wasm", out_stem));
-    let wit_path = PathBuf::from(format!("{}.wit", out_stem));
+    let mut wat_path = out_base.to_path_buf();
+    wat_path.set_extension("wat");
+    let mut component_path = out_base.to_path_buf();
+    component_path.set_extension("wasm");
+    let mut wit_path = out_base.to_path_buf();
+    wit_path.set_extension("wit");
 
     fs::write(&wat_path, &wat)
         .with_context(|| format!("failed to write {}", wat_path.display()))?;

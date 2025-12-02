@@ -63,22 +63,36 @@ fn main() -> Result<()> {
 }
 
 fn run_compile(source: &Path, out: Option<&str>) -> Result<()> {
-    let out_stem = match out {
-        Some(stem) => stem.to_string(),
-        None => derive_out_stem(source)?,
-    };
+    let out_base = derive_out_base(source, out)?;
 
-    let artifacts = compiler::compile(source, &out_stem)?;
+    let artifacts = compiler::compile(source, &out_base)?;
     print_artifacts(&artifacts);
     Ok(())
 }
 
-fn derive_out_stem(source: &Path) -> Result<String> {
-    let stem = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .with_context(|| format!("{} has no valid file stem", source.display()))?;
-    Ok(stem.to_string())
+fn derive_out_base(source: &Path, out: Option<&str>) -> Result<PathBuf> {
+    let parent = source
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    match out {
+        Some(raw) => {
+            let candidate = PathBuf::from(raw);
+            if candidate.parent().is_none() {
+                Ok(parent.join(candidate))
+            } else {
+                Ok(candidate)
+            }
+        }
+        None => {
+            let stem = source
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .with_context(|| format!("{} has no valid file stem", source.display()))?;
+            Ok(parent.join(stem))
+        }
+    }
 }
 
 fn print_artifacts(artifacts: &CompileArtifacts) {
