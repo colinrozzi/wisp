@@ -5,17 +5,17 @@
 ## Workflow
 
 ```
-$ cargo run -- compile prog.lisp wisp
+$ cargo run -- compile examples/prog.lisp examples/prog
 Wrote:
-  wisp.wat
-  wisp.wasm
-  wisp.wit
+  examples/prog.wat
+  examples/prog.wasm
+  examples/prog.wit
 
-$ cargo run -- run wisp.wasm double 7
+$ cargo run -- run examples/prog.wasm double 7
 14
 ```
 
-1. **Compile** – `cargo run -- compile <source.lisp> [out-stem]` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and encodes `out-stem.wasm` as a WebAssembly component (with embedded WIT). If `out-stem` is omitted, it defaults to the source filename stem (e.g., `prog` for `prog.lisp`).
+1. **Compile** – `cargo run -- compile <source.lisp> [out-stem]` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and encodes `out-stem.wasm` as a WebAssembly component (with embedded WIT). If `out-stem` is omitted, it defaults to the source filename stem (e.g., `examples/prog` for `examples/prog.lisp`), and artifacts are placed next to the source.
 2. **Run** – `cargo run -- run out-stem.wasm <export> <args…> [--dep mod=dep.wasm]` instantiates the component via Wasmtime and calls the chosen export. The optional `--dep` registers a single dependency component under the given module name to satisfy imports.
 
 ## Language Features
@@ -37,7 +37,7 @@ Everything is an `s32`. The current surface includes:
 
 ## Example
 
-`prog.lisp` exercises most forms:
+`examples/prog.lisp` exercises most forms:
 
 ```lisp
 (export
@@ -58,35 +58,35 @@ Everything is an `s32`. The current surface includes:
 Compiling it yields WAT/WIT with `double` and `factorial` exported (based on the explicit `export` forms). You can then call any export with the built-in runner:
 
 ```
-$ cargo run -- run wisp.wasm factorial 5
+$ cargo run -- run examples/prog.wasm factorial 5
 120
 ```
 
 To link two components, declare imports and supply a dependency at runtime:
 
 ```lisp
-; math.lisp
+; examples/math.lisp
 (export (fn double (x) (* x 2)))
 
-; user.lisp
+; examples/user.lisp
 (import math double (x) s32)
 (export (fn run (x) (double x)))
 ```
 
 ```
-$ cargo run -- compile math.lisp math
-$ cargo run -- compile user.lisp user
-$ cargo run -- run user.wasm run 5 --dep math=math.wasm
+$ cargo run -- compile examples/math.lisp examples/math
+$ cargo run -- compile examples/user.lisp examples/user
+$ cargo run -- run examples/user.wasm run 5 --dep math=examples/math.wasm
 10
 ```
 
 Typed scalars beyond `s32` are supported; build and run `typed.lisp` with:
 
 ```
-$ cargo run -- compile typed.lisp typed
-$ cargo run -- run typed.wasm add64 40 2
+$ cargo run -- compile examples/typed.lisp examples/typed
+$ cargo run -- run examples/typed.wasm add64 40 2
 42
-$ cargo run -- run typed.wasm mul-f64 3.5
+$ cargo run -- run examples/typed.wasm mul-f64 3.5
 8.75
 ```
 

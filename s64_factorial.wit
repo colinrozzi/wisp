@@ -1,5 +1,0 @@
-package example:wisp;
-
-world wisp {
-  export factorial64: func(n: s64) -> s64;
-}
