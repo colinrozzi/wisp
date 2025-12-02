@@ -80,6 +80,21 @@ $ cargo run -- run user.wasm run 5 --dep math=math.wasm
 10
 ```
 
+Typed scalars beyond `s32` are supported; build and run `typed.lisp` with:
+
+```
+$ cargo run -- compile typed.lisp typed
+$ cargo run -- run typed.wasm add64 40 2
+42
+$ cargo run -- run typed.wasm mul-f64 3.5
+8.75
+```
+
+Typed fixtures live under `tests/fixtures/`:
+
+- `s64_factorial.lisp` – recursive factorial using `s64`
+- `f64_math.lisp` – `f64` addition/scaling plus a small `f32` dot product
+
 ## Next Ideas
 
 - Broaden the surface language (multiple `let` bindings, boolean ops, structured types).

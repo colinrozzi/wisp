@@ -39,7 +39,7 @@ enum Command {
         func: String,
         /// Integer arguments to pass to the function.
         #[arg(value_name = "ARGS")]
-        args: Vec<i32>,
+        args: Vec<String>,
         /// Optional dependency to satisfy imports, in the form `module=path.wasm`.
         #[arg(long = "dep", value_name = "MOD=PATH")]
         dep: Option<String>,
@@ -88,7 +88,12 @@ fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("  {}", artifacts.wit.display());
 }
 
-fn run_component(component_path: &Path, func: &str, args: &[i32], dep: Option<&str>) -> Result<()> {
+fn run_component(
+    component_path: &Path,
+    func: &str,
+    args: &[String],
+    dep: Option<&str>,
+) -> Result<()> {
     let engine = Engine::default();
     let component = Component::from_file(&engine, component_path)
         .with_context(|| format!("failed to load component {}", component_path.display()))?;
@@ -152,6 +157,9 @@ fn run_component(component_path: &Path, func: &str, args: &[i32], dep: Option<&s
     if let Some((ty, value)) = result_types.into_vec().into_iter().zip(results).next() {
         match (ty, value) {
             (Type::S32, Val::S32(n)) => println!("{}", n),
+            (Type::S64, Val::S64(n)) => println!("{}", n),
+            (Type::Float32, Val::Float32(n)) => println!("{}", n),
+            (Type::Float64, Val::Float64(n)) => println!("{}", n),
             (other_ty, other_val) => bail!(
                 "unsupported return combination {:?} / {:?} from '{}'",
                 other_ty,
@@ -164,11 +172,34 @@ fn run_component(component_path: &Path, func: &str, args: &[i32], dep: Option<&s
     Ok(())
 }
 
-fn encode_params(param_types: &[Type], args: &[i32], func: &str) -> Result<Vec<Val>> {
+fn encode_params(param_types: &[Type], args: &[String], func: &str) -> Result<Vec<Val>> {
     let mut params = Vec::with_capacity(args.len());
-    for (ty, value) in param_types.iter().zip(args.iter()) {
+    for (ty, raw) in param_types.iter().zip(args.iter()) {
         match ty {
-            Type::S32 => params.push(Val::S32(*value)),
+            Type::S32 => {
+                let parsed: i32 = raw
+                    .parse()
+                    .with_context(|| format!("expected s32 arg, got '{}'", raw))?;
+                params.push(Val::S32(parsed));
+            }
+            Type::S64 => {
+                let parsed: i64 = raw
+                    .parse()
+                    .with_context(|| format!("expected s64 arg, got '{}'", raw))?;
+                params.push(Val::S64(parsed));
+            }
+            Type::Float32 => {
+                let parsed: f32 = raw
+                    .parse()
+                    .with_context(|| format!("expected f32 arg, got '{}'", raw))?;
+                params.push(Val::Float32(parsed));
+            }
+            Type::Float64 => {
+                let parsed: f64 = raw
+                    .parse()
+                    .with_context(|| format!("expected f64 arg, got '{}'", raw))?;
+                params.push(Val::Float64(parsed));
+            }
             other => bail!(
                 "unsupported parameter type {:?} encountered while calling '{}'",
                 other,
