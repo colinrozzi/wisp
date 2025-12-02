@@ -3,4 +3,5 @@ package example:wisp;
 world wisp {
   export add-and-scale: func(x: f64, y: f64) -> f64;
   export dot-f32: func(ax: f32, ay: f32, bx: f32, by: f32) -> f32;
+  export widen-then-trunc: func(x: s32) -> s32;
 }

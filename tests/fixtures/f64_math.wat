@@ -15,6 +15,15 @@
     f32.mul
     f32.add
   )
+  (func $widen-then-trunc (param $x i32) (result i32)
+    i32.const 2
+    i64.extend_i32_s
+    local.get 0
+    i64.extend_i32_s
+    i64.mul
+    i32.wrap_i64
+  )
   (export "add-and-scale" (func $add-and-scale))
   (export "dot-f32" (func $dot-f32))
+  (export "widen-then-trunc" (func $widen-then-trunc))
 )

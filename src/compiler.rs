@@ -127,6 +127,10 @@ enum Expr {
         value: f64,
         ty: Type,
     },
+    Ascribe {
+        expr: Box<Expr>,
+        ty: Type,
+    },
     Var(String),
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
@@ -255,6 +259,12 @@ fn check_expr(
     match expr {
         Expr::Int { ty, .. } => Ok(*ty),
         Expr::Float { ty, .. } => Ok(*ty),
+        Expr::Ascribe { expr, ty } => {
+            let inner_ty = check_expr(expr, env, signatures)?;
+            ensure_numeric(inner_ty, "ascribe requires numeric types")?;
+            ensure_numeric(*ty, "ascribe requires numeric types")?;
+            Ok(*ty)
+        }
         Expr::Var(name) => env
             .get(name)
             .copied()
@@ -262,15 +272,14 @@ fn check_expr(
         Expr::Add(lhs, rhs) | Expr::Sub(lhs, rhs) | Expr::Mul(lhs, rhs) => {
             let lty = check_expr(lhs, env, signatures)?;
             let rty = check_expr(rhs, env, signatures)?;
-            if lty != rty {
-                bail!(
+            let common = unify_numeric(lty, rty).ok_or_else(|| {
+                anyhow!(
                     "arithmetic operands must match types, got {:?} and {:?}",
                     lty,
                     rty
-                );
-            }
-            ensure_numeric(lty, "arithmetic requires numeric types")?;
-            Ok(lty)
+                )
+            })?;
+            Ok(common)
         }
         Expr::Call { name, args } => {
             let sig = signatures
@@ -342,6 +351,19 @@ fn check_expr(
 fn ensure_numeric(ty: Type, _msg: &str) -> Result<()> {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
+    }
+}
+
+fn unify_numeric(lhs: Type, rhs: Type) -> Option<Type> {
+    if lhs == rhs {
+        return Some(lhs);
+    }
+    match (lhs, rhs) {
+        (Type::S32, Type::S64) => Some(Type::S64),
+        (Type::S64, Type::S32) => Some(Type::S64),
+        (Type::F32, Type::F64) => Some(Type::F64),
+        (Type::F64, Type::F32) => Some(Type::F64),
+        _ => None,
     }
 }
 
@@ -671,6 +693,10 @@ fn parse_type_symbol(sym: &str) -> Type {
     }
 }
 
+fn is_type_symbol(sym: &str) -> bool {
+    matches!(sym, "s32" | "s64" | "f32" | "f64")
+}
+
 fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signature>) -> Expr {
     match sexpr {
         SExpr::Int { value, ty } => Expr::Int {
@@ -694,6 +720,14 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
             }
             let op = &items[0];
             match op {
+                SExpr::Sym(sym) if is_type_symbol(sym) && items.len() == 2 => {
+                    let ty = parse_type_symbol(sym);
+                    let inner = parse_expr(&items[1], vars, functions);
+                    Expr::Ascribe {
+                        expr: Box::new(inner),
+                        ty,
+                    }
+                }
                 SExpr::Sym(sym) if sym == "+" || sym == "-" || sym == "*" => {
                     if items.len() != 3 {
                         panic!("Operator {} expects exactly 2 operands", sym);
@@ -865,38 +899,24 @@ fn gen_expr(
             }
             *ty
         }
+        Expr::Ascribe { expr, ty } => {
+            let from_ty = gen_expr(expr, out, indent, env, signatures);
+            if from_ty == *ty {
+                return from_ty;
+            }
+            let instr = conversion_instr(from_ty, *ty)
+                .unwrap_or_else(|| panic!("unsupported conversion {:?} -> {:?}", from_ty, ty));
+            out.push_str(&format!("{}{}\n", pad, instr));
+            *ty
+        }
         Expr::Var(name) => {
             let (idx, ty) = env.lookup(name);
             out.push_str(&format!("{}local.get {}\n", pad, idx));
             ty
         }
-        Expr::Add(a, b) => {
-            let lty = gen_expr(a, out, indent, env, signatures);
-            let rty = gen_expr(b, out, indent, env, signatures);
-            if lty != rty {
-                panic!("Mismatched operand types {:?} and {:?}", lty, rty);
-            }
-            out.push_str(&format!("{}{}\n", pad, binop_for(lty, "add")));
-            lty
-        }
-        Expr::Sub(a, b) => {
-            let lty = gen_expr(a, out, indent, env, signatures);
-            let rty = gen_expr(b, out, indent, env, signatures);
-            if lty != rty {
-                panic!("Mismatched operand types {:?} and {:?}", lty, rty);
-            }
-            out.push_str(&format!("{}{}\n", pad, binop_for(lty, "sub")));
-            lty
-        }
-        Expr::Mul(a, b) => {
-            let lty = gen_expr(a, out, indent, env, signatures);
-            let rty = gen_expr(b, out, indent, env, signatures);
-            if lty != rty {
-                panic!("Mismatched operand types {:?} and {:?}", lty, rty);
-            }
-            out.push_str(&format!("{}{}\n", pad, binop_for(lty, "mul")));
-            lty
-        }
+        Expr::Add(a, b) => gen_numeric_binop("add", a, b, out, &pad, env, signatures),
+        Expr::Sub(a, b) => gen_numeric_binop("sub", a, b, out, &pad, env, signatures),
+        Expr::Mul(a, b) => gen_numeric_binop("mul", a, b, out, &pad, env, signatures),
         Expr::Call { name, args } => {
             let sig = signatures
                 .get(name)
@@ -1043,6 +1063,59 @@ fn expr_type(expr: &Expr, env: &CodegenEnv, signatures: &HashMap<String, Signatu
         vars.insert(name.clone(), ty);
     }
     check_expr(expr, &vars, signatures).expect("type checking already performed")
+}
+
+fn conversion_instr(from: Type, to: Type) -> Option<&'static str> {
+    match (from, to) {
+        (Type::S32, Type::S64) => Some("i64.extend_i32_s"),
+        (Type::S64, Type::S32) => Some("i32.wrap_i64"),
+        (Type::F32, Type::F64) => Some("f64.promote_f32"),
+        (Type::F64, Type::F32) => Some("f32.demote_f64"),
+        (Type::S32, Type::F32) => Some("f32.convert_i32_s"),
+        (Type::S32, Type::F64) => Some("f64.convert_i32_s"),
+        (Type::S64, Type::F32) => Some("f32.convert_i64_s"),
+        (Type::S64, Type::F64) => Some("f64.convert_i64_s"),
+        (Type::F32, Type::S32) => Some("i32.trunc_f32_s"),
+        (Type::F32, Type::S64) => Some("i64.trunc_f32_s"),
+        (Type::F64, Type::S32) => Some("i32.trunc_f64_s"),
+        (Type::F64, Type::S64) => Some("i64.trunc_f64_s"),
+        _ if from == to => None,
+        _ => None,
+    }
+}
+
+fn maybe_convert(from: Type, to: Type, out: &mut String, pad: &str) {
+    if from == to {
+        return;
+    }
+    if let Some(instr) = conversion_instr(from, to) {
+        out.push_str(&format!("{}{}\n", pad, instr));
+    } else {
+        panic!("missing conversion {:?} -> {:?}", from, to);
+    }
+}
+
+fn gen_numeric_binop(
+    op: &str,
+    lhs: &Expr,
+    rhs: &Expr,
+    out: &mut String,
+    pad: &str,
+    env: &mut CodegenEnv,
+    signatures: &HashMap<String, Signature>,
+) -> Type {
+    let lty_decl = expr_type(lhs, env, signatures);
+    let rty_decl = expr_type(rhs, env, signatures);
+    let common = unify_numeric(lty_decl, rty_decl)
+        .unwrap_or_else(|| panic!("Mismatched operand types {:?} and {:?}", lty_decl, rty_decl));
+
+    let lty_emitted = gen_expr(lhs, out, pad.len(), env, signatures);
+    maybe_convert(lty_emitted, common, out, pad);
+    let rty_emitted = gen_expr(rhs, out, pad.len(), env, signatures);
+    maybe_convert(rty_emitted, common, out, pad);
+
+    out.push_str(&format!("{}{}\n", pad, binop_for(common, op)));
+    common
 }
 
 fn wat_type(ty: Type) -> &'static str {
