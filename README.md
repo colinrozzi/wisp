@@ -20,20 +20,21 @@ $ cargo run -- run examples/prog.wasm double 7
 
 ## Language Features
 
-Everything is an `s32`. The current surface includes:
+Scalar types: `s32`, `s64`, `f32`, `f64`.
 
 | Form | Description |
 | ---- | ----------- |
-| `(fn name (params...) body)` | Function definition. All functions return `s32`. |
-| `(import mod fn (params…) s32)` | Declare an imported function; params/results are `s32` only. |
+| `(fn name ((p1 t1) …) ret body)` | Function definition with explicit param/return types. |
+| `(import mod fn ((p1 t1) …) ret)` | Declare an imported function with explicit types. |
 | `(export name)` / `(export (fn ...))` | Mark a function for export; list form defines and exports in one go. |
-| Literals (`42`) | Signed 32-bit integers. |
+| Literals (`42`, `3.14f32`) | Numeric literals default to `s32`/`f64`; suffixes allowed. |
 | Variables | Function parameters and `let` bindings (lexically scoped). |
-| Arithmetic | `(+ a b)`, `(- a b)`, `(* a b)` |
-| Comparisons | `(= a b)` (also `==`), `(< a b)`, `(<= a b)`, `(> a b)`, `(>= a b)` – all return `0`/`1`. |
-| Conditionals | `(if cond then else)` – both branches must evaluate to `s32`. |
+| Arithmetic | `(+ a b)`, `(- a b)`, `(* a b)` with type unification/widening. |
+| Comparisons | `(= a b)` (also `==`), `(< a b)`, `(<= a b)`, `(> a b)`, `(>= a b)` – all return `s32` 0/1. |
+| Conditionals | `(if cond then else)` – condition must be `s32` 0/1; branches must match. |
 | Let bindings | `(let (name value) body)` – introduces a new local binding. |
 | Function calls | `(foo arg1 arg2 …)` with arity checked at compile time. Recursion is supported. |
+| Type ascription/cast | `(s32 expr)`, `(s64 expr)`, `(f32 expr)`, `(f64 expr)` to assert or convert types. |
 
 ## Example
 
@@ -93,7 +94,7 @@ $ cargo run -- run examples/typed.wasm mul-f64 3.5
 Typed fixtures live under `tests/fixtures/`:
 
 - `s64_factorial.lisp` – recursive factorial using `s64`
-- `f64_math.lisp` – `f64` addition/scaling plus a small `f32` dot product
+- `f64_math.lisp` – `f64` addition/scaling, a small `f32` dot product, and typed casts (`s64`/`f64`/`s32`)
 
 ## Next Ideas
 
