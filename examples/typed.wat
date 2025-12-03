@@ -1,4 +1,5 @@
 (module
+  (memory 1 100)
   (func $add64 (param $x i64) (param $y i64) (result i64)
     local.get 0
     local.get 1

@@ -1,0 +1,6 @@
+package example:wisp;
+
+world wisp {
+  export demo-alloc: func() -> s32;
+  export demo-write-read: func() -> s32;
+}

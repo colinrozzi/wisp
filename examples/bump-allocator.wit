@@ -1,0 +1,9 @@
+package example:wisp;
+
+world wisp {
+  export init-heap: func() -> s32;
+  export alloc: func(size: s32) -> s32;
+  export write-i32: func(addr: s32, val: s32) -> s32;
+  export read-i32: func(addr: s32) -> s32;
+  export test-allocator: func() -> s32;
+}

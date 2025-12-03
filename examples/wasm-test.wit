@@ -1,0 +1,7 @@
+package example:wisp;
+
+world wisp {
+  export test-add: func(a: s32, b: s32) -> s32;
+  export test-div: func(a: s32, b: s32) -> s32;
+  export test-compare: func(a: s32, b: s32) -> s32;
+}

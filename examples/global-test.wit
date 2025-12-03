@@ -1,0 +1,8 @@
+package example:wisp;
+
+world wisp {
+  export get-counter: func() -> s32;
+  export increment: func() -> s32;
+  export scaled-counter: func() -> s32;
+  export reset: func() -> s32;
+}

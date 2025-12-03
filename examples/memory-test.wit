@@ -1,0 +1,6 @@
+package example:wisp;
+
+world wisp {
+  export store-and-load: func(val: s32) -> s32;
+  export memory-ops: func() -> s32;
+}

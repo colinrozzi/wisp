@@ -1,4 +1,5 @@
 (module
+  (memory 1 100)
   (func $double (param $x i32) (result i32)
     local.get 0
     i32.const 2

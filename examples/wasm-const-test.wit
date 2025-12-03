@@ -1,0 +1,6 @@
+package example:wisp;
+
+world wisp {
+  export test-const: func(x: s32) -> s32;
+  export test-convert: func(x: s32) -> s64;
+}

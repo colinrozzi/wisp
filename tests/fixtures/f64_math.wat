@@ -16,8 +16,7 @@
     f32.add
   )
   (func $widen-then-trunc (param $x i32) (result i32)
-    i32.const 2
-    i64.extend_i32_s
+    i64.const 2
     local.get 0
     i64.extend_i32_s
     i64.mul

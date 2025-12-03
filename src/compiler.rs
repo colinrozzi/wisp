@@ -132,17 +132,9 @@ enum Expr {
         ty: Type,
     },
     Var(String),
-    Add(Box<Expr>, Box<Expr>),
-    Sub(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
     Call {
         name: String,
         args: Vec<Expr>,
-    },
-    Cmp {
-        op: CmpOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
     },
     If {
         cond: Box<Expr>,
@@ -154,15 +146,17 @@ enum Expr {
         value: Box<Expr>,
         body: Box<Expr>,
     },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CmpOp {
-    Eq,
-    Lt,
-    Le,
-    Gt,
-    Ge,
+    WasmInstr {
+        name: String,
+        args: Vec<Expr>,
+    },
+    GlobalGet {
+        name: String,
+    },
+    GlobalSet {
+        name: String,
+        value: Box<Expr>,
+    },
 }
 
 #[derive(Debug)]
@@ -187,6 +181,14 @@ struct Import {
     return_type: Type,
 }
 
+#[derive(Debug, Clone)]
+struct Global {
+    name: String,
+    ty: Type,
+    mutable: bool,
+    init_value: i64, // For simplicity, we'll only support integer constants initially
+}
+
 struct PendingFunction {
     name: String,
     params: Vec<Parameter>,
@@ -199,6 +201,7 @@ struct Program {
     functions: Vec<Function>,
     imports: Vec<Import>,
     exports: Vec<String>,
+    globals: Vec<Global>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,13 +210,237 @@ struct Signature {
     result: Type,
 }
 
+struct WasmInstrInfo {
+    params: Vec<Type>,
+    result: Type,
+}
+
+fn lookup_wasm_instr(name: &str) -> Option<WasmInstrInfo> {
+    // Arithmetic instructions
+    match name {
+        // i32 arithmetic
+        "i32.add" | "i32.sub" | "i32.mul" | "i32.div_s" | "i32.div_u" | "i32.rem_s"
+        | "i32.rem_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S32],
+            result: Type::S32,
+        }),
+        // i64 arithmetic
+        "i64.add" | "i64.sub" | "i64.mul" | "i64.div_s" | "i64.div_u" | "i64.rem_s"
+        | "i64.rem_u" => Some(WasmInstrInfo {
+            params: vec![Type::S64, Type::S64],
+            result: Type::S64,
+        }),
+        // f32 arithmetic
+        "f32.add" | "f32.sub" | "f32.mul" | "f32.div" => Some(WasmInstrInfo {
+            params: vec![Type::F32, Type::F32],
+            result: Type::F32,
+        }),
+        // f64 arithmetic
+        "f64.add" | "f64.sub" | "f64.mul" | "f64.div" => Some(WasmInstrInfo {
+            params: vec![Type::F64, Type::F64],
+            result: Type::F64,
+        }),
+
+        // i32 comparisons (return i32)
+        "i32.eq" | "i32.ne" | "i32.lt_s" | "i32.lt_u" | "i32.gt_s" | "i32.gt_u" | "i32.le_s"
+        | "i32.le_u" | "i32.ge_s" | "i32.ge_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S32],
+            result: Type::S32,
+        }),
+        // i64 comparisons (return i32)
+        "i64.eq" | "i64.ne" | "i64.lt_s" | "i64.lt_u" | "i64.gt_s" | "i64.gt_u" | "i64.le_s"
+        | "i64.le_u" | "i64.ge_s" | "i64.ge_u" => Some(WasmInstrInfo {
+            params: vec![Type::S64, Type::S64],
+            result: Type::S32,
+        }),
+        // f32 comparisons (return i32)
+        "f32.eq" | "f32.ne" | "f32.lt" | "f32.gt" | "f32.le" | "f32.ge" => Some(WasmInstrInfo {
+            params: vec![Type::F32, Type::F32],
+            result: Type::S32,
+        }),
+        // f64 comparisons (return i32)
+        "f64.eq" | "f64.ne" | "f64.lt" | "f64.gt" | "f64.le" | "f64.ge" => Some(WasmInstrInfo {
+            params: vec![Type::F64, Type::F64],
+            result: Type::S32,
+        }),
+
+        // Constants (0 params, return typed value)
+        "i32.const" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S32,
+        }),
+        "i64.const" => Some(WasmInstrInfo {
+            params: vec![Type::S64],
+            result: Type::S64,
+        }),
+        "f32.const" => Some(WasmInstrInfo {
+            params: vec![Type::F32],
+            result: Type::F32,
+        }),
+        "f64.const" => Some(WasmInstrInfo {
+            params: vec![Type::F64],
+            result: Type::F64,
+        }),
+
+        // Type conversions
+        "i32.wrap_i64" => Some(WasmInstrInfo {
+            params: vec![Type::S64],
+            result: Type::S32,
+        }),
+        "i64.extend_i32_s" | "i64.extend_i32_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S64,
+        }),
+        "f32.demote_f64" => Some(WasmInstrInfo {
+            params: vec![Type::F64],
+            result: Type::F32,
+        }),
+        "f64.promote_f32" => Some(WasmInstrInfo {
+            params: vec![Type::F32],
+            result: Type::F64,
+        }),
+        "i32.trunc_f32_s" | "i32.trunc_f32_u" => Some(WasmInstrInfo {
+            params: vec![Type::F32],
+            result: Type::S32,
+        }),
+        "i32.trunc_f64_s" | "i32.trunc_f64_u" => Some(WasmInstrInfo {
+            params: vec![Type::F64],
+            result: Type::S32,
+        }),
+        "i64.trunc_f32_s" | "i64.trunc_f32_u" => Some(WasmInstrInfo {
+            params: vec![Type::F32],
+            result: Type::S64,
+        }),
+        "i64.trunc_f64_s" | "i64.trunc_f64_u" => Some(WasmInstrInfo {
+            params: vec![Type::F64],
+            result: Type::S64,
+        }),
+        "f32.convert_i32_s" | "f32.convert_i32_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::F32,
+        }),
+        "f32.convert_i64_s" | "f32.convert_i64_u" => Some(WasmInstrInfo {
+            params: vec![Type::S64],
+            result: Type::F32,
+        }),
+        "f64.convert_i32_s" | "f64.convert_i32_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::F64,
+        }),
+        "f64.convert_i64_s" | "f64.convert_i64_u" => Some(WasmInstrInfo {
+            params: vec![Type::S64],
+            result: Type::F64,
+        }),
+
+        // Memory operations
+        "memory.size" => Some(WasmInstrInfo {
+            params: vec![],
+            result: Type::S32,
+        }),
+        "memory.grow" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S32,
+        }),
+
+        // Load instructions (address -> value)
+        "i32.load" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S32,
+        }),
+        "i64.load" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S64,
+        }),
+        "f32.load" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::F32,
+        }),
+        "f64.load" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::F64,
+        }),
+
+        // Store instructions (address, value -> value)
+        // Note: In WASM, stores don't return values, but for our expression-based
+        // language we make them return the value that was stored for composability
+        "i32.store" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S32],
+            result: Type::S32,
+        }),
+        "i64.store" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S64],
+            result: Type::S64,
+        }),
+        "f32.store" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::F32],
+            result: Type::F32,
+        }),
+        "f64.store" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::F64],
+            result: Type::F64,
+        }),
+
+        // Byte-level load operations
+        "i32.load8_s" | "i32.load8_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S32,
+        }),
+        "i32.load16_s" | "i32.load16_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S32,
+        }),
+        "i64.load8_s" | "i64.load8_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S64,
+        }),
+        "i64.load16_s" | "i64.load16_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S64,
+        }),
+        "i64.load32_s" | "i64.load32_u" => Some(WasmInstrInfo {
+            params: vec![Type::S32],
+            result: Type::S64,
+        }),
+
+        // Byte-level store operations
+        "i32.store8" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S32],
+            result: Type::S32,
+        }),
+        "i32.store16" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S32],
+            result: Type::S32,
+        }),
+        "i64.store8" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S64],
+            result: Type::S64,
+        }),
+        "i64.store16" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S64],
+            result: Type::S64,
+        }),
+        "i64.store32" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S64],
+            result: Type::S64,
+        }),
+
+        _ => None,
+    }
+}
+
 fn type_check(prog: &Program, signatures: &HashMap<String, Signature>) -> Result<()> {
+    // Build global type map
+    let mut globals_map = HashMap::new();
+    for global in &prog.globals {
+        globals_map.insert(global.name.clone(), (global.ty, global.mutable));
+    }
+
     for func in &prog.functions {
         let mut env = HashMap::new();
         for param in &func.params {
             env.insert(param.name.clone(), param.ty);
         }
-        let body_ty = check_expr(&func.body, &env, signatures)?;
+        let body_ty = check_expr(&func.body, &env, signatures, &globals_map)?;
         if body_ty != func.return_type {
             bail!(
                 "function '{}' returns {:?} but body has type {:?}",
@@ -255,12 +482,13 @@ fn check_expr(
     expr: &Expr,
     env: &HashMap<String, Type>,
     signatures: &HashMap<String, Signature>,
+    globals: &HashMap<String, (Type, bool)>,
 ) -> Result<Type> {
     match expr {
         Expr::Int { ty, .. } => Ok(*ty),
         Expr::Float { ty, .. } => Ok(*ty),
         Expr::Ascribe { expr, ty } => {
-            let inner_ty = check_expr(expr, env, signatures)?;
+            let inner_ty = check_expr(expr, env, signatures, globals)?;
             ensure_numeric(inner_ty, "ascribe requires numeric types")?;
             ensure_numeric(*ty, "ascribe requires numeric types")?;
             Ok(*ty)
@@ -269,18 +497,6 @@ fn check_expr(
             .get(name)
             .copied()
             .ok_or_else(|| anyhow!("unknown variable '{}'", name)),
-        Expr::Add(lhs, rhs) | Expr::Sub(lhs, rhs) | Expr::Mul(lhs, rhs) => {
-            let lty = check_expr(lhs, env, signatures)?;
-            let rty = check_expr(rhs, env, signatures)?;
-            let common = unify_numeric(lty, rty).ok_or_else(|| {
-                anyhow!(
-                    "arithmetic operands must match types, got {:?} and {:?}",
-                    lty,
-                    rty
-                )
-            })?;
-            Ok(common)
-        }
         Expr::Call { name, args } => {
             let sig = signatures
                 .get(name)
@@ -294,7 +510,7 @@ fn check_expr(
                 );
             }
             for (arg, expected_ty) in args.iter().zip(sig.params.iter()) {
-                let ty = check_expr(arg, env, signatures)?;
+                let ty = check_expr(arg, env, signatures, globals)?;
                 if ty != *expected_ty {
                     bail!(
                         "argument type mismatch calling '{}': expected {:?}, got {:?}",
@@ -306,30 +522,17 @@ fn check_expr(
             }
             Ok(sig.result)
         }
-        Expr::Cmp { lhs, rhs, .. } => {
-            let lty = check_expr(lhs, env, signatures)?;
-            let rty = check_expr(rhs, env, signatures)?;
-            if lty != rty {
-                bail!(
-                    "comparison operands must match types, got {:?} and {:?}",
-                    lty,
-                    rty
-                );
-            }
-            ensure_numeric(lty, "comparison requires numeric types")?;
-            Ok(Type::S32)
-        }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            let cond_ty = check_expr(cond, env, signatures)?;
+            let cond_ty = check_expr(cond, env, signatures, globals)?;
             if cond_ty != Type::S32 {
                 bail!("if condition must be s32 (0/1), got {:?}", cond_ty);
             }
-            let then_ty = check_expr(then_branch, env, signatures)?;
-            let else_ty = check_expr(else_branch, env, signatures)?;
+            let then_ty = check_expr(then_branch, env, signatures, globals)?;
+            let else_ty = check_expr(else_branch, env, signatures, globals)?;
             if then_ty != else_ty {
                 bail!(
                     "if branches must return the same type, got {:?} and {:?}",
@@ -340,10 +543,72 @@ fn check_expr(
             Ok(then_ty)
         }
         Expr::Let { name, value, body } => {
-            let value_ty = check_expr(value, env, signatures)?;
+            let value_ty = check_expr(value, env, signatures, globals)?;
             let mut next_env = env.clone();
             next_env.insert(name.clone(), value_ty);
-            check_expr(body, &next_env, signatures)
+            check_expr(body, &next_env, signatures, globals)
+        }
+        Expr::WasmInstr { name, args } => {
+            let instr_info = lookup_wasm_instr(name)
+                .ok_or_else(|| anyhow!("unknown WASM instruction '{}'", name))?;
+
+            // Special handling for const instructions - they define the type, not check it
+            if name.ends_with(".const") {
+                if args.len() != 1 {
+                    bail!("{} expects exactly 1 argument", name);
+                }
+                // Just verify it's a literal, don't type check it
+                match &args[0] {
+                    Expr::Int { .. } | Expr::Float { .. } => {}
+                    _ => bail!("{} requires a literal value", name),
+                }
+                return Ok(instr_info.result);
+            }
+
+            if instr_info.params.len() != args.len() {
+                bail!(
+                    "WASM instruction '{}' expects {} arguments but {} were provided",
+                    name,
+                    instr_info.params.len(),
+                    args.len()
+                );
+            }
+            for (arg, expected_ty) in args.iter().zip(instr_info.params.iter()) {
+                let ty = check_expr(arg, env, signatures, globals)?;
+                if ty != *expected_ty {
+                    bail!(
+                        "argument type mismatch in '{}': expected {:?}, got {:?}",
+                        name,
+                        expected_ty,
+                        ty
+                    );
+                }
+            }
+            Ok(instr_info.result)
+        }
+        Expr::GlobalGet { name } => {
+            let (ty, _mutable) = globals
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown global '{}'", name))?;
+            Ok(*ty)
+        }
+        Expr::GlobalSet { name, value } => {
+            let (expected_ty, mutable) = globals
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown global '{}'", name))?;
+            if !mutable {
+                bail!("cannot set immutable global '{}'", name);
+            }
+            let value_ty = check_expr(value, env, signatures, globals)?;
+            if value_ty != *expected_ty {
+                bail!(
+                    "type mismatch setting global '{}': expected {:?}, got {:?}",
+                    name,
+                    expected_ty,
+                    value_ty
+                );
+            }
+            Ok(value_ty)
         }
     }
 }
@@ -351,19 +616,6 @@ fn check_expr(
 fn ensure_numeric(ty: Type, _msg: &str) -> Result<()> {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
-    }
-}
-
-fn unify_numeric(lhs: Type, rhs: Type) -> Option<Type> {
-    if lhs == rhs {
-        return Some(lhs);
-    }
-    match (lhs, rhs) {
-        (Type::S32, Type::S64) => Some(Type::S64),
-        (Type::S64, Type::S32) => Some(Type::S64),
-        (Type::F32, Type::F64) => Some(Type::F64),
-        (Type::F64, Type::F32) => Some(Type::F64),
-        _ => None,
     }
 }
 
@@ -490,6 +742,8 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
     let mut imported = HashSet::new();
     let mut exports = Vec::new();
     let mut export_set = HashSet::new();
+    let mut globals = Vec::new();
+    let mut global_names = HashSet::new();
 
     for form in forms {
         match form {
@@ -540,6 +794,13 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
                             panic!("Duplicate import '{}'", import.name);
                         }
                         imports.push(import);
+                    }
+                    SExpr::Sym(sym) if sym == "global" => {
+                        let global = parse_global_form(&items);
+                        if !global_names.insert(global.name.clone()) {
+                            panic!("Duplicate global '{}'", global.name);
+                        }
+                        globals.push(global);
                     }
                     _ => panic!("Unknown top-level form"),
                 }
@@ -600,6 +861,7 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
         functions,
         imports,
         exports,
+        globals,
     }
 }
 
@@ -650,6 +912,45 @@ fn parse_import_form(items: &[SExpr]) -> Import {
         name,
         params,
         return_type,
+    }
+}
+
+fn parse_global_form(items: &[SExpr]) -> Global {
+    if items.len() != 5 {
+        panic!("Globals must look like (global $name type mutability init-value)");
+    }
+
+    let name = match &items[1] {
+        SExpr::Sym(s) => {
+            if !s.starts_with('$') {
+                panic!("Global name must start with $ (e.g., $heap-ptr)");
+            }
+            s.clone()
+        }
+        _ => panic!("Global name must be a symbol starting with $"),
+    };
+
+    let ty = parse_type_expr(&items[2]);
+
+    let mutable = match &items[3] {
+        SExpr::Sym(s) => match s.as_str() {
+            "mut" => true,
+            "const" => false,
+            _ => panic!("Global mutability must be 'mut' or 'const'"),
+        },
+        _ => panic!("Global mutability must be 'mut' or 'const'"),
+    };
+
+    let init_value = match &items[4] {
+        SExpr::Int { value, .. } => *value,
+        _ => panic!("Global init value must be an integer constant"),
+    };
+
+    Global {
+        name,
+        ty,
+        mutable,
+        init_value,
     }
 }
 
@@ -728,46 +1029,6 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
                         ty,
                     }
                 }
-                SExpr::Sym(sym) if sym == "+" || sym == "-" || sym == "*" => {
-                    if items.len() != 3 {
-                        panic!("Operator {} expects exactly 2 operands", sym);
-                    }
-                    let lhs = parse_expr(&items[1], vars, functions);
-                    let rhs = parse_expr(&items[2], vars, functions);
-                    match sym.as_str() {
-                        "+" => Expr::Add(Box::new(lhs), Box::new(rhs)),
-                        "-" => Expr::Sub(Box::new(lhs), Box::new(rhs)),
-                        "*" => Expr::Mul(Box::new(lhs), Box::new(rhs)),
-                        _ => unreachable!(),
-                    }
-                }
-                SExpr::Sym(sym)
-                    if sym == "="
-                        || sym == "=="
-                        || sym == "<"
-                        || sym == "<="
-                        || sym == ">"
-                        || sym == ">=" =>
-                {
-                    if items.len() != 3 {
-                        panic!("Operator {} expects exactly 2 operands", sym);
-                    }
-                    let lhs = parse_expr(&items[1], vars, functions);
-                    let rhs = parse_expr(&items[2], vars, functions);
-                    let op = match sym.as_str() {
-                        "=" | "==" => CmpOp::Eq,
-                        "<" => CmpOp::Lt,
-                        "<=" => CmpOp::Le,
-                        ">" => CmpOp::Gt,
-                        ">=" => CmpOp::Ge,
-                        _ => unreachable!(),
-                    };
-                    Expr::Cmp {
-                        op,
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                    }
-                }
                 SExpr::Sym(sym) if sym == "if" => {
                     if items.len() != 4 {
                         panic!("if expects condition, then, else");
@@ -779,6 +1040,42 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
                         cond: Box::new(cond),
                         then_branch: Box::new(then_branch),
                         else_branch: Box::new(else_branch),
+                    }
+                }
+                SExpr::Sym(sym) if sym == "global.get" => {
+                    if items.len() != 2 {
+                        panic!("global.get expects exactly one argument (the global name)");
+                    }
+                    let name = match &items[1] {
+                        SExpr::Sym(s) => {
+                            if !s.starts_with('$') {
+                                panic!("Global name must start with $");
+                            }
+                            s.clone()
+                        }
+                        _ => panic!("global.get argument must be a global name starting with $"),
+                    };
+                    Expr::GlobalGet { name }
+                }
+                SExpr::Sym(sym) if sym == "global.set" => {
+                    if items.len() != 3 {
+                        panic!("global.set expects exactly two arguments (name and value)");
+                    }
+                    let name = match &items[1] {
+                        SExpr::Sym(s) => {
+                            if !s.starts_with('$') {
+                                panic!("Global name must start with $");
+                            }
+                            s.clone()
+                        }
+                        _ => panic!(
+                            "global.set first argument must be a global name starting with $"
+                        ),
+                    };
+                    let value = parse_expr(&items[2], vars, functions);
+                    Expr::GlobalSet {
+                        name,
+                        value: Box::new(value),
                     }
                 }
                 SExpr::Sym(sym) if sym == "let" => {
@@ -808,7 +1105,17 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
                 }
                 _ => {
                     if let SExpr::Sym(sym) = op {
-                        if let Some(expected) = functions.get(sym) {
+                        // Check if this is a WASM instruction
+                        if lookup_wasm_instr(sym).is_some() {
+                            let mut args = Vec::new();
+                            for arg in &items[1..] {
+                                args.push(parse_expr(arg, vars, functions));
+                            }
+                            Expr::WasmInstr {
+                                name: sym.clone(),
+                                args,
+                            }
+                        } else if let Some(expected) = functions.get(sym) {
                             if items.len() - 1 != expected.params.len() {
                                 panic!(
                                     "Function '{}' expects {} arguments, got {}",
@@ -840,6 +1147,8 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
 fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> String {
     let mut out = String::new();
     out.push_str("(module\n");
+
+    // Imports must come first in WAT
     for import in &prog.imports {
         out.push_str(&format!(
             "  (import \"{}\" \"{}\" (func ${} ",
@@ -850,10 +1159,35 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         }
         out.push_str(&format!("(result {})))\n", wat_type(import.return_type)));
     }
+
+    // Declare memory (1 page = 64KB, allow growth up to 100 pages)
+    out.push_str("  (memory 1 100)\n");
+
+    // Build global type map for codegen
+    let mut globals_map = HashMap::new();
+    for global in &prog.globals {
+        globals_map.insert(global.name.clone(), (global.ty, global.mutable));
+    }
+
+    // Declare globals
+    for global in &prog.globals {
+        let mutability = if global.mutable { "(mut " } else { "" };
+        let close = if global.mutable { ")" } else { "" };
+        out.push_str(&format!(
+            "  (global {} {}{}{} ({}.const {}))\n",
+            global.name,
+            mutability,
+            wat_type(global.ty),
+            close,
+            wat_type(global.ty),
+            global.init_value
+        ));
+    }
+
     for func in &prog.functions {
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
-        gen_expr(&func.body, &mut body, 4, &mut env, signatures);
+        gen_expr(&func.body, &mut body, 4, &mut env, signatures, &globals_map);
 
         out.push_str(&format!("  (func ${} ", func.name));
         for param in &func.params {
@@ -879,6 +1213,7 @@ fn gen_expr(
     indent: usize,
     env: &mut CodegenEnv,
     signatures: &HashMap<String, Signature>,
+    globals: &HashMap<String, (Type, bool)>,
 ) -> Type {
     let pad = " ".repeat(indent);
     match expr {
@@ -900,7 +1235,7 @@ fn gen_expr(
             *ty
         }
         Expr::Ascribe { expr, ty } => {
-            let from_ty = gen_expr(expr, out, indent, env, signatures);
+            let from_ty = gen_expr(expr, out, indent, env, signatures, globals);
             if from_ty == *ty {
                 return from_ty;
             }
@@ -914,15 +1249,12 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, idx));
             ty
         }
-        Expr::Add(a, b) => gen_numeric_binop("add", a, b, out, &pad, env, signatures),
-        Expr::Sub(a, b) => gen_numeric_binop("sub", a, b, out, &pad, env, signatures),
-        Expr::Mul(a, b) => gen_numeric_binop("mul", a, b, out, &pad, env, signatures),
         Expr::Call { name, args } => {
             let sig = signatures
                 .get(name)
                 .unwrap_or_else(|| panic!("Missing signature for {}", name));
             for arg in args {
-                gen_expr(arg, out, indent, env, signatures);
+                gen_expr(arg, out, indent, env, signatures, globals);
             }
             out.push_str(&format!("{}call ${}\n", pad, name));
             sig.result
@@ -932,17 +1264,17 @@ fn gen_expr(
             then_branch,
             else_branch,
         } => {
-            let cond_ty = gen_expr(cond, out, indent, env, signatures);
+            let cond_ty = gen_expr(cond, out, indent, env, signatures, globals);
             if cond_ty != Type::S32 {
                 panic!("if condition must be s32");
             }
-            let result_ty = expr_type(then_branch, env, signatures);
+            let result_ty = expr_type(then_branch, env, signatures, globals);
             out.push_str(&format!("{}(if (result {})\n", pad, wat_type(result_ty)));
             out.push_str(&format!("{}  (then\n", pad));
-            gen_expr(then_branch, out, indent + 4, env, signatures);
+            gen_expr(then_branch, out, indent + 4, env, signatures, globals);
             out.push_str(&format!("{}  )\n", pad));
             out.push_str(&format!("{}  (else\n", pad));
-            let else_ty = gen_expr(else_branch, out, indent + 4, env, signatures);
+            let else_ty = gen_expr(else_branch, out, indent + 4, env, signatures, globals);
             if else_ty != result_ty {
                 panic!(
                     "if branches must match types: {:?} vs {:?}",
@@ -953,30 +1285,87 @@ fn gen_expr(
             out.push_str(&format!("{})\n", pad));
             result_ty
         }
-        Expr::Cmp { op, lhs, rhs } => {
-            let lty = gen_expr(lhs, out, indent, env, signatures);
-            let rty = gen_expr(rhs, out, indent, env, signatures);
-            if lty != rty {
-                panic!("Mismatched operand types {:?} and {:?}", lty, rty);
-            }
-            let instr = match op {
-                CmpOp::Eq => cmp_for(lty, "eq"),
-                CmpOp::Lt => cmp_for(lty, "lt_s"),
-                CmpOp::Le => cmp_for(lty, "le_s"),
-                CmpOp::Gt => cmp_for(lty, "gt_s"),
-                CmpOp::Ge => cmp_for(lty, "ge_s"),
-            };
-            out.push_str(&format!("{}{}\n", pad, instr));
-            Type::S32
-        }
         Expr::Let { name, value, body } => {
-            let value_ty = gen_expr(value, out, indent, env, signatures);
+            let value_ty = gen_expr(value, out, indent, env, signatures, globals);
             let idx = env.declare_local(value_ty);
             out.push_str(&format!("{}local.set {}\n", pad, idx));
             env.push_binding(name.clone(), idx);
-            let body_ty = gen_expr(body, out, indent, env, signatures);
+            let body_ty = gen_expr(body, out, indent, env, signatures, globals);
             env.pop_binding();
             body_ty
+        }
+        Expr::WasmInstr { name, args } => {
+            let instr_info = lookup_wasm_instr(name)
+                .unwrap_or_else(|| panic!("Missing WASM instruction info for {}", name));
+
+            // Special handling for const instructions - they take immediates, not stack values
+            if name.ends_with(".const") {
+                if args.len() != 1 {
+                    panic!("{} expects exactly 1 argument", name);
+                }
+                match &args[0] {
+                    Expr::Int { value, .. } => {
+                        out.push_str(&format!("{}{} {}\n", pad, name, value));
+                    }
+                    Expr::Float { value, .. } => {
+                        out.push_str(&format!("{}{} {}\n", pad, name, value));
+                    }
+                    _ => panic!("{} requires a literal value", name),
+                }
+            } else if name.ends_with(".store")
+                || name == "i32.store8"
+                || name == "i32.store16"
+                || name == "i64.store8"
+                || name == "i64.store16"
+                || name == "i64.store32"
+            {
+                // Store instructions: emit address, then value, then store
+                // Note: In WASM stores don't return values, but we make them return the stored value
+                // We save the value in a local, emit the store, then restore it
+                if args.len() != 2 {
+                    panic!("{} expects exactly 2 arguments (address, value)", name);
+                }
+
+                // Emit and save the value first
+                let value_ty = gen_expr(&args[1], out, indent, env, signatures, globals);
+                let value_local = env.declare_local(value_ty);
+                out.push_str(&format!("{}local.set {}\n", pad, value_local));
+
+                // Emit the address
+                gen_expr(&args[0], out, indent, env, signatures, globals);
+
+                // Get the value back
+                out.push_str(&format!("{}local.get {}\n", pad, value_local));
+
+                // Emit the store
+                out.push_str(&format!("{}{}\n", pad, name));
+
+                // Put the value back on the stack as the "return value"
+                out.push_str(&format!("{}local.get {}\n", pad, value_local));
+            } else {
+                // Normal instructions - emit args then instruction
+                for arg in args {
+                    gen_expr(arg, out, indent, env, signatures, globals);
+                }
+                out.push_str(&format!("{}{}\n", pad, name));
+            }
+            instr_info.result
+        }
+        Expr::GlobalGet { name } => {
+            out.push_str(&format!("{}global.get {}\n", pad, name));
+            let (ty, _) = globals.get(name).expect("global should exist");
+            *ty
+        }
+        Expr::GlobalSet { name, value } => {
+            // Global.set consumes the value, so we save it to a local first
+            // and restore it after to return the value for composability
+            let value_ty = gen_expr(value, out, indent, env, signatures, globals);
+            let value_local = env.declare_local(value_ty);
+            out.push_str(&format!("{}local.set {}\n", pad, value_local));
+            out.push_str(&format!("{}local.get {}\n", pad, value_local));
+            out.push_str(&format!("{}global.set {}\n", pad, name));
+            out.push_str(&format!("{}local.get {}\n", pad, value_local));
+            value_ty
         }
     }
 }
@@ -1033,25 +1422,12 @@ impl CodegenEnv {
     }
 }
 
-fn binop_for(ty: Type, op: &str) -> String {
-    match ty {
-        Type::S32 => format!("i32.{}", op),
-        Type::S64 => format!("i64.{}", op),
-        Type::F32 => format!("f32.{}", op),
-        Type::F64 => format!("f64.{}", op),
-    }
-}
-
-fn cmp_for(ty: Type, op: &str) -> String {
-    match ty {
-        Type::S32 => format!("i32.{}", op),
-        Type::S64 => format!("i64.{}", op),
-        Type::F32 => format!("f32.{}", op),
-        Type::F64 => format!("f64.{}", op),
-    }
-}
-
-fn expr_type(expr: &Expr, env: &CodegenEnv, signatures: &HashMap<String, Signature>) -> Type {
+fn expr_type(
+    expr: &Expr,
+    env: &CodegenEnv,
+    signatures: &HashMap<String, Signature>,
+    globals: &HashMap<String, (Type, bool)>,
+) -> Type {
     let mut vars = HashMap::new();
     for (name, idx) in &env.bindings {
         let ty = if (*idx as usize) < env.param_count as usize {
@@ -1062,7 +1438,7 @@ fn expr_type(expr: &Expr, env: &CodegenEnv, signatures: &HashMap<String, Signatu
         };
         vars.insert(name.clone(), ty);
     }
-    check_expr(expr, &vars, signatures).expect("type checking already performed")
+    check_expr(expr, &vars, signatures, globals).expect("type checking already performed")
 }
 
 fn conversion_instr(from: Type, to: Type) -> Option<&'static str> {
@@ -1082,40 +1458,6 @@ fn conversion_instr(from: Type, to: Type) -> Option<&'static str> {
         _ if from == to => None,
         _ => None,
     }
-}
-
-fn maybe_convert(from: Type, to: Type, out: &mut String, pad: &str) {
-    if from == to {
-        return;
-    }
-    if let Some(instr) = conversion_instr(from, to) {
-        out.push_str(&format!("{}{}\n", pad, instr));
-    } else {
-        panic!("missing conversion {:?} -> {:?}", from, to);
-    }
-}
-
-fn gen_numeric_binop(
-    op: &str,
-    lhs: &Expr,
-    rhs: &Expr,
-    out: &mut String,
-    pad: &str,
-    env: &mut CodegenEnv,
-    signatures: &HashMap<String, Signature>,
-) -> Type {
-    let lty_decl = expr_type(lhs, env, signatures);
-    let rty_decl = expr_type(rhs, env, signatures);
-    let common = unify_numeric(lty_decl, rty_decl)
-        .unwrap_or_else(|| panic!("Mismatched operand types {:?} and {:?}", lty_decl, rty_decl));
-
-    let lty_emitted = gen_expr(lhs, out, pad.len(), env, signatures);
-    maybe_convert(lty_emitted, common, out, pad);
-    let rty_emitted = gen_expr(rhs, out, pad.len(), env, signatures);
-    maybe_convert(rty_emitted, common, out, pad);
-
-    out.push_str(&format!("{}{}\n", pad, binop_for(common, op)));
-    common
 }
 
 fn wat_type(ty: Type) -> &'static str {

@@ -1,0 +1,6 @@
+package example:wisp;
+
+world wisp {
+  export store-bytes: func(b1: s32, b2: s32, b3: s32, b4: s32) -> s32;
+  export pack-unpack: func(val: s32) -> s32;
+}
