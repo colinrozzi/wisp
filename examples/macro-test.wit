@@ -1,0 +1,8 @@
+package example:wisp;
+
+world wisp {
+  export double: func(x: s32) -> s32;
+  export add-five: func(x: s32) -> s32;
+  export factorial: func(n: s32) -> s32;
+  export test-when: func(x: s32) -> s32;
+}

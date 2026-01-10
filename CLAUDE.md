@@ -22,7 +22,9 @@ The project uses a two-tier documentation system:
    - Tracks status, breaking changes, examples, and success criteria
    - These are "on the ground" documents that drive current development
 
-**Recently completed**: [PHASE-0-WASM-INSTRUCTIONS.md](docs/changes/PHASE-0-WASM-INSTRUCTIONS.md) - Exposing core WASM instructions (complete)
+**Recently completed**:
+- [PHASE-1-MACROS.md](docs/changes/PHASE-1-MACROS.md) - Unhygienic macros with quasiquotation (complete)
+- [PHASE-0-WASM-INSTRUCTIONS.md](docs/changes/PHASE-0-WASM-INSTRUCTIONS.md) - Exposing core WASM instructions (complete)
 
 ## Common Commands
 
@@ -103,6 +105,8 @@ cargo run -- compile examples/prog.lisp
 Functions: `(fn name ((param type) ...) return-type body)`
 Imports: `(import module func ((param type) ...) return-type)`
 Exports: `(export name)` or `(export (fn ...))`
+**Macros:** `(defmacro name (params...) template)` - define syntactic abstractions
+**Quasiquote:** `` `expr `` - quote template, `,expr` - unquote, `,@expr` - splice
 **Globals:** `(global $name type mut|const init-value)` - module-level mutable/immutable state
 **Global ops:** `(global.get $name)`, `(global.set $name value)`
 **WASM arithmetic (explicit):** `(i32.add a b)`, `(i64.sub a b)`, `(f32.mul a b)`, `(f64.div a b)`
@@ -113,6 +117,7 @@ Exports: `(export name)` or `(export (fn ...))`
 Conditionals: `(if cond then else)` - condition must be s32 (0=false, 1=true)
 Let bindings: `(let (name value) body)` - introduces lexically scoped local
 Type casts: `(s32 expr)`, `(s64 expr)`, `(f32 expr)`, `(f64 expr)`
+Comments: `; comment to end of line`
 
 ## Testing
 

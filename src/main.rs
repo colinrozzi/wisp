@@ -131,7 +131,7 @@ fn run_component(
                 let func_ref = dep_instance
                     .get_func(&mut store, name)
                     .with_context(|| format!("dependency export '{}' not found", name))?;
-                let func_clone = func_ref.clone();
+                let func_clone = func_ref;
                 ns.func_new(name, move |mut cx, params, results| {
                     func_clone.call(&mut cx, params, results)
                 })

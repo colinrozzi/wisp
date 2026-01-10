@@ -38,7 +38,11 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
         bail!("no function definitions found in source");
     }
 
-    let prog = parse_program(forms);
+    // Collect macro definitions and expand macros
+    let macros = collect_macros(&forms);
+    let expanded_forms = expand_all_macros(forms, &macros);
+
+    let prog = parse_program(expanded_forms);
     let signatures = collect_signatures(&prog)?;
     type_check(&prog, &signatures)?;
     let wat = generate_wat(&prog, &signatures);
@@ -101,6 +105,9 @@ enum Token {
     RParen,
     Symbol(String),
     Number(NumericToken),
+    Quasiquote,    // `
+    Unquote,       // ,
+    UnquoteSplice, // ,@
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +122,9 @@ enum SExpr {
     Int { value: i64, ty: Type },
     Float { value: f64, ty: Type },
     List(Vec<SExpr>),
+    Quasiquote(Box<SExpr>),
+    Unquote(Box<SExpr>),
+    UnquoteSplice(Box<SExpr>),
 }
 
 #[derive(Debug)]
@@ -187,6 +197,13 @@ struct Global {
     ty: Type,
     mutable: bool,
     init_value: i64, // For simplicity, we'll only support integer constants initially
+}
+
+#[derive(Debug, Clone)]
+struct Macro {
+    name: String,
+    params: Vec<String>,
+    template: SExpr,
 }
 
 struct PendingFunction {
@@ -633,6 +650,28 @@ fn tokenize(input: &str) -> Vec<Token> {
                 tokens.push(Token::RParen);
                 chars.next();
             }
+            '`' => {
+                tokens.push(Token::Quasiquote);
+                chars.next();
+            }
+            ',' => {
+                chars.next();
+                if chars.peek() == Some(&'@') {
+                    chars.next();
+                    tokens.push(Token::UnquoteSplice);
+                } else {
+                    tokens.push(Token::Unquote);
+                }
+            }
+            ';' => {
+                // Skip comments (everything until end of line)
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
             _ => {
                 if ch.is_whitespace() {
                     chars.next();
@@ -640,7 +679,13 @@ fn tokenize(input: &str) -> Vec<Token> {
                 }
                 let mut lexeme = String::new();
                 while let Some(&c2) = chars.peek() {
-                    if c2.is_whitespace() || c2 == '(' || c2 == ')' {
+                    if c2.is_whitespace()
+                        || c2 == '('
+                        || c2 == ')'
+                        || c2 == '`'
+                        || c2 == ','
+                        || c2 == ';'
+                    {
                         break;
                     }
                     lexeme.push(c2);
@@ -731,7 +776,197 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
             },
             pos + 1,
         ),
+        Some(Token::Quasiquote) => {
+            let (inner, next) = parse_sexpr(tokens, pos + 1);
+            (SExpr::Quasiquote(Box::new(inner)), next)
+        }
+        Some(Token::Unquote) => {
+            let (inner, next) = parse_sexpr(tokens, pos + 1);
+            (SExpr::Unquote(Box::new(inner)), next)
+        }
+        Some(Token::UnquoteSplice) => {
+            let (inner, next) = parse_sexpr(tokens, pos + 1);
+            (SExpr::UnquoteSplice(Box::new(inner)), next)
+        }
         None => panic!("Unexpected end of tokens"),
+    }
+}
+
+// Collect macro definitions from forms
+fn collect_macros(forms: &[SExpr]) -> HashMap<String, Macro> {
+    let mut macros = HashMap::new();
+    for form in forms {
+        if let SExpr::List(items) = form
+            && items.len() >= 4
+                && matches!(&items[0], SExpr::Sym(sym) if sym == "defmacro")
+            {
+                let mac = parse_defmacro_form(items);
+                macros.insert(mac.name.clone(), mac);
+            }
+    }
+    macros
+}
+
+fn parse_defmacro_form(items: &[SExpr]) -> Macro {
+    // (defmacro name (params...) template)
+    if items.len() != 4 {
+        panic!("defmacro must have form: (defmacro name (params...) template)");
+    }
+    let name = match &items[1] {
+        SExpr::Sym(s) => s.clone(),
+        _ => panic!("Macro name must be a symbol"),
+    };
+    let params = match &items[2] {
+        SExpr::List(params) => params
+            .iter()
+            .map(|p| match p {
+                SExpr::Sym(s) => s.clone(),
+                _ => panic!("Macro parameters must be symbols"),
+            })
+            .collect(),
+        _ => panic!("Macro parameters must be a list"),
+    };
+    Macro {
+        name,
+        params,
+        template: items[3].clone(),
+    }
+}
+
+// Expand macros in all forms
+fn expand_all_macros(forms: Vec<SExpr>, macros: &HashMap<String, Macro>) -> Vec<SExpr> {
+    forms
+        .into_iter()
+        .filter(|form| {
+            // Filter out defmacro forms (they're already collected)
+            if let SExpr::List(items) = form
+                && let Some(SExpr::Sym(sym)) = items.first() {
+                    return sym != "defmacro";
+                }
+            true
+        })
+        .map(|form| expand_macros(form, macros, 0))
+        .collect()
+}
+
+// Expand macros in a single S-expression
+fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> SExpr {
+    const MAX_EXPANSION_DEPTH: usize = 100;
+    if depth > MAX_EXPANSION_DEPTH {
+        panic!("Macro expansion depth exceeded (possible infinite recursion)");
+    }
+
+    match expr {
+        SExpr::List(items) if !items.is_empty() => {
+            // Check if this is a macro call
+            if let SExpr::Sym(name) = &items[0]
+                && let Some(mac) = macros.get(name) {
+                    // It's a macro call - expand it
+                    if items.len() - 1 != mac.params.len() {
+                        panic!(
+                            "Macro '{}' expects {} arguments, got {}",
+                            name,
+                            mac.params.len(),
+                            items.len() - 1
+                        );
+                    }
+                    // Build substitution map
+                    let args: Vec<SExpr> = items[1..].to_vec();
+                    let substitutions: HashMap<String, SExpr> =
+                        mac.params.iter().cloned().zip(args).collect();
+
+                    // Evaluate the template with substitutions
+                    // Unwrap the top-level quasiquote if present
+                    let template_inner = match &mac.template {
+                        SExpr::Quasiquote(inner) => inner.as_ref(),
+                        other => other,
+                    };
+                    let expanded = eval_quasiquote(template_inner, &substitutions);
+
+                    // Recursively expand the result
+                    return expand_macros(expanded, macros, depth + 1);
+                }
+            // Not a macro call - recursively expand children
+            SExpr::List(
+                items
+                    .into_iter()
+                    .map(|item| expand_macros(item, macros, depth))
+                    .collect(),
+            )
+        }
+        SExpr::Quasiquote(inner) => {
+            // Quasiquote outside of macro - evaluate it directly
+            eval_quasiquote(&inner, &HashMap::new())
+        }
+        // Pass through other forms
+        other => other,
+    }
+}
+
+// Evaluate quasiquoted template with substitutions
+fn eval_quasiquote(template: &SExpr, subs: &HashMap<String, SExpr>) -> SExpr {
+    match template {
+        SExpr::Quasiquote(inner) => {
+            // Nested quasiquote - increase depth conceptually
+            // For now, just return as-is (proper nesting would need depth tracking)
+            SExpr::Quasiquote(Box::new(eval_quasiquote(inner, subs)))
+        }
+        SExpr::Unquote(inner) => {
+            // Unquote - substitute the inner expression
+            match inner.as_ref() {
+                SExpr::Sym(name) => {
+                    if let Some(replacement) = subs.get(name) {
+                        replacement.clone()
+                    } else {
+                        // Not a macro parameter - keep as symbol
+                        SExpr::Sym(name.clone())
+                    }
+                }
+                // For complex expressions in unquote, just return them
+                other => eval_quasiquote(other, subs),
+            }
+        }
+        SExpr::UnquoteSplice(_) => {
+            // Unquote-splice should only appear inside lists
+            panic!("Unquote-splice (,@) can only appear inside a list");
+        }
+        SExpr::List(items) => {
+            // Recursively process list, handling unquote-splice
+            let mut result = Vec::new();
+            for item in items {
+                match item {
+                    SExpr::UnquoteSplice(inner) => {
+                        // Splice the contents into the result
+                        let spliced = eval_quasiquote(inner, subs);
+                        match spliced {
+                            SExpr::List(splice_items) => {
+                                result.extend(splice_items);
+                            }
+                            other => {
+                                // If not a list, just add it (could be an error)
+                                result.push(other);
+                            }
+                        }
+                    }
+                    _ => {
+                        result.push(eval_quasiquote(item, subs));
+                    }
+                }
+            }
+            SExpr::List(result)
+        }
+        SExpr::Sym(name) => {
+            // In quasiquote context, symbols are NOT substituted (only in unquote)
+            SExpr::Sym(name.clone())
+        }
+        SExpr::Int { value, ty } => SExpr::Int {
+            value: *value,
+            ty: *ty,
+        },
+        SExpr::Float { value, ty } => SExpr::Float {
+            value: *value,
+            ty: *ty,
+        },
     }
 }
 
@@ -1140,6 +1375,9 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
                     }
                 }
             }
+        }
+        SExpr::Quasiquote(_) | SExpr::Unquote(_) | SExpr::UnquoteSplice(_) => {
+            panic!("Quasiquote/unquote should have been expanded before parse_expr");
         }
     }
 }
