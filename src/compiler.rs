@@ -15,6 +15,138 @@ enum Type {
     F64,
 }
 
+/// Source location information for error reporting
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Span {
+    line: usize,
+    column: usize,
+    length: usize,
+}
+
+impl Span {
+    fn new(line: usize, column: usize, length: usize) -> Self {
+        Self { line, column, length }
+    }
+
+    /// Create a dummy span for generated code
+    fn dummy() -> Self {
+        Self { line: 0, column: 0, length: 0 }
+    }
+
+    /// Merge two spans (from start of first to end of second)
+    fn merge(&self, other: &Span) -> Span {
+        if self.line == 0 && self.column == 0 {
+            return other.clone();
+        }
+        if other.line == 0 && other.column == 0 {
+            return self.clone();
+        }
+        // For simplicity, just use the start of self
+        // A proper implementation would compute the full range
+        Span {
+            line: self.line,
+            column: self.column,
+            length: 1, // Simplified
+        }
+    }
+}
+
+/// A compilation error with source location information
+#[derive(Debug)]
+struct CompileError {
+    message: String,
+    span: Span,
+    note: Option<String>,
+}
+
+impl CompileError {
+    fn new(message: impl Into<String>, span: Span) -> Self {
+        Self {
+            message: message.into(),
+            span,
+            note: None,
+        }
+    }
+
+    fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
+
+    /// Format the error with source context
+    fn format(&self, source: &str, file_path: &str) -> String {
+        let mut out = String::new();
+
+        // Error header
+        out.push_str(&format!("error: {}\n", self.message));
+
+        // Location line
+        out.push_str(&format!(
+            "  --> {}:{}:{}\n",
+            file_path, self.span.line, self.span.column
+        ));
+
+        // Get the source line
+        if let Some(line) = source.lines().nth(self.span.line.saturating_sub(1)) {
+            let line_num_width = self.span.line.to_string().len();
+
+            // Blank line with separator
+            out.push_str(&format!("{:width$} |\n", "", width = line_num_width));
+
+            // Source line
+            out.push_str(&format!("{} | {}\n", self.span.line, line));
+
+            // Caret line pointing to the error
+            let padding = " ".repeat(self.span.column.saturating_sub(1));
+            let carets = "^".repeat(self.span.length.max(1));
+            out.push_str(&format!(
+                "{:width$} | {}{}\n",
+                "",
+                padding,
+                carets,
+                width = line_num_width
+            ));
+        }
+
+        // Optional note
+        if let Some(note) = &self.note {
+            out.push_str(&format!("  = note: {}\n", note));
+        }
+
+        out
+    }
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at line {}, column {}", self.message, self.span.line, self.span.column)
+    }
+}
+
+impl std::error::Error for CompileError {}
+
+/// Context for error reporting during compilation
+struct CompileContext {
+    source: String,
+    file_path: String,
+}
+
+impl CompileContext {
+    fn new(source: String, file_path: String) -> Self {
+        Self { source, file_path }
+    }
+
+    fn error(&self, message: impl Into<String>, span: &Span) -> anyhow::Error {
+        let err = CompileError::new(message, span.clone());
+        anyhow::anyhow!("{}", err.format(&self.source, &self.file_path))
+    }
+
+    fn error_with_note(&self, message: impl Into<String>, span: &Span, note: impl Into<String>) -> anyhow::Error {
+        let err = CompileError::new(message, span.clone()).with_note(note);
+        anyhow::anyhow!("{}", err.format(&self.source, &self.file_path))
+    }
+}
+
 #[derive(Debug)]
 pub struct CompileArtifacts {
     pub wat: PathBuf,
@@ -25,6 +157,9 @@ pub struct CompileArtifacts {
 pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> {
     let src = fs::read_to_string(source_path)
         .with_context(|| format!("failed to read source file {}", source_path.display()))?;
+
+    let file_path = source_path.display().to_string();
+    let ctx = CompileContext::new(src.clone(), file_path);
 
     let tokens = tokenize(&src);
     let mut forms = Vec::new();
@@ -42,9 +177,9 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     let macros = collect_macros(&forms);
     let expanded_forms = expand_all_macros(forms, &macros);
 
-    let prog = parse_program(expanded_forms);
+    let prog = parse_program(expanded_forms, &ctx)?;
     let signatures = collect_signatures(&prog)?;
-    type_check(&prog, &signatures)?;
+    type_check(&prog, &signatures, &ctx)?;
     let wat = generate_wat(&prog, &signatures);
     let wit = generate_wit(&prog);
     let mut wat_path = out_base.to_path_buf();
@@ -100,7 +235,13 @@ fn encode_component(module: &[u8], wit_source: &str) -> Result<Vec<u8>> {
 }
 
 #[derive(Debug, Clone)]
-enum Token {
+struct Token {
+    kind: TokenKind,
+    span: Span,
+}
+
+#[derive(Debug, Clone)]
+enum TokenKind {
     LParen,
     RParen,
     Symbol(String),
@@ -118,13 +259,27 @@ enum NumericToken {
 
 #[derive(Debug, Clone)]
 enum SExpr {
-    Sym(String),
-    Int { value: i64, ty: Type },
-    Float { value: f64, ty: Type },
-    List(Vec<SExpr>),
-    Quasiquote(Box<SExpr>),
-    Unquote(Box<SExpr>),
-    UnquoteSplice(Box<SExpr>),
+    Sym(String, Span),
+    Int { value: i64, ty: Type, span: Span },
+    Float { value: f64, ty: Type, span: Span },
+    List(Vec<SExpr>, Span),
+    Quasiquote(Box<SExpr>, Span),
+    Unquote(Box<SExpr>, Span),
+    UnquoteSplice(Box<SExpr>, Span),
+}
+
+impl SExpr {
+    fn span(&self) -> &Span {
+        match self {
+            SExpr::Sym(_, span) => span,
+            SExpr::Int { span, .. } => span,
+            SExpr::Float { span, .. } => span,
+            SExpr::List(_, span) => span,
+            SExpr::Quasiquote(_, span) => span,
+            SExpr::Unquote(_, span) => span,
+            SExpr::UnquoteSplice(_, span) => span,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -189,6 +344,7 @@ struct Import {
     name: String,
     params: Vec<Parameter>,
     return_type: Type,
+    span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +367,7 @@ struct PendingFunction {
     params: Vec<Parameter>,
     return_type: Type,
     body: SExpr,
+    span: Span,
 }
 
 #[derive(Debug)]
@@ -445,7 +602,7 @@ fn lookup_wasm_instr(name: &str) -> Option<WasmInstrInfo> {
     }
 }
 
-fn type_check(prog: &Program, signatures: &HashMap<String, Signature>) -> Result<()> {
+fn type_check(prog: &Program, signatures: &HashMap<String, Signature>, _ctx: &CompileContext) -> Result<()> {
     // Build global type map
     let mut globals_map = HashMap::new();
     for global in &prog.globals {
@@ -639,28 +796,51 @@ fn ensure_numeric(ty: Type, _msg: &str) -> Result<()> {
 fn tokenize(input: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
+    let mut line = 1usize;
+    let mut column = 1usize;
 
     while let Some(&ch) = chars.peek() {
         match ch {
             '(' => {
-                tokens.push(Token::LParen);
+                tokens.push(Token {
+                    kind: TokenKind::LParen,
+                    span: Span::new(line, column, 1),
+                });
                 chars.next();
+                column += 1;
             }
             ')' => {
-                tokens.push(Token::RParen);
+                tokens.push(Token {
+                    kind: TokenKind::RParen,
+                    span: Span::new(line, column, 1),
+                });
                 chars.next();
+                column += 1;
             }
             '`' => {
-                tokens.push(Token::Quasiquote);
+                tokens.push(Token {
+                    kind: TokenKind::Quasiquote,
+                    span: Span::new(line, column, 1),
+                });
                 chars.next();
+                column += 1;
             }
             ',' => {
+                let start_col = column;
                 chars.next();
+                column += 1;
                 if chars.peek() == Some(&'@') {
                     chars.next();
-                    tokens.push(Token::UnquoteSplice);
+                    column += 1;
+                    tokens.push(Token {
+                        kind: TokenKind::UnquoteSplice,
+                        span: Span::new(line, start_col, 2),
+                    });
                 } else {
-                    tokens.push(Token::Unquote);
+                    tokens.push(Token {
+                        kind: TokenKind::Unquote,
+                        span: Span::new(line, start_col, 1),
+                    });
                 }
             }
             ';' => {
@@ -668,15 +848,26 @@ fn tokenize(input: &str) -> Vec<Token> {
                 while let Some(&c) = chars.peek() {
                     chars.next();
                     if c == '\n' {
+                        line += 1;
+                        column = 1;
                         break;
+                    } else {
+                        column += 1;
                     }
                 }
+            }
+            '\n' => {
+                chars.next();
+                line += 1;
+                column = 1;
             }
             _ => {
                 if ch.is_whitespace() {
                     chars.next();
+                    column += 1;
                     continue;
                 }
+                let start_col = column;
                 let mut lexeme = String::new();
                 while let Some(&c2) = chars.peek() {
                     if c2.is_whitespace()
@@ -690,11 +881,19 @@ fn tokenize(input: &str) -> Vec<Token> {
                     }
                     lexeme.push(c2);
                     chars.next();
+                    column += 1;
                 }
+                let span = Span::new(line, start_col, lexeme.len());
                 if let Some(num) = parse_numeric_token(&lexeme) {
-                    tokens.push(Token::Number(num));
+                    tokens.push(Token {
+                        kind: TokenKind::Number(num),
+                        span,
+                    });
                 } else {
-                    tokens.push(Token::Symbol(lexeme));
+                    tokens.push(Token {
+                        kind: TokenKind::Symbol(lexeme),
+                        span,
+                    });
                 }
             }
         }
@@ -738,14 +937,16 @@ fn strip_numeric_suffix(raw: &str) -> Option<(&str, Option<Type>)> {
 }
 
 fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
-    match tokens.get(pos) {
-        Some(Token::LParen) => {
+    let token = tokens.get(pos);
+    match token.map(|t| (&t.kind, &t.span)) {
+        Some((TokenKind::LParen, start_span)) => {
             let mut elems = Vec::new();
             let mut i = pos + 1;
             loop {
-                match tokens.get(i) {
-                    Some(Token::RParen) => {
-                        return (SExpr::List(elems), i + 1);
+                match tokens.get(i).map(|t| (&t.kind, &t.span)) {
+                    Some((TokenKind::RParen, end_span)) => {
+                        let span = start_span.merge(end_span);
+                        return (SExpr::List(elems, span), i + 1);
                     }
                     Some(_) => {
                         let (sexpr, next) = parse_sexpr(tokens, i);
@@ -753,40 +954,42 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
                         i = next;
                     }
                     None => {
-                        panic!("Unclosed parenthesis in input");
+                        panic!("Unclosed parenthesis at line {}, column {}", start_span.line, start_span.column);
                     }
                 }
             }
         }
-        Some(Token::RParen) => {
-            panic!("Unexpected closing parenthesis");
+        Some((TokenKind::RParen, span)) => {
+            panic!("Unexpected closing parenthesis at line {}, column {}", span.line, span.column);
         }
-        Some(Token::Symbol(s)) => (SExpr::Sym(s.clone()), pos + 1),
-        Some(Token::Number(NumericToken::Int { value, ty })) => (
+        Some((TokenKind::Symbol(s), span)) => (SExpr::Sym(s.clone(), span.clone()), pos + 1),
+        Some((TokenKind::Number(NumericToken::Int { value, ty }), span)) => (
             SExpr::Int {
                 value: *value,
                 ty: *ty,
+                span: span.clone(),
             },
             pos + 1,
         ),
-        Some(Token::Number(NumericToken::Float { value, ty })) => (
+        Some((TokenKind::Number(NumericToken::Float { value, ty }), span)) => (
             SExpr::Float {
                 value: *value,
                 ty: *ty,
+                span: span.clone(),
             },
             pos + 1,
         ),
-        Some(Token::Quasiquote) => {
+        Some((TokenKind::Quasiquote, span)) => {
             let (inner, next) = parse_sexpr(tokens, pos + 1);
-            (SExpr::Quasiquote(Box::new(inner)), next)
+            (SExpr::Quasiquote(Box::new(inner), span.clone()), next)
         }
-        Some(Token::Unquote) => {
+        Some((TokenKind::Unquote, span)) => {
             let (inner, next) = parse_sexpr(tokens, pos + 1);
-            (SExpr::Unquote(Box::new(inner)), next)
+            (SExpr::Unquote(Box::new(inner), span.clone()), next)
         }
-        Some(Token::UnquoteSplice) => {
+        Some((TokenKind::UnquoteSplice, span)) => {
             let (inner, next) = parse_sexpr(tokens, pos + 1);
-            (SExpr::UnquoteSplice(Box::new(inner)), next)
+            (SExpr::UnquoteSplice(Box::new(inner), span.clone()), next)
         }
         None => panic!("Unexpected end of tokens"),
     }
@@ -796,9 +999,9 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
 fn collect_macros(forms: &[SExpr]) -> HashMap<String, Macro> {
     let mut macros = HashMap::new();
     for form in forms {
-        if let SExpr::List(items) = form
+        if let SExpr::List(items, _) = form
             && items.len() >= 4
-                && matches!(&items[0], SExpr::Sym(sym) if sym == "defmacro")
+                && matches!(&items[0], SExpr::Sym(sym, _) if sym == "defmacro")
             {
                 let mac = parse_defmacro_form(items);
                 macros.insert(mac.name.clone(), mac);
@@ -813,14 +1016,14 @@ fn parse_defmacro_form(items: &[SExpr]) -> Macro {
         panic!("defmacro must have form: (defmacro name (params...) template)");
     }
     let name = match &items[1] {
-        SExpr::Sym(s) => s.clone(),
+        SExpr::Sym(s, _) => s.clone(),
         _ => panic!("Macro name must be a symbol"),
     };
     let params = match &items[2] {
-        SExpr::List(params) => params
+        SExpr::List(params, _) => params
             .iter()
             .map(|p| match p {
-                SExpr::Sym(s) => s.clone(),
+                SExpr::Sym(s, _) => s.clone(),
                 _ => panic!("Macro parameters must be symbols"),
             })
             .collect(),
@@ -839,8 +1042,8 @@ fn expand_all_macros(forms: Vec<SExpr>, macros: &HashMap<String, Macro>) -> Vec<
         .into_iter()
         .filter(|form| {
             // Filter out defmacro forms (they're already collected)
-            if let SExpr::List(items) = form
-                && let Some(SExpr::Sym(sym)) = items.first() {
+            if let SExpr::List(items, _) = form
+                && let Some(SExpr::Sym(sym, _)) = items.first() {
                     return sym != "defmacro";
                 }
             true
@@ -857,9 +1060,9 @@ fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> 
     }
 
     match expr {
-        SExpr::List(items) if !items.is_empty() => {
+        SExpr::List(items, span) if !items.is_empty() => {
             // Check if this is a macro call
-            if let SExpr::Sym(name) = &items[0]
+            if let SExpr::Sym(name, _) = &items[0]
                 && let Some(mac) = macros.get(name) {
                     // It's a macro call - expand it
                     if items.len() - 1 != mac.params.len() {
@@ -878,10 +1081,10 @@ fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> 
                     // Evaluate the template with substitutions
                     // Unwrap the top-level quasiquote if present
                     let template_inner = match &mac.template {
-                        SExpr::Quasiquote(inner) => inner.as_ref(),
+                        SExpr::Quasiquote(inner, _) => inner.as_ref(),
                         other => other,
                     };
-                    let expanded = eval_quasiquote(template_inner, &substitutions);
+                    let expanded = eval_quasiquote(template_inner, &substitutions, &span);
 
                     // Recursively expand the result
                     return expand_macros(expanded, macros, depth + 1);
@@ -892,11 +1095,12 @@ fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> 
                     .into_iter()
                     .map(|item| expand_macros(item, macros, depth))
                     .collect(),
+                span,
             )
         }
-        SExpr::Quasiquote(inner) => {
+        SExpr::Quasiquote(inner, span) => {
             // Quasiquote outside of macro - evaluate it directly
-            eval_quasiquote(&inner, &HashMap::new())
+            eval_quasiquote(&inner, &HashMap::new(), &span)
         }
         // Pass through other forms
         other => other,
@@ -904,42 +1108,42 @@ fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> 
 }
 
 // Evaluate quasiquoted template with substitutions
-fn eval_quasiquote(template: &SExpr, subs: &HashMap<String, SExpr>) -> SExpr {
+fn eval_quasiquote(template: &SExpr, subs: &HashMap<String, SExpr>, span: &Span) -> SExpr {
     match template {
-        SExpr::Quasiquote(inner) => {
+        SExpr::Quasiquote(inner, inner_span) => {
             // Nested quasiquote - increase depth conceptually
             // For now, just return as-is (proper nesting would need depth tracking)
-            SExpr::Quasiquote(Box::new(eval_quasiquote(inner, subs)))
+            SExpr::Quasiquote(Box::new(eval_quasiquote(inner, subs, inner_span)), inner_span.clone())
         }
-        SExpr::Unquote(inner) => {
+        SExpr::Unquote(inner, _) => {
             // Unquote - substitute the inner expression
             match inner.as_ref() {
-                SExpr::Sym(name) => {
+                SExpr::Sym(name, sym_span) => {
                     if let Some(replacement) = subs.get(name) {
                         replacement.clone()
                     } else {
                         // Not a macro parameter - keep as symbol
-                        SExpr::Sym(name.clone())
+                        SExpr::Sym(name.clone(), sym_span.clone())
                     }
                 }
                 // For complex expressions in unquote, just return them
-                other => eval_quasiquote(other, subs),
+                other => eval_quasiquote(other, subs, span),
             }
         }
-        SExpr::UnquoteSplice(_) => {
+        SExpr::UnquoteSplice(_, _) => {
             // Unquote-splice should only appear inside lists
             panic!("Unquote-splice (,@) can only appear inside a list");
         }
-        SExpr::List(items) => {
+        SExpr::List(items, list_span) => {
             // Recursively process list, handling unquote-splice
             let mut result = Vec::new();
             for item in items {
                 match item {
-                    SExpr::UnquoteSplice(inner) => {
+                    SExpr::UnquoteSplice(inner, _) => {
                         // Splice the contents into the result
-                        let spliced = eval_quasiquote(inner, subs);
+                        let spliced = eval_quasiquote(inner, subs, span);
                         match spliced {
-                            SExpr::List(splice_items) => {
+                            SExpr::List(splice_items, _) => {
                                 result.extend(splice_items);
                             }
                             other => {
@@ -949,28 +1153,30 @@ fn eval_quasiquote(template: &SExpr, subs: &HashMap<String, SExpr>) -> SExpr {
                         }
                     }
                     _ => {
-                        result.push(eval_quasiquote(item, subs));
+                        result.push(eval_quasiquote(item, subs, span));
                     }
                 }
             }
-            SExpr::List(result)
+            SExpr::List(result, list_span.clone())
         }
-        SExpr::Sym(name) => {
+        SExpr::Sym(name, sym_span) => {
             // In quasiquote context, symbols are NOT substituted (only in unquote)
-            SExpr::Sym(name.clone())
+            SExpr::Sym(name.clone(), sym_span.clone())
         }
-        SExpr::Int { value, ty } => SExpr::Int {
+        SExpr::Int { value, ty, span: int_span } => SExpr::Int {
             value: *value,
             ty: *ty,
+            span: int_span.clone(),
         },
-        SExpr::Float { value, ty } => SExpr::Float {
+        SExpr::Float { value, ty, span: float_span } => SExpr::Float {
             value: *value,
             ty: *ty,
+            span: float_span.clone(),
         },
     }
 }
 
-fn parse_program(forms: Vec<SExpr>) -> Program {
+fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut pending = Vec::new();
     let mut defined = HashSet::new();
     let mut imports = Vec::new();
@@ -982,65 +1188,73 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
 
     for form in forms {
         match form {
-            SExpr::List(items) => {
+            SExpr::List(items, span) => {
                 if items.is_empty() {
-                    panic!("Top-level list cannot be empty");
+                    return Err(ctx.error("empty list is not a valid top-level form", &span));
                 }
                 match &items[0] {
-                    SExpr::Sym(sym) if sym == "fn" => {
-                        let func = parse_fn_form(SExpr::List(items));
+                    SExpr::Sym(sym, _) if sym == "fn" => {
+                        let func = parse_fn_form(SExpr::List(items, span.clone()), ctx)?;
                         if !defined.insert(func.name.clone()) {
-                            panic!("Duplicate function '{}'", func.name);
+                            return Err(ctx.error(format!("duplicate function '{}'", func.name), &span));
                         }
                         pending.push(func);
                     }
-                    SExpr::Sym(sym) if sym == "export" => {
+                    SExpr::Sym(sym, _) if sym == "export" => {
                         if items.len() != 2 {
-                            panic!("export expects exactly one argument");
+                            return Err(ctx.error("export expects exactly one argument", &span));
                         }
                         match &items[1] {
-                            SExpr::Sym(name) => {
+                            SExpr::Sym(name, _) => {
                                 if export_set.insert(name.clone()) {
                                     exports.push(name.clone());
                                 }
                             }
-                            SExpr::List(_) => {
-                                let func = parse_fn_form(items[1].clone());
+                            SExpr::List(_, inner_span) => {
+                                let func = parse_fn_form(items[1].clone(), ctx)?;
                                 if !defined.insert(func.name.clone()) {
-                                    panic!("Duplicate function '{}'", func.name);
+                                    return Err(ctx.error(format!("duplicate function '{}'", func.name), inner_span));
                                 }
                                 if export_set.insert(func.name.clone()) {
                                     exports.push(func.name.clone());
                                 }
                                 pending.push(func);
                             }
-                            _ => panic!("export argument must be a symbol or (fn ...)"),
+                            other => return Err(ctx.error("export argument must be a symbol or (fn ...)", other.span())),
                         }
                     }
-                    SExpr::Sym(sym) if sym == "import" => {
-                        let import = parse_import_form(&items);
+                    SExpr::Sym(sym, _) if sym == "import" => {
+                        let import = parse_import_form(&items, ctx)?;
                         if defined.contains(&import.name) {
-                            panic!(
-                                "Function '{}' is already defined and cannot be imported",
-                                import.name
-                            );
+                            return Err(ctx.error(
+                                format!("function '{}' is already defined and cannot be imported", import.name),
+                                &span
+                            ));
                         }
                         if !imported.insert(import.name.clone()) {
-                            panic!("Duplicate import '{}'", import.name);
+                            return Err(ctx.error(format!("duplicate import '{}'", import.name), &span));
                         }
                         imports.push(import);
                     }
-                    SExpr::Sym(sym) if sym == "global" => {
-                        let global = parse_global_form(&items);
+                    SExpr::Sym(sym, _) if sym == "global" => {
+                        let global = parse_global_form(&items, ctx)?;
                         if !global_names.insert(global.name.clone()) {
-                            panic!("Duplicate global '{}'", global.name);
+                            return Err(ctx.error(format!("duplicate global '{}'", global.name), &span));
                         }
                         globals.push(global);
                     }
-                    _ => panic!("Unknown top-level form"),
+                    other => {
+                        return Err(ctx.error_with_note(
+                            "unknown top-level form",
+                            other.span(),
+                            "expected 'fn', 'export', 'import', or 'global'"
+                        ));
+                    }
                 }
             }
-            _ => panic!("Top-level forms must be lists"),
+            other => {
+                return Err(ctx.error("top-level forms must be lists", other.span()));
+            }
         }
     }
 
@@ -1052,7 +1266,7 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
             result: func.return_type,
         };
         if signatures.insert(func.name.clone(), sig).is_some() {
-            panic!("Duplicate function '{}'", func.name);
+            return Err(ctx.error(format!("duplicate function '{}'", func.name), &func.span));
         }
     }
 
@@ -1063,16 +1277,16 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
             result: import.return_type,
         };
         if signatures.insert(import.name.clone(), sig).is_some() {
-            panic!("Duplicate function '{}'", import.name);
+            return Err(ctx.error(format!("duplicate function '{}'", import.name), &import.span));
         }
     }
 
-    for export in &exports {
+    for (export, export_span) in exports.iter().zip(export_set.iter()) {
         if !signatures.contains_key(export) {
-            panic!("Cannot export undefined function '{}'", export);
+            return Err(ctx.error(format!("cannot export undefined function '{}'", export), &Span::dummy()));
         }
         if imported.contains(export) {
-            panic!("Cannot export imported function '{}'", export);
+            return Err(ctx.error(format!("cannot export imported function '{}'", export), &Span::dummy()));
         }
     }
 
@@ -1083,7 +1297,7 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
             .iter()
             .map(|p| p.name.clone())
             .collect::<Vec<_>>();
-        let body_expr = parse_expr(&func.body, &param_names, &signatures);
+        let body_expr = parse_expr(&func.body, &param_names, &signatures, ctx)?;
         functions.push(Function {
             name: func.name,
             params: func.params,
@@ -1092,140 +1306,179 @@ fn parse_program(forms: Vec<SExpr>) -> Program {
         });
     }
 
-    Program {
+    Ok(Program {
         functions,
         imports,
         exports,
         globals,
-    }
+    })
 }
 
-fn parse_fn_form(form: SExpr) -> PendingFunction {
-    let items = match form {
-        SExpr::List(items) => items,
-        _ => panic!("Function definition must be a list"),
+fn parse_fn_form(form: SExpr, ctx: &CompileContext) -> Result<PendingFunction> {
+    let (items, span) = match form {
+        SExpr::List(items, span) => (items, span),
+        other => return Err(ctx.error("function definition must be a list", other.span())),
     };
     if items.len() != 5 {
-        panic!("Function definitions must look like (fn name ((param type) ...) return body)");
+        return Err(ctx.error_with_note(
+            "invalid function definition",
+            &span,
+            "expected: (fn name ((param type) ...) return-type body)"
+        ));
     }
     match &items[0] {
-        SExpr::Sym(s) if s == "fn" => {}
-        _ => panic!("Function definition must start with (fn ...)"),
+        SExpr::Sym(s, _) if s == "fn" => {}
+        other => return Err(ctx.error("function definition must start with 'fn'", other.span())),
     }
     let name = match &items[1] {
-        SExpr::Sym(name) => name.clone(),
-        _ => panic!("Function name must be a symbol"),
+        SExpr::Sym(name, _) => name.clone(),
+        other => return Err(ctx.error("function name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[2]);
-    let return_type = parse_type_expr(&items[3]);
-    PendingFunction {
+    let params = parse_typed_params(&items[2], ctx)?;
+    let return_type = parse_type_expr(&items[3], ctx)?;
+    Ok(PendingFunction {
         name,
         params,
         return_type,
         body: items[4].clone(),
-    }
+        span,
+    })
 }
 
-fn parse_import_form(items: &[SExpr]) -> Import {
+fn parse_import_form(items: &[SExpr], ctx: &CompileContext) -> Result<Import> {
+    let span = items[0].span().clone();
     if items.len() != 5 {
-        panic!("Imports must look like (import module name ((param type) ...) result)");
+        return Err(ctx.error_with_note(
+            "invalid import declaration",
+            &span,
+            "expected: (import module name ((param type) ...) return-type)"
+        ));
     }
 
     let module = match &items[1] {
-        SExpr::Sym(s) => s.clone(),
-        _ => panic!("Import module must be a symbol"),
+        SExpr::Sym(s, _) => s.clone(),
+        other => return Err(ctx.error("import module must be a symbol", other.span())),
     };
     let name = match &items[2] {
-        SExpr::Sym(s) => s.clone(),
-        _ => panic!("Import name must be a symbol"),
+        SExpr::Sym(s, _) => s.clone(),
+        other => return Err(ctx.error("import name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[3]);
-    let return_type = parse_type_expr(&items[4]);
+    let params = parse_typed_params(&items[3], ctx)?;
+    let return_type = parse_type_expr(&items[4], ctx)?;
 
-    Import {
+    Ok(Import {
         module,
         name,
         params,
         return_type,
-    }
+        span,
+    })
 }
 
-fn parse_global_form(items: &[SExpr]) -> Global {
+fn parse_global_form(items: &[SExpr], ctx: &CompileContext) -> Result<Global> {
+    let span = items[0].span().clone();
     if items.len() != 5 {
-        panic!("Globals must look like (global $name type mutability init-value)");
+        return Err(ctx.error_with_note(
+            "invalid global declaration",
+            &span,
+            "expected: (global $name type mutability init-value)"
+        ));
     }
 
     let name = match &items[1] {
-        SExpr::Sym(s) => {
+        SExpr::Sym(s, sym_span) => {
             if !s.starts_with('$') {
-                panic!("Global name must start with $ (e.g., $heap-ptr)");
+                return Err(ctx.error_with_note(
+                    "global name must start with '$'",
+                    sym_span,
+                    "e.g., $heap-ptr, $counter"
+                ));
             }
             s.clone()
         }
-        _ => panic!("Global name must be a symbol starting with $"),
+        other => return Err(ctx.error("global name must be a symbol starting with $", other.span())),
     };
 
-    let ty = parse_type_expr(&items[2]);
+    let ty = parse_type_expr(&items[2], ctx)?;
 
     let mutable = match &items[3] {
-        SExpr::Sym(s) => match s.as_str() {
+        SExpr::Sym(s, sym_span) => match s.as_str() {
             "mut" => true,
             "const" => false,
-            _ => panic!("Global mutability must be 'mut' or 'const'"),
+            _ => return Err(ctx.error_with_note(
+                "invalid mutability specifier",
+                sym_span,
+                "expected 'mut' or 'const'"
+            )),
         },
-        _ => panic!("Global mutability must be 'mut' or 'const'"),
+        other => return Err(ctx.error("mutability must be 'mut' or 'const'", other.span())),
     };
 
     let init_value = match &items[4] {
         SExpr::Int { value, .. } => *value,
-        _ => panic!("Global init value must be an integer constant"),
+        other => return Err(ctx.error("global init value must be an integer constant", other.span())),
     };
 
-    Global {
+    Ok(Global {
         name,
         ty,
         mutable,
         init_value,
-    }
+    })
 }
 
-fn parse_typed_params(expr: &SExpr) -> Vec<Parameter> {
+fn parse_typed_params(expr: &SExpr, ctx: &CompileContext) -> Result<Vec<Parameter>> {
     match expr {
-        SExpr::List(params) => params
-            .iter()
-            .map(|p| match p {
-                SExpr::List(parts) => {
-                    if parts.len() != 2 {
-                        panic!("Parameters must be in the form (name type)");
+        SExpr::List(params, _) => {
+            let mut result = Vec::new();
+            for p in params {
+                match p {
+                    SExpr::List(parts, param_span) => {
+                        if parts.len() != 2 {
+                            return Err(ctx.error_with_note(
+                                "invalid parameter",
+                                param_span,
+                                "expected: (name type)"
+                            ));
+                        }
+                        let name = match &parts[0] {
+                            SExpr::Sym(s, _) => s.clone(),
+                            other => return Err(ctx.error("parameter name must be a symbol", other.span())),
+                        };
+                        let ty = parse_type_expr(&parts[1], ctx)?;
+                        result.push(Parameter { name, ty });
                     }
-                    let name = match &parts[0] {
-                        SExpr::Sym(s) => s.clone(),
-                        _ => panic!("Parameter name must be a symbol"),
-                    };
-                    let ty = parse_type_expr(&parts[1]);
-                    Parameter { name, ty }
+                    other => return Err(ctx.error_with_note(
+                        "invalid parameter",
+                        other.span(),
+                        "expected: (name type)"
+                    )),
                 }
-                _ => panic!("Parameters must be in the form (name type)"),
-            })
-            .collect(),
-        _ => panic!("Expected parameter list"),
+            }
+            Ok(result)
+        }
+        other => Err(ctx.error("expected parameter list", other.span())),
     }
 }
 
-fn parse_type_expr(expr: &SExpr) -> Type {
+fn parse_type_expr(expr: &SExpr, ctx: &CompileContext) -> Result<Type> {
     match expr {
-        SExpr::Sym(s) => parse_type_symbol(s),
-        _ => panic!("Type must be a symbol"),
+        SExpr::Sym(s, span) => parse_type_symbol(s, span, ctx),
+        other => Err(ctx.error("type must be a symbol", other.span())),
     }
 }
 
-fn parse_type_symbol(sym: &str) -> Type {
+fn parse_type_symbol(sym: &str, span: &Span, ctx: &CompileContext) -> Result<Type> {
     match sym {
-        "s32" => Type::S32,
-        "s64" => Type::S64,
-        "f32" => Type::F32,
-        "f64" => Type::F64,
-        other => panic!("Unknown type '{}'", other),
+        "s32" => Ok(Type::S32),
+        "s64" => Ok(Type::S64),
+        "f32" => Ok(Type::F32),
+        "f64" => Ok(Type::F64),
+        other => Err(ctx.error_with_note(
+            format!("unknown type '{}'", other),
+            span,
+            "expected: s32, s64, f32, or f64"
+        )),
     }
 }
 
@@ -1233,151 +1486,182 @@ fn is_type_symbol(sym: &str) -> bool {
     matches!(sym, "s32" | "s64" | "f32" | "f64")
 }
 
-fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signature>) -> Expr {
+fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signature>, ctx: &CompileContext) -> Result<Expr> {
     match sexpr {
-        SExpr::Int { value, ty } => Expr::Int {
+        SExpr::Int { value, ty, .. } => Ok(Expr::Int {
             value: *value,
             ty: *ty,
-        },
-        SExpr::Float { value, ty } => Expr::Float {
+        }),
+        SExpr::Float { value, ty, .. } => Ok(Expr::Float {
             value: *value,
             ty: *ty,
-        },
-        SExpr::Sym(s) => {
+        }),
+        SExpr::Sym(s, span) => {
             if vars.iter().any(|name| name == s) {
-                Expr::Var(s.clone())
+                Ok(Expr::Var(s.clone()))
             } else {
-                panic!("Unknown symbol: {}", s);
+                Err(ctx.error(format!("unknown variable '{}'", s), span))
             }
         }
-        SExpr::List(items) => {
+        SExpr::List(items, list_span) => {
             if items.is_empty() {
-                panic!("Empty list is not a valid expression");
+                return Err(ctx.error("empty list is not a valid expression", list_span));
             }
             let op = &items[0];
             match op {
-                SExpr::Sym(sym) if is_type_symbol(sym) && items.len() == 2 => {
-                    let ty = parse_type_symbol(sym);
-                    let inner = parse_expr(&items[1], vars, functions);
-                    Expr::Ascribe {
+                SExpr::Sym(sym, sym_span) if is_type_symbol(sym) && items.len() == 2 => {
+                    let ty = match sym.as_str() {
+                        "s32" => Type::S32,
+                        "s64" => Type::S64,
+                        "f32" => Type::F32,
+                        "f64" => Type::F64,
+                        _ => unreachable!(),
+                    };
+                    let inner = parse_expr(&items[1], vars, functions, ctx)?;
+                    Ok(Expr::Ascribe {
                         expr: Box::new(inner),
                         ty,
-                    }
+                    })
                 }
-                SExpr::Sym(sym) if sym == "if" => {
+                SExpr::Sym(sym, sym_span) if sym == "if" => {
                     if items.len() != 4 {
-                        panic!("if expects condition, then, else");
+                        return Err(ctx.error_with_note(
+                            "invalid 'if' expression",
+                            list_span,
+                            "expected: (if condition then-expr else-expr)"
+                        ));
                     }
-                    let cond = parse_expr(&items[1], vars, functions);
-                    let then_branch = parse_expr(&items[2], vars, functions);
-                    let else_branch = parse_expr(&items[3], vars, functions);
-                    Expr::If {
+                    let cond = parse_expr(&items[1], vars, functions, ctx)?;
+                    let then_branch = parse_expr(&items[2], vars, functions, ctx)?;
+                    let else_branch = parse_expr(&items[3], vars, functions, ctx)?;
+                    Ok(Expr::If {
                         cond: Box::new(cond),
                         then_branch: Box::new(then_branch),
                         else_branch: Box::new(else_branch),
-                    }
+                    })
                 }
-                SExpr::Sym(sym) if sym == "global.get" => {
+                SExpr::Sym(sym, sym_span) if sym == "global.get" => {
                     if items.len() != 2 {
-                        panic!("global.get expects exactly one argument (the global name)");
+                        return Err(ctx.error_with_note(
+                            "invalid 'global.get' expression",
+                            list_span,
+                            "expected: (global.get $name)"
+                        ));
                     }
                     let name = match &items[1] {
-                        SExpr::Sym(s) => {
+                        SExpr::Sym(s, s_span) => {
                             if !s.starts_with('$') {
-                                panic!("Global name must start with $");
+                                return Err(ctx.error("global name must start with '$'", s_span));
                             }
                             s.clone()
                         }
-                        _ => panic!("global.get argument must be a global name starting with $"),
+                        other => return Err(ctx.error("global.get argument must be a global name starting with $", other.span())),
                     };
-                    Expr::GlobalGet { name }
+                    Ok(Expr::GlobalGet { name })
                 }
-                SExpr::Sym(sym) if sym == "global.set" => {
+                SExpr::Sym(sym, sym_span) if sym == "global.set" => {
                     if items.len() != 3 {
-                        panic!("global.set expects exactly two arguments (name and value)");
+                        return Err(ctx.error_with_note(
+                            "invalid 'global.set' expression",
+                            list_span,
+                            "expected: (global.set $name value)"
+                        ));
                     }
                     let name = match &items[1] {
-                        SExpr::Sym(s) => {
+                        SExpr::Sym(s, s_span) => {
                             if !s.starts_with('$') {
-                                panic!("Global name must start with $");
+                                return Err(ctx.error("global name must start with '$'", s_span));
                             }
                             s.clone()
                         }
-                        _ => panic!(
-                            "global.set first argument must be a global name starting with $"
-                        ),
+                        other => return Err(ctx.error("global.set first argument must be a global name starting with $", other.span())),
                     };
-                    let value = parse_expr(&items[2], vars, functions);
-                    Expr::GlobalSet {
+                    let value = parse_expr(&items[2], vars, functions, ctx)?;
+                    Ok(Expr::GlobalSet {
                         name,
                         value: Box::new(value),
-                    }
+                    })
                 }
-                SExpr::Sym(sym) if sym == "let" => {
+                SExpr::Sym(sym, sym_span) if sym == "let" => {
                     if items.len() != 3 {
-                        panic!("let expects binding and body");
+                        return Err(ctx.error_with_note(
+                            "invalid 'let' expression",
+                            list_span,
+                            "expected: (let (name value) body)"
+                        ));
                     }
                     let binding = match &items[1] {
-                        SExpr::List(parts) => parts,
-                        _ => panic!("let binding must be a list (name value)"),
+                        SExpr::List(parts, _) => parts,
+                        other => return Err(ctx.error_with_note(
+                            "let binding must be a list",
+                            other.span(),
+                            "expected: (name value)"
+                        )),
                     };
                     if binding.len() != 2 {
-                        panic!("let binding must have exactly a name and value");
+                        return Err(ctx.error_with_note(
+                            "invalid let binding",
+                            items[1].span(),
+                            "expected: (name value)"
+                        ));
                     }
                     let name = match &binding[0] {
-                        SExpr::Sym(s) => s.clone(),
-                        _ => panic!("let binding name must be a symbol"),
+                        SExpr::Sym(s, _) => s.clone(),
+                        other => return Err(ctx.error("let binding name must be a symbol", other.span())),
                     };
-                    let value_expr = parse_expr(&binding[1], vars, functions);
+                    let value_expr = parse_expr(&binding[1], vars, functions, ctx)?;
                     let mut next_vars = vars.to_vec();
                     next_vars.push(name.clone());
-                    let body_expr = parse_expr(&items[2], &next_vars, functions);
-                    Expr::Let {
+                    let body_expr = parse_expr(&items[2], &next_vars, functions, ctx)?;
+                    Ok(Expr::Let {
                         name,
                         value: Box::new(value_expr),
                         body: Box::new(body_expr),
-                    }
+                    })
                 }
                 _ => {
-                    if let SExpr::Sym(sym) = op {
+                    if let SExpr::Sym(sym, sym_span) = op {
                         // Check if this is a WASM instruction
                         if lookup_wasm_instr(sym).is_some() {
                             let mut args = Vec::new();
                             for arg in &items[1..] {
-                                args.push(parse_expr(arg, vars, functions));
+                                args.push(parse_expr(arg, vars, functions, ctx)?);
                             }
-                            Expr::WasmInstr {
+                            Ok(Expr::WasmInstr {
                                 name: sym.clone(),
                                 args,
-                            }
+                            })
                         } else if let Some(expected) = functions.get(sym) {
                             if items.len() - 1 != expected.params.len() {
-                                panic!(
-                                    "Function '{}' expects {} arguments, got {}",
-                                    sym,
-                                    expected.params.len(),
-                                    items.len() - 1
-                                );
+                                return Err(ctx.error(
+                                    format!(
+                                        "function '{}' expects {} arguments, got {}",
+                                        sym,
+                                        expected.params.len(),
+                                        items.len() - 1
+                                    ),
+                                    list_span
+                                ));
                             }
                             let mut args = Vec::new();
                             for arg in &items[1..] {
-                                args.push(parse_expr(arg, vars, functions));
+                                args.push(parse_expr(arg, vars, functions, ctx)?);
                             }
-                            Expr::Call {
+                            Ok(Expr::Call {
                                 name: sym.clone(),
                                 args,
-                            }
+                            })
                         } else {
-                            panic!("Unknown operator or function: {}", sym);
+                            Err(ctx.error(format!("unknown function or operator '{}'", sym), sym_span))
                         }
                     } else {
-                        panic!("List does not start with a symbol");
+                        Err(ctx.error("expression must start with a symbol", op.span()))
                     }
                 }
             }
         }
-        SExpr::Quasiquote(_) | SExpr::Unquote(_) | SExpr::UnquoteSplice(_) => {
-            panic!("Quasiquote/unquote should have been expanded before parse_expr");
+        SExpr::Quasiquote(_, span) | SExpr::Unquote(_, span) | SExpr::UnquoteSplice(_, span) => {
+            Err(ctx.error("quasiquote/unquote should have been expanded before parsing", span))
         }
     }
 }
