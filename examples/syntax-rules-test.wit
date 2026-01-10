@@ -1,0 +1,10 @@
+package example:wisp;
+
+world wisp {
+  export test-simple: func(x: s32, y: s32) -> s32;
+  export test-inc: func(x: s32) -> s32;
+  export test-inc-n: func(x: s32, n: s32) -> s32;
+  export test-begin: func(x: s32) -> s32;
+  export test-else: func() -> s32;
+  export test-cond: func(x: s32) -> s32;
+}

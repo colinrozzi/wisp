@@ -1,0 +1,7 @@
+package example:wisp;
+
+world wisp {
+  export test-no-capture: func() -> s32;
+  export test-self-ref: func() -> s32;
+  export test-nested: func() -> s32;
+}

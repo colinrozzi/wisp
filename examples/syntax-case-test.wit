@@ -1,0 +1,10 @@
+package example:wisp;
+
+world wisp {
+  export test-simple: func(x: s32, y: s32) -> s32;
+  export test-guard-id: func(n: s32) -> s32;
+  export test-guard-nonid: func() -> s32;
+  export test-quasisyntax: func(n: s32) -> s32;
+  export test-ct-let: func(n: s32) -> s32;
+  export test-when: func(x: s32) -> s32;
+}

@@ -15,22 +15,75 @@ enum Type {
     F64,
 }
 
-/// Source location information for error reporting
+/// Unique identifier for a lexical scope (used for hygiene)
+type ScopeId = u64;
+
+/// Thread-local counter for generating unique scope IDs
+use std::sync::atomic::{AtomicU64, Ordering};
+static SCOPE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_scope() -> ScopeId {
+    SCOPE_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Set of scopes attached to an identifier for hygiene tracking
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ScopeSet {
+    scopes: HashSet<ScopeId>,
+}
+
+impl ScopeSet {
+    fn new() -> Self {
+        Self { scopes: HashSet::new() }
+    }
+
+    /// Create a scope set with the base scope (scope 0)
+    fn base() -> Self {
+        let mut scopes = HashSet::new();
+        scopes.insert(0);
+        Self { scopes }
+    }
+
+    /// Add a scope to this set
+    fn with_scope(&self, scope: ScopeId) -> Self {
+        let mut new_scopes = self.scopes.clone();
+        new_scopes.insert(scope);
+        Self { scopes: new_scopes }
+    }
+
+    /// Check if this scope set is a subset of another
+    fn is_subset_of(&self, other: &ScopeSet) -> bool {
+        self.scopes.is_subset(&other.scopes)
+    }
+}
+
+/// Source location information for error reporting and hygiene
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Span {
     line: usize,
     column: usize,
     length: usize,
+    scopes: ScopeSet,
 }
 
 impl Span {
     fn new(line: usize, column: usize, length: usize) -> Self {
-        Self { line, column, length }
+        Self { line, column, length, scopes: ScopeSet::base() }
     }
 
     /// Create a dummy span for generated code
     fn dummy() -> Self {
-        Self { line: 0, column: 0, length: 0 }
+        Self { line: 0, column: 0, length: 0, scopes: ScopeSet::base() }
+    }
+
+    /// Create a span with additional scope (for macro hygiene)
+    fn with_scope(&self, scope: ScopeId) -> Self {
+        Self {
+            line: self.line,
+            column: self.column,
+            length: self.length,
+            scopes: self.scopes.with_scope(scope),
+        }
     }
 
     /// Merge two spans (from start of first to end of second)
@@ -47,6 +100,7 @@ impl Span {
             line: self.line,
             column: self.column,
             length: 1, // Simplified
+            scopes: self.scopes.clone(),
         }
     }
 }
@@ -173,7 +227,7 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
         bail!("no function definitions found in source");
     }
 
-    // Collect macro definitions and expand macros
+    // Collect macro definitions (both defmacro and define-syntax) and expand macros
     let macros = collect_macros(&forms);
     let expanded_forms = expand_all_macros(forms, &macros);
 
@@ -246,9 +300,13 @@ enum TokenKind {
     RParen,
     Symbol(String),
     Number(NumericToken),
-    Quasiquote,    // `
-    Unquote,       // ,
-    UnquoteSplice, // ,@
+    Quasiquote,       // `
+    Unquote,          // ,
+    UnquoteSplice,    // ,@
+    SyntaxQuote,      // #'
+    Quasisyntax,      // #`
+    Unsyntax,         // #,
+    UnsyntaxSplice,   // #,@
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +324,11 @@ enum SExpr {
     Quasiquote(Box<SExpr>, Span),
     Unquote(Box<SExpr>, Span),
     UnquoteSplice(Box<SExpr>, Span),
+    // Syntax object forms for syntax-case
+    SyntaxQuote(Box<SExpr>, Span),    // #'expr - creates syntax object
+    Quasisyntax(Box<SExpr>, Span),    // #`template - syntax template
+    Unsyntax(Box<SExpr>, Span),       // #,expr - unquote in syntax
+    UnsyntaxSplice(Box<SExpr>, Span), // #,@expr - splice in syntax
 }
 
 impl SExpr {
@@ -278,6 +341,10 @@ impl SExpr {
             SExpr::Quasiquote(_, span) => span,
             SExpr::Unquote(_, span) => span,
             SExpr::UnquoteSplice(_, span) => span,
+            SExpr::SyntaxQuote(_, span) => span,
+            SExpr::Quasisyntax(_, span) => span,
+            SExpr::Unsyntax(_, span) => span,
+            SExpr::UnsyntaxSplice(_, span) => span,
         }
     }
 }
@@ -332,10 +399,52 @@ struct Function {
     body: Expr,
 }
 
+/// A variable binding for hygiene tracking
+#[derive(Debug, Clone)]
+struct Binding {
+    name: String,
+    scopes: ScopeSet,
+}
+
+impl Binding {
+    fn new(name: String, scopes: ScopeSet) -> Self {
+        Self { name, scopes }
+    }
+
+    /// Check if this binding can be referenced by a reference with the given scopes.
+    /// A binding is visible to a reference if the binding's scopes are a subset
+    /// of the reference's scopes.
+    fn is_visible_from(&self, ref_scopes: &ScopeSet) -> bool {
+        self.scopes.is_subset_of(ref_scopes)
+    }
+
+    /// Get a unique mangled name that includes scope information.
+    /// This ensures variables with the same name but different scopes
+    /// are distinct in the generated code.
+    fn mangled_name(&self) -> String {
+        if self.scopes.scopes.len() <= 1 && self.scopes.scopes.contains(&0) {
+            // Base scope only - no mangling needed
+            self.name.clone()
+        } else {
+            // Include non-base scopes in the name
+            let mut scope_ids: Vec<_> = self.scopes.scopes.iter()
+                .filter(|&&s| s != 0)
+                .copied()
+                .collect();
+            scope_ids.sort();
+            format!("{}__hyg{}", self.name, scope_ids.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join("_"))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Parameter {
     name: String,
     ty: Type,
+    scopes: ScopeSet,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +469,122 @@ struct Macro {
     name: String,
     params: Vec<String>,
     template: SExpr,
+}
+
+/// Pattern for syntax-rules matching
+#[derive(Debug, Clone)]
+enum Pattern {
+    /// Pattern variable (matches anything, binds to name)
+    Variable(String),
+    /// Literal symbol (matches exactly this symbol)
+    Literal(String),
+    /// Wildcard _ (matches anything, doesn't bind)
+    Wildcard,
+    /// List pattern without ellipsis
+    List(Vec<Pattern>),
+    /// List pattern with ellipsis: (p1 p2 ... pN pN+1)
+    /// before: patterns before the repeated element
+    /// repeated: the pattern that repeats (before ...)
+    /// after: patterns after the ...
+    ListWithEllipsis {
+        before: Vec<Pattern>,
+        repeated: Box<Pattern>,
+        after: Vec<Pattern>,
+    },
+}
+
+/// Template for syntax-rules expansion
+#[derive(Debug, Clone)]
+enum Template {
+    /// Pattern variable reference
+    Variable(String),
+    /// Literal symbol (not a pattern variable)
+    Symbol(String),
+    /// Literal number or other atom
+    Atom(SExpr),
+    /// List template without ellipsis
+    List(Vec<Template>),
+    /// Element followed by ellipsis: t ...
+    /// This expands the template for each value in the binding
+    Ellipsis(Box<Template>),
+}
+
+/// Binding from pattern matching - either single value or list (from ellipsis)
+#[derive(Debug, Clone)]
+enum PatternBinding {
+    Single(SExpr),
+    List(Vec<SExpr>),
+}
+
+/// A single syntax-rules rule (pattern -> template)
+#[derive(Debug, Clone)]
+struct SyntaxRule {
+    pattern: Pattern,
+    template: Template,
+}
+
+/// A syntax-rules macro definition
+#[derive(Debug, Clone)]
+struct SyntaxRulesMacro {
+    name: String,
+    literals: Vec<String>,
+    rules: Vec<SyntaxRule>,
+}
+
+/// A syntax-case clause with optional guard
+#[derive(Debug, Clone)]
+struct SyntaxCaseClause {
+    pattern: Pattern,
+    guard: Option<CompileTimeExpr>,
+    template: CompileTimeExpr,
+}
+
+/// A syntax-case macro definition (syntax-case-lambda)
+#[derive(Debug, Clone)]
+struct SyntaxCaseMacro {
+    name: String,
+    param: String,       // The stx parameter name
+    literals: Vec<String>,
+    clauses: Vec<SyntaxCaseClause>,
+}
+
+/// Expressions evaluated at compile time (for syntax-case macros)
+#[derive(Debug, Clone)]
+enum CompileTimeExpr {
+    /// A quoted syntax object: #'expr
+    Syntax(SExpr),
+    /// A quasisyntax template: #`template with #, and #,@
+    Quasisyntax(SExpr),
+    /// Reference to a pattern binding or macro parameter
+    Var(String),
+    /// Function application: (func args...)
+    App {
+        func: String,
+        args: Vec<CompileTimeExpr>,
+    },
+    /// Conditional: (if cond then else)
+    If {
+        cond: Box<CompileTimeExpr>,
+        then_branch: Box<CompileTimeExpr>,
+        else_branch: Box<CompileTimeExpr>,
+    },
+    /// Let binding: (let (name value) body)
+    Let {
+        name: String,
+        value: Box<CompileTimeExpr>,
+        body: Box<CompileTimeExpr>,
+    },
+    /// Literal value (number, boolean)
+    Literal(SExpr),
+}
+
+/// Result of compile-time evaluation
+#[derive(Debug, Clone)]
+enum CompileTimeValue {
+    Syntax(SExpr),
+    Bool(bool),
+    Int(i64),
+    List(Vec<CompileTimeValue>),
 }
 
 struct PendingFunction {
@@ -843,6 +1068,62 @@ fn tokenize(input: &str) -> Vec<Token> {
                     });
                 }
             }
+            '#' => {
+                let start_col = column;
+                chars.next();
+                column += 1;
+                match chars.peek() {
+                    Some(&'\'') => {
+                        chars.next();
+                        column += 1;
+                        tokens.push(Token {
+                            kind: TokenKind::SyntaxQuote,
+                            span: Span::new(line, start_col, 2),
+                        });
+                    }
+                    Some(&'`') => {
+                        chars.next();
+                        column += 1;
+                        tokens.push(Token {
+                            kind: TokenKind::Quasisyntax,
+                            span: Span::new(line, start_col, 2),
+                        });
+                    }
+                    Some(&',') => {
+                        chars.next();
+                        column += 1;
+                        if chars.peek() == Some(&'@') {
+                            chars.next();
+                            column += 1;
+                            tokens.push(Token {
+                                kind: TokenKind::UnsyntaxSplice,
+                                span: Span::new(line, start_col, 3),
+                            });
+                        } else {
+                            tokens.push(Token {
+                                kind: TokenKind::Unsyntax,
+                                span: Span::new(line, start_col, 2),
+                            });
+                        }
+                    }
+                    _ => {
+                        // Treat # as start of a symbol (e.g., #t, #f)
+                        let mut lexeme = String::from("#");
+                        while let Some(&c2) = chars.peek() {
+                            if c2.is_whitespace() || c2 == '(' || c2 == ')' || c2 == '`' || c2 == ',' || c2 == ';' || c2 == '\'' {
+                                break;
+                            }
+                            lexeme.push(c2);
+                            chars.next();
+                            column += 1;
+                        }
+                        tokens.push(Token {
+                            kind: TokenKind::Symbol(lexeme),
+                            span: Span::new(line, start_col, column - start_col),
+                        });
+                    }
+                }
+            }
             ';' => {
                 // Skip comments (everything until end of line)
                 while let Some(&c) = chars.peek() {
@@ -991,23 +1272,66 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
             let (inner, next) = parse_sexpr(tokens, pos + 1);
             (SExpr::UnquoteSplice(Box::new(inner), span.clone()), next)
         }
+        Some((TokenKind::SyntaxQuote, span)) => {
+            let (inner, next) = parse_sexpr(tokens, pos + 1);
+            (SExpr::SyntaxQuote(Box::new(inner), span.clone()), next)
+        }
+        Some((TokenKind::Quasisyntax, span)) => {
+            let (inner, next) = parse_sexpr(tokens, pos + 1);
+            (SExpr::Quasisyntax(Box::new(inner), span.clone()), next)
+        }
+        Some((TokenKind::Unsyntax, span)) => {
+            let (inner, next) = parse_sexpr(tokens, pos + 1);
+            (SExpr::Unsyntax(Box::new(inner), span.clone()), next)
+        }
+        Some((TokenKind::UnsyntaxSplice, span)) => {
+            let (inner, next) = parse_sexpr(tokens, pos + 1);
+            (SExpr::UnsyntaxSplice(Box::new(inner), span.clone()), next)
+        }
         None => panic!("Unexpected end of tokens"),
     }
 }
 
 // Collect macro definitions from forms
-fn collect_macros(forms: &[SExpr]) -> HashMap<String, Macro> {
-    let mut macros = HashMap::new();
+/// Collected macros from defmacro, define-syntax (syntax-rules), and syntax-case
+struct CollectedMacros {
+    defmacros: HashMap<String, Macro>,
+    syntax_rules: HashMap<String, SyntaxRulesMacro>,
+    syntax_case: HashMap<String, SyntaxCaseMacro>,
+}
+
+fn collect_macros(forms: &[SExpr]) -> CollectedMacros {
+    let mut defmacros = HashMap::new();
+    let mut syntax_rules = HashMap::new();
+    let mut syntax_case = HashMap::new();
+
     for form in forms {
-        if let SExpr::List(items, _) = form
-            && items.len() >= 4
-                && matches!(&items[0], SExpr::Sym(sym, _) if sym == "defmacro")
-            {
-                let mac = parse_defmacro_form(items);
-                macros.insert(mac.name.clone(), mac);
+        if let SExpr::List(items, _) = form {
+            if let Some(SExpr::Sym(sym, _)) = items.first() {
+                if sym == "defmacro" && items.len() >= 4 {
+                    let mac = parse_defmacro_form(items);
+                    defmacros.insert(mac.name.clone(), mac);
+                } else if sym == "define-syntax" && items.len() >= 3 {
+                    // Check if it's syntax-rules or syntax-case-lambda
+                    if let SExpr::List(body_items, _) = &items[2] {
+                        if let Some(SExpr::Sym(body_sym, _)) = body_items.first() {
+                            if body_sym == "syntax-rules" {
+                                if let Some(mac) = parse_define_syntax_form(items) {
+                                    syntax_rules.insert(mac.name.clone(), mac);
+                                }
+                            } else if body_sym == "syntax-case-lambda" {
+                                if let Some(mac) = parse_syntax_case_form(items) {
+                                    syntax_case.insert(mac.name.clone(), mac);
+                                }
+                            }
+                        }
+                    }
+                }
             }
+        }
     }
-    macros
+
+    CollectedMacros { defmacros, syntax_rules, syntax_case }
 }
 
 fn parse_defmacro_form(items: &[SExpr]) -> Macro {
@@ -1036,15 +1360,454 @@ fn parse_defmacro_form(items: &[SExpr]) -> Macro {
     }
 }
 
+/// Parse a define-syntax form
+/// (define-syntax name (syntax-rules (literals...) [pattern template] ...))
+fn parse_define_syntax_form(items: &[SExpr]) -> Option<SyntaxRulesMacro> {
+    // items[0] = define-syntax
+    // items[1] = name
+    // items[2] = (syntax-rules ...)
+    if items.len() != 3 {
+        eprintln!("define-syntax requires exactly 2 arguments");
+        return None;
+    }
+
+    let name = match &items[1] {
+        SExpr::Sym(s, _) => s.clone(),
+        _ => {
+            eprintln!("define-syntax name must be a symbol");
+            return None;
+        }
+    };
+
+    // Parse (syntax-rules (literals...) rules...)
+    let syntax_rules_form = match &items[2] {
+        SExpr::List(sr_items, _) => sr_items,
+        _ => {
+            eprintln!("define-syntax body must be (syntax-rules ...)");
+            return None;
+        }
+    };
+
+    if syntax_rules_form.is_empty() {
+        eprintln!("syntax-rules form is empty");
+        return None;
+    }
+
+    // Check for "syntax-rules" keyword
+    match &syntax_rules_form[0] {
+        SExpr::Sym(s, _) if s == "syntax-rules" => {}
+        _ => {
+            eprintln!("Expected syntax-rules");
+            return None;
+        }
+    }
+
+    if syntax_rules_form.len() < 2 {
+        eprintln!("syntax-rules requires literals list and at least one rule");
+        return None;
+    }
+
+    // Parse literals list
+    let literals: Vec<String> = match &syntax_rules_form[1] {
+        SExpr::List(lits, _) => {
+            lits.iter()
+                .filter_map(|l| match l {
+                    SExpr::Sym(s, _) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => {
+            eprintln!("syntax-rules literals must be a list");
+            return None;
+        }
+    };
+
+    // Parse rules: each rule is [pattern template] or (pattern template)
+    let mut rules = Vec::new();
+    for rule_form in &syntax_rules_form[2..] {
+        if let Some(rule) = parse_syntax_rule(rule_form, &name, &literals) {
+            rules.push(rule);
+        } else {
+            eprintln!("Failed to parse syntax rule");
+            return None;
+        }
+    }
+
+    Some(SyntaxRulesMacro { name, literals, rules })
+}
+
+/// Parse a define-syntax form with syntax-case-lambda
+/// (define-syntax name (syntax-case-lambda (stx) clauses...))
+/// or
+/// (define-syntax name (syntax-case-lambda (stx) (syntax-case stx (lits) clauses...)))
+fn parse_syntax_case_form(items: &[SExpr]) -> Option<SyntaxCaseMacro> {
+    // items[0] = define-syntax
+    // items[1] = name
+    // items[2] = (syntax-case-lambda (param) ...)
+    if items.len() != 3 {
+        eprintln!("define-syntax requires exactly 2 arguments");
+        return None;
+    }
+
+    let name = match &items[1] {
+        SExpr::Sym(s, _) => s.clone(),
+        _ => {
+            eprintln!("define-syntax name must be a symbol");
+            return None;
+        }
+    };
+
+    // Parse (syntax-case-lambda (param) body...)
+    let scl_form = match &items[2] {
+        SExpr::List(scl_items, _) => scl_items,
+        _ => {
+            eprintln!("define-syntax body must be (syntax-case-lambda ...)");
+            return None;
+        }
+    };
+
+    if scl_form.len() < 3 {
+        eprintln!("syntax-case-lambda requires parameter and at least one clause");
+        return None;
+    }
+
+    // Check for "syntax-case-lambda" keyword
+    match &scl_form[0] {
+        SExpr::Sym(s, _) if s == "syntax-case-lambda" => {}
+        _ => {
+            eprintln!("Expected syntax-case-lambda");
+            return None;
+        }
+    }
+
+    // Parse parameter: (stx)
+    let param = match &scl_form[1] {
+        SExpr::List(params, _) if params.len() == 1 => {
+            match &params[0] {
+                SExpr::Sym(s, _) => s.clone(),
+                _ => {
+                    eprintln!("syntax-case-lambda parameter must be a symbol");
+                    return None;
+                }
+            }
+        }
+        _ => {
+            eprintln!("syntax-case-lambda requires exactly one parameter");
+            return None;
+        }
+    };
+
+    // Check if body starts with syntax-case or is just clauses
+    let (literals, clauses_forms): (Vec<String>, &[SExpr]) =
+        if let SExpr::List(inner, _) = &scl_form[2] {
+            if let Some(SExpr::Sym(s, _)) = inner.first() {
+                if s == "syntax-case" && inner.len() >= 3 {
+                    // (syntax-case stx (literals) clauses...)
+                    let lits = match &inner[2] {
+                        SExpr::List(lits, _) => {
+                            lits.iter()
+                                .filter_map(|l| match l {
+                                    SExpr::Sym(s, _) => Some(s.clone()),
+                                    _ => None,
+                                })
+                                .collect()
+                        }
+                        _ => vec![],
+                    };
+                    (lits, &inner[3..])
+                } else {
+                    // Direct clauses without syntax-case wrapper
+                    (vec![], &scl_form[2..])
+                }
+            } else {
+                // Direct clauses
+                (vec![], &scl_form[2..])
+            }
+        } else {
+            (vec![], &scl_form[2..])
+        };
+
+    // Parse clauses
+    let mut clauses = Vec::new();
+    for clause_form in clauses_forms {
+        if let Some(clause) = parse_syntax_case_clause(clause_form, &name, &literals) {
+            clauses.push(clause);
+        } else {
+            eprintln!("Failed to parse syntax-case clause");
+            return None;
+        }
+    }
+
+    Some(SyntaxCaseMacro { name, param, literals, clauses })
+}
+
+/// Parse a syntax-case clause: (pattern template) or (pattern guard template)
+fn parse_syntax_case_clause(form: &SExpr, macro_name: &str, literals: &[String]) -> Option<SyntaxCaseClause> {
+    let items = match form {
+        SExpr::List(items, _) => items,
+        _ => {
+            eprintln!("Syntax-case clause must be a list");
+            return None;
+        }
+    };
+
+    if items.len() < 2 || items.len() > 3 {
+        eprintln!("Syntax-case clause must have 2 or 3 elements: (pattern [guard] template)");
+        return None;
+    }
+
+    // Collect pattern variables from the pattern
+    let mut pattern_vars = HashSet::new();
+    let pattern = parse_pattern(&items[0], macro_name, literals, &mut pattern_vars)?;
+
+    if items.len() == 2 {
+        // No guard: (pattern template)
+        let template = parse_compile_time_expr(&items[1], &pattern_vars)?;
+        Some(SyntaxCaseClause { pattern, guard: None, template })
+    } else {
+        // With guard: (pattern guard template)
+        let guard = parse_compile_time_expr(&items[1], &pattern_vars)?;
+        let template = parse_compile_time_expr(&items[2], &pattern_vars)?;
+        Some(SyntaxCaseClause { pattern, guard: Some(guard), template })
+    }
+}
+
+/// Parse a compile-time expression from an S-expression
+fn parse_compile_time_expr(sexpr: &SExpr, pattern_vars: &HashSet<String>) -> Option<CompileTimeExpr> {
+    match sexpr {
+        SExpr::SyntaxQuote(inner, _) => {
+            // #'expr - syntax quote
+            Some(CompileTimeExpr::Syntax(inner.as_ref().clone()))
+        }
+        SExpr::Quasisyntax(inner, _) => {
+            // #`template - quasisyntax
+            Some(CompileTimeExpr::Quasisyntax(inner.as_ref().clone()))
+        }
+        SExpr::Sym(name, _) => {
+            // Variable reference (could be pattern var or builtin)
+            Some(CompileTimeExpr::Var(name.clone()))
+        }
+        SExpr::Int { .. } | SExpr::Float { .. } => {
+            Some(CompileTimeExpr::Literal(sexpr.clone()))
+        }
+        SExpr::List(items, _) => {
+            if items.is_empty() {
+                return Some(CompileTimeExpr::Literal(sexpr.clone()));
+            }
+
+            // Check for special forms
+            if let SExpr::Sym(name, _) = &items[0] {
+                match name.as_str() {
+                    "if" if items.len() == 4 => {
+                        let cond = parse_compile_time_expr(&items[1], pattern_vars)?;
+                        let then_branch = parse_compile_time_expr(&items[2], pattern_vars)?;
+                        let else_branch = parse_compile_time_expr(&items[3], pattern_vars)?;
+                        return Some(CompileTimeExpr::If {
+                            cond: Box::new(cond),
+                            then_branch: Box::new(then_branch),
+                            else_branch: Box::new(else_branch),
+                        });
+                    }
+                    "let" if items.len() == 3 => {
+                        if let SExpr::List(binding, _) = &items[1] {
+                            if binding.len() == 2 {
+                                if let SExpr::Sym(var_name, _) = &binding[0] {
+                                    let value = parse_compile_time_expr(&binding[1], pattern_vars)?;
+                                    let mut extended_vars = pattern_vars.clone();
+                                    extended_vars.insert(var_name.clone());
+                                    let body = parse_compile_time_expr(&items[2], &extended_vars)?;
+                                    return Some(CompileTimeExpr::Let {
+                                        name: var_name.clone(),
+                                        value: Box::new(value),
+                                        body: Box::new(body),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Function application
+                let args: Option<Vec<_>> = items[1..]
+                    .iter()
+                    .map(|arg| parse_compile_time_expr(arg, pattern_vars))
+                    .collect();
+                return Some(CompileTimeExpr::App {
+                    func: name.clone(),
+                    args: args?,
+                });
+            }
+
+            // Unknown form
+            eprintln!("Unknown compile-time expression: {:?}", sexpr);
+            None
+        }
+        _ => {
+            eprintln!("Unsupported compile-time expression: {:?}", sexpr);
+            None
+        }
+    }
+}
+
+/// Parse a single syntax rule: [pattern template] or (pattern template)
+fn parse_syntax_rule(form: &SExpr, macro_name: &str, literals: &[String]) -> Option<SyntaxRule> {
+    let items = match form {
+        SExpr::List(items, _) => items,
+        _ => {
+            eprintln!("Syntax rule must be a list");
+            return None;
+        }
+    };
+
+    if items.len() != 2 {
+        eprintln!("Syntax rule must have exactly 2 elements: [pattern template]");
+        return None;
+    }
+
+    // Collect pattern variables from the pattern
+    let mut pattern_vars = HashSet::new();
+    let pattern = parse_pattern(&items[0], macro_name, literals, &mut pattern_vars)?;
+    let template = parse_template(&items[1], &pattern_vars)?;
+
+    Some(SyntaxRule { pattern, template })
+}
+
+/// Parse a pattern from an S-expression
+fn parse_pattern(
+    sexpr: &SExpr,
+    macro_name: &str,
+    literals: &[String],
+    pattern_vars: &mut HashSet<String>,
+) -> Option<Pattern> {
+    match sexpr {
+        SExpr::Sym(s, _) => {
+            if s == "_" {
+                Some(Pattern::Wildcard)
+            } else if s == "..." {
+                // Ellipsis shouldn't appear as a standalone pattern
+                eprintln!("Unexpected ellipsis in pattern");
+                None
+            } else if s == macro_name {
+                // The macro name itself is treated as a literal in the pattern
+                Some(Pattern::Literal(s.clone()))
+            } else if literals.contains(s) {
+                Some(Pattern::Literal(s.clone()))
+            } else {
+                // It's a pattern variable
+                pattern_vars.insert(s.clone());
+                Some(Pattern::Variable(s.clone()))
+            }
+        }
+        SExpr::Int { .. } | SExpr::Float { .. } => {
+            // Numbers match literally
+            Some(Pattern::Literal(format!("{:?}", sexpr)))
+        }
+        SExpr::List(items, _) => {
+            // Check for ellipsis in the list
+            let ellipsis_pos = items.iter().position(|item| {
+                matches!(item, SExpr::Sym(s, _) if s == "...")
+            });
+
+            if let Some(pos) = ellipsis_pos {
+                // Pattern has ellipsis
+                if pos == 0 {
+                    eprintln!("Ellipsis cannot be first element");
+                    return None;
+                }
+
+                // Elements before the repeated pattern
+                let mut before = Vec::new();
+                for item in &items[..pos - 1] {
+                    before.push(parse_pattern(item, macro_name, literals, pattern_vars)?);
+                }
+
+                // The repeated pattern (element before ...)
+                let repeated = parse_pattern(&items[pos - 1], macro_name, literals, pattern_vars)?;
+
+                // Elements after the ellipsis
+                let mut after = Vec::new();
+                for item in &items[pos + 1..] {
+                    after.push(parse_pattern(item, macro_name, literals, pattern_vars)?);
+                }
+
+                Some(Pattern::ListWithEllipsis {
+                    before,
+                    repeated: Box::new(repeated),
+                    after,
+                })
+            } else {
+                // No ellipsis - regular list pattern
+                let patterns: Option<Vec<_>> = items
+                    .iter()
+                    .map(|item| parse_pattern(item, macro_name, literals, pattern_vars))
+                    .collect();
+                Some(Pattern::List(patterns?))
+            }
+        }
+        _ => {
+            eprintln!("Unexpected form in pattern");
+            None
+        }
+    }
+}
+
+/// Parse a template from an S-expression
+fn parse_template(sexpr: &SExpr, pattern_vars: &HashSet<String>) -> Option<Template> {
+    match sexpr {
+        SExpr::Sym(s, _) => {
+            if s == "..." {
+                eprintln!("Unexpected ellipsis in template");
+                None
+            } else if pattern_vars.contains(s) {
+                Some(Template::Variable(s.clone()))
+            } else {
+                Some(Template::Symbol(s.clone()))
+            }
+        }
+        SExpr::Int { .. } | SExpr::Float { .. } => {
+            Some(Template::Atom(sexpr.clone()))
+        }
+        SExpr::List(items, _) => {
+            // Check for ellipsis patterns like (t ...)
+            let mut templates = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                // Check if next item is ellipsis
+                if i + 1 < items.len() {
+                    if let SExpr::Sym(s, _) = &items[i + 1] {
+                        if s == "..." {
+                            // This element is repeated
+                            let inner = parse_template(&items[i], pattern_vars)?;
+                            templates.push(Template::Ellipsis(Box::new(inner)));
+                            i += 2; // Skip both element and ellipsis
+                            continue;
+                        }
+                    }
+                }
+                // Regular element
+                templates.push(parse_template(&items[i], pattern_vars)?);
+                i += 1;
+            }
+            Some(Template::List(templates))
+        }
+        _ => {
+            eprintln!("Unexpected form in template");
+            None
+        }
+    }
+}
+
 // Expand macros in all forms
-fn expand_all_macros(forms: Vec<SExpr>, macros: &HashMap<String, Macro>) -> Vec<SExpr> {
+fn expand_all_macros(forms: Vec<SExpr>, macros: &CollectedMacros) -> Vec<SExpr> {
     forms
         .into_iter()
         .filter(|form| {
-            // Filter out defmacro forms (they're already collected)
+            // Filter out defmacro and define-syntax forms (they're already collected)
             if let SExpr::List(items, _) = form
                 && let Some(SExpr::Sym(sym, _)) = items.first() {
-                    return sym != "defmacro";
+                    return sym != "defmacro" && sym != "define-syntax";
                 }
             true
         })
@@ -1053,7 +1816,7 @@ fn expand_all_macros(forms: Vec<SExpr>, macros: &HashMap<String, Macro>) -> Vec<
 }
 
 // Expand macros in a single S-expression
-fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> SExpr {
+fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
     const MAX_EXPANSION_DEPTH: usize = 100;
     if depth > MAX_EXPANSION_DEPTH {
         panic!("Macro expansion depth exceeded (possible infinite recursion)");
@@ -1062,9 +1825,10 @@ fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> 
     match expr {
         SExpr::List(items, span) if !items.is_empty() => {
             // Check if this is a macro call
-            if let SExpr::Sym(name, _) = &items[0]
-                && let Some(mac) = macros.get(name) {
-                    // It's a macro call - expand it
+            if let SExpr::Sym(name, _) = &items[0] {
+                // First check defmacro
+                if let Some(mac) = macros.defmacros.get(name) {
+                    // It's a defmacro call - expand it
                     if items.len() - 1 != mac.params.len() {
                         panic!(
                             "Macro '{}' expects {} arguments, got {}",
@@ -1078,17 +1842,95 @@ fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> 
                     let substitutions: HashMap<String, SExpr> =
                         mac.params.iter().cloned().zip(args).collect();
 
+                    // Generate fresh scope for this macro expansion (hygiene)
+                    let macro_scope = fresh_scope();
+
                     // Evaluate the template with substitutions
                     // Unwrap the top-level quasiquote if present
                     let template_inner = match &mac.template {
                         SExpr::Quasiquote(inner, _) => inner.as_ref(),
                         other => other,
                     };
-                    let expanded = eval_quasiquote(template_inner, &substitutions, &span);
+                    let expanded = eval_quasiquote(template_inner, &substitutions, &span, Some(macro_scope));
 
                     // Recursively expand the result
                     return expand_macros(expanded, macros, depth + 1);
                 }
+
+                // Then check syntax-rules
+                if let Some(sr_mac) = macros.syntax_rules.get(name) {
+                    // Try to match against each rule in order
+                    let input = SExpr::List(items.clone(), span.clone());
+                    for rule in &sr_mac.rules {
+                        if let Some(bindings) = match_pattern(&rule.pattern, &input, &sr_mac.literals) {
+                            // Generate fresh scope for hygiene
+                            let macro_scope = fresh_scope();
+
+                            // Expand the template with bindings
+                            let expanded = expand_template(&rule.template, &bindings, &span, macro_scope);
+
+                            // Recursively expand the result
+                            return expand_macros(expanded, macros, depth + 1);
+                        }
+                    }
+                    // No rule matched
+                    panic!("No matching rule for macro '{}' with input {:?}", name, items);
+                }
+
+                // Then check syntax-case
+                if let Some(sc_mac) = macros.syntax_case.get(name) {
+                    let input = SExpr::List(items.clone(), span.clone());
+                    for clause in &sc_mac.clauses {
+                        if let Some(bindings) = match_pattern(&clause.pattern, &input, &sc_mac.literals) {
+                            // Generate fresh scope for hygiene
+                            let macro_scope = fresh_scope();
+
+                            // Create compile-time environment with pattern bindings
+                            let mut ct_env: HashMap<String, CompileTimeValue> = HashMap::new();
+                            for (name, binding) in &bindings {
+                                match binding {
+                                    PatternBinding::Single(sexpr) => {
+                                        ct_env.insert(name.clone(), CompileTimeValue::Syntax(sexpr.clone()));
+                                    }
+                                    PatternBinding::List(sexprs) => {
+                                        let vals = sexprs.iter()
+                                            .map(|s| CompileTimeValue::Syntax(s.clone()))
+                                            .collect();
+                                        ct_env.insert(name.clone(), CompileTimeValue::List(vals));
+                                    }
+                                }
+                            }
+
+                            // Evaluate guard if present
+                            let guard_result = if let Some(guard) = &clause.guard {
+                                match eval_compile_time_expr(guard, &ct_env, &span, macro_scope) {
+                                    CompileTimeValue::Bool(b) => b,
+                                    _ => true, // Non-boolean treated as true
+                                }
+                            } else {
+                                true
+                            };
+
+                            if guard_result {
+                                // Evaluate the template
+                                let result = eval_compile_time_expr(&clause.template, &ct_env, &span, macro_scope);
+
+                                // Convert result to SExpr
+                                let expanded = match result {
+                                    CompileTimeValue::Syntax(sexpr) => sexpr,
+                                    other => panic!("syntax-case template must return syntax, got {:?}", other),
+                                };
+
+                                // Recursively expand the result
+                                return expand_macros(expanded, macros, depth + 1);
+                            }
+                        }
+                    }
+                    // No clause matched
+                    panic!("No matching clause for syntax-case macro '{}' with input {:?}", name, items);
+                }
+            }
+
             // Not a macro call - recursively expand children
             SExpr::List(
                 items
@@ -1099,35 +1941,654 @@ fn expand_macros(expr: SExpr, macros: &HashMap<String, Macro>, depth: usize) -> 
             )
         }
         SExpr::Quasiquote(inner, span) => {
-            // Quasiquote outside of macro - evaluate it directly
-            eval_quasiquote(&inner, &HashMap::new(), &span)
+            // Quasiquote outside of macro - evaluate it directly (no hygiene scope needed)
+            eval_quasiquote(&inner, &HashMap::new(), &span, None)
         }
         // Pass through other forms
         other => other,
     }
 }
 
+/// Substitute pattern variables in a syntax template
+/// Pattern variables bound in the environment are replaced with their values
+/// Other symbols get the macro scope added for hygiene
+fn substitute_pattern_vars_in_syntax(
+    sexpr: &SExpr,
+    env: &HashMap<String, CompileTimeValue>,
+    span: &Span,
+    macro_scope: ScopeId,
+) -> SExpr {
+    match sexpr {
+        SExpr::Sym(name, sym_span) => {
+            // Check if this is a pattern variable
+            if let Some(val) = env.get(name) {
+                match val {
+                    CompileTimeValue::Syntax(s) => s.clone(),  // Keep original scopes (from call site)
+                    CompileTimeValue::Int(i) => SExpr::Int {
+                        value: *i,
+                        ty: Type::S32,
+                        span: sym_span.clone(),
+                    },
+                    CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), sym_span.with_scope(macro_scope)),
+                    CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), sym_span.with_scope(macro_scope)),
+                    CompileTimeValue::List(_) => panic!("Cannot substitute list value as single syntax"),
+                }
+            } else {
+                // Not a pattern variable - add macro scope for hygiene
+                SExpr::Sym(name.clone(), sym_span.with_scope(macro_scope))
+            }
+        }
+        SExpr::List(items, list_span) => {
+            let substituted: Vec<_> = items.iter()
+                .map(|item| substitute_pattern_vars_in_syntax(item, env, span, macro_scope))
+                .collect();
+            SExpr::List(substituted, list_span.with_scope(macro_scope))
+        }
+        SExpr::Int { value, ty, span: int_span } => SExpr::Int {
+            value: *value,
+            ty: *ty,
+            span: int_span.with_scope(macro_scope),
+        },
+        SExpr::Float { value, ty, span: float_span } => SExpr::Float {
+            value: *value,
+            ty: *ty,
+            span: float_span.with_scope(macro_scope),
+        },
+        other => add_scope_to_sexpr(other, macro_scope),
+    }
+}
+
+/// Evaluate a compile-time expression in the given environment
+fn eval_compile_time_expr(
+    expr: &CompileTimeExpr,
+    env: &HashMap<String, CompileTimeValue>,
+    span: &Span,
+    macro_scope: ScopeId,
+) -> CompileTimeValue {
+    match expr {
+        CompileTimeExpr::Syntax(sexpr) => {
+            // #'expr - substitute pattern variables and add macro scope
+            let substituted = substitute_pattern_vars_in_syntax(sexpr, env, span, macro_scope);
+            CompileTimeValue::Syntax(substituted)
+        }
+        CompileTimeExpr::Quasisyntax(template) => {
+            // #`template - evaluate with #, and #,@
+            let expanded = eval_quasisyntax(template, env, span, macro_scope);
+            CompileTimeValue::Syntax(expanded)
+        }
+        CompileTimeExpr::Var(name) => {
+            // Look up in environment
+            if let Some(val) = env.get(name) {
+                val.clone()
+            } else {
+                // Unbound variable - treat as syntax
+                CompileTimeValue::Syntax(SExpr::Sym(name.clone(), span.with_scope(macro_scope)))
+            }
+        }
+        CompileTimeExpr::Literal(sexpr) => {
+            match sexpr {
+                SExpr::Int { value, .. } => CompileTimeValue::Int(*value),
+                SExpr::Sym(s, _) if s == "#t" || s == "true" => CompileTimeValue::Bool(true),
+                SExpr::Sym(s, _) if s == "#f" || s == "false" => CompileTimeValue::Bool(false),
+                other => CompileTimeValue::Syntax(other.clone()),
+            }
+        }
+        CompileTimeExpr::If { cond, then_branch, else_branch } => {
+            let cond_val = eval_compile_time_expr(cond, env, span, macro_scope);
+            let is_true = match cond_val {
+                CompileTimeValue::Bool(b) => b,
+                CompileTimeValue::Int(i) => i != 0,
+                _ => true, // Non-false values are truthy
+            };
+            if is_true {
+                eval_compile_time_expr(then_branch, env, span, macro_scope)
+            } else {
+                eval_compile_time_expr(else_branch, env, span, macro_scope)
+            }
+        }
+        CompileTimeExpr::Let { name, value, body } => {
+            let val = eval_compile_time_expr(value, env, span, macro_scope);
+            let mut new_env = env.clone();
+            new_env.insert(name.clone(), val);
+            eval_compile_time_expr(body, &new_env, span, macro_scope)
+        }
+        CompileTimeExpr::App { func, args } => {
+            // Evaluate builtin compile-time functions
+            let arg_vals: Vec<_> = args.iter()
+                .map(|a| eval_compile_time_expr(a, env, span, macro_scope))
+                .collect();
+
+            match func.as_str() {
+                "identifier?" => {
+                    // Check if argument is an identifier (symbol syntax)
+                    if let Some(CompileTimeValue::Syntax(SExpr::Sym(_, _))) = arg_vals.first() {
+                        CompileTimeValue::Bool(true)
+                    } else {
+                        CompileTimeValue::Bool(false)
+                    }
+                }
+                "number?" => {
+                    // Check if argument is a number syntax
+                    match arg_vals.first() {
+                        Some(CompileTimeValue::Syntax(SExpr::Int { .. })) => CompileTimeValue::Bool(true),
+                        Some(CompileTimeValue::Syntax(SExpr::Float { .. })) => CompileTimeValue::Bool(true),
+                        Some(CompileTimeValue::Int(_)) => CompileTimeValue::Bool(true),
+                        _ => CompileTimeValue::Bool(false),
+                    }
+                }
+                "syntax->datum" => {
+                    // Extract the datum from syntax
+                    match arg_vals.first() {
+                        Some(CompileTimeValue::Syntax(SExpr::Int { value, .. })) => CompileTimeValue::Int(*value),
+                        Some(CompileTimeValue::Syntax(SExpr::Sym(s, _))) => {
+                            CompileTimeValue::Syntax(SExpr::Sym(s.clone(), Span::dummy()))
+                        }
+                        Some(v) => v.clone(),
+                        None => panic!("syntax->datum requires an argument"),
+                    }
+                }
+                "not" => {
+                    match arg_vals.first() {
+                        Some(CompileTimeValue::Bool(b)) => CompileTimeValue::Bool(!b),
+                        Some(CompileTimeValue::Int(0)) => CompileTimeValue::Bool(true),
+                        _ => CompileTimeValue::Bool(false),
+                    }
+                }
+                "and" => {
+                    let result = arg_vals.iter().all(|v| match v {
+                        CompileTimeValue::Bool(b) => *b,
+                        CompileTimeValue::Int(i) => *i != 0,
+                        _ => true,
+                    });
+                    CompileTimeValue::Bool(result)
+                }
+                "or" => {
+                    let result = arg_vals.iter().any(|v| match v {
+                        CompileTimeValue::Bool(b) => *b,
+                        CompileTimeValue::Int(i) => *i != 0,
+                        _ => true,
+                    });
+                    CompileTimeValue::Bool(result)
+                }
+                "+" => {
+                    let sum: i64 = arg_vals.iter().map(|v| match v {
+                        CompileTimeValue::Int(i) => *i,
+                        CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
+                        _ => 0,
+                    }).sum();
+                    CompileTimeValue::Int(sum)
+                }
+                "-" => {
+                    if arg_vals.len() == 1 {
+                        match &arg_vals[0] {
+                            CompileTimeValue::Int(i) => CompileTimeValue::Int(-i),
+                            _ => CompileTimeValue::Int(0),
+                        }
+                    } else if arg_vals.len() >= 2 {
+                        let first = match &arg_vals[0] {
+                            CompileTimeValue::Int(i) => *i,
+                            CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
+                            _ => 0,
+                        };
+                        let rest: i64 = arg_vals[1..].iter().map(|v| match v {
+                            CompileTimeValue::Int(i) => *i,
+                            CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
+                            _ => 0,
+                        }).sum();
+                        CompileTimeValue::Int(first - rest)
+                    } else {
+                        CompileTimeValue::Int(0)
+                    }
+                }
+                "integer?" => {
+                    match arg_vals.first() {
+                        Some(CompileTimeValue::Int(_)) => CompileTimeValue::Bool(true),
+                        Some(CompileTimeValue::Syntax(SExpr::Int { .. })) => CompileTimeValue::Bool(true),
+                        _ => CompileTimeValue::Bool(false),
+                    }
+                }
+                "syntax-error" => {
+                    let msg = match arg_vals.first() {
+                        Some(CompileTimeValue::Syntax(SExpr::Sym(s, _))) => s.clone(),
+                        _ => "syntax error".to_string(),
+                    };
+                    panic!("Compile-time error: {}", msg);
+                }
+                _ => {
+                    // Unknown function - return as syntax application
+                    let func_sym = SExpr::Sym(func.clone(), span.with_scope(macro_scope));
+                    let arg_sexprs: Vec<_> = arg_vals.iter().map(|v| match v {
+                        CompileTimeValue::Syntax(s) => s.clone(),
+                        CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), span.with_scope(macro_scope)),
+                        CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), span.with_scope(macro_scope)),
+                        CompileTimeValue::Int(i) => SExpr::Int { value: *i, ty: Type::S32, span: span.with_scope(macro_scope) },
+                        CompileTimeValue::List(items) => {
+                            let sexprs: Vec<_> = items.iter().map(|item| match item {
+                                CompileTimeValue::Syntax(s) => s.clone(),
+                                _ => SExpr::Sym("?".to_string(), span.with_scope(macro_scope)),
+                            }).collect();
+                            SExpr::List(sexprs, span.with_scope(macro_scope))
+                        }
+                    }).collect();
+                    let mut all_items = vec![func_sym];
+                    all_items.extend(arg_sexprs);
+                    CompileTimeValue::Syntax(SExpr::List(all_items, span.with_scope(macro_scope)))
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate quasisyntax template (#`) with #, and #,@
+fn eval_quasisyntax(
+    template: &SExpr,
+    env: &HashMap<String, CompileTimeValue>,
+    span: &Span,
+    macro_scope: ScopeId,
+) -> SExpr {
+    match template {
+        SExpr::Unsyntax(inner, _) => {
+            // #, - evaluate and insert
+            match inner.as_ref() {
+                SExpr::Sym(name, _) => {
+                    if let Some(val) = env.get(name) {
+                        match val {
+                            CompileTimeValue::Syntax(s) => s.clone(),
+                            CompileTimeValue::Int(i) => SExpr::Int { value: *i, ty: Type::S32, span: span.with_scope(macro_scope) },
+                            CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), span.with_scope(macro_scope)),
+                            CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), span.with_scope(macro_scope)),
+                            CompileTimeValue::List(_) => panic!("Cannot unsyntax a list directly, use #,@"),
+                        }
+                    } else {
+                        // Unbound - keep as symbol
+                        SExpr::Sym(name.clone(), span.with_scope(macro_scope))
+                    }
+                }
+                other => eval_quasisyntax(other, env, span, macro_scope),
+            }
+        }
+        SExpr::UnsyntaxSplice(inner, _) => {
+            // #,@ should only appear inside lists
+            panic!("Unsyntax-splice (#,@) can only appear inside a list");
+        }
+        SExpr::List(items, list_span) => {
+            let mut result = Vec::new();
+            for item in items {
+                match item {
+                    SExpr::UnsyntaxSplice(inner, _) => {
+                        // #,@ - splice the list
+                        if let SExpr::Sym(name, _) = inner.as_ref() {
+                            if let Some(CompileTimeValue::List(vals)) = env.get(name) {
+                                for v in vals {
+                                    match v {
+                                        CompileTimeValue::Syntax(s) => result.push(s.clone()),
+                                        _ => panic!("Cannot splice non-syntax value"),
+                                    }
+                                }
+                            } else if let Some(CompileTimeValue::Syntax(s)) = env.get(name) {
+                                // Single value - just push it
+                                result.push(s.clone());
+                            }
+                        }
+                    }
+                    _ => {
+                        result.push(eval_quasisyntax(item, env, span, macro_scope));
+                    }
+                }
+            }
+            SExpr::List(result, list_span.with_scope(macro_scope))
+        }
+        SExpr::Sym(s, sym_span) => {
+            // Check if this is a pattern variable that should be substituted
+            if let Some(val) = env.get(s) {
+                match val {
+                    CompileTimeValue::Syntax(syntax) => syntax.clone(),  // Keep original scopes
+                    CompileTimeValue::Int(i) => SExpr::Int {
+                        value: *i,
+                        ty: Type::S32,
+                        span: sym_span.clone(),
+                    },
+                    CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), sym_span.with_scope(macro_scope)),
+                    CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), sym_span.with_scope(macro_scope)),
+                    CompileTimeValue::List(_) => panic!("Cannot substitute list as single syntax in quasisyntax"),
+                }
+            } else {
+                // Not a pattern variable - add macro scope for hygiene
+                SExpr::Sym(s.clone(), sym_span.with_scope(macro_scope))
+            }
+        }
+        other => add_scope_to_sexpr(other, macro_scope),
+    }
+}
+
+/// Match a pattern against an S-expression, returning bindings if successful
+fn match_pattern(
+    pattern: &Pattern,
+    input: &SExpr,
+    literals: &[String],
+) -> Option<HashMap<String, PatternBinding>> {
+    let mut bindings = HashMap::new();
+    if match_pattern_impl(pattern, input, literals, &mut bindings) {
+        Some(bindings)
+    } else {
+        None
+    }
+}
+
+fn match_pattern_impl(
+    pattern: &Pattern,
+    input: &SExpr,
+    literals: &[String],
+    bindings: &mut HashMap<String, PatternBinding>,
+) -> bool {
+    match pattern {
+        Pattern::Wildcard => true,
+        Pattern::Variable(name) => {
+            bindings.insert(name.clone(), PatternBinding::Single(input.clone()));
+            true
+        }
+        Pattern::Literal(lit) => {
+            // Match against literal symbol
+            match input {
+                SExpr::Sym(s, _) => s == lit,
+                _ => false,
+            }
+        }
+        Pattern::List(patterns) => {
+            match input {
+                SExpr::List(items, _) => {
+                    if items.len() != patterns.len() {
+                        return false;
+                    }
+                    for (pat, item) in patterns.iter().zip(items.iter()) {
+                        if !match_pattern_impl(pat, item, literals, bindings) {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        Pattern::ListWithEllipsis { before, repeated, after } => {
+            match input {
+                SExpr::List(items, _) => {
+                    let min_len = before.len() + after.len();
+                    if items.len() < min_len {
+                        return false;
+                    }
+
+                    // Match elements before the ellipsis
+                    for (pat, item) in before.iter().zip(items.iter()) {
+                        if !match_pattern_impl(pat, item, literals, bindings) {
+                            return false;
+                        }
+                    }
+
+                    // Match elements after the ellipsis (from the end)
+                    let after_start = items.len() - after.len();
+                    for (pat, item) in after.iter().zip(items[after_start..].iter()) {
+                        if !match_pattern_impl(pat, item, literals, bindings) {
+                            return false;
+                        }
+                    }
+
+                    // Match the repeated elements in the middle
+                    let repeated_items = &items[before.len()..after_start];
+
+                    // Collect bindings from repeated pattern
+                    // We need to match each repeated item and collect all the bindings
+                    match repeated.as_ref() {
+                        Pattern::Variable(var_name) => {
+                            // Simple case: pattern variable matches each item
+                            let values: Vec<SExpr> = repeated_items.to_vec();
+                            bindings.insert(var_name.clone(), PatternBinding::List(values));
+                            true
+                        }
+                        _ => {
+                            // Complex pattern - match each item and collect bindings
+                            // For now, only support simple variable patterns in ellipsis
+                            // A full implementation would need to collect nested bindings
+                            for item in repeated_items {
+                                if !match_pattern_impl(repeated, item, literals, bindings) {
+                                    return false;
+                                }
+                            }
+                            true
+                        }
+                    }
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Expand a template with bindings
+fn expand_template(
+    template: &Template,
+    bindings: &HashMap<String, PatternBinding>,
+    span: &Span,
+    macro_scope: ScopeId,
+) -> SExpr {
+    match template {
+        Template::Variable(name) => {
+            match bindings.get(name) {
+                Some(PatternBinding::Single(expr)) => {
+                    // Keep original scopes (from call site)
+                    expr.clone()
+                }
+                Some(PatternBinding::List(exprs)) => {
+                    // This shouldn't happen in non-ellipsis context
+                    // Return first element or error
+                    if let Some(first) = exprs.first() {
+                        first.clone()
+                    } else {
+                        SExpr::List(vec![], span.clone())
+                    }
+                }
+                None => {
+                    // Unbound variable - treat as symbol with macro scope
+                    SExpr::Sym(name.clone(), span.with_scope(macro_scope))
+                }
+            }
+        }
+        Template::Symbol(name) => {
+            // Template-introduced symbol - add macro scope
+            SExpr::Sym(name.clone(), span.with_scope(macro_scope))
+        }
+        Template::Atom(sexpr) => {
+            // Keep the atom as-is but add macro scope
+            add_scope_to_sexpr(sexpr, macro_scope)
+        }
+        Template::List(templates) => {
+            let mut items = Vec::new();
+            for t in templates {
+                match t {
+                    Template::Ellipsis(inner) => {
+                        // Expand the inner template for each value in the ellipsis binding
+                        let expanded = expand_ellipsis_template(inner, bindings, span, macro_scope);
+                        items.extend(expanded);
+                    }
+                    _ => {
+                        items.push(expand_template(t, bindings, span, macro_scope));
+                    }
+                }
+            }
+            SExpr::List(items, span.with_scope(macro_scope))
+        }
+        Template::Ellipsis(_) => {
+            // Ellipsis at top level shouldn't happen
+            panic!("Unexpected ellipsis at top level of template");
+        }
+    }
+}
+
+/// Expand an ellipsis template, returning multiple S-expressions
+fn expand_ellipsis_template(
+    template: &Template,
+    bindings: &HashMap<String, PatternBinding>,
+    span: &Span,
+    macro_scope: ScopeId,
+) -> Vec<SExpr> {
+    // Find how many iterations we need by checking list bindings
+    let count = find_ellipsis_count(template, bindings);
+
+    (0..count)
+        .map(|i| expand_template_at_index(template, bindings, span, macro_scope, i))
+        .collect()
+}
+
+/// Find the number of elements in ellipsis bindings
+fn find_ellipsis_count(template: &Template, bindings: &HashMap<String, PatternBinding>) -> usize {
+    match template {
+        Template::Variable(name) => {
+            match bindings.get(name) {
+                Some(PatternBinding::List(items)) => items.len(),
+                _ => 0,
+            }
+        }
+        Template::List(templates) => {
+            // Find the first list binding
+            for t in templates {
+                let count = find_ellipsis_count(t, bindings);
+                if count > 0 {
+                    return count;
+                }
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// Expand a template at a specific ellipsis index
+fn expand_template_at_index(
+    template: &Template,
+    bindings: &HashMap<String, PatternBinding>,
+    span: &Span,
+    macro_scope: ScopeId,
+    index: usize,
+) -> SExpr {
+    match template {
+        Template::Variable(name) => {
+            match bindings.get(name) {
+                Some(PatternBinding::List(items)) => {
+                    items.get(index).cloned().unwrap_or_else(|| {
+                        SExpr::List(vec![], span.clone())
+                    })
+                }
+                Some(PatternBinding::Single(expr)) => expr.clone(),
+                None => SExpr::Sym(name.clone(), span.with_scope(macro_scope)),
+            }
+        }
+        Template::Symbol(name) => {
+            SExpr::Sym(name.clone(), span.with_scope(macro_scope))
+        }
+        Template::Atom(sexpr) => {
+            add_scope_to_sexpr(sexpr, macro_scope)
+        }
+        Template::List(templates) => {
+            let items: Vec<_> = templates
+                .iter()
+                .map(|t| match t {
+                    Template::Ellipsis(inner) => {
+                        // Nested ellipsis - expand at this index
+                        expand_template_at_index(inner, bindings, span, macro_scope, index)
+                    }
+                    _ => expand_template_at_index(t, bindings, span, macro_scope, index),
+                })
+                .collect();
+            SExpr::List(items, span.with_scope(macro_scope))
+        }
+        Template::Ellipsis(inner) => {
+            expand_template_at_index(inner, bindings, span, macro_scope, index)
+        }
+    }
+}
+
+/// Add a scope to an S-expression
+fn add_scope_to_sexpr(sexpr: &SExpr, scope: ScopeId) -> SExpr {
+    match sexpr {
+        SExpr::Sym(s, span) => SExpr::Sym(s.clone(), span.with_scope(scope)),
+        SExpr::Int { value, ty, span } => SExpr::Int {
+            value: *value,
+            ty: *ty,
+            span: span.with_scope(scope),
+        },
+        SExpr::Float { value, ty, span } => SExpr::Float {
+            value: *value,
+            ty: *ty,
+            span: span.with_scope(scope),
+        },
+        SExpr::List(items, span) => SExpr::List(
+            items.iter().map(|i| add_scope_to_sexpr(i, scope)).collect(),
+            span.with_scope(scope),
+        ),
+        SExpr::Quasiquote(inner, span) => SExpr::Quasiquote(
+            Box::new(add_scope_to_sexpr(inner, scope)),
+            span.with_scope(scope),
+        ),
+        SExpr::Unquote(inner, span) => SExpr::Unquote(
+            Box::new(add_scope_to_sexpr(inner, scope)),
+            span.with_scope(scope),
+        ),
+        SExpr::UnquoteSplice(inner, span) => SExpr::UnquoteSplice(
+            Box::new(add_scope_to_sexpr(inner, scope)),
+            span.with_scope(scope),
+        ),
+        SExpr::SyntaxQuote(inner, span) => SExpr::SyntaxQuote(
+            Box::new(add_scope_to_sexpr(inner, scope)),
+            span.with_scope(scope),
+        ),
+        SExpr::Quasisyntax(inner, span) => SExpr::Quasisyntax(
+            Box::new(add_scope_to_sexpr(inner, scope)),
+            span.with_scope(scope),
+        ),
+        SExpr::Unsyntax(inner, span) => SExpr::Unsyntax(
+            Box::new(add_scope_to_sexpr(inner, scope)),
+            span.with_scope(scope),
+        ),
+        SExpr::UnsyntaxSplice(inner, span) => SExpr::UnsyntaxSplice(
+            Box::new(add_scope_to_sexpr(inner, scope)),
+            span.with_scope(scope),
+        ),
+    }
+}
+
 // Evaluate quasiquoted template with substitutions
-fn eval_quasiquote(template: &SExpr, subs: &HashMap<String, SExpr>, span: &Span) -> SExpr {
+// macro_scope: Optional scope to add to template-introduced identifiers (for hygiene)
+fn eval_quasiquote(
+    template: &SExpr,
+    subs: &HashMap<String, SExpr>,
+    span: &Span,
+    macro_scope: Option<ScopeId>,
+) -> SExpr {
     match template {
         SExpr::Quasiquote(inner, inner_span) => {
             // Nested quasiquote - increase depth conceptually
             // For now, just return as-is (proper nesting would need depth tracking)
-            SExpr::Quasiquote(Box::new(eval_quasiquote(inner, subs, inner_span)), inner_span.clone())
+            SExpr::Quasiquote(
+                Box::new(eval_quasiquote(inner, subs, inner_span, macro_scope)),
+                add_scope_to_span(inner_span, macro_scope),
+            )
         }
         SExpr::Unquote(inner, _) => {
             // Unquote - substitute the inner expression
+            // IMPORTANT: Unquoted expressions keep their ORIGINAL scopes (call site scopes)
+            // This is key to hygiene - user code is not affected by macro's scope
             match inner.as_ref() {
                 SExpr::Sym(name, sym_span) => {
                     if let Some(replacement) = subs.get(name) {
+                        // Substitution from call site - keep original scopes
                         replacement.clone()
                     } else {
-                        // Not a macro parameter - keep as symbol
+                        // Not a macro parameter - keep as symbol with original scopes
                         SExpr::Sym(name.clone(), sym_span.clone())
                     }
                 }
-                // For complex expressions in unquote, just return them
-                other => eval_quasiquote(other, subs, span),
+                // For complex expressions in unquote, evaluate but don't add macro scope
+                other => eval_quasiquote(other, subs, span, None),
             }
         }
         SExpr::UnquoteSplice(_, _) => {
@@ -1141,7 +2602,8 @@ fn eval_quasiquote(template: &SExpr, subs: &HashMap<String, SExpr>, span: &Span)
                 match item {
                     SExpr::UnquoteSplice(inner, _) => {
                         // Splice the contents into the result
-                        let spliced = eval_quasiquote(inner, subs, span);
+                        // Unquote-splice uses call site scopes (no macro scope added)
+                        let spliced = eval_quasiquote(inner, subs, span, None);
                         match spliced {
                             SExpr::List(splice_items, _) => {
                                 result.extend(splice_items);
@@ -1153,26 +2615,53 @@ fn eval_quasiquote(template: &SExpr, subs: &HashMap<String, SExpr>, span: &Span)
                         }
                     }
                     _ => {
-                        result.push(eval_quasiquote(item, subs, span));
+                        result.push(eval_quasiquote(item, subs, span, macro_scope));
                     }
                 }
             }
-            SExpr::List(result, list_span.clone())
+            // Add macro scope to the list span (template-introduced)
+            SExpr::List(result, add_scope_to_span(list_span, macro_scope))
         }
         SExpr::Sym(name, sym_span) => {
-            // In quasiquote context, symbols are NOT substituted (only in unquote)
-            SExpr::Sym(name.clone(), sym_span.clone())
+            // Template-introduced symbol - add macro scope for hygiene
+            // This makes it distinct from same-named symbols at the call site
+            SExpr::Sym(name.clone(), add_scope_to_span(sym_span, macro_scope))
         }
         SExpr::Int { value, ty, span: int_span } => SExpr::Int {
             value: *value,
             ty: *ty,
-            span: int_span.clone(),
+            span: add_scope_to_span(int_span, macro_scope),
         },
         SExpr::Float { value, ty, span: float_span } => SExpr::Float {
             value: *value,
             ty: *ty,
-            span: float_span.clone(),
+            span: add_scope_to_span(float_span, macro_scope),
         },
+        // New syntax forms - pass through with scope
+        SExpr::SyntaxQuote(inner, sq_span) => SExpr::SyntaxQuote(
+            Box::new(eval_quasiquote(inner, subs, span, macro_scope)),
+            add_scope_to_span(sq_span, macro_scope),
+        ),
+        SExpr::Quasisyntax(inner, qs_span) => SExpr::Quasisyntax(
+            Box::new(eval_quasiquote(inner, subs, span, macro_scope)),
+            add_scope_to_span(qs_span, macro_scope),
+        ),
+        SExpr::Unsyntax(inner, us_span) => SExpr::Unsyntax(
+            Box::new(eval_quasiquote(inner, subs, span, macro_scope)),
+            add_scope_to_span(us_span, macro_scope),
+        ),
+        SExpr::UnsyntaxSplice(inner, uss_span) => SExpr::UnsyntaxSplice(
+            Box::new(eval_quasiquote(inner, subs, span, macro_scope)),
+            add_scope_to_span(uss_span, macro_scope),
+        ),
+    }
+}
+
+// Helper to add a scope to a span if provided
+fn add_scope_to_span(span: &Span, scope: Option<ScopeId>) -> Span {
+    match scope {
+        Some(s) => span.with_scope(s),
+        None => span.clone(),
     }
 }
 
@@ -1292,12 +2781,13 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
 
     let mut functions = Vec::new();
     for func in pending {
-        let param_names = func
+        // Create bindings with scopes from parameters for hygienic variable resolution
+        let param_bindings = func
             .params
             .iter()
-            .map(|p| p.name.clone())
+            .map(|p| Binding::new(p.name.clone(), p.scopes.clone()))
             .collect::<Vec<_>>();
-        let body_expr = parse_expr(&func.body, &param_names, &signatures, ctx)?;
+        let body_expr = parse_expr(&func.body, &param_bindings, &signatures, ctx)?;
         functions.push(Function {
             name: func.name,
             params: func.params,
@@ -1441,12 +2931,12 @@ fn parse_typed_params(expr: &SExpr, ctx: &CompileContext) -> Result<Vec<Paramete
                                 "expected: (name type)"
                             ));
                         }
-                        let name = match &parts[0] {
-                            SExpr::Sym(s, _) => s.clone(),
+                        let (name, scopes) = match &parts[0] {
+                            SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                             other => return Err(ctx.error("parameter name must be a symbol", other.span())),
                         };
                         let ty = parse_type_expr(&parts[1], ctx)?;
-                        result.push(Parameter { name, ty });
+                        result.push(Parameter { name, ty, scopes });
                     }
                     other => return Err(ctx.error_with_note(
                         "invalid parameter",
@@ -1486,7 +2976,7 @@ fn is_type_symbol(sym: &str) -> bool {
     matches!(sym, "s32" | "s64" | "f32" | "f64")
 }
 
-fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signature>, ctx: &CompileContext) -> Result<Expr> {
+fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signature>, ctx: &CompileContext) -> Result<Expr> {
     match sexpr {
         SExpr::Int { value, ty, .. } => Ok(Expr::Int {
             value: *value,
@@ -1497,10 +2987,31 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
             ty: *ty,
         }),
         SExpr::Sym(s, span) => {
-            if vars.iter().any(|name| name == s) {
-                Ok(Expr::Var(s.clone()))
-            } else {
-                Err(ctx.error(format!("unknown variable '{}'", s), span))
+            // Hygienic variable resolution: find bindings with matching name
+            // where the binding's scopes are a subset of the reference's scopes
+            let ref_scopes = &span.scopes;
+
+            let matching_bindings: Vec<_> = vars
+                .iter()
+                .filter(|b| b.name == *s && b.is_visible_from(ref_scopes))
+                .collect();
+
+            match matching_bindings.len() {
+                0 => Err(ctx.error(format!("unknown variable '{}'", s), span)),
+                1 => {
+                    // Use mangled name to preserve scope distinction in codegen
+                    Ok(Expr::Var(matching_bindings[0].mangled_name()))
+                }
+                _ => {
+                    // Multiple matching bindings - find the most specific one
+                    // (the one with the most scopes that is still a subset)
+                    let best = matching_bindings
+                        .iter()
+                        .max_by_key(|b| b.scopes.scopes.len())
+                        .unwrap();
+                    // Use mangled name to preserve scope distinction in codegen
+                    Ok(Expr::Var(best.mangled_name()))
+                }
             }
         }
         SExpr::List(items, list_span) => {
@@ -1605,16 +3116,19 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
                             "expected: (name value)"
                         ));
                     }
-                    let name = match &binding[0] {
-                        SExpr::Sym(s, _) => s.clone(),
+                    let (name, name_scopes) = match &binding[0] {
+                        SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                         other => return Err(ctx.error("let binding name must be a symbol", other.span())),
                     };
                     let value_expr = parse_expr(&binding[1], vars, functions, ctx)?;
+                    // Create a new binding with the name and its scopes for hygienic resolution
+                    let new_binding = Binding::new(name, name_scopes);
+                    let mangled_name = new_binding.mangled_name();
                     let mut next_vars = vars.to_vec();
-                    next_vars.push(name.clone());
+                    next_vars.push(new_binding);
                     let body_expr = parse_expr(&items[2], &next_vars, functions, ctx)?;
                     Ok(Expr::Let {
-                        name,
+                        name: mangled_name,  // Use mangled name for codegen
                         value: Box::new(value_expr),
                         body: Box::new(body_expr),
                     })
@@ -1662,6 +3176,10 @@ fn parse_expr(sexpr: &SExpr, vars: &[String], functions: &HashMap<String, Signat
         }
         SExpr::Quasiquote(_, span) | SExpr::Unquote(_, span) | SExpr::UnquoteSplice(_, span) => {
             Err(ctx.error("quasiquote/unquote should have been expanded before parsing", span))
+        }
+        SExpr::SyntaxQuote(_, span) | SExpr::Quasisyntax(_, span) |
+        SExpr::Unsyntax(_, span) | SExpr::UnsyntaxSplice(_, span) => {
+            Err(ctx.error("syntax forms (#', #`, #,, #,@) should have been expanded before parsing", span))
         }
     }
 }
