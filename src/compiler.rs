@@ -7,12 +7,14 @@ use wat::parse_str;
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 use wit_parser::Resolve;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Type {
     S32,
     S64,
     F32,
     F64,
+    Record(String),  // Named record type
+    Variant(String), // Named variant type
 }
 
 /// Unique identifier for a lexical scope (used for hygiene)
@@ -269,7 +271,7 @@ fn encode_component(module: &[u8], wit_source: &str) -> Result<Vec<u8>> {
         .worlds
         .values()
         .next()
-        .copied()
+        .cloned()
         .context("generated WIT is missing a world declaration")?;
     let mut module_with_metadata = module.to_vec();
     embed_component_metadata(
@@ -389,6 +391,36 @@ enum Expr {
         name: String,
         value: Box<Expr>,
     },
+    /// Construct a record: (point 10 20)
+    RecordConstruct {
+        record_name: String,
+        fields: Vec<Expr>,
+    },
+    /// Access a record field: (record.field-name expr)
+    RecordAccess {
+        record_name: String,
+        field_name: String,
+        expr: Box<Expr>,
+    },
+    /// Construct a variant: (circle 5) or (point)
+    VariantConstruct {
+        variant_name: String,
+        case_name: String,
+        payload: Vec<Expr>,
+    },
+    /// Match on a variant: (match expr ((case1 vars...) body1) ...)
+    Match {
+        expr: Box<Expr>,
+        cases: Vec<MatchArm>,
+    },
+}
+
+/// A single arm in a match expression
+#[derive(Debug)]
+struct MatchArm {
+    case_name: String,
+    bindings: Vec<String>, // Variable names to bind payload values
+    body: Expr,
 }
 
 #[derive(Debug)]
@@ -429,7 +461,7 @@ impl Binding {
             // Include non-base scopes in the name
             let mut scope_ids: Vec<_> = self.scopes.scopes.iter()
                 .filter(|&&s| s != 0)
-                .copied()
+                .cloned()
                 .collect();
             scope_ids.sort();
             format!("{}__hyg{}", self.name, scope_ids.iter()
@@ -462,6 +494,77 @@ struct Global {
     ty: Type,
     mutable: bool,
     init_value: i64, // For simplicity, we'll only support integer constants initially
+}
+
+/// A field in a record type
+#[derive(Debug, Clone)]
+struct RecordField {
+    name: String,
+    ty: Type,
+}
+
+/// A record type definition
+#[derive(Debug, Clone)]
+struct RecordDef {
+    name: String,
+    fields: Vec<RecordField>,
+}
+
+impl RecordDef {
+    /// Calculate the size of this record in bytes
+    fn size(&self) -> usize {
+        self.fields.iter().map(|f| type_size(&f.ty)).sum()
+    }
+
+    /// Calculate the offset of a field by index
+    fn field_offset(&self, index: usize) -> usize {
+        self.fields[..index].iter().map(|f| type_size(&f.ty)).sum()
+    }
+}
+
+/// A case in a variant type
+#[derive(Debug, Clone)]
+struct VariantCase {
+    name: String,
+    payload: Vec<Type>, // Can have 0, 1, or more payload types
+}
+
+/// A variant type definition (sum type)
+#[derive(Debug, Clone)]
+struct VariantDef {
+    name: String,
+    cases: Vec<VariantCase>,
+}
+
+impl VariantDef {
+    /// Calculate the size of this variant in bytes (discriminant + max payload)
+    fn size(&self) -> usize {
+        let discriminant_size = 4; // i32 discriminant
+        let max_payload_size = self.cases.iter()
+            .map(|c| c.payload.iter().map(type_size).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        discriminant_size + max_payload_size
+    }
+
+    /// Find a case by name and return its index
+    fn find_case(&self, name: &str) -> Option<(usize, &VariantCase)> {
+        self.cases.iter().enumerate().find(|(_, c)| c.name == name)
+    }
+}
+
+/// Find a variant definition that contains a case with the given name
+fn find_variant_by_case<'a>(case_name: &str, variants: &'a HashMap<String, VariantDef>) -> Option<&'a VariantDef> {
+    variants.values().find(|v| v.find_case(case_name).is_some())
+}
+
+/// Get the size of a type in bytes (for memory layout)
+fn type_size(ty: &Type) -> usize {
+    match ty {
+        Type::S32 | Type::F32 => 4,
+        Type::S64 | Type::F64 => 8,
+        Type::Record(_) | Type::Variant(_) => 4, // Records and variants are pointer-sized
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +704,8 @@ struct Program {
     imports: Vec<Import>,
     exports: Vec<String>,
     globals: Vec<Global>,
+    records: Vec<RecordDef>,
+    variants: Vec<VariantDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -831,15 +936,25 @@ fn type_check(prog: &Program, signatures: &HashMap<String, Signature>, _ctx: &Co
     // Build global type map
     let mut globals_map = HashMap::new();
     for global in &prog.globals {
-        globals_map.insert(global.name.clone(), (global.ty, global.mutable));
+        globals_map.insert(global.name.clone(), (global.ty.clone(), global.mutable));
     }
+
+    // Build records and variants maps for type checking
+    let records_map: HashMap<String, RecordDef> = prog.records
+        .iter()
+        .map(|r| (r.name.clone(), r.clone()))
+        .collect();
+    let variants_map: HashMap<String, VariantDef> = prog.variants
+        .iter()
+        .map(|v| (v.name.clone(), v.clone()))
+        .collect();
 
     for func in &prog.functions {
         let mut env = HashMap::new();
         for param in &func.params {
-            env.insert(param.name.clone(), param.ty);
+            env.insert(param.name.clone(), param.ty.clone());
         }
-        let body_ty = check_expr(&func.body, &env, signatures, &globals_map)?;
+        let body_ty = check_expr(&func.body, &env, signatures, &globals_map, &records_map, &variants_map)?;
         if body_ty != func.return_type {
             bail!(
                 "function '{}' returns {:?} but body has type {:?}",
@@ -855,20 +970,20 @@ fn type_check(prog: &Program, signatures: &HashMap<String, Signature>, _ctx: &Co
 fn collect_signatures(prog: &Program) -> Result<HashMap<String, Signature>> {
     let mut signatures = HashMap::new();
     for func in &prog.functions {
-        let params = func.params.iter().map(|p| p.ty).collect();
+        let params = func.params.iter().map(|p| p.ty.clone()).collect();
         let sig = Signature {
             params,
-            result: func.return_type,
+            result: func.return_type.clone(),
         };
         if signatures.insert(func.name.clone(), sig).is_some() {
             bail!("Duplicate function '{}'", func.name);
         }
     }
     for import in &prog.imports {
-        let params = import.params.iter().map(|p| p.ty).collect();
+        let params = import.params.iter().map(|p| p.ty.clone()).collect();
         let sig = Signature {
             params,
-            result: import.return_type,
+            result: import.return_type.clone(),
         };
         if signatures.insert(import.name.clone(), sig).is_some() {
             bail!("Duplicate function '{}'", import.name);
@@ -882,19 +997,21 @@ fn check_expr(
     env: &HashMap<String, Type>,
     signatures: &HashMap<String, Signature>,
     globals: &HashMap<String, (Type, bool)>,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
 ) -> Result<Type> {
     match expr {
-        Expr::Int { ty, .. } => Ok(*ty),
-        Expr::Float { ty, .. } => Ok(*ty),
+        Expr::Int { ty, .. } => Ok(ty.clone()),
+        Expr::Float { ty, .. } => Ok(ty.clone()),
         Expr::Ascribe { expr, ty } => {
-            let inner_ty = check_expr(expr, env, signatures, globals)?;
-            ensure_numeric(inner_ty, "ascribe requires numeric types")?;
-            ensure_numeric(*ty, "ascribe requires numeric types")?;
-            Ok(*ty)
+            let inner_ty = check_expr(expr, env, signatures, globals, records, variants)?;
+            ensure_numeric(&inner_ty, "ascribe requires numeric types")?;
+            ensure_numeric(ty, "ascribe requires numeric types")?;
+            Ok(ty.clone())
         }
         Expr::Var(name) => env
             .get(name)
-            .copied()
+            .cloned()
             .ok_or_else(|| anyhow!("unknown variable '{}'", name)),
         Expr::Call { name, args } => {
             let sig = signatures
@@ -909,7 +1026,7 @@ fn check_expr(
                 );
             }
             for (arg, expected_ty) in args.iter().zip(sig.params.iter()) {
-                let ty = check_expr(arg, env, signatures, globals)?;
+                let ty = check_expr(arg, env, signatures, globals, records, variants)?;
                 if ty != *expected_ty {
                     bail!(
                         "argument type mismatch calling '{}': expected {:?}, got {:?}",
@@ -919,19 +1036,19 @@ fn check_expr(
                     );
                 }
             }
-            Ok(sig.result)
+            Ok(sig.result.clone())
         }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            let cond_ty = check_expr(cond, env, signatures, globals)?;
+            let cond_ty = check_expr(cond, env, signatures, globals, records, variants)?;
             if cond_ty != Type::S32 {
                 bail!("if condition must be s32 (0/1), got {:?}", cond_ty);
             }
-            let then_ty = check_expr(then_branch, env, signatures, globals)?;
-            let else_ty = check_expr(else_branch, env, signatures, globals)?;
+            let then_ty = check_expr(then_branch, env, signatures, globals, records, variants)?;
+            let else_ty = check_expr(else_branch, env, signatures, globals, records, variants)?;
             if then_ty != else_ty {
                 bail!(
                     "if branches must return the same type, got {:?} and {:?}",
@@ -942,10 +1059,10 @@ fn check_expr(
             Ok(then_ty)
         }
         Expr::Let { name, value, body } => {
-            let value_ty = check_expr(value, env, signatures, globals)?;
+            let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
             let mut next_env = env.clone();
             next_env.insert(name.clone(), value_ty);
-            check_expr(body, &next_env, signatures, globals)
+            check_expr(body, &next_env, signatures, globals, records, variants)
         }
         Expr::WasmInstr { name, args } => {
             let instr_info = lookup_wasm_instr(name)
@@ -973,7 +1090,7 @@ fn check_expr(
                 );
             }
             for (arg, expected_ty) in args.iter().zip(instr_info.params.iter()) {
-                let ty = check_expr(arg, env, signatures, globals)?;
+                let ty = check_expr(arg, env, signatures, globals, records, variants)?;
                 if ty != *expected_ty {
                     bail!(
                         "argument type mismatch in '{}': expected {:?}, got {:?}",
@@ -989,7 +1106,7 @@ fn check_expr(
             let (ty, _mutable) = globals
                 .get(name)
                 .ok_or_else(|| anyhow!("unknown global '{}'", name))?;
-            Ok(*ty)
+            Ok(ty.clone())
         }
         Expr::GlobalSet { name, value } => {
             let (expected_ty, mutable) = globals
@@ -998,7 +1115,7 @@ fn check_expr(
             if !mutable {
                 bail!("cannot set immutable global '{}'", name);
             }
-            let value_ty = check_expr(value, env, signatures, globals)?;
+            let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
             if value_ty != *expected_ty {
                 bail!(
                     "type mismatch setting global '{}': expected {:?}, got {:?}",
@@ -1009,12 +1126,133 @@ fn check_expr(
             }
             Ok(value_ty)
         }
+        Expr::RecordConstruct { record_name, fields } => {
+            let record_def = records
+                .get(record_name)
+                .ok_or_else(|| anyhow!("unknown record type '{}'", record_name))?;
+            if record_def.fields.len() != fields.len() {
+                bail!(
+                    "record '{}' expects {} fields but {} were provided",
+                    record_name,
+                    record_def.fields.len(),
+                    fields.len()
+                );
+            }
+            for (field_expr, field_def) in fields.iter().zip(record_def.fields.iter()) {
+                let ty = check_expr(field_expr, env, signatures, globals, records, variants)?;
+                if ty != field_def.ty {
+                    bail!(
+                        "field '{}' of record '{}': expected {:?}, got {:?}",
+                        field_def.name,
+                        record_name,
+                        field_def.ty,
+                        ty
+                    );
+                }
+            }
+            Ok(Type::Record(record_name.clone()))
+        }
+        Expr::RecordAccess { record_name, field_name, expr } => {
+            let record_def = records
+                .get(record_name)
+                .ok_or_else(|| anyhow!("unknown record type '{}'", record_name))?;
+            let field = record_def.fields
+                .iter()
+                .find(|f| f.name == *field_name)
+                .ok_or_else(|| anyhow!("record '{}' has no field '{}'", record_name, field_name))?;
+            let expr_ty = check_expr(expr, env, signatures, globals, records, variants)?;
+            if expr_ty != Type::Record(record_name.clone()) {
+                bail!(
+                    "field access expects record '{}', got {:?}",
+                    record_name,
+                    expr_ty
+                );
+            }
+            Ok(field.ty.clone())
+        }
+        Expr::VariantConstruct { variant_name, case_name, payload } => {
+            let variant_def = variants
+                .get(variant_name)
+                .ok_or_else(|| anyhow!("unknown variant type '{}'", variant_name))?;
+            let (_, case) = variant_def.find_case(case_name)
+                .ok_or_else(|| anyhow!("variant '{}' has no case '{}'", variant_name, case_name))?;
+            if case.payload.len() != payload.len() {
+                bail!(
+                    "variant case '{}::{}' expects {} payload values but {} were provided",
+                    variant_name,
+                    case_name,
+                    case.payload.len(),
+                    payload.len()
+                );
+            }
+            for (payload_expr, expected_ty) in payload.iter().zip(case.payload.iter()) {
+                let ty = check_expr(payload_expr, env, signatures, globals, records, variants)?;
+                if ty != *expected_ty {
+                    bail!(
+                        "payload type mismatch in '{}::{}': expected {:?}, got {:?}",
+                        variant_name,
+                        case_name,
+                        expected_ty,
+                        ty
+                    );
+                }
+            }
+            Ok(Type::Variant(variant_name.clone()))
+        }
+        Expr::Match { expr, cases } => {
+            let expr_ty = check_expr(expr, env, signatures, globals, records, variants)?;
+            let variant_name = match &expr_ty {
+                Type::Variant(name) => name.clone(),
+                _ => bail!("match expression must be a variant, got {:?}", expr_ty),
+            };
+            let variant_def = variants
+                .get(&variant_name)
+                .ok_or_else(|| anyhow!("unknown variant type '{}'", variant_name))?;
+
+            // Check that all cases exist and have correct bindings
+            let mut result_ty: Option<Type> = None;
+            for arm in cases {
+                let (_, case) = variant_def.find_case(&arm.case_name)
+                    .ok_or_else(|| anyhow!("variant '{}' has no case '{}'", variant_name, arm.case_name))?;
+                if arm.bindings.len() != case.payload.len() {
+                    bail!(
+                        "match arm for '{}' expects {} bindings but {} were provided",
+                        arm.case_name,
+                        case.payload.len(),
+                        arm.bindings.len()
+                    );
+                }
+
+                // Extend environment with bound variables
+                let mut arm_env = env.clone();
+                for (binding_name, ty) in arm.bindings.iter().zip(case.payload.iter()) {
+                    arm_env.insert(binding_name.clone(), ty.clone());
+                }
+
+                let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
+                match &result_ty {
+                    None => result_ty = Some(arm_ty),
+                    Some(expected) => {
+                        if arm_ty != *expected {
+                            bail!(
+                                "match arms must return the same type, got {:?} and {:?}",
+                                expected,
+                                arm_ty
+                            );
+                        }
+                    }
+                }
+            }
+            result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
+        }
     }
 }
 
-fn ensure_numeric(ty: Type, _msg: &str) -> Result<()> {
+fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
+        Type::Record(name) => bail!("{}: expected numeric type, got record '{}'", msg, name),
+        Type::Variant(name) => bail!("{}: expected numeric type, got variant '{}'", msg, name),
     }
 }
 
@@ -1247,7 +1485,7 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
         Some((TokenKind::Number(NumericToken::Int { value, ty }), span)) => (
             SExpr::Int {
                 value: *value,
-                ty: *ty,
+                ty: ty.clone(),
                 span: span.clone(),
             },
             pos + 1,
@@ -1255,7 +1493,7 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
         Some((TokenKind::Number(NumericToken::Float { value, ty }), span)) => (
             SExpr::Float {
                 value: *value,
-                ty: *ty,
+                ty: ty.clone(),
                 span: span.clone(),
             },
             pos + 1,
@@ -1986,12 +2224,12 @@ fn substitute_pattern_vars_in_syntax(
         }
         SExpr::Int { value, ty, span: int_span } => SExpr::Int {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
             span: int_span.with_scope(macro_scope),
         },
         SExpr::Float { value, ty, span: float_span } => SExpr::Float {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
             span: float_span.with_scope(macro_scope),
         },
         other => add_scope_to_sexpr(other, macro_scope),
@@ -2513,12 +2751,12 @@ fn add_scope_to_sexpr(sexpr: &SExpr, scope: ScopeId) -> SExpr {
         SExpr::Sym(s, span) => SExpr::Sym(s.clone(), span.with_scope(scope)),
         SExpr::Int { value, ty, span } => SExpr::Int {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
             span: span.with_scope(scope),
         },
         SExpr::Float { value, ty, span } => SExpr::Float {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
             span: span.with_scope(scope),
         },
         SExpr::List(items, span) => SExpr::List(
@@ -2629,12 +2867,12 @@ fn eval_quasiquote(
         }
         SExpr::Int { value, ty, span: int_span } => SExpr::Int {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
             span: add_scope_to_span(int_span, macro_scope),
         },
         SExpr::Float { value, ty, span: float_span } => SExpr::Float {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
             span: add_scope_to_span(float_span, macro_scope),
         },
         // New syntax forms - pass through with scope
@@ -2674,7 +2912,42 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut export_set = HashSet::new();
     let mut globals = Vec::new();
     let mut global_names = HashSet::new();
+    let mut records = Vec::new();
+    let mut record_names: HashSet<String> = HashSet::new();
+    let mut variants = Vec::new();
+    let mut variant_names: HashSet<String> = HashSet::new();
 
+    // First pass: collect type names (records and variants) so we can distinguish them
+    for form in &forms {
+        if let SExpr::List(items, span) = form {
+            if items.is_empty() {
+                return Err(ctx.error("empty list is not a valid top-level form", span));
+            }
+            match &items[0] {
+                SExpr::Sym(sym, _) if sym == "record" => {
+                    if items.len() >= 2 {
+                        if let SExpr::Sym(name, _) = &items[1] {
+                            if !record_names.insert(name.clone()) {
+                                return Err(ctx.error(format!("duplicate record type '{}'", name), span));
+                            }
+                        }
+                    }
+                }
+                SExpr::Sym(sym, _) if sym == "variant" => {
+                    if items.len() >= 2 {
+                        if let SExpr::Sym(name, _) = &items[1] {
+                            if !variant_names.insert(name.clone()) {
+                                return Err(ctx.error(format!("duplicate variant type '{}'", name), span));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Second pass: parse everything with type names available
     for form in forms {
         match form {
             SExpr::List(items, span) => {
@@ -2683,7 +2956,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                 }
                 match &items[0] {
                     SExpr::Sym(sym, _) if sym == "fn" => {
-                        let func = parse_fn_form(SExpr::List(items, span.clone()), ctx)?;
+                        let func = parse_fn_form(SExpr::List(items, span.clone()), &variant_names, ctx)?;
                         if !defined.insert(func.name.clone()) {
                             return Err(ctx.error(format!("duplicate function '{}'", func.name), &span));
                         }
@@ -2700,7 +2973,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                                 }
                             }
                             SExpr::List(_, inner_span) => {
-                                let func = parse_fn_form(items[1].clone(), ctx)?;
+                                let func = parse_fn_form(items[1].clone(), &variant_names, ctx)?;
                                 if !defined.insert(func.name.clone()) {
                                     return Err(ctx.error(format!("duplicate function '{}'", func.name), inner_span));
                                 }
@@ -2713,7 +2986,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         }
                     }
                     SExpr::Sym(sym, _) if sym == "import" => {
-                        let import = parse_import_form(&items, ctx)?;
+                        let import = parse_import_form(&items, &variant_names, ctx)?;
                         if defined.contains(&import.name) {
                             return Err(ctx.error(
                                 format!("function '{}' is already defined and cannot be imported", import.name),
@@ -2726,17 +2999,27 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         imports.push(import);
                     }
                     SExpr::Sym(sym, _) if sym == "global" => {
-                        let global = parse_global_form(&items, ctx)?;
+                        let global = parse_global_form(&items, &variant_names, ctx)?;
                         if !global_names.insert(global.name.clone()) {
                             return Err(ctx.error(format!("duplicate global '{}'", global.name), &span));
                         }
                         globals.push(global);
                     }
+                    SExpr::Sym(sym, _) if sym == "record" => {
+                        let record = parse_record_form(&items, &variant_names, ctx)?;
+                        // Already checked for duplicates in first pass
+                        records.push(record);
+                    }
+                    SExpr::Sym(sym, _) if sym == "variant" => {
+                        let variant = parse_variant_form(&items, &variant_names, ctx)?;
+                        // Already checked for duplicates in first pass
+                        variants.push(variant);
+                    }
                     other => {
                         return Err(ctx.error_with_note(
                             "unknown top-level form",
                             other.span(),
-                            "expected 'fn', 'export', 'import', or 'global'"
+                            "expected 'fn', 'export', 'import', 'global', 'record', or 'variant'"
                         ));
                     }
                 }
@@ -2749,10 +3032,10 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
 
     let mut signatures = HashMap::new();
     for func in &pending {
-        let params = func.params.iter().map(|p| p.ty).collect();
+        let params = func.params.iter().map(|p| p.ty.clone()).collect();
         let sig = Signature {
             params,
-            result: func.return_type,
+            result: func.return_type.clone(),
         };
         if signatures.insert(func.name.clone(), sig).is_some() {
             return Err(ctx.error(format!("duplicate function '{}'", func.name), &func.span));
@@ -2760,10 +3043,10 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     }
 
     for import in &imports {
-        let params = import.params.iter().map(|p| p.ty).collect();
+        let params = import.params.iter().map(|p| p.ty.clone()).collect();
         let sig = Signature {
             params,
-            result: import.return_type,
+            result: import.return_type.clone(),
         };
         if signatures.insert(import.name.clone(), sig).is_some() {
             return Err(ctx.error(format!("duplicate function '{}'", import.name), &import.span));
@@ -2779,6 +3062,16 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
         }
     }
 
+    // Build records and variants maps for parse_expr
+    let records_map: HashMap<String, RecordDef> = records
+        .iter()
+        .map(|r| (r.name.clone(), r.clone()))
+        .collect();
+    let variants_map: HashMap<String, VariantDef> = variants
+        .iter()
+        .map(|v| (v.name.clone(), v.clone()))
+        .collect();
+
     let mut functions = Vec::new();
     for func in pending {
         // Create bindings with scopes from parameters for hygienic variable resolution
@@ -2787,7 +3080,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
             .iter()
             .map(|p| Binding::new(p.name.clone(), p.scopes.clone()))
             .collect::<Vec<_>>();
-        let body_expr = parse_expr(&func.body, &param_bindings, &signatures, ctx)?;
+        let body_expr = parse_expr(&func.body, &param_bindings, &signatures, &records_map, &variants_map, ctx)?;
         functions.push(Function {
             name: func.name,
             params: func.params,
@@ -2801,10 +3094,12 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
         imports,
         exports,
         globals,
+        records,
+        variants,
     })
 }
 
-fn parse_fn_form(form: SExpr, ctx: &CompileContext) -> Result<PendingFunction> {
+fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<PendingFunction> {
     let (items, span) = match form {
         SExpr::List(items, span) => (items, span),
         other => return Err(ctx.error("function definition must be a list", other.span())),
@@ -2824,8 +3119,8 @@ fn parse_fn_form(form: SExpr, ctx: &CompileContext) -> Result<PendingFunction> {
         SExpr::Sym(name, _) => name.clone(),
         other => return Err(ctx.error("function name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[2], ctx)?;
-    let return_type = parse_type_expr(&items[3], ctx)?;
+    let params = parse_typed_params(&items[2], variant_names, ctx)?;
+    let return_type = parse_type_expr(&items[3], variant_names, ctx)?;
     Ok(PendingFunction {
         name,
         params,
@@ -2835,7 +3130,7 @@ fn parse_fn_form(form: SExpr, ctx: &CompileContext) -> Result<PendingFunction> {
     })
 }
 
-fn parse_import_form(items: &[SExpr], ctx: &CompileContext) -> Result<Import> {
+fn parse_import_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Import> {
     let span = items[0].span().clone();
     if items.len() != 5 {
         return Err(ctx.error_with_note(
@@ -2853,8 +3148,8 @@ fn parse_import_form(items: &[SExpr], ctx: &CompileContext) -> Result<Import> {
         SExpr::Sym(s, _) => s.clone(),
         other => return Err(ctx.error("import name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[3], ctx)?;
-    let return_type = parse_type_expr(&items[4], ctx)?;
+    let params = parse_typed_params(&items[3], variant_names, ctx)?;
+    let return_type = parse_type_expr(&items[4], variant_names, ctx)?;
 
     Ok(Import {
         module,
@@ -2865,7 +3160,7 @@ fn parse_import_form(items: &[SExpr], ctx: &CompileContext) -> Result<Import> {
     })
 }
 
-fn parse_global_form(items: &[SExpr], ctx: &CompileContext) -> Result<Global> {
+fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Global> {
     let span = items[0].span().clone();
     if items.len() != 5 {
         return Err(ctx.error_with_note(
@@ -2889,7 +3184,7 @@ fn parse_global_form(items: &[SExpr], ctx: &CompileContext) -> Result<Global> {
         other => return Err(ctx.error("global name must be a symbol starting with $", other.span())),
     };
 
-    let ty = parse_type_expr(&items[2], ctx)?;
+    let ty = parse_type_expr(&items[2], variant_names, ctx)?;
 
     let mutable = match &items[3] {
         SExpr::Sym(s, sym_span) => match s.as_str() {
@@ -2917,7 +3212,111 @@ fn parse_global_form(items: &[SExpr], ctx: &CompileContext) -> Result<Global> {
     })
 }
 
-fn parse_typed_params(expr: &SExpr, ctx: &CompileContext) -> Result<Vec<Parameter>> {
+/// Parse a record definition: (record name (field1 type1) (field2 type2) ...)
+fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<RecordDef> {
+    let span = items[0].span().clone();
+
+    if items.len() < 2 {
+        return Err(ctx.error_with_note(
+            "invalid record declaration",
+            &span,
+            "expected: (record name (field type) ...)"
+        ));
+    }
+
+    let name = match &items[1] {
+        SExpr::Sym(s, _) => s.clone(),
+        other => return Err(ctx.error("record name must be a symbol", other.span())),
+    };
+
+    let mut fields = Vec::new();
+    for item in &items[2..] {
+        match item {
+            SExpr::List(parts, field_span) => {
+                if parts.len() != 2 {
+                    return Err(ctx.error_with_note(
+                        "invalid field declaration",
+                        field_span,
+                        "expected: (field-name type)"
+                    ));
+                }
+                let field_name = match &parts[0] {
+                    SExpr::Sym(s, _) => s.clone(),
+                    other => return Err(ctx.error("field name must be a symbol", other.span())),
+                };
+                let field_ty = parse_type_expr(&parts[1], variant_names, ctx)?;
+                fields.push(RecordField {
+                    name: field_name,
+                    ty: field_ty,
+                });
+            }
+            other => return Err(ctx.error("field must be a list (name type)", other.span())),
+        }
+    }
+
+    if fields.is_empty() {
+        return Err(ctx.error_with_note(
+            "record must have at least one field",
+            &span,
+            "add fields like: (record point (x s32) (y s32))"
+        ));
+    }
+
+    Ok(RecordDef { name, fields })
+}
+
+fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<VariantDef> {
+    let span = items[0].span().clone();
+
+    if items.len() < 2 {
+        return Err(ctx.error_with_note(
+            "invalid variant declaration",
+            &span,
+            "expected: (variant name (case payload...) ...)"
+        ));
+    }
+
+    let name = match &items[1] {
+        SExpr::Sym(s, _) => s.clone(),
+        other => return Err(ctx.error("variant name must be a symbol", other.span())),
+    };
+
+    let mut cases = Vec::new();
+    for item in &items[2..] {
+        match item {
+            SExpr::List(parts, case_span) => {
+                if parts.is_empty() {
+                    return Err(ctx.error("variant case must have a name", case_span));
+                }
+                let case_name = match &parts[0] {
+                    SExpr::Sym(s, _) => s.clone(),
+                    other => return Err(ctx.error("case name must be a symbol", other.span())),
+                };
+                let mut payload = Vec::new();
+                for ty_expr in &parts[1..] {
+                    payload.push(parse_type_expr(ty_expr, variant_names, ctx)?);
+                }
+                cases.push(VariantCase {
+                    name: case_name,
+                    payload,
+                });
+            }
+            other => return Err(ctx.error("variant case must be a list (case-name type...)", other.span())),
+        }
+    }
+
+    if cases.is_empty() {
+        return Err(ctx.error_with_note(
+            "variant must have at least one case",
+            &span,
+            "add cases like: (variant shape (circle s32) (rectangle s32 s32) (point))"
+        ));
+    }
+
+    Ok(VariantDef { name, cases })
+}
+
+fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Vec<Parameter>> {
     match expr {
         SExpr::List(params, _) => {
             let mut result = Vec::new();
@@ -2935,7 +3334,7 @@ fn parse_typed_params(expr: &SExpr, ctx: &CompileContext) -> Result<Vec<Paramete
                             SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                             other => return Err(ctx.error("parameter name must be a symbol", other.span())),
                         };
-                        let ty = parse_type_expr(&parts[1], ctx)?;
+                        let ty = parse_type_expr(&parts[1], variant_names, ctx)?;
                         result.push(Parameter { name, ty, scopes });
                     }
                     other => return Err(ctx.error_with_note(
@@ -2951,24 +3350,24 @@ fn parse_typed_params(expr: &SExpr, ctx: &CompileContext) -> Result<Vec<Paramete
     }
 }
 
-fn parse_type_expr(expr: &SExpr, ctx: &CompileContext) -> Result<Type> {
+fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Type> {
     match expr {
-        SExpr::Sym(s, span) => parse_type_symbol(s, span, ctx),
+        SExpr::Sym(s, span) => parse_type_symbol(s, variant_names, span, ctx),
         other => Err(ctx.error("type must be a symbol", other.span())),
     }
 }
 
-fn parse_type_symbol(sym: &str, span: &Span, ctx: &CompileContext) -> Result<Type> {
+fn parse_type_symbol(sym: &str, variant_names: &HashSet<String>, _span: &Span, _ctx: &CompileContext) -> Result<Type> {
     match sym {
         "s32" => Ok(Type::S32),
         "s64" => Ok(Type::S64),
         "f32" => Ok(Type::F32),
         "f64" => Ok(Type::F64),
-        other => Err(ctx.error_with_note(
-            format!("unknown type '{}'", other),
-            span,
-            "expected: s32, s64, f32, or f64"
-        )),
+        // Check if this is a variant type name
+        other if variant_names.contains(other) => Ok(Type::Variant(other.to_string())),
+        // Otherwise treat as a record type name
+        // We'll validate that the record actually exists during type checking
+        other => Ok(Type::Record(other.to_string())),
     }
 }
 
@@ -2976,15 +3375,22 @@ fn is_type_symbol(sym: &str) -> bool {
     matches!(sym, "s32" | "s64" | "f32" | "f64")
 }
 
-fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signature>, ctx: &CompileContext) -> Result<Expr> {
+fn parse_expr(
+    sexpr: &SExpr,
+    vars: &[Binding],
+    functions: &HashMap<String, Signature>,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
+    ctx: &CompileContext,
+) -> Result<Expr> {
     match sexpr {
         SExpr::Int { value, ty, .. } => Ok(Expr::Int {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
         }),
         SExpr::Float { value, ty, .. } => Ok(Expr::Float {
             value: *value,
-            ty: *ty,
+            ty: ty.clone(),
         }),
         SExpr::Sym(s, span) => {
             // Hygienic variable resolution: find bindings with matching name
@@ -3028,7 +3434,7 @@ fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signa
                         "f64" => Type::F64,
                         _ => unreachable!(),
                     };
-                    let inner = parse_expr(&items[1], vars, functions, ctx)?;
+                    let inner = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Ascribe {
                         expr: Box::new(inner),
                         ty,
@@ -3042,9 +3448,9 @@ fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signa
                             "expected: (if condition then-expr else-expr)"
                         ));
                     }
-                    let cond = parse_expr(&items[1], vars, functions, ctx)?;
-                    let then_branch = parse_expr(&items[2], vars, functions, ctx)?;
-                    let else_branch = parse_expr(&items[3], vars, functions, ctx)?;
+                    let cond = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let then_branch = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    let else_branch = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::If {
                         cond: Box::new(cond),
                         then_branch: Box::new(then_branch),
@@ -3087,7 +3493,7 @@ fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signa
                         }
                         other => return Err(ctx.error("global.set first argument must be a global name starting with $", other.span())),
                     };
-                    let value = parse_expr(&items[2], vars, functions, ctx)?;
+                    let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
                     Ok(Expr::GlobalSet {
                         name,
                         value: Box::new(value),
@@ -3120,17 +3526,87 @@ fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signa
                         SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                         other => return Err(ctx.error("let binding name must be a symbol", other.span())),
                     };
-                    let value_expr = parse_expr(&binding[1], vars, functions, ctx)?;
+                    let value_expr = parse_expr(&binding[1], vars, functions, records, variants, ctx)?;
                     // Create a new binding with the name and its scopes for hygienic resolution
                     let new_binding = Binding::new(name, name_scopes);
                     let mangled_name = new_binding.mangled_name();
                     let mut next_vars = vars.to_vec();
                     next_vars.push(new_binding);
-                    let body_expr = parse_expr(&items[2], &next_vars, functions, ctx)?;
+                    let body_expr = parse_expr(&items[2], &next_vars, functions, records, variants, ctx)?;
                     Ok(Expr::Let {
                         name: mangled_name,  // Use mangled name for codegen
                         value: Box::new(value_expr),
                         body: Box::new(body_expr),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "match" => {
+                    // (match expr ((case var1 var2) body) ...)
+                    if items.len() < 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'match' expression",
+                            list_span,
+                            "expected: (match expr ((case-name bindings...) body) ...)"
+                        ));
+                    }
+                    let match_expr = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let mut arms = Vec::new();
+
+                    for case_item in &items[2..] {
+                        let case_parts = match case_item {
+                            SExpr::List(parts, _) => parts,
+                            other => return Err(ctx.error("match arm must be a list", other.span())),
+                        };
+
+                        if case_parts.len() != 2 {
+                            return Err(ctx.error_with_note(
+                                "invalid match arm",
+                                case_item.span(),
+                                "expected: ((case-name bindings...) body)"
+                            ));
+                        }
+
+                        // Parse pattern: (case-name binding1 binding2 ...)
+                        let pattern = match &case_parts[0] {
+                            SExpr::List(pat_parts, _) => pat_parts,
+                            other => return Err(ctx.error("match pattern must be a list", other.span())),
+                        };
+
+                        if pattern.is_empty() {
+                            return Err(ctx.error("match pattern cannot be empty", case_parts[0].span()));
+                        }
+
+                        let case_name = match &pattern[0] {
+                            SExpr::Sym(s, _) => s.clone(),
+                            other => return Err(ctx.error("case name must be a symbol", other.span())),
+                        };
+
+                        // Collect bindings
+                        let mut bindings = Vec::new();
+                        let mut next_vars = vars.to_vec();
+                        for binding in &pattern[1..] {
+                            let (name, name_scopes) = match binding {
+                                SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
+                                other => return Err(ctx.error("binding must be a symbol", other.span())),
+                            };
+                            let new_binding = Binding::new(name, name_scopes);
+                            let mangled_name = new_binding.mangled_name();
+                            bindings.push(mangled_name);
+                            next_vars.push(new_binding);
+                        }
+
+                        // Parse body with extended bindings
+                        let body = parse_expr(&case_parts[1], &next_vars, functions, records, variants, ctx)?;
+
+                        arms.push(MatchArm {
+                            case_name,
+                            bindings,
+                            body,
+                        });
+                    }
+
+                    Ok(Expr::Match {
+                        expr: Box::new(match_expr),
+                        cases: arms,
                     })
                 }
                 _ => {
@@ -3139,13 +3615,14 @@ fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signa
                         if lookup_wasm_instr(sym).is_some() {
                             let mut args = Vec::new();
                             for arg in &items[1..] {
-                                args.push(parse_expr(arg, vars, functions, ctx)?);
+                                args.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
                             }
                             Ok(Expr::WasmInstr {
                                 name: sym.clone(),
                                 args,
                             })
                         } else if let Some(expected) = functions.get(sym) {
+                            // Function call
                             if items.len() - 1 != expected.params.len() {
                                 return Err(ctx.error(
                                     format!(
@@ -3159,12 +3636,82 @@ fn parse_expr(sexpr: &SExpr, vars: &[Binding], functions: &HashMap<String, Signa
                             }
                             let mut args = Vec::new();
                             for arg in &items[1..] {
-                                args.push(parse_expr(arg, vars, functions, ctx)?);
+                                args.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
                             }
                             Ok(Expr::Call {
                                 name: sym.clone(),
                                 args,
                             })
+                        } else if let Some(record_def) = records.get(sym) {
+                            // Record construction: (point 10 20)
+                            if items.len() - 1 != record_def.fields.len() {
+                                return Err(ctx.error(
+                                    format!(
+                                        "record '{}' expects {} fields, got {}",
+                                        sym,
+                                        record_def.fields.len(),
+                                        items.len() - 1
+                                    ),
+                                    list_span
+                                ));
+                            }
+                            let mut fields = Vec::new();
+                            for arg in &items[1..] {
+                                fields.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
+                            }
+                            Ok(Expr::RecordConstruct {
+                                record_name: sym.clone(),
+                                fields,
+                            })
+                        } else if let Some(variant_def) = find_variant_by_case(sym, variants) {
+                            // Variant case construction: (circle 5) or (point)
+                            let (_, case) = variant_def.find_case(sym).unwrap();
+                            if items.len() - 1 != case.payload.len() {
+                                return Err(ctx.error(
+                                    format!(
+                                        "variant case '{}' expects {} payload values, got {}",
+                                        sym,
+                                        case.payload.len(),
+                                        items.len() - 1
+                                    ),
+                                    list_span
+                                ));
+                            }
+                            let mut payload = Vec::new();
+                            for arg in &items[1..] {
+                                payload.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
+                            }
+                            Ok(Expr::VariantConstruct {
+                                variant_name: variant_def.name.clone(),
+                                case_name: sym.clone(),
+                                payload,
+                            })
+                        } else if sym.contains('.') {
+                            // Check for record field access: (point.x expr)
+                            let parts: Vec<&str> = sym.splitn(2, '.').collect();
+                            if parts.len() == 2 {
+                                let record_name = parts[0];
+                                let field_name = parts[1];
+                                if let Some(_record_def) = records.get(record_name) {
+                                    if items.len() != 2 {
+                                        return Err(ctx.error_with_note(
+                                            "invalid field access",
+                                            list_span,
+                                            format!("expected: ({}.{} record-expr)", record_name, field_name)
+                                        ));
+                                    }
+                                    let expr = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                                    Ok(Expr::RecordAccess {
+                                        record_name: record_name.to_string(),
+                                        field_name: field_name.to_string(),
+                                        expr: Box::new(expr),
+                                    })
+                                } else {
+                                    Err(ctx.error(format!("unknown record type '{}'", record_name), sym_span))
+                                }
+                            } else {
+                                Err(ctx.error(format!("unknown function or operator '{}'", sym), sym_span))
+                            }
                         } else {
                             Err(ctx.error(format!("unknown function or operator '{}'", sym), sym_span))
                         }
@@ -3195,9 +3742,9 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
             import.module, import.name, import.name
         ));
         for param in &import.params {
-            out.push_str(&format!("(param ${} {}) ", param.name, wat_type(param.ty)));
+            out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
         }
-        out.push_str(&format!("(result {})))\n", wat_type(import.return_type)));
+        out.push_str(&format!("(result {})))\n", wat_type(&import.return_type)));
     }
 
     // Declare memory (1 page = 64KB, allow growth up to 100 pages)
@@ -3206,10 +3753,27 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
     // Build global type map for codegen
     let mut globals_map = HashMap::new();
     for global in &prog.globals {
-        globals_map.insert(global.name.clone(), (global.ty, global.mutable));
+        globals_map.insert(global.name.clone(), (global.ty.clone(), global.mutable));
     }
 
-    // Declare globals
+    // Build records and variants maps for codegen
+    let records_map: HashMap<String, RecordDef> = prog.records
+        .iter()
+        .map(|r| (r.name.clone(), r.clone()))
+        .collect();
+    let variants_map: HashMap<String, VariantDef> = prog.variants
+        .iter()
+        .map(|v| (v.name.clone(), v.clone()))
+        .collect();
+
+    // Add heap pointer global for bump allocation (if we have records or variants)
+    let needs_heap = !prog.records.is_empty() || !prog.variants.is_empty();
+    if needs_heap {
+        // Start heap at byte 0 (first page of memory)
+        out.push_str("  (global $__heap_ptr (mut i32) (i32.const 0))\n");
+    }
+
+    // Declare user globals
     for global in &prog.globals {
         let mutability = if global.mutable { "(mut " } else { "" };
         let close = if global.mutable { ")" } else { "" };
@@ -3217,9 +3781,9 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
             "  (global {} {}{}{} ({}.const {}))\n",
             global.name,
             mutability,
-            wat_type(global.ty),
+            wat_type(&global.ty),
             close,
-            wat_type(global.ty),
+            wat_type(&global.ty),
             global.init_value
         ));
     }
@@ -3227,15 +3791,15 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
     for func in &prog.functions {
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
-        gen_expr(&func.body, &mut body, 4, &mut env, signatures, &globals_map);
+        gen_expr(&func.body, &mut body, 4, &mut env, signatures, &globals_map, &records_map, &variants_map);
 
         out.push_str(&format!("  (func ${} ", func.name));
         for param in &func.params {
-            out.push_str(&format!("(param ${} {}) ", param.name, wat_type(param.ty)));
+            out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
         }
-        out.push_str(&format!("(result {})\n", wat_type(func.return_type)));
+        out.push_str(&format!("(result {})\n", wat_type(&func.return_type)));
         for local in &env.locals {
-            out.push_str(&format!("    (local {})\n", wat_type(*local)));
+            out.push_str(&format!("    (local {})\n", wat_type(local)));
         }
         out.push_str(&body);
         out.push_str("  )\n");
@@ -3254,6 +3818,8 @@ fn gen_expr(
     env: &mut CodegenEnv,
     signatures: &HashMap<String, Signature>,
     globals: &HashMap<String, (Type, bool)>,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
 ) -> Type {
     let pad = " ".repeat(indent);
     match expr {
@@ -3264,7 +3830,7 @@ fn gen_expr(
                 _ => panic!("integer literal not supported for {:?}", ty),
             };
             out.push_str(&format!("{}{} {}\n", pad, instr, *value));
-            *ty
+            ty.clone()
         }
         Expr::Float { value, ty } => {
             match ty {
@@ -3272,17 +3838,17 @@ fn gen_expr(
                 Type::F64 => out.push_str(&format!("{}f64.const {}\n", pad, *value)),
                 _ => panic!("float literal not supported for {:?}", ty),
             }
-            *ty
+            ty.clone()
         }
         Expr::Ascribe { expr, ty } => {
-            let from_ty = gen_expr(expr, out, indent, env, signatures, globals);
+            let from_ty = gen_expr(expr, out, indent, env, signatures, globals, records, variants);
             if from_ty == *ty {
                 return from_ty;
             }
-            let instr = conversion_instr(from_ty, *ty)
+            let instr = conversion_instr(&from_ty, ty)
                 .unwrap_or_else(|| panic!("unsupported conversion {:?} -> {:?}", from_ty, ty));
             out.push_str(&format!("{}{}\n", pad, instr));
-            *ty
+            ty.clone()
         }
         Expr::Var(name) => {
             let (idx, ty) = env.lookup(name);
@@ -3294,27 +3860,27 @@ fn gen_expr(
                 .get(name)
                 .unwrap_or_else(|| panic!("Missing signature for {}", name));
             for arg in args {
-                gen_expr(arg, out, indent, env, signatures, globals);
+                gen_expr(arg, out, indent, env, signatures, globals, records, variants);
             }
             out.push_str(&format!("{}call ${}\n", pad, name));
-            sig.result
+            sig.result.clone()
         }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            let cond_ty = gen_expr(cond, out, indent, env, signatures, globals);
+            let cond_ty = gen_expr(cond, out, indent, env, signatures, globals, records, variants);
             if cond_ty != Type::S32 {
                 panic!("if condition must be s32");
             }
-            let result_ty = expr_type(then_branch, env, signatures, globals);
-            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(result_ty)));
+            let result_ty = expr_type(then_branch, env, signatures, globals, records, variants);
+            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
             out.push_str(&format!("{}  (then\n", pad));
-            gen_expr(then_branch, out, indent + 4, env, signatures, globals);
+            gen_expr(then_branch, out, indent + 4, env, signatures, globals, records, variants);
             out.push_str(&format!("{}  )\n", pad));
             out.push_str(&format!("{}  (else\n", pad));
-            let else_ty = gen_expr(else_branch, out, indent + 4, env, signatures, globals);
+            let else_ty = gen_expr(else_branch, out, indent + 4, env, signatures, globals, records, variants);
             if else_ty != result_ty {
                 panic!(
                     "if branches must match types: {:?} vs {:?}",
@@ -3326,11 +3892,11 @@ fn gen_expr(
             result_ty
         }
         Expr::Let { name, value, body } => {
-            let value_ty = gen_expr(value, out, indent, env, signatures, globals);
+            let value_ty = gen_expr(value, out, indent, env, signatures, globals, records, variants);
             let idx = env.declare_local(value_ty);
             out.push_str(&format!("{}local.set {}\n", pad, idx));
             env.push_binding(name.clone(), idx);
-            let body_ty = gen_expr(body, out, indent, env, signatures, globals);
+            let body_ty = gen_expr(body, out, indent, env, signatures, globals, records, variants);
             env.pop_binding();
             body_ty
         }
@@ -3367,12 +3933,12 @@ fn gen_expr(
                 }
 
                 // Emit and save the value first
-                let value_ty = gen_expr(&args[1], out, indent, env, signatures, globals);
+                let value_ty = gen_expr(&args[1], out, indent, env, signatures, globals, records, variants);
                 let value_local = env.declare_local(value_ty);
                 out.push_str(&format!("{}local.set {}\n", pad, value_local));
 
                 // Emit the address
-                gen_expr(&args[0], out, indent, env, signatures, globals);
+                gen_expr(&args[0], out, indent, env, signatures, globals, records, variants);
 
                 // Get the value back
                 out.push_str(&format!("{}local.get {}\n", pad, value_local));
@@ -3385,7 +3951,7 @@ fn gen_expr(
             } else {
                 // Normal instructions - emit args then instruction
                 for arg in args {
-                    gen_expr(arg, out, indent, env, signatures, globals);
+                    gen_expr(arg, out, indent, env, signatures, globals, records, variants);
                 }
                 out.push_str(&format!("{}{}\n", pad, name));
             }
@@ -3394,18 +3960,282 @@ fn gen_expr(
         Expr::GlobalGet { name } => {
             out.push_str(&format!("{}global.get {}\n", pad, name));
             let (ty, _) = globals.get(name).expect("global should exist");
-            *ty
+            ty.clone()
         }
         Expr::GlobalSet { name, value } => {
             // Global.set consumes the value, so we save it to a local first
             // and restore it after to return the value for composability
-            let value_ty = gen_expr(value, out, indent, env, signatures, globals);
-            let value_local = env.declare_local(value_ty);
+            let value_ty = gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            let value_local = env.declare_local(value_ty.clone());
             out.push_str(&format!("{}local.set {}\n", pad, value_local));
             out.push_str(&format!("{}local.get {}\n", pad, value_local));
             out.push_str(&format!("{}global.set {}\n", pad, name));
             out.push_str(&format!("{}local.get {}\n", pad, value_local));
             value_ty
+        }
+        Expr::RecordConstruct { record_name, fields } => {
+            let record_def = records
+                .get(record_name)
+                .expect("record should exist");
+            let size = record_def.size();
+
+            // Bump allocate: get current heap_ptr, advance it by record size
+            // Save the base pointer to a local
+            let ptr_local = env.declare_local(Type::S32);
+
+            // ptr = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            // heap_ptr += size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store each field at the appropriate offset
+            for (i, (field_expr, field_def)) in fields.iter().zip(record_def.fields.iter()).enumerate() {
+                let offset = record_def.field_offset(i);
+
+                // Compute address: ptr + offset
+                out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+                if offset > 0 {
+                    out.push_str(&format!("{}i32.const {}\n", pad, offset));
+                    out.push_str(&format!("{}i32.add\n", pad));
+                }
+
+                // Evaluate the field expression
+                gen_expr(field_expr, out, indent, env, signatures, globals, records, variants);
+
+                // Store based on field type
+                let store_instr = match &field_def.ty {
+                    Type::S32 => "i32.store",
+                    Type::S64 => "i64.store",
+                    Type::F32 => "f32.store",
+                    Type::F64 => "f64.store",
+                    Type::Record(_) | Type::Variant(_) => "i32.store", // Records/variants are pointers
+                };
+                out.push_str(&format!("{}{}\n", pad, store_instr));
+            }
+
+            // Return the pointer to the record
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Record(record_name.clone())
+        }
+        Expr::RecordAccess { record_name, field_name, expr } => {
+            let record_def = records
+                .get(record_name)
+                .expect("record should exist");
+
+            // Find the field and its offset
+            let (field_idx, field_def) = record_def.fields
+                .iter()
+                .enumerate()
+                .find(|(_, f)| f.name == *field_name)
+                .expect("field should exist");
+            let offset = record_def.field_offset(field_idx);
+
+            // Evaluate the record expression (gives us the pointer)
+            gen_expr(expr, out, indent, env, signatures, globals, records, variants);
+
+            // Add offset if non-zero
+            if offset > 0 {
+                out.push_str(&format!("{}i32.const {}\n", pad, offset));
+                out.push_str(&format!("{}i32.add\n", pad));
+            }
+
+            // Load based on field type
+            let load_instr = match &field_def.ty {
+                Type::S32 => "i32.load",
+                Type::S64 => "i64.load",
+                Type::F32 => "f32.load",
+                Type::F64 => "f64.load",
+                Type::Record(_) | Type::Variant(_) => "i32.load", // Records/variants are pointers
+            };
+            out.push_str(&format!("{}{}\n", pad, load_instr));
+            field_def.ty.clone()
+        }
+        Expr::VariantConstruct { variant_name, case_name, payload } => {
+            let variant_def = variants
+                .get(variant_name)
+                .expect("variant should exist");
+            let (case_idx, case) = variant_def.find_case(case_name)
+                .expect("case should exist");
+            let size = variant_def.size();
+
+            // Bump allocate: get current heap_ptr, advance it by variant size
+            let ptr_local = env.declare_local(Type::S32);
+
+            // ptr = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            // heap_ptr += size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store discriminant (case index) at offset 0
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Store payload values starting at offset 4 (after discriminant)
+            let mut payload_offset = 4;
+            for (payload_expr, payload_ty) in payload.iter().zip(case.payload.iter()) {
+                // Compute address: ptr + payload_offset
+                out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+                out.push_str(&format!("{}i32.const {}\n", pad, payload_offset));
+                out.push_str(&format!("{}i32.add\n", pad));
+
+                // Evaluate the payload expression
+                gen_expr(payload_expr, out, indent, env, signatures, globals, records, variants);
+
+                // Store based on payload type
+                let store_instr = match payload_ty {
+                    Type::S32 => "i32.store",
+                    Type::S64 => "i64.store",
+                    Type::F32 => "f32.store",
+                    Type::F64 => "f64.store",
+                    Type::Record(_) | Type::Variant(_) => "i32.store",
+                };
+                out.push_str(&format!("{}{}\n", pad, store_instr));
+                payload_offset += type_size(payload_ty);
+            }
+
+            // Return the pointer to the variant
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Variant(variant_name.clone())
+        }
+        Expr::Match { expr, cases } => {
+            // Evaluate the variant expression to get the pointer
+            let expr_ty = gen_expr(expr, out, indent, env, signatures, globals, records, variants);
+            let variant_name = match &expr_ty {
+                Type::Variant(name) => name.clone(),
+                _ => panic!("match expression must be a variant"),
+            };
+            let variant_def = variants
+                .get(&variant_name)
+                .expect("variant should exist");
+
+            // Save the variant pointer to a local
+            let variant_ptr = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.set {}\n", pad, variant_ptr));
+
+            // Load discriminant
+            out.push_str(&format!("{}local.get {}\n", pad, variant_ptr));
+            out.push_str(&format!("{}i32.load\n", pad));
+
+            // Determine result type from first arm
+            let result_ty = if let Some(first_arm) = cases.first() {
+                // Build environment for first arm to get its type
+                let (_, first_case) = variant_def.find_case(&first_arm.case_name).expect("case should exist");
+                let mut arm_env = HashMap::new();
+                for (binding, ty) in first_arm.bindings.iter().zip(first_case.payload.iter()) {
+                    arm_env.insert(binding.clone(), ty.clone());
+                }
+                // Get type from body - simplified, assumes type checking passed
+                match &first_arm.body {
+                    Expr::Int { ty, .. } => ty.clone(),
+                    Expr::Float { ty, .. } => ty.clone(),
+                    Expr::Var(name) => arm_env.get(name).cloned().unwrap_or(Type::S32),
+                    _ => Type::S32, // Default fallback
+                }
+            } else {
+                Type::S32
+            };
+
+            // Generate br_table-based dispatch
+            // (block $done (result T)
+            //   (block $case_n
+            //     (block $case_n-1
+            //       ...
+            //       (br_table $case_0 $case_1 ... $case_n)
+            //     )
+            //     ;; case_n-1 body
+            //   )
+            //   ;; case_n body
+            // )
+
+            // For simplicity, use nested if-else for now
+            // (if (i32.eq discriminant 0) (then case0) (else (if ...)))
+            let num_cases = cases.len();
+            for (i, arm) in cases.iter().enumerate() {
+                let (case_idx, case) = variant_def.find_case(&arm.case_name)
+                    .expect("case should exist");
+
+                // Compare discriminant with case index
+                if i > 0 {
+                    out.push_str(&format!("{}local.get {}\n", pad, variant_ptr));
+                    out.push_str(&format!("{}i32.load\n", pad));
+                }
+                out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
+                out.push_str(&format!("{}i32.eq\n", pad));
+
+                let is_last = i == num_cases - 1;
+                if is_last && num_cases > 1 {
+                    // Last case in else branch - just emit body
+                    out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                    out.push_str(&format!("{}  (then\n", pad));
+                } else if !is_last {
+                    out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                    out.push_str(&format!("{}  (then\n", pad));
+                }
+
+                // Load payload values into locals and bind them
+                let saved_binding_count = env.bindings.len();
+                let mut payload_offset = 4;
+                for (binding, payload_ty) in arm.bindings.iter().zip(case.payload.iter()) {
+                    // Load payload value
+                    out.push_str(&format!("{}    local.get {}\n", pad, variant_ptr));
+                    out.push_str(&format!("{}    i32.const {}\n", pad, payload_offset));
+                    out.push_str(&format!("{}    i32.add\n", pad));
+
+                    let load_instr = match payload_ty {
+                        Type::S32 => "i32.load",
+                        Type::S64 => "i64.load",
+                        Type::F32 => "f32.load",
+                        Type::F64 => "f64.load",
+                        Type::Record(_) | Type::Variant(_) => "i32.load",
+                    };
+                    out.push_str(&format!("{}    {}\n", pad, load_instr));
+
+                    // Save to local
+                    let idx = env.declare_local(payload_ty.clone());
+                    out.push_str(&format!("{}    local.set {}\n", pad, idx));
+                    env.push_binding(binding.clone(), idx);
+
+                    payload_offset += type_size(payload_ty);
+                }
+
+                // Generate arm body
+                gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
+
+                // Pop bindings
+                while env.bindings.len() > saved_binding_count {
+                    env.pop_binding();
+                }
+
+                if !is_last {
+                    out.push_str(&format!("{}  )\n", pad));
+                    out.push_str(&format!("{}  (else\n", pad));
+                } else if num_cases > 1 {
+                    out.push_str(&format!("{}  )\n", pad));
+                    out.push_str(&format!("{}  (else\n", pad));
+                    out.push_str(&format!("{}    unreachable\n", pad)); // Should never reach here
+                    out.push_str(&format!("{}  )\n", pad));
+                    out.push_str(&format!("{})\n", pad));
+                }
+            }
+
+            // Close all the if-else blocks
+            for _ in 0..num_cases.saturating_sub(1) {
+                out.push_str(&format!("{}  )\n", pad));
+                out.push_str(&format!("{})\n", pad));
+            }
+
+            result_ty
         }
     }
 }
@@ -3427,7 +4257,7 @@ impl CodegenEnv {
             bindings,
             param_count: params.len() as u32,
             locals: Vec::new(),
-            param_types: params.iter().map(|p| p.ty).collect(),
+            param_types: params.iter().map(|p| p.ty.clone()).collect(),
         }
     }
 
@@ -3453,10 +4283,10 @@ impl CodegenEnv {
             .find(|(n, _)| n == name)
             .unwrap_or_else(|| panic!("Codegen missing variable {}", name));
         let ty = if (*idx as usize) < self.param_count as usize {
-            self.param_types[*idx as usize]
+            self.param_types[*idx as usize].clone()
         } else {
             let local_idx = *idx as usize - self.param_count as usize;
-            self.locals[local_idx]
+            self.locals[local_idx].clone()
         };
         (*idx, ty)
     }
@@ -3467,21 +4297,23 @@ fn expr_type(
     env: &CodegenEnv,
     signatures: &HashMap<String, Signature>,
     globals: &HashMap<String, (Type, bool)>,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
 ) -> Type {
     let mut vars = HashMap::new();
     for (name, idx) in &env.bindings {
         let ty = if (*idx as usize) < env.param_count as usize {
-            env.param_types[*idx as usize]
+            env.param_types[*idx as usize].clone()
         } else {
             let local_idx = *idx as usize - env.param_count as usize;
-            env.locals[local_idx]
+            env.locals[local_idx].clone()
         };
         vars.insert(name.clone(), ty);
     }
-    check_expr(expr, &vars, signatures, globals).expect("type checking already performed")
+    check_expr(expr, &vars, signatures, globals, records, variants).expect("type checking already performed")
 }
 
-fn conversion_instr(from: Type, to: Type) -> Option<&'static str> {
+fn conversion_instr(from: &Type, to: &Type) -> Option<&'static str> {
     match (from, to) {
         (Type::S32, Type::S64) => Some("i64.extend_i32_s"),
         (Type::S64, Type::S32) => Some("i32.wrap_i64"),
@@ -3496,25 +4328,29 @@ fn conversion_instr(from: Type, to: Type) -> Option<&'static str> {
         (Type::F64, Type::S32) => Some("i32.trunc_f64_s"),
         (Type::F64, Type::S64) => Some("i64.trunc_f64_s"),
         _ if from == to => None,
+        // Records don't have conversion instructions
+        (Type::Record(_), _) | (_, Type::Record(_)) => None,
         _ => None,
     }
 }
 
-fn wat_type(ty: Type) -> &'static str {
+fn wat_type(ty: &Type) -> &'static str {
     match ty {
         Type::S32 => "i32",
         Type::S64 => "i64",
         Type::F32 => "f32",
         Type::F64 => "f64",
+        Type::Record(_) | Type::Variant(_) => "i32", // Records and variants are pointer-sized
     }
 }
 
-fn wit_type(ty: Type) -> &'static str {
+fn wit_type(ty: &Type) -> String {
     match ty {
-        Type::S32 => "s32",
-        Type::S64 => "s64",
-        Type::F32 => "f32",
-        Type::F64 => "f64",
+        Type::S32 => "s32".to_string(),
+        Type::S64 => "s64".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::Record(name) | Type::Variant(name) => name.clone(),
     }
 }
 
@@ -3522,6 +4358,35 @@ fn generate_wit(prog: &Program) -> String {
     let mut out = String::new();
     out.push_str("package example:wisp;\n\n");
     out.push_str("world wisp {\n");
+
+    // Generate record type declarations
+    for record in &prog.records {
+        out.push_str(&format!("  record {} {{\n", record.name));
+        for field in &record.fields {
+            out.push_str(&format!("    {}: {},\n", field.name, wit_type(&field.ty)));
+        }
+        out.push_str("  }\n\n");
+    }
+
+    // Generate variant type declarations
+    for variant in &prog.variants {
+        out.push_str(&format!("  variant {} {{\n", variant.name));
+        for case in &variant.cases {
+            if case.payload.is_empty() {
+                // Case with no payload: just the name
+                out.push_str(&format!("    {},\n", case.name));
+            } else if case.payload.len() == 1 {
+                // Case with single payload: name(type)
+                out.push_str(&format!("    {}({}),\n", case.name, wit_type(&case.payload[0])));
+            } else {
+                // Case with multiple payloads: name(tuple<type1, type2, ...>)
+                let types: Vec<String> = case.payload.iter().map(wit_type).collect();
+                out.push_str(&format!("    {}(tuple<{}>),\n", case.name, types.join(", ")));
+            }
+        }
+        out.push_str("  }\n\n");
+    }
+
     let mut imports_by_module: BTreeMap<&str, Vec<&Import>> = BTreeMap::new();
     for import in &prog.imports {
         imports_by_module
@@ -3537,9 +4402,9 @@ fn generate_wit(prog: &Program) -> String {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push_str(&format!("{}: {}", param.name, wit_type(param.ty)));
+                out.push_str(&format!("{}: {}", param.name, wit_type(&param.ty)));
             }
-            out.push_str(&format!(") -> {};\n", wit_type(import.return_type)));
+            out.push_str(&format!(") -> {};\n", wit_type(&import.return_type)));
         }
         out.push_str("  }\n");
     }
@@ -3550,9 +4415,9 @@ fn generate_wit(prog: &Program) -> String {
             if i > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&format!("{}: {}", param.name, wit_type(param.ty)));
+            out.push_str(&format!("{}: {}", param.name, wit_type(&param.ty)));
         }
-        out.push_str(&format!(") -> {};\n", wit_type(func.return_type)));
+        out.push_str(&format!(") -> {};\n", wit_type(&func.return_type)));
     }
     out.push_str("}\n");
     out

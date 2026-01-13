@@ -1,0 +1,13 @@
+package example:wisp;
+
+world wisp {
+  variant shape {
+    circle(s32),
+    rectangle(tuple<s32, s32>),
+    point,
+  }
+
+  export test-circle: func() -> s32;
+  export test-rect: func() -> s32;
+  export test-point: func() -> s32;
+}

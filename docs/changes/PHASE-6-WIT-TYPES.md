@@ -1,6 +1,6 @@
 # Phase 6: WIT Types
 
-**Status**: Design
+**Status**: In Progress (Phase 6.1 Records complete, Phase 6.2 Variants complete)
 **Started**: 2025-01-12
 **Prerequisites**: Phase 5 (syntax-case) complete
 
@@ -240,22 +240,23 @@ For macro components (future Phase 7), `sexpr` becomes a real WIT variant that c
 ## Implementation Plan
 
 ### Phase 6.1: Records
-- [ ] Add `record` declaration parsing
-- [ ] Add record type to Type enum
-- [ ] Implement record construction
-- [ ] Implement `let-record` destructuring
-- [ ] Generate correct WAT (memory layout, load/store)
-- [ ] Generate WIT record declarations
-- [ ] Test with simple point/span examples
+- [x] Add `record` declaration parsing
+- [x] Add record type to Type enum
+- [x] Implement record construction
+- [x] Implement field access via `(record.field expr)` syntax
+- [ ] Implement `let-record` destructuring (optional, have field access instead)
+- [x] Generate correct WAT (memory layout, load/store)
+- [x] Generate WIT record declarations
+- [x] Test with simple point/span examples
 
 ### Phase 6.2: Variants
-- [ ] Add `variant` declaration parsing
-- [ ] Add variant type to Type enum
-- [ ] Implement variant case construction
-- [ ] Implement `match` expression
-- [ ] Generate correct WAT (discriminant + payload)
-- [ ] Generate WIT variant declarations
-- [ ] Test with shape example
+- [x] Add `variant` declaration parsing
+- [x] Add variant type to Type enum
+- [x] Implement variant case construction
+- [x] Implement `match` expression
+- [x] Generate correct WAT (discriminant + payload)
+- [x] Generate WIT variant declarations
+- [x] Test with shape example
 
 ### Phase 6.3: Built-in Parameterized Types
 - [ ] Add `list<T>` type support

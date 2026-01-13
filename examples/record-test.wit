@@ -1,0 +1,11 @@
+package example:wisp;
+
+world wisp {
+  record point {
+    x: s32,
+    y: s32,
+  }
+
+  export test: func() -> s32;
+  export test2: func() -> s32;
+}
