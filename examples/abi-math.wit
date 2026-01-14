@@ -1,0 +1,12 @@
+package example:wisp;
+
+world wisp {
+  record point {
+    x: s32,
+    y: s32,
+  }
+
+  export make-point: func(x: s32, y: s32) -> point;
+  export point-sum: func(p: point) -> s32;
+  export test-internal: func() -> s32;
+}

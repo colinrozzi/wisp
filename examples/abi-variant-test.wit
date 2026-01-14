@@ -1,0 +1,12 @@
+package example:wisp;
+
+world wisp {
+  variant shape {
+    circle(s32),
+    rectangle(tuple<s32, s32>),
+  }
+
+  export shape-area: func(s: shape) -> s32;
+  export test-circle: func() -> s32;
+  export test-rectangle: func() -> s32;
+}

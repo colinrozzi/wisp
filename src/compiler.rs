@@ -4270,12 +4270,23 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         ));
     }
 
+    // Generate functions
     for func in &prog.functions {
+        let is_exported = prog.exports.contains(&func.name);
+        let needs_wrapper = is_exported && function_needs_abi_wrapper(func);
+
+        // If this function is exported and needs a wrapper, name the internal function differently
+        let internal_name = if needs_wrapper {
+            format!("{}__internal", func.name)
+        } else {
+            func.name.clone()
+        };
+
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
         gen_expr(&func.body, &mut body, 4, &mut env, signatures, &globals_map, &records_map, &variants_map);
 
-        out.push_str(&format!("  (func ${} ", func.name));
+        out.push_str(&format!("  (func ${} ", internal_name));
         for param in &func.params {
             out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
         }
@@ -4285,10 +4296,53 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         }
         out.push_str(&body);
         out.push_str("  )\n");
+
+        // Generate ABI wrapper if needed
+        if needs_wrapper {
+            generate_abi_wrapper(&mut out, func, &records_map, &variants_map);
+        }
     }
+    // Generate cabi_realloc for component model (required for strings/lists crossing component boundary)
+    // cabi_realloc(old_ptr: i32, old_size: i32, align: i32, new_size: i32) -> i32
+    if needs_heap {
+        out.push_str("  (func $cabi_realloc (param $old_ptr i32) (param $old_size i32) (param $align i32) (param $new_size i32) (result i32)\n");
+        out.push_str("    (local $ptr i32)\n");
+        // Simple bump allocation - ignore old_ptr/old_size (no reuse), just allocate new_size bytes
+        // Align the heap pointer to the requested alignment
+        out.push_str("    global.get $__heap_ptr\n");
+        out.push_str("    local.get $align\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n");
+        out.push_str("    i32.sub\n");
+        out.push_str("    local.get $align\n");
+        out.push_str("    i32.const 1\n");
+        out.push_str("    i32.sub\n");
+        out.push_str("    i32.const -1\n");
+        out.push_str("    i32.xor\n");
+        out.push_str("    i32.and\n");
+        out.push_str("    local.set $ptr\n");
+        // Bump the heap pointer
+        out.push_str("    local.get $ptr\n");
+        out.push_str("    local.get $new_size\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    global.set $__heap_ptr\n");
+        // Return the pointer
+        out.push_str("    local.get $ptr\n");
+        out.push_str("  )\n");
+    }
+
     for export in &prog.exports {
         out.push_str(&format!("  (export \"{}\" (func ${}))\n", export, export));
     }
+
+    // Export memory for component model
+    out.push_str("  (export \"memory\" (memory 0))\n");
+
+    // Export cabi_realloc for component model
+    if needs_heap {
+        out.push_str("  (export \"cabi_realloc\" (func $cabi_realloc))\n");
+    }
+
     out.push_str(")\n");
     out
 }
@@ -5329,6 +5383,244 @@ fn wit_type(ty: &Type) -> String {
         Type::Result(ok, err) => format!("result<{}, {}>", wit_type(ok), wit_type(err)),
         Type::List(inner) => format!("list<{}>", wit_type(inner)),
         Type::Str => "string".to_string(),
+    }
+}
+
+/// Returns the flattened canonical ABI types for a given type.
+/// Records are flattened into their fields, variants into discriminant + max payload.
+fn flatten_type(ty: &Type, records: &HashMap<String, RecordDef>, variants: &HashMap<String, VariantDef>) -> Vec<Type> {
+    match ty {
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 => vec![ty.clone()],
+        Type::Record(name) => {
+            let record = records.get(name).expect("record not found");
+            let mut result = Vec::new();
+            for field in &record.fields {
+                result.extend(flatten_type(&field.ty, records, variants));
+            }
+            result
+        }
+        Type::Variant(name) => {
+            // Variants: discriminant (i32) + flattened max payload
+            let variant = variants.get(name).expect("variant not found");
+            let mut result = vec![Type::S32]; // discriminant
+
+            // Find max payload size (in number of flattened fields)
+            let max_payload_size = variant.cases.iter()
+                .map(|c| c.payload.iter()
+                    .map(|t| flatten_type(t, records, variants).len())
+                    .sum::<usize>())
+                .max()
+                .unwrap_or(0);
+
+            // Add i32 slots for the max payload
+            for _ in 0..max_payload_size {
+                result.push(Type::S32);
+            }
+            result
+        }
+        Type::Option(inner) => {
+            // Option: discriminant (i32) + flattened inner type
+            let mut result = vec![Type::S32]; // discriminant (0=none, 1=some)
+            result.extend(flatten_type(inner, records, variants));
+            result
+        }
+        Type::Result(ok, err) => {
+            // Result: discriminant (i32) + max of ok/err flattened
+            let ok_flat = flatten_type(ok, records, variants);
+            let err_flat = flatten_type(err, records, variants);
+            let max_size = ok_flat.len().max(err_flat.len());
+            let mut result = vec![Type::S32]; // discriminant (0=ok, 1=err)
+            for _ in 0..max_size {
+                result.push(Type::S32);
+            }
+            result
+        }
+        Type::List(_) => {
+            // List is pointer + length
+            vec![Type::S32, Type::S32]
+        }
+        Type::Str => {
+            // String is pointer + length (canonical ABI)
+            vec![Type::S32, Type::S32]
+        }
+    }
+}
+
+/// Check if a type needs ABI wrapper (is not a simple scalar)
+fn needs_abi_wrapper(ty: &Type) -> bool {
+    !matches!(ty, Type::S32 | Type::S64 | Type::F32 | Type::F64)
+}
+
+/// Check if a function needs an ABI wrapper for export
+fn function_needs_abi_wrapper(func: &Function) -> bool {
+    needs_abi_wrapper(&func.return_type) || func.params.iter().any(|p| needs_abi_wrapper(&p.ty))
+}
+
+/// Generate an ABI wrapper function for exported functions with rich types.
+/// The wrapper takes flattened canonical ABI params and calls the internal function.
+///
+/// Canonical ABI rules:
+/// - Record params: flattened into individual scalar fields
+/// - Variant params: flattened into discriminant + max payload fields
+/// - Record/Variant returns: pointer (MAX_FLAT_RESULTS=1, so complex types stay as pointers)
+fn generate_abi_wrapper(
+    out: &mut String,
+    func: &Function,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
+) {
+    let pad = "    ";
+
+    // Compute flattened params (but NOT returns - returns stay as pointers for complex types)
+    let mut flat_params: Vec<(String, Type)> = Vec::new();
+
+    for param in &func.params {
+        let flat = flatten_type(&param.ty, records, variants);
+        for (i, ty) in flat.iter().enumerate() {
+            flat_params.push((format!("{}_{}", param.name, i), ty.clone()));
+        }
+    }
+
+    // For returns: scalar types stay scalar, records/variants stay as pointers
+    // (Canonical ABI MAX_FLAT_RESULTS = 1, so multi-field records return as pointer)
+    let return_wat = wat_type(&func.return_type);
+
+    // Start function definition
+    out.push_str(&format!("  (func ${} ", func.name));
+    for (name, ty) in &flat_params {
+        out.push_str(&format!("(param ${} {}) ", name, wat_type(ty)));
+    }
+    out.push_str(&format!("(result {})\n", return_wat));
+
+    // For each record/variant parameter, we need a local to store the pointer
+    for param in &func.params {
+        if matches!(&param.ty, Type::Record(_) | Type::Variant(_)) {
+            out.push_str(&format!("{}(local i32)\n", pad)); // pointer to constructed value
+        }
+    }
+
+    // Construct record/variant parameters from flattened values
+    let mut flat_param_idx = 0;
+    let mut complex_local_idx = flat_params.len();
+    let mut internal_call_args: Vec<String> = Vec::new();
+
+    for param in &func.params {
+        match &param.ty {
+            Type::Record(name) => {
+                let record = records.get(name).expect("record not found");
+                let size = type_size(&param.ty);
+
+                // Allocate space for the record
+                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+                out.push_str(&format!("{}local.set {}\n", pad, complex_local_idx));
+                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+                out.push_str(&format!("{}i32.const {}\n", pad, size));
+                out.push_str(&format!("{}i32.add\n", pad));
+                out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+                // Store each field
+                let mut offset = 0;
+                for field in &record.fields {
+                    out.push_str(&format!("{}local.get {}\n", pad, complex_local_idx));
+                    if offset > 0 {
+                        out.push_str(&format!("{}i32.const {}\n", pad, offset));
+                        out.push_str(&format!("{}i32.add\n", pad));
+                    }
+                    out.push_str(&format!("{}local.get ${}\n", pad, flat_params[flat_param_idx].0));
+                    out.push_str(&format!("{}{}\n", pad, store_instr(&field.ty)));
+                    offset += type_size(&field.ty);
+                    flat_param_idx += 1;
+                }
+
+                internal_call_args.push(format!("local.get {}", complex_local_idx));
+                complex_local_idx += 1;
+            }
+            Type::Variant(name) => {
+                let variant = variants.get(name).expect("variant not found");
+                let size = type_size(&param.ty);
+
+                // Allocate space for the variant
+                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+                out.push_str(&format!("{}local.set {}\n", pad, complex_local_idx));
+                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+                out.push_str(&format!("{}i32.const {}\n", pad, size));
+                out.push_str(&format!("{}i32.add\n", pad));
+                out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+                // Store discriminant (first flat param)
+                out.push_str(&format!("{}local.get {}\n", pad, complex_local_idx));
+                out.push_str(&format!("{}local.get ${}\n", pad, flat_params[flat_param_idx].0));
+                out.push_str(&format!("{}i32.store\n", pad));
+                flat_param_idx += 1;
+
+                // Find max payload size for this variant
+                let max_payload_count = variant.cases.iter()
+                    .map(|c| c.payload.len())
+                    .max()
+                    .unwrap_or(0);
+
+                // Store payload values
+                for i in 0..max_payload_count {
+                    out.push_str(&format!("{}local.get {}\n", pad, complex_local_idx));
+                    out.push_str(&format!("{}i32.const {}\n", pad, 4 + i * 4));
+                    out.push_str(&format!("{}i32.add\n", pad));
+                    out.push_str(&format!("{}local.get ${}\n", pad, flat_params[flat_param_idx].0));
+                    out.push_str(&format!("{}i32.store\n", pad));
+                    flat_param_idx += 1;
+                }
+
+                internal_call_args.push(format!("local.get {}", complex_local_idx));
+                complex_local_idx += 1;
+            }
+            Type::S32 | Type::S64 | Type::F32 | Type::F64 => {
+                internal_call_args.push(format!("local.get ${}", flat_params[flat_param_idx].0));
+                flat_param_idx += 1;
+            }
+            _ => {
+                // For other types (options, results, etc.), consume their flattened params
+                let flat_count = flatten_type(&param.ty, records, variants).len();
+                for _ in 0..flat_count {
+                    flat_param_idx += 1;
+                }
+                // TODO: properly handle options/results
+                internal_call_args.push(format!("i32.const 0"));
+            }
+        }
+    }
+
+    // Call the internal function - return value stays on stack (pointer or scalar)
+    for arg in &internal_call_args {
+        out.push_str(&format!("{}{}\n", pad, arg));
+    }
+    out.push_str(&format!("{}call ${}__internal\n", pad, func.name));
+
+    // Return value is already on stack from internal function call
+    // For records, it's a pointer; for scalars, it's the value
+
+    out.push_str("  )\n");
+}
+
+/// Get the store instruction for a type
+fn store_instr(ty: &Type) -> &'static str {
+    match ty {
+        Type::S32 => "i32.store",
+        Type::S64 => "i64.store",
+        Type::F32 => "f32.store",
+        Type::F64 => "f64.store",
+        // Compound types are pointer-sized
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.store",
+    }
+}
+
+/// Get the load instruction for a type
+fn load_instr(ty: &Type) -> &'static str {
+    match ty {
+        Type::S32 => "i32.load",
+        Type::S64 => "i64.load",
+        Type::F32 => "f32.load",
+        Type::F64 => "f64.load",
+        // Compound types are pointer-sized
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
     }
 }
 

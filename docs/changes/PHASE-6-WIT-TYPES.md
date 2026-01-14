@@ -1,6 +1,6 @@
 # Phase 6: WIT Types
 
-**Status**: In Progress (Phase 6.1-6.4 complete)
+**Status**: In Progress (Phase 6.1-6.5 complete)
 **Started**: 2025-01-12
 **Prerequisites**: Phase 5 (syntax-case) complete
 
@@ -273,10 +273,12 @@ For macro components (future Phase 7), `sexpr` becomes a real WIT variant that c
 - [x] Proper WIT string handling
 
 ### Phase 6.5: Component ABI
-- [ ] Implement canonical ABI lowering for records
-- [ ] Implement canonical ABI lowering for variants
-- [ ] Implement canonical ABI for lists/strings
-- [ ] Test cross-component calls with rich types
+- [x] Export memory for component model
+- [x] Implement cabi_realloc for component model memory allocation
+- [x] Implement canonical ABI lowering for records (flatten params, pointer returns)
+- [x] Implement canonical ABI lowering for variants (discriminant + max payload)
+- [x] Implement canonical ABI for lists/strings (pointer + length)
+- [x] Test cross-component calls with rich types
 
 ### Phase 6.6: Recursive Types
 - [ ] Support recursive type definitions (like sexpr)

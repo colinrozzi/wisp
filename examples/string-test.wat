@@ -169,8 +169,30 @@
     local.get 1
     i32.load
   )
+  (func $cabi_realloc (param $old_ptr i32) (param $old_size i32) (param $align i32) (param $new_size i32) (result i32)
+    (local $ptr i32)
+    global.get $__heap_ptr
+    local.get $align
+    i32.add
+    i32.const 1
+    i32.sub
+    local.get $align
+    i32.const 1
+    i32.sub
+    i32.const -1
+    i32.xor
+    i32.and
+    local.set $ptr
+    local.get $ptr
+    local.get $new_size
+    i32.add
+    global.set $__heap_ptr
+    local.get $ptr
+  )
   (export "test-string-len" (func $test-string-len))
   (export "test-empty-string" (func $test-empty-string))
   (export "test-long-string" (func $test-long-string))
   (export "test-escape-string" (func $test-escape-string))
+  (export "memory" (memory 0))
+  (export "cabi_realloc" (func $cabi_realloc))
 )
