@@ -13,8 +13,11 @@ enum Type {
     S64,
     F32,
     F64,
-    Record(String),  // Named record type
-    Variant(String), // Named variant type
+    Record(String),               // Named record type
+    Variant(String),              // Named variant type
+    Option(Box<Type>),            // option<T> - some or none
+    Result(Box<Type>, Box<Type>), // result<T, E> - ok or err
+    List(Box<Type>),              // list<T> - dynamic list
 }
 
 /// Unique identifier for a lexical scope (used for hygiene)
@@ -413,6 +416,40 @@ enum Expr {
         expr: Box<Expr>,
         cases: Vec<MatchArm>,
     },
+    /// Option constructors
+    Some {
+        inner_type: Type,
+        value: Box<Expr>,
+    },
+    None {
+        inner_type: Type,
+    },
+    /// Result constructors
+    Ok {
+        ok_type: Type,
+        err_type: Type,
+        value: Box<Expr>,
+    },
+    Err {
+        ok_type: Type,
+        err_type: Type,
+        value: Box<Expr>,
+    },
+    /// List operations
+    ListNew {
+        elem_type: Type,
+    },
+    ListPush {
+        list: Box<Expr>,
+        value: Box<Expr>,
+    },
+    ListGet {
+        list: Box<Expr>,
+        index: Box<Expr>,
+    },
+    ListLen {
+        list: Box<Expr>,
+    },
 }
 
 /// A single arm in a match expression
@@ -563,7 +600,16 @@ fn type_size(ty: &Type) -> usize {
     match ty {
         Type::S32 | Type::F32 => 4,
         Type::S64 | Type::F64 => 8,
-        Type::Record(_) | Type::Variant(_) => 4, // Records and variants are pointer-sized
+        // Records, variants, options, results, and lists are pointer-sized
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => 4,
+    }
+}
+
+/// Check if a type requires heap allocation
+fn type_needs_heap(ty: &Type) -> bool {
+    match ty {
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 => false,
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => true,
     }
 }
 
@@ -1201,49 +1247,212 @@ fn check_expr(
         }
         Expr::Match { expr, cases } => {
             let expr_ty = check_expr(expr, env, signatures, globals, records, variants)?;
-            let variant_name = match &expr_ty {
-                Type::Variant(name) => name.clone(),
-                _ => bail!("match expression must be a variant, got {:?}", expr_ty),
-            };
-            let variant_def = variants
-                .get(&variant_name)
-                .ok_or_else(|| anyhow!("unknown variant type '{}'", variant_name))?;
 
-            // Check that all cases exist and have correct bindings
-            let mut result_ty: Option<Type> = None;
-            for arm in cases {
-                let (_, case) = variant_def.find_case(&arm.case_name)
-                    .ok_or_else(|| anyhow!("variant '{}' has no case '{}'", variant_name, arm.case_name))?;
-                if arm.bindings.len() != case.payload.len() {
-                    bail!(
-                        "match arm for '{}' expects {} bindings but {} were provided",
-                        arm.case_name,
-                        case.payload.len(),
-                        arm.bindings.len()
-                    );
-                }
-
-                // Extend environment with bound variables
-                let mut arm_env = env.clone();
-                for (binding_name, ty) in arm.bindings.iter().zip(case.payload.iter()) {
-                    arm_env.insert(binding_name.clone(), ty.clone());
-                }
-
-                let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
-                match &result_ty {
-                    None => result_ty = Some(arm_ty),
-                    Some(expected) => {
-                        if arm_ty != *expected {
+            // Handle Option and Result types specially
+            match &expr_ty {
+                Type::Option(inner_ty) => {
+                    // Option can match on 'some' and 'none'
+                    let mut result_ty: Option<Type> = None;
+                    for arm in cases {
+                        // Validate case names and bindings for option
+                        let expected_bindings = match arm.case_name.as_str() {
+                            "some" => 1,
+                            "none" => 0,
+                            other => bail!("option match: unknown case '{}', expected 'some' or 'none'", other),
+                        };
+                        if arm.bindings.len() != expected_bindings {
                             bail!(
-                                "match arms must return the same type, got {:?} and {:?}",
-                                expected,
-                                arm_ty
+                                "match arm for '{}' expects {} bindings but {} were provided",
+                                arm.case_name,
+                                expected_bindings,
+                                arm.bindings.len()
                             );
                         }
+
+                        // Extend environment with bound variables
+                        let mut arm_env = env.clone();
+                        if arm.case_name == "some" && !arm.bindings.is_empty() {
+                            arm_env.insert(arm.bindings[0].clone(), (**inner_ty).clone());
+                        }
+
+                        let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
+                        match &result_ty {
+                            None => result_ty = Some(arm_ty),
+                            Some(expected) => {
+                                if arm_ty != *expected {
+                                    bail!(
+                                        "match arms must return the same type, got {:?} and {:?}",
+                                        expected,
+                                        arm_ty
+                                    );
+                                }
+                            }
+                        }
                     }
+                    return result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"));
                 }
+                Type::Result(ok_ty, err_ty) => {
+                    // Result can match on 'ok' and 'err'
+                    let mut result_ty: Option<Type> = None;
+                    for arm in cases {
+                        // Validate case names and bindings for result
+                        let (expected_bindings, payload_ty) = match arm.case_name.as_str() {
+                            "ok" => (1, (**ok_ty).clone()),
+                            "err" => (1, (**err_ty).clone()),
+                            other => bail!("result match: unknown case '{}', expected 'ok' or 'err'", other),
+                        };
+                        if arm.bindings.len() != expected_bindings {
+                            bail!(
+                                "match arm for '{}' expects {} bindings but {} were provided",
+                                arm.case_name,
+                                expected_bindings,
+                                arm.bindings.len()
+                            );
+                        }
+
+                        // Extend environment with bound variables
+                        let mut arm_env = env.clone();
+                        if !arm.bindings.is_empty() {
+                            arm_env.insert(arm.bindings[0].clone(), payload_ty);
+                        }
+
+                        let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
+                        match &result_ty {
+                            None => result_ty = Some(arm_ty),
+                            Some(expected) => {
+                                if arm_ty != *expected {
+                                    bail!(
+                                        "match arms must return the same type, got {:?} and {:?}",
+                                        expected,
+                                        arm_ty
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"));
+                }
+                Type::Variant(variant_name) => {
+                    // User-defined variant
+                    let variant_def = variants
+                        .get(variant_name)
+                        .ok_or_else(|| anyhow!("unknown variant type '{}'", variant_name))?;
+
+                    // Check that all cases exist and have correct bindings
+                    let mut result_ty: Option<Type> = None;
+                    for arm in cases {
+                        let (_, case) = variant_def.find_case(&arm.case_name)
+                            .ok_or_else(|| anyhow!("variant '{}' has no case '{}'", variant_name, arm.case_name))?;
+                        if arm.bindings.len() != case.payload.len() {
+                            bail!(
+                                "match arm for '{}' expects {} bindings but {} were provided",
+                                arm.case_name,
+                                case.payload.len(),
+                                arm.bindings.len()
+                            );
+                        }
+
+                        // Extend environment with bound variables
+                        let mut arm_env = env.clone();
+                        for (binding_name, ty) in arm.bindings.iter().zip(case.payload.iter()) {
+                            arm_env.insert(binding_name.clone(), ty.clone());
+                        }
+
+                        let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
+                        match &result_ty {
+                            None => result_ty = Some(arm_ty),
+                            Some(expected) => {
+                                if arm_ty != *expected {
+                                    bail!(
+                                        "match arms must return the same type, got {:?} and {:?}",
+                                        expected,
+                                        arm_ty
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"));
+                }
+                _ => bail!("match expression must be a variant, option, or result type, got {:?}", expr_ty),
             }
-            result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
+        }
+        // Option constructors
+        Expr::Some { inner_type, value } => {
+            let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if value_ty != *inner_type {
+                bail!(
+                    "some value type mismatch: expected {:?}, got {:?}",
+                    inner_type,
+                    value_ty
+                );
+            }
+            Ok(Type::Option(Box::new(inner_type.clone())))
+        }
+        Expr::None { inner_type } => {
+            Ok(Type::Option(Box::new(inner_type.clone())))
+        }
+        // Result constructors
+        Expr::Ok { ok_type, err_type, value } => {
+            let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if value_ty != *ok_type {
+                bail!(
+                    "ok value type mismatch: expected {:?}, got {:?}",
+                    ok_type,
+                    value_ty
+                );
+            }
+            Ok(Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone())))
+        }
+        Expr::Err { ok_type, err_type, value } => {
+            let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if value_ty != *err_type {
+                bail!(
+                    "err value type mismatch: expected {:?}, got {:?}",
+                    err_type,
+                    value_ty
+                );
+            }
+            Ok(Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone())))
+        }
+        // List operations
+        Expr::ListNew { elem_type } => {
+            Ok(Type::List(Box::new(elem_type.clone())))
+        }
+        Expr::ListPush { list, value } => {
+            let list_ty = check_expr(list, env, signatures, globals, records, variants)?;
+            let elem_type = match &list_ty {
+                Type::List(inner) => inner.as_ref().clone(),
+                _ => bail!("list-push expects a list, got {:?}", list_ty),
+            };
+            let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if value_ty != elem_type {
+                bail!(
+                    "list-push value type mismatch: expected {:?}, got {:?}",
+                    elem_type,
+                    value_ty
+                );
+            }
+            Ok(list_ty)
+        }
+        Expr::ListGet { list, index } => {
+            let list_ty = check_expr(list, env, signatures, globals, records, variants)?;
+            let elem_type = match &list_ty {
+                Type::List(inner) => inner.as_ref().clone(),
+                _ => bail!("list-get expects a list, got {:?}", list_ty),
+            };
+            let index_ty = check_expr(index, env, signatures, globals, records, variants)?;
+            if index_ty != Type::S32 {
+                bail!("list-get index must be s32, got {:?}", index_ty);
+            }
+            Ok(elem_type)
+        }
+        Expr::ListLen { list } => {
+            let list_ty = check_expr(list, env, signatures, globals, records, variants)?;
+            match &list_ty {
+                Type::List(_) => Ok(Type::S32),
+                _ => bail!("list-len expects a list, got {:?}", list_ty),
+            }
         }
     }
 }
@@ -1253,6 +1462,9 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
         Type::Record(name) => bail!("{}: expected numeric type, got record '{}'", msg, name),
         Type::Variant(name) => bail!("{}: expected numeric type, got variant '{}'", msg, name),
+        Type::Option(_) => bail!("{}: expected numeric type, got option", msg),
+        Type::Result(_, _) => bail!("{}: expected numeric type, got result", msg),
+        Type::List(_) => bail!("{}: expected numeric type, got list", msg),
     }
 }
 
@@ -3353,7 +3565,49 @@ fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, ctx: &Compi
 fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Type> {
     match expr {
         SExpr::Sym(s, span) => parse_type_symbol(s, variant_names, span, ctx),
-        other => Err(ctx.error("type must be a symbol", other.span())),
+        SExpr::List(items, span) => {
+            if items.is_empty() {
+                return Err(ctx.error("empty type expression", span));
+            }
+            match &items[0] {
+                SExpr::Sym(s, _) if s == "option" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid option type",
+                            span,
+                            "expected: (option T)"
+                        ));
+                    }
+                    let inner = parse_type_expr(&items[1], variant_names, ctx)?;
+                    Ok(Type::Option(Box::new(inner)))
+                }
+                SExpr::Sym(s, _) if s == "result" => {
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid result type",
+                            span,
+                            "expected: (result T E)"
+                        ));
+                    }
+                    let ok_ty = parse_type_expr(&items[1], variant_names, ctx)?;
+                    let err_ty = parse_type_expr(&items[2], variant_names, ctx)?;
+                    Ok(Type::Result(Box::new(ok_ty), Box::new(err_ty)))
+                }
+                SExpr::Sym(s, _) if s == "list" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid list type",
+                            span,
+                            "expected: (list T)"
+                        ));
+                    }
+                    let inner = parse_type_expr(&items[1], variant_names, ctx)?;
+                    Ok(Type::List(Box::new(inner)))
+                }
+                _ => Err(ctx.error("unknown parameterized type", span)),
+            }
+        }
+        other => Err(ctx.error("type must be a symbol or parameterized type", other.span())),
     }
 }
 
@@ -3609,6 +3863,123 @@ fn parse_expr(
                         cases: arms,
                     })
                 }
+                // Option constructors: (some T value) and (none T)
+                SExpr::Sym(sym, _sym_span) if sym == "some" => {
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'some' expression",
+                            list_span,
+                            "expected: (some inner-type value)"
+                        ));
+                    }
+                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::Some {
+                        inner_type,
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "none" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'none' expression",
+                            list_span,
+                            "expected: (none inner-type)"
+                        ));
+                    }
+                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    Ok(Expr::None { inner_type })
+                }
+                // Result constructors: (ok T E value) and (err T E value)
+                SExpr::Sym(sym, _sym_span) if sym == "ok" => {
+                    if items.len() != 4 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'ok' expression",
+                            list_span,
+                            "expected: (ok ok-type err-type value)"
+                        ));
+                    }
+                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    let err_type = parse_type_expr(&items[2], &HashSet::new(), ctx)?;
+                    let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::Ok {
+                        ok_type,
+                        err_type,
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "err" => {
+                    if items.len() != 4 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'err' expression",
+                            list_span,
+                            "expected: (err ok-type err-type value)"
+                        ));
+                    }
+                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    let err_type = parse_type_expr(&items[2], &HashSet::new(), ctx)?;
+                    let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::Err {
+                        ok_type,
+                        err_type,
+                        value: Box::new(value),
+                    })
+                }
+                // List operations
+                SExpr::Sym(sym, _sym_span) if sym == "list-new" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'list-new' expression",
+                            list_span,
+                            "expected: (list-new elem-type)"
+                        ));
+                    }
+                    let elem_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    Ok(Expr::ListNew { elem_type })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "list-push" => {
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'list-push' expression",
+                            list_span,
+                            "expected: (list-push list value)"
+                        ));
+                    }
+                    let list = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::ListPush {
+                        list: Box::new(list),
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "list-get" => {
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'list-get' expression",
+                            list_span,
+                            "expected: (list-get list index)"
+                        ));
+                    }
+                    let list = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let index = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::ListGet {
+                        list: Box::new(list),
+                        index: Box::new(index),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "list-len" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'list-len' expression",
+                            list_span,
+                            "expected: (list-len list)"
+                        ));
+                    }
+                    let list = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::ListLen {
+                        list: Box::new(list),
+                    })
+                }
                 _ => {
                     if let SExpr::Sym(sym, sym_span) = op {
                         // Check if this is a WASM instruction
@@ -3766,8 +4137,13 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         .map(|v| (v.name.clone(), v.clone()))
         .collect();
 
-    // Add heap pointer global for bump allocation (if we have records or variants)
-    let needs_heap = !prog.records.is_empty() || !prog.variants.is_empty();
+    // Add heap pointer global for bump allocation (if we have records, variants, or parameterized types)
+    let needs_heap = !prog.records.is_empty()
+        || !prog.variants.is_empty()
+        || prog.functions.iter().any(|f| {
+            type_needs_heap(&f.return_type)
+                || f.params.iter().any(|p| type_needs_heap(&p.ty))
+        });
     if needs_heap {
         // Start heap at byte 0 (first page of memory)
         out.push_str("  (global $__heap_ptr (mut i32) (i32.const 0))\n");
@@ -4013,7 +4389,8 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
-                    Type::Record(_) | Type::Variant(_) => "i32.store", // Records/variants are pointers
+                    // All compound types are pointers
+                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
             }
@@ -4050,7 +4427,8 @@ fn gen_expr(
                 Type::S64 => "i64.load",
                 Type::F32 => "f32.load",
                 Type::F64 => "f64.load",
-                Type::Record(_) | Type::Variant(_) => "i32.load", // Records/variants are pointers
+                // All compound types are pointers
+                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
             field_def.ty.clone()
@@ -4098,7 +4476,7 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
-                    Type::Record(_) | Type::Variant(_) => "i32.store",
+                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
                 payload_offset += type_size(payload_ty);
@@ -4109,133 +4487,582 @@ fn gen_expr(
             Type::Variant(variant_name.clone())
         }
         Expr::Match { expr, cases } => {
-            // Evaluate the variant expression to get the pointer
+            // Evaluate the expression to get the pointer
             let expr_ty = gen_expr(expr, out, indent, env, signatures, globals, records, variants);
-            let variant_name = match &expr_ty {
-                Type::Variant(name) => name.clone(),
-                _ => panic!("match expression must be a variant"),
+
+            // Save the pointer to a local
+            let value_ptr = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.set {}\n", pad, value_ptr));
+
+            // Handle Option, Result, and Variant types
+            match &expr_ty {
+                Type::Option(inner_ty) => {
+                    // Option: discriminant 0 = none, 1 = some
+                    // Load discriminant
+                    out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                    out.push_str(&format!("{}i32.load\n", pad));
+
+                    // Determine result type (simplified)
+                    let result_ty = Type::S32; // Will be overridden by actual arm body type
+
+                    let num_cases = cases.len();
+                    for (i, arm) in cases.iter().enumerate() {
+                        let case_idx = match arm.case_name.as_str() {
+                            "none" => 0,
+                            "some" => 1,
+                            _ => panic!("invalid option case"),
+                        };
+
+                        // Compare discriminant with case index
+                        if i > 0 {
+                            out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                            out.push_str(&format!("{}i32.load\n", pad));
+                        }
+                        out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
+                        out.push_str(&format!("{}i32.eq\n", pad));
+
+                        let is_last = i == num_cases - 1;
+                        if !is_last || (is_last && num_cases > 1) {
+                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!("{}  (then\n", pad));
+                        }
+
+                        // Load payload for 'some' case
+                        let saved_binding_count = env.bindings.len();
+                        if arm.case_name == "some" && !arm.bindings.is_empty() {
+                            out.push_str(&format!("{}    local.get {}\n", pad, value_ptr));
+                            out.push_str(&format!("{}    i32.const 4\n", pad));
+                            out.push_str(&format!("{}    i32.add\n", pad));
+
+                            let load_instr = match **inner_ty {
+                                Type::S32 => "i32.load",
+                                Type::S64 => "i64.load",
+                                Type::F32 => "f32.load",
+                                Type::F64 => "f64.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
+                            };
+                            out.push_str(&format!("{}    {}\n", pad, load_instr));
+
+                            let idx = env.declare_local((**inner_ty).clone());
+                            out.push_str(&format!("{}    local.set {}\n", pad, idx));
+                            env.push_binding(arm.bindings[0].clone(), idx);
+                        }
+
+                        // Generate arm body
+                        gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
+
+                        // Pop bindings
+                        while env.bindings.len() > saved_binding_count {
+                            env.pop_binding();
+                        }
+
+                        if !is_last {
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{}  (else\n", pad));
+                        } else if num_cases > 1 {
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{}  (else\n", pad));
+                            out.push_str(&format!("{}    unreachable\n", pad));
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{})\n", pad));
+                        }
+                    }
+
+                    // Close all if-else blocks
+                    for _ in 0..num_cases.saturating_sub(1) {
+                        out.push_str(&format!("{}  )\n", pad));
+                        out.push_str(&format!("{})\n", pad));
+                    }
+
+                    result_ty
+                }
+                Type::Result(ok_ty, err_ty) => {
+                    // Result: discriminant 0 = ok, 1 = err
+                    // Load discriminant
+                    out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                    out.push_str(&format!("{}i32.load\n", pad));
+
+                    // Determine result type (simplified)
+                    let result_ty = Type::S32;
+
+                    let num_cases = cases.len();
+                    for (i, arm) in cases.iter().enumerate() {
+                        let (case_idx, payload_ty) = match arm.case_name.as_str() {
+                            "ok" => (0, (**ok_ty).clone()),
+                            "err" => (1, (**err_ty).clone()),
+                            _ => panic!("invalid result case"),
+                        };
+
+                        // Compare discriminant with case index
+                        if i > 0 {
+                            out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                            out.push_str(&format!("{}i32.load\n", pad));
+                        }
+                        out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
+                        out.push_str(&format!("{}i32.eq\n", pad));
+
+                        let is_last = i == num_cases - 1;
+                        if !is_last || (is_last && num_cases > 1) {
+                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!("{}  (then\n", pad));
+                        }
+
+                        // Load payload
+                        let saved_binding_count = env.bindings.len();
+                        if !arm.bindings.is_empty() {
+                            out.push_str(&format!("{}    local.get {}\n", pad, value_ptr));
+                            out.push_str(&format!("{}    i32.const 4\n", pad));
+                            out.push_str(&format!("{}    i32.add\n", pad));
+
+                            let load_instr = match payload_ty {
+                                Type::S32 => "i32.load",
+                                Type::S64 => "i64.load",
+                                Type::F32 => "f32.load",
+                                Type::F64 => "f64.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
+                            };
+                            out.push_str(&format!("{}    {}\n", pad, load_instr));
+
+                            let idx = env.declare_local(payload_ty.clone());
+                            out.push_str(&format!("{}    local.set {}\n", pad, idx));
+                            env.push_binding(arm.bindings[0].clone(), idx);
+                        }
+
+                        // Generate arm body
+                        gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
+
+                        // Pop bindings
+                        while env.bindings.len() > saved_binding_count {
+                            env.pop_binding();
+                        }
+
+                        if !is_last {
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{}  (else\n", pad));
+                        } else if num_cases > 1 {
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{}  (else\n", pad));
+                            out.push_str(&format!("{}    unreachable\n", pad));
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{})\n", pad));
+                        }
+                    }
+
+                    // Close all if-else blocks
+                    for _ in 0..num_cases.saturating_sub(1) {
+                        out.push_str(&format!("{}  )\n", pad));
+                        out.push_str(&format!("{})\n", pad));
+                    }
+
+                    result_ty
+                }
+                Type::Variant(variant_name) => {
+                    let variant_def = variants
+                        .get(variant_name)
+                        .expect("variant should exist");
+
+                    // Load discriminant
+                    out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                    out.push_str(&format!("{}i32.load\n", pad));
+
+                    // Determine result type from first arm
+                    let result_ty = if let Some(first_arm) = cases.first() {
+                        // Build environment for first arm to get its type
+                        let (_, first_case) = variant_def.find_case(&first_arm.case_name).expect("case should exist");
+                        let mut arm_env = HashMap::new();
+                        for (binding, ty) in first_arm.bindings.iter().zip(first_case.payload.iter()) {
+                            arm_env.insert(binding.clone(), ty.clone());
+                        }
+                        // Get type from body - simplified, assumes type checking passed
+                        match &first_arm.body {
+                            Expr::Int { ty, .. } => ty.clone(),
+                            Expr::Float { ty, .. } => ty.clone(),
+                            Expr::Var(name) => arm_env.get(name).cloned().unwrap_or(Type::S32),
+                            _ => Type::S32, // Default fallback
+                        }
+                    } else {
+                        Type::S32
+                    };
+
+                    // For simplicity, use nested if-else for now
+                    let num_cases = cases.len();
+                    for (i, arm) in cases.iter().enumerate() {
+                        let (case_idx, case) = variant_def.find_case(&arm.case_name)
+                            .expect("case should exist");
+
+                        // Compare discriminant with case index
+                        if i > 0 {
+                            out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                            out.push_str(&format!("{}i32.load\n", pad));
+                        }
+                        out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
+                        out.push_str(&format!("{}i32.eq\n", pad));
+
+                        let is_last = i == num_cases - 1;
+                        if is_last && num_cases > 1 {
+                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!("{}  (then\n", pad));
+                        } else if !is_last {
+                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!("{}  (then\n", pad));
+                        }
+
+                        // Load payload values into locals and bind them
+                        let saved_binding_count = env.bindings.len();
+                        let mut payload_offset = 4;
+                        for (binding, payload_ty) in arm.bindings.iter().zip(case.payload.iter()) {
+                            // Load payload value
+                            out.push_str(&format!("{}    local.get {}\n", pad, value_ptr));
+                            out.push_str(&format!("{}    i32.const {}\n", pad, payload_offset));
+                            out.push_str(&format!("{}    i32.add\n", pad));
+
+                            let load_instr = match payload_ty {
+                                Type::S32 => "i32.load",
+                                Type::S64 => "i64.load",
+                                Type::F32 => "f32.load",
+                                Type::F64 => "f64.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
+                            };
+                            out.push_str(&format!("{}    {}\n", pad, load_instr));
+
+                            // Save to local
+                            let idx = env.declare_local(payload_ty.clone());
+                            out.push_str(&format!("{}    local.set {}\n", pad, idx));
+                            env.push_binding(binding.clone(), idx);
+
+                            payload_offset += type_size(payload_ty);
+                        }
+
+                        // Generate arm body
+                        gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
+
+                        // Pop bindings
+                        while env.bindings.len() > saved_binding_count {
+                            env.pop_binding();
+                        }
+
+                        if !is_last {
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{}  (else\n", pad));
+                        } else if num_cases > 1 {
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{}  (else\n", pad));
+                            out.push_str(&format!("{}    unreachable\n", pad));
+                            out.push_str(&format!("{}  )\n", pad));
+                            out.push_str(&format!("{})\n", pad));
+                        }
+                    }
+
+                    // Close all the if-else blocks
+                    for _ in 0..num_cases.saturating_sub(1) {
+                        out.push_str(&format!("{}  )\n", pad));
+                        out.push_str(&format!("{})\n", pad));
+                    }
+
+                    result_ty
+                }
+                _ => panic!("match expression must be variant, option, or result"),
+            }
+        }
+        // Option: some - allocate, store discriminant 1, store value
+        Expr::Some { inner_type, value } => {
+            let size = 4 + type_size(inner_type); // discriminant + payload
+            let ptr_local = env.declare_local(Type::S32);
+
+            // ptr = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            // heap_ptr += size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store discriminant = 1 (some)
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 1\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Store value at offset 4
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            let store_instr = match inner_type {
+                Type::S32 => "i32.store",
+                Type::S64 => "i64.store",
+                Type::F32 => "f32.store",
+                Type::F64 => "f64.store",
+                _ => "i32.store",
             };
-            let variant_def = variants
-                .get(&variant_name)
-                .expect("variant should exist");
+            out.push_str(&format!("{}{}\n", pad, store_instr));
 
-            // Save the variant pointer to a local
-            let variant_ptr = env.declare_local(Type::S32);
-            out.push_str(&format!("{}local.set {}\n", pad, variant_ptr));
+            // Return pointer
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Option(Box::new(inner_type.clone()))
+        }
+        // Option: none - allocate, store discriminant 0
+        Expr::None { inner_type } => {
+            let size = 4 + type_size(inner_type); // discriminant + payload space
+            let ptr_local = env.declare_local(Type::S32);
 
-            // Load discriminant
-            out.push_str(&format!("{}local.get {}\n", pad, variant_ptr));
+            // ptr = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            // heap_ptr += size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store discriminant = 0 (none)
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 0\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Return pointer
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Option(Box::new(inner_type.clone()))
+        }
+        // Result: ok - allocate, store discriminant 0, store value
+        Expr::Ok { ok_type, err_type, value } => {
+            let max_payload = std::cmp::max(type_size(ok_type), type_size(err_type));
+            let size = 4 + max_payload; // discriminant + max payload
+            let ptr_local = env.declare_local(Type::S32);
+
+            // ptr = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            // heap_ptr += size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store discriminant = 0 (ok)
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 0\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Store ok value at offset 4
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            let store_instr = match ok_type {
+                Type::S32 => "i32.store",
+                Type::S64 => "i64.store",
+                Type::F32 => "f32.store",
+                Type::F64 => "f64.store",
+                _ => "i32.store",
+            };
+            out.push_str(&format!("{}{}\n", pad, store_instr));
+
+            // Return pointer
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
+        }
+        // Result: err - allocate, store discriminant 1, store value
+        Expr::Err { ok_type, err_type, value } => {
+            let max_payload = std::cmp::max(type_size(ok_type), type_size(err_type));
+            let size = 4 + max_payload; // discriminant + max payload
+            let ptr_local = env.declare_local(Type::S32);
+
+            // ptr = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            // heap_ptr += size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store discriminant = 1 (err)
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 1\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Store err value at offset 4
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            let store_instr = match err_type {
+                Type::S32 => "i32.store",
+                Type::S64 => "i64.store",
+                Type::F32 => "f32.store",
+                Type::F64 => "f64.store",
+                _ => "i32.store",
+            };
+            out.push_str(&format!("{}{}\n", pad, store_instr));
+
+            // Return pointer
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
+        }
+        // List: new - allocate header (len=0, cap=0, data=null)
+        Expr::ListNew { elem_type } => {
+            let header_size = 12; // 4 bytes len + 4 bytes cap + 4 bytes data ptr
+            let ptr_local = env.declare_local(Type::S32);
+
+            // ptr = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            // heap_ptr += header_size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, header_size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store len = 0
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 0\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Store cap = 0
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.const 0\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Store data = 0 (null)
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const 8\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.const 0\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Return pointer
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::List(Box::new(elem_type.clone()))
+        }
+        // List: push - simplified version that reallocates every time
+        Expr::ListPush { list, value } => {
+            let list_ty = gen_expr(list, out, indent, env, signatures, globals, records, variants);
+            let elem_type = match &list_ty {
+                Type::List(inner) => inner.as_ref().clone(),
+                _ => panic!("list-push expects a list"),
+            };
+            let elem_size = type_size(&elem_type);
+            let list_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.set {}\n", pad, list_local));
+
+            // Get current len
+            let len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, len_local));
+
+            // Allocate new data array (simple approach: always reallocate)
+            let new_data_local = env.declare_local(Type::S32);
+            let new_size = env.declare_local(Type::S32);
+
+            // new_size = (len + 1) * elem_size
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}i32.const 1\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
+            out.push_str(&format!("{}i32.mul\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_size));
+
+            // new_data = heap_ptr
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_data_local));
+
+            // heap_ptr += new_size
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, new_size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Copy old data if len > 0 (simplified: use memory.copy if available, else skip for now)
+            // For simplicity, we'll just update the list - old data is orphaned (no GC)
+
+            // Store new value at new_data + len * elem_size
+            out.push_str(&format!("{}local.get {}\n", pad, new_data_local));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
+            out.push_str(&format!("{}i32.mul\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            let store_instr = match &elem_type {
+                Type::S32 => "i32.store",
+                Type::S64 => "i64.store",
+                Type::F32 => "f32.store",
+                Type::F64 => "f64.store",
+                _ => "i32.store",
+            };
+            out.push_str(&format!("{}{}\n", pad, store_instr));
+
+            // Update list header: len = len + 1
+            out.push_str(&format!("{}local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}i32.const 1\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Update list header: data = new_data
+            out.push_str(&format!("{}local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}i32.const 8\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, new_data_local));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Return the list pointer
+            out.push_str(&format!("{}local.get {}\n", pad, list_local));
+            list_ty
+        }
+        // List: get - load element at index
+        Expr::ListGet { list, index } => {
+            let list_ty = gen_expr(list, out, indent, env, signatures, globals, records, variants);
+            let elem_type = match &list_ty {
+                Type::List(inner) => inner.as_ref().clone(),
+                _ => panic!("list-get expects a list"),
+            };
+            let elem_size = type_size(&elem_type);
+            let list_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.set {}\n", pad, list_local));
+
+            // Evaluate index
+            gen_expr(index, out, indent, env, signatures, globals, records, variants);
+            let index_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.set {}\n", pad, index_local));
+
+            // Load data pointer
+            out.push_str(&format!("{}local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}i32.const 8\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
             out.push_str(&format!("{}i32.load\n", pad));
 
-            // Determine result type from first arm
-            let result_ty = if let Some(first_arm) = cases.first() {
-                // Build environment for first arm to get its type
-                let (_, first_case) = variant_def.find_case(&first_arm.case_name).expect("case should exist");
-                let mut arm_env = HashMap::new();
-                for (binding, ty) in first_arm.bindings.iter().zip(first_case.payload.iter()) {
-                    arm_env.insert(binding.clone(), ty.clone());
-                }
-                // Get type from body - simplified, assumes type checking passed
-                match &first_arm.body {
-                    Expr::Int { ty, .. } => ty.clone(),
-                    Expr::Float { ty, .. } => ty.clone(),
-                    Expr::Var(name) => arm_env.get(name).cloned().unwrap_or(Type::S32),
-                    _ => Type::S32, // Default fallback
-                }
-            } else {
-                Type::S32
+            // Add index * elem_size
+            out.push_str(&format!("{}local.get {}\n", pad, index_local));
+            out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
+            out.push_str(&format!("{}i32.mul\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+
+            // Load element
+            let load_instr = match &elem_type {
+                Type::S32 => "i32.load",
+                Type::S64 => "i64.load",
+                Type::F32 => "f32.load",
+                Type::F64 => "f64.load",
+                _ => "i32.load",
             };
-
-            // Generate br_table-based dispatch
-            // (block $done (result T)
-            //   (block $case_n
-            //     (block $case_n-1
-            //       ...
-            //       (br_table $case_0 $case_1 ... $case_n)
-            //     )
-            //     ;; case_n-1 body
-            //   )
-            //   ;; case_n body
-            // )
-
-            // For simplicity, use nested if-else for now
-            // (if (i32.eq discriminant 0) (then case0) (else (if ...)))
-            let num_cases = cases.len();
-            for (i, arm) in cases.iter().enumerate() {
-                let (case_idx, case) = variant_def.find_case(&arm.case_name)
-                    .expect("case should exist");
-
-                // Compare discriminant with case index
-                if i > 0 {
-                    out.push_str(&format!("{}local.get {}\n", pad, variant_ptr));
-                    out.push_str(&format!("{}i32.load\n", pad));
-                }
-                out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
-                out.push_str(&format!("{}i32.eq\n", pad));
-
-                let is_last = i == num_cases - 1;
-                if is_last && num_cases > 1 {
-                    // Last case in else branch - just emit body
-                    out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
-                    out.push_str(&format!("{}  (then\n", pad));
-                } else if !is_last {
-                    out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
-                    out.push_str(&format!("{}  (then\n", pad));
-                }
-
-                // Load payload values into locals and bind them
-                let saved_binding_count = env.bindings.len();
-                let mut payload_offset = 4;
-                for (binding, payload_ty) in arm.bindings.iter().zip(case.payload.iter()) {
-                    // Load payload value
-                    out.push_str(&format!("{}    local.get {}\n", pad, variant_ptr));
-                    out.push_str(&format!("{}    i32.const {}\n", pad, payload_offset));
-                    out.push_str(&format!("{}    i32.add\n", pad));
-
-                    let load_instr = match payload_ty {
-                        Type::S32 => "i32.load",
-                        Type::S64 => "i64.load",
-                        Type::F32 => "f32.load",
-                        Type::F64 => "f64.load",
-                        Type::Record(_) | Type::Variant(_) => "i32.load",
-                    };
-                    out.push_str(&format!("{}    {}\n", pad, load_instr));
-
-                    // Save to local
-                    let idx = env.declare_local(payload_ty.clone());
-                    out.push_str(&format!("{}    local.set {}\n", pad, idx));
-                    env.push_binding(binding.clone(), idx);
-
-                    payload_offset += type_size(payload_ty);
-                }
-
-                // Generate arm body
-                gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
-
-                // Pop bindings
-                while env.bindings.len() > saved_binding_count {
-                    env.pop_binding();
-                }
-
-                if !is_last {
-                    out.push_str(&format!("{}  )\n", pad));
-                    out.push_str(&format!("{}  (else\n", pad));
-                } else if num_cases > 1 {
-                    out.push_str(&format!("{}  )\n", pad));
-                    out.push_str(&format!("{}  (else\n", pad));
-                    out.push_str(&format!("{}    unreachable\n", pad)); // Should never reach here
-                    out.push_str(&format!("{}  )\n", pad));
-                    out.push_str(&format!("{})\n", pad));
-                }
-            }
-
-            // Close all the if-else blocks
-            for _ in 0..num_cases.saturating_sub(1) {
-                out.push_str(&format!("{}  )\n", pad));
-                out.push_str(&format!("{})\n", pad));
-            }
-
-            result_ty
+            out.push_str(&format!("{}{}\n", pad, load_instr));
+            elem_type
+        }
+        // List: len - return length
+        Expr::ListLen { list } => {
+            gen_expr(list, out, indent, env, signatures, globals, records, variants);
+            // Load len field at offset 0
+            out.push_str(&format!("{}i32.load\n", pad));
+            Type::S32
         }
     }
 }
@@ -4340,7 +5167,8 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::S64 => "i64",
         Type::F32 => "f32",
         Type::F64 => "f64",
-        Type::Record(_) | Type::Variant(_) => "i32", // Records and variants are pointer-sized
+        // All compound types are pointer-sized
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32",
     }
 }
 
@@ -4351,6 +5179,9 @@ fn wit_type(ty: &Type) -> String {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
+        Type::Option(inner) => format!("option<{}>", wit_type(inner)),
+        Type::Result(ok, err) => format!("result<{}, {}>", wit_type(ok), wit_type(err)),
+        Type::List(inner) => format!("list<{}>", wit_type(inner)),
     }
 }
 

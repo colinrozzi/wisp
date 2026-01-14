@@ -1,6 +1,6 @@
 # Phase 6: WIT Types
 
-**Status**: In Progress (Phase 6.1 Records complete, Phase 6.2 Variants complete)
+**Status**: In Progress (Phase 6.1-6.3 complete)
 **Started**: 2025-01-12
 **Prerequisites**: Phase 5 (syntax-case) complete
 
@@ -259,12 +259,12 @@ For macro components (future Phase 7), `sexpr` becomes a real WIT variant that c
 - [x] Test with shape example
 
 ### Phase 6.3: Built-in Parameterized Types
-- [ ] Add `list<T>` type support
-- [ ] Add `option<T>` type support
-- [ ] Add `result<T, E>` type support
-- [ ] Implement constructors (some, none, ok, err)
-- [ ] Implement list operations (list-new, list-push, etc.)
-- [ ] Pattern matching for options/results
+- [x] Add `list<T>` type support
+- [x] Add `option<T>` type support
+- [x] Add `result<T, E>` type support
+- [x] Implement constructors (some, none, ok, err)
+- [x] Implement list operations (list-new, list-push, list-get, list-len)
+- [x] Pattern matching for options/results
 
 ### Phase 6.4: Strings
 - [ ] Add `string` as built-in type

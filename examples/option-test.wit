@@ -1,0 +1,14 @@
+package example:wisp;
+
+world wisp {
+  export test-some: func() -> s32;
+  export test-none: func() -> s32;
+  export test-ok: func() -> s32;
+  export test-err: func() -> s32;
+  export test-list-len: func() -> s32;
+  export test-list-get: func() -> s32;
+  export test-unwrap-some: func() -> s32;
+  export test-unwrap-none: func() -> s32;
+  export test-result-ok: func() -> s32;
+  export test-result-err: func() -> s32;
+}
