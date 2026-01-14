@@ -1,6 +1,6 @@
 # Phase 6: WIT Types
 
-**Status**: In Progress (Phase 6.1-6.5 complete)
+**Status**: Complete (Phase 6.1-6.6)
 **Started**: 2025-01-12
 **Prerequisites**: Phase 5 (syntax-case) complete
 
@@ -280,10 +280,14 @@ For macro components (future Phase 7), `sexpr` becomes a real WIT variant that c
 - [x] Implement canonical ABI for lists/strings (pointer + length)
 - [x] Test cross-component calls with rich types
 
-### Phase 6.6: Recursive Types
-- [ ] Support recursive type definitions (like sexpr)
-- [ ] Handle recursive memory layout
-- [ ] Test with actual sexpr variant
+### Phase 6.6: Resource Types
+- [x] Add `resource` type declaration syntax
+- [x] Add `borrow<T>` type support for borrowed handles
+- [x] Generate WIT resource declarations
+- [x] Test with simple resource example
+
+Note: WIT MVP doesn't support recursive type definitions. For complex data structures
+like `sexpr`, use resources with handle-based APIs instead. See examples/resource-test.lisp.
 
 ## Examples
 

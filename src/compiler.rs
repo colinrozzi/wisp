@@ -19,6 +19,8 @@ enum Type {
     Result(Box<Type>, Box<Type>), // result<T, E> - ok or err
     List(Box<Type>),              // list<T> - dynamic list
     Str,                          // UTF-8 string
+    Resource(String),             // resource handle (opaque i32)
+    Borrow(Box<Type>),            // borrow<T> - borrowed reference
 }
 
 /// Unique identifier for a lexical scope (used for hygiene)
@@ -604,6 +606,12 @@ fn find_variant_by_case<'a>(case_name: &str, variants: &'a HashMap<String, Varia
     variants.values().find(|v| v.find_case(case_name).is_some())
 }
 
+/// A resource type definition (opaque handle managed externally)
+#[derive(Debug, Clone)]
+struct ResourceDef {
+    name: String,
+}
+
 /// Get the size of a type in bytes (for memory layout)
 fn type_size(ty: &Type) -> usize {
     match ty {
@@ -611,6 +619,8 @@ fn type_size(ty: &Type) -> usize {
         Type::S64 | Type::F64 => 8,
         // Records, variants, options, results, lists, and strings are pointer-sized
         Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => 4,
+        // Resources and borrows are i32 handles
+        Type::Resource(_) | Type::Borrow(_) => 4,
     }
 }
 
@@ -619,6 +629,8 @@ fn type_needs_heap(ty: &Type) -> bool {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => false,
         Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => true,
+        // Resources don't need heap - they're opaque handles managed externally
+        Type::Resource(_) | Type::Borrow(_) => false,
     }
 }
 
@@ -789,6 +801,7 @@ struct Program {
     globals: Vec<Global>,
     records: Vec<RecordDef>,
     variants: Vec<VariantDef>,
+    resources: Vec<ResourceDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -1511,6 +1524,8 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
         Type::Result(_, _) => bail!("{}: expected numeric type, got result", msg),
         Type::List(_) => bail!("{}: expected numeric type, got list", msg),
         Type::Str => bail!("{}: expected numeric type, got string", msg),
+        Type::Resource(name) => bail!("{}: expected numeric type, got resource '{}'", msg, name),
+        Type::Borrow(_) => bail!("{}: expected numeric type, got borrow", msg),
     }
 }
 
@@ -3218,8 +3233,10 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut record_names: HashSet<String> = HashSet::new();
     let mut variants = Vec::new();
     let mut variant_names: HashSet<String> = HashSet::new();
+    let mut resources = Vec::new();
+    let mut resource_names: HashSet<String> = HashSet::new();
 
-    // First pass: collect type names (records and variants) so we can distinguish them
+    // First pass: collect type names (records, variants, resources) so we can distinguish them
     for form in &forms {
         if let SExpr::List(items, span) = form {
             if items.is_empty() {
@@ -3244,6 +3261,15 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         }
                     }
                 }
+                SExpr::Sym(sym, _) if sym == "resource" => {
+                    if items.len() >= 2 {
+                        if let SExpr::Sym(name, _) = &items[1] {
+                            if !resource_names.insert(name.clone()) {
+                                return Err(ctx.error(format!("duplicate resource type '{}'", name), span));
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -3258,7 +3284,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                 }
                 match &items[0] {
                     SExpr::Sym(sym, _) if sym == "fn" => {
-                        let func = parse_fn_form(SExpr::List(items, span.clone()), &variant_names, ctx)?;
+                        let func = parse_fn_form(SExpr::List(items, span.clone()), &variant_names, &resource_names, ctx)?;
                         if !defined.insert(func.name.clone()) {
                             return Err(ctx.error(format!("duplicate function '{}'", func.name), &span));
                         }
@@ -3275,7 +3301,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                                 }
                             }
                             SExpr::List(_, inner_span) => {
-                                let func = parse_fn_form(items[1].clone(), &variant_names, ctx)?;
+                                let func = parse_fn_form(items[1].clone(), &variant_names, &resource_names, ctx)?;
                                 if !defined.insert(func.name.clone()) {
                                     return Err(ctx.error(format!("duplicate function '{}'", func.name), inner_span));
                                 }
@@ -3288,7 +3314,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         }
                     }
                     SExpr::Sym(sym, _) if sym == "import" => {
-                        let import = parse_import_form(&items, &variant_names, ctx)?;
+                        let import = parse_import_form(&items, &variant_names, &resource_names, ctx)?;
                         if defined.contains(&import.name) {
                             return Err(ctx.error(
                                 format!("function '{}' is already defined and cannot be imported", import.name),
@@ -3301,27 +3327,32 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         imports.push(import);
                     }
                     SExpr::Sym(sym, _) if sym == "global" => {
-                        let global = parse_global_form(&items, &variant_names, ctx)?;
+                        let global = parse_global_form(&items, &variant_names, &resource_names, ctx)?;
                         if !global_names.insert(global.name.clone()) {
                             return Err(ctx.error(format!("duplicate global '{}'", global.name), &span));
                         }
                         globals.push(global);
                     }
                     SExpr::Sym(sym, _) if sym == "record" => {
-                        let record = parse_record_form(&items, &variant_names, ctx)?;
+                        let record = parse_record_form(&items, &variant_names, &resource_names, ctx)?;
                         // Already checked for duplicates in first pass
                         records.push(record);
                     }
                     SExpr::Sym(sym, _) if sym == "variant" => {
-                        let variant = parse_variant_form(&items, &variant_names, ctx)?;
+                        let variant = parse_variant_form(&items, &variant_names, &resource_names, ctx)?;
                         // Already checked for duplicates in first pass
                         variants.push(variant);
+                    }
+                    SExpr::Sym(sym, _) if sym == "resource" => {
+                        let resource = parse_resource_form(&items, ctx)?;
+                        // Already checked for duplicates in first pass
+                        resources.push(resource);
                     }
                     other => {
                         return Err(ctx.error_with_note(
                             "unknown top-level form",
                             other.span(),
-                            "expected 'fn', 'export', 'import', 'global', 'record', or 'variant'"
+                            "expected 'fn', 'export', 'import', 'global', 'record', 'variant', or 'resource'"
                         ));
                     }
                 }
@@ -3398,10 +3429,11 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
         globals,
         records,
         variants,
+        resources,
     })
 }
 
-fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<PendingFunction> {
+fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<PendingFunction> {
     let (items, span) = match form {
         SExpr::List(items, span) => (items, span),
         other => return Err(ctx.error("function definition must be a list", other.span())),
@@ -3421,8 +3453,8 @@ fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, ctx: &CompileCont
         SExpr::Sym(name, _) => name.clone(),
         other => return Err(ctx.error("function name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[2], variant_names, ctx)?;
-    let return_type = parse_type_expr(&items[3], variant_names, ctx)?;
+    let params = parse_typed_params(&items[2], variant_names, resource_names, ctx)?;
+    let return_type = parse_type_expr(&items[3], variant_names, resource_names, ctx)?;
     Ok(PendingFunction {
         name,
         params,
@@ -3432,7 +3464,7 @@ fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, ctx: &CompileCont
     })
 }
 
-fn parse_import_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Import> {
+fn parse_import_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Import> {
     let span = items[0].span().clone();
     if items.len() != 5 {
         return Err(ctx.error_with_note(
@@ -3450,8 +3482,8 @@ fn parse_import_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Com
         SExpr::Sym(s, _) => s.clone(),
         other => return Err(ctx.error("import name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[3], variant_names, ctx)?;
-    let return_type = parse_type_expr(&items[4], variant_names, ctx)?;
+    let params = parse_typed_params(&items[3], variant_names, resource_names, ctx)?;
+    let return_type = parse_type_expr(&items[4], variant_names, resource_names, ctx)?;
 
     Ok(Import {
         module,
@@ -3462,7 +3494,7 @@ fn parse_import_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Com
     })
 }
 
-fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Global> {
+fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Global> {
     let span = items[0].span().clone();
     if items.len() != 5 {
         return Err(ctx.error_with_note(
@@ -3486,7 +3518,7 @@ fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Com
         other => return Err(ctx.error("global name must be a symbol starting with $", other.span())),
     };
 
-    let ty = parse_type_expr(&items[2], variant_names, ctx)?;
+    let ty = parse_type_expr(&items[2], variant_names, resource_names, ctx)?;
 
     let mutable = match &items[3] {
         SExpr::Sym(s, sym_span) => match s.as_str() {
@@ -3515,7 +3547,7 @@ fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Com
 }
 
 /// Parse a record definition: (record name (field1 type1) (field2 type2) ...)
-fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<RecordDef> {
+fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<RecordDef> {
     let span = items[0].span().clone();
 
     if items.len() < 2 {
@@ -3546,7 +3578,7 @@ fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Com
                     SExpr::Sym(s, _) => s.clone(),
                     other => return Err(ctx.error("field name must be a symbol", other.span())),
                 };
-                let field_ty = parse_type_expr(&parts[1], variant_names, ctx)?;
+                let field_ty = parse_type_expr(&parts[1], variant_names, resource_names, ctx)?;
                 fields.push(RecordField {
                     name: field_name,
                     ty: field_ty,
@@ -3567,7 +3599,7 @@ fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Com
     Ok(RecordDef { name, fields })
 }
 
-fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<VariantDef> {
+fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<VariantDef> {
     let span = items[0].span().clone();
 
     if items.len() < 2 {
@@ -3596,7 +3628,7 @@ fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Co
                 };
                 let mut payload = Vec::new();
                 for ty_expr in &parts[1..] {
-                    payload.push(parse_type_expr(ty_expr, variant_names, ctx)?);
+                    payload.push(parse_type_expr(ty_expr, variant_names, resource_names, ctx)?);
                 }
                 cases.push(VariantCase {
                     name: case_name,
@@ -3618,7 +3650,26 @@ fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, ctx: &Co
     Ok(VariantDef { name, cases })
 }
 
-fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Vec<Parameter>> {
+fn parse_resource_form(items: &[SExpr], ctx: &CompileContext) -> Result<ResourceDef> {
+    let span = items[0].span().clone();
+
+    if items.len() != 2 {
+        return Err(ctx.error_with_note(
+            "invalid resource declaration",
+            &span,
+            "expected: (resource name)"
+        ));
+    }
+
+    let name = match &items[1] {
+        SExpr::Sym(s, _) => s.clone(),
+        other => return Err(ctx.error("resource name must be a symbol", other.span())),
+    };
+
+    Ok(ResourceDef { name })
+}
+
+fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Vec<Parameter>> {
     match expr {
         SExpr::List(params, _) => {
             let mut result = Vec::new();
@@ -3636,7 +3687,7 @@ fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, ctx: &Compi
                             SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                             other => return Err(ctx.error("parameter name must be a symbol", other.span())),
                         };
-                        let ty = parse_type_expr(&parts[1], variant_names, ctx)?;
+                        let ty = parse_type_expr(&parts[1], variant_names, resource_names, ctx)?;
                         result.push(Parameter { name, ty, scopes });
                     }
                     other => return Err(ctx.error_with_note(
@@ -3652,9 +3703,9 @@ fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, ctx: &Compi
     }
 }
 
-fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileContext) -> Result<Type> {
+fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Type> {
     match expr {
-        SExpr::Sym(s, span) => parse_type_symbol(s, variant_names, span, ctx),
+        SExpr::Sym(s, span) => parse_type_symbol(s, variant_names, resource_names, span, ctx),
         SExpr::List(items, span) => {
             if items.is_empty() {
                 return Err(ctx.error("empty type expression", span));
@@ -3668,7 +3719,7 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileC
                             "expected: (option T)"
                         ));
                     }
-                    let inner = parse_type_expr(&items[1], variant_names, ctx)?;
+                    let inner = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
                     Ok(Type::Option(Box::new(inner)))
                 }
                 SExpr::Sym(s, _) if s == "result" => {
@@ -3679,8 +3730,8 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileC
                             "expected: (result T E)"
                         ));
                     }
-                    let ok_ty = parse_type_expr(&items[1], variant_names, ctx)?;
-                    let err_ty = parse_type_expr(&items[2], variant_names, ctx)?;
+                    let ok_ty = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
+                    let err_ty = parse_type_expr(&items[2], variant_names, resource_names, ctx)?;
                     Ok(Type::Result(Box::new(ok_ty), Box::new(err_ty)))
                 }
                 SExpr::Sym(s, _) if s == "list" => {
@@ -3691,8 +3742,19 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileC
                             "expected: (list T)"
                         ));
                     }
-                    let inner = parse_type_expr(&items[1], variant_names, ctx)?;
+                    let inner = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
                     Ok(Type::List(Box::new(inner)))
+                }
+                SExpr::Sym(s, _) if s == "borrow" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid borrow type",
+                            span,
+                            "expected: (borrow T)"
+                        ));
+                    }
+                    let inner = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
+                    Ok(Type::Borrow(Box::new(inner)))
                 }
                 _ => Err(ctx.error("unknown parameterized type", span)),
             }
@@ -3701,7 +3763,7 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, ctx: &CompileC
     }
 }
 
-fn parse_type_symbol(sym: &str, variant_names: &HashSet<String>, _span: &Span, _ctx: &CompileContext) -> Result<Type> {
+fn parse_type_symbol(sym: &str, variant_names: &HashSet<String>, resource_names: &HashSet<String>, _span: &Span, _ctx: &CompileContext) -> Result<Type> {
     match sym {
         "s32" => Ok(Type::S32),
         "s64" => Ok(Type::S64),
@@ -3710,6 +3772,8 @@ fn parse_type_symbol(sym: &str, variant_names: &HashSet<String>, _span: &Span, _
         "string" => Ok(Type::Str),
         // Check if this is a variant type name
         other if variant_names.contains(other) => Ok(Type::Variant(other.to_string())),
+        // Check if this is a resource type name
+        other if resource_names.contains(other) => Ok(Type::Resource(other.to_string())),
         // Otherwise treat as a record type name
         // We'll validate that the record actually exists during type checking
         other => Ok(Type::Record(other.to_string())),
@@ -3964,7 +4028,7 @@ fn parse_expr(
                             "expected: (some inner-type value)"
                         ));
                     }
-                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Some {
                         inner_type,
@@ -3979,7 +4043,7 @@ fn parse_expr(
                             "expected: (none inner-type)"
                         ));
                     }
-                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
                     Ok(Expr::None { inner_type })
                 }
                 // Result constructors: (ok T E value) and (err T E value)
@@ -3991,8 +4055,8 @@ fn parse_expr(
                             "expected: (ok ok-type err-type value)"
                         ));
                     }
-                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
-                    let err_type = parse_type_expr(&items[2], &HashSet::new(), ctx)?;
+                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let err_type = parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Ok {
                         ok_type,
@@ -4008,8 +4072,8 @@ fn parse_expr(
                             "expected: (err ok-type err-type value)"
                         ));
                     }
-                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
-                    let err_type = parse_type_expr(&items[2], &HashSet::new(), ctx)?;
+                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let err_type = parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Err {
                         ok_type,
@@ -4026,7 +4090,7 @@ fn parse_expr(
                             "expected: (list-new elem-type)"
                         ));
                     }
-                    let elem_type = parse_type_expr(&items[1], &HashSet::new(), ctx)?;
+                    let elem_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
                     Ok(Expr::ListNew { elem_type })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "list-push" => {
@@ -4582,8 +4646,8 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
-                    // All compound types are pointers
-                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.store",
+                    // All compound types are pointers, resources are i32 handles
+                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
             }
@@ -4620,8 +4684,8 @@ fn gen_expr(
                 Type::S64 => "i64.load",
                 Type::F32 => "f32.load",
                 Type::F64 => "f64.load",
-                // All compound types are pointers
-                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
+                // All compound types are pointers, resources are i32 handles
+                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
             field_def.ty.clone()
@@ -4669,7 +4733,7 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
-                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.store",
+                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
                 payload_offset += type_size(payload_ty);
@@ -4732,7 +4796,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -4812,7 +4876,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -4914,7 +4978,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -5367,8 +5431,10 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::S64 => "i64",
         Type::F32 => "f32",
         Type::F64 => "f64",
-        // All compound types are pointer-sized
+        // All compound types are pointer-sized (i32 handles)
         Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32",
+        // Resources are i32 handles
+        Type::Resource(_) | Type::Borrow(_) => "i32",
     }
 }
 
@@ -5383,6 +5449,8 @@ fn wit_type(ty: &Type) -> String {
         Type::Result(ok, err) => format!("result<{}, {}>", wit_type(ok), wit_type(err)),
         Type::List(inner) => format!("list<{}>", wit_type(inner)),
         Type::Str => "string".to_string(),
+        Type::Resource(name) => name.clone(),
+        Type::Borrow(inner) => format!("borrow<{}>", wit_type(inner)),
     }
 }
 
@@ -5443,12 +5511,17 @@ fn flatten_type(ty: &Type, records: &HashMap<String, RecordDef>, variants: &Hash
             // String is pointer + length (canonical ABI)
             vec![Type::S32, Type::S32]
         }
+        Type::Resource(_) | Type::Borrow(_) => {
+            // Resources and borrows are i32 handles
+            vec![Type::S32]
+        }
     }
 }
 
-/// Check if a type needs ABI wrapper (is not a simple scalar)
+/// Check if a type needs ABI wrapper (is not a simple scalar or handle)
 fn needs_abi_wrapper(ty: &Type) -> bool {
-    !matches!(ty, Type::S32 | Type::S64 | Type::F32 | Type::F64)
+    // Scalars and resource handles don't need ABI wrappers - they pass directly as primitives
+    !matches!(ty, Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Resource(_) | Type::Borrow(_))
 }
 
 /// Check if a function needs an ABI wrapper for export
@@ -5607,8 +5680,8 @@ fn store_instr(ty: &Type) -> &'static str {
         Type::S64 => "i64.store",
         Type::F32 => "f32.store",
         Type::F64 => "f64.store",
-        // Compound types are pointer-sized
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.store",
+        // Compound types are pointer-sized, resources are i32 handles
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.store",
     }
 }
 
@@ -5619,8 +5692,8 @@ fn load_instr(ty: &Type) -> &'static str {
         Type::S64 => "i64.load",
         Type::F32 => "f32.load",
         Type::F64 => "f64.load",
-        // Compound types are pointer-sized
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
+        // Compound types are pointer-sized, resources are i32 handles
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
     }
 }
 
@@ -5655,6 +5728,11 @@ fn generate_wit(prog: &Program) -> String {
             }
         }
         out.push_str("  }\n\n");
+    }
+
+    // Generate resource type declarations
+    for resource in &prog.resources {
+        out.push_str(&format!("  resource {};\n\n", resource.name));
     }
 
     let mut imports_by_module: BTreeMap<&str, Vec<&Import>> = BTreeMap::new();
