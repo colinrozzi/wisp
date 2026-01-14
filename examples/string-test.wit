@@ -1,0 +1,8 @@
+package example:wisp;
+
+world wisp {
+  export test-string-len: func() -> s32;
+  export test-empty-string: func() -> s32;
+  export test-long-string: func() -> s32;
+  export test-escape-string: func() -> s32;
+}

@@ -18,6 +18,7 @@ enum Type {
     Option(Box<Type>),            // option<T> - some or none
     Result(Box<Type>, Box<Type>), // result<T, E> - ok or err
     List(Box<Type>),              // list<T> - dynamic list
+    Str,                          // UTF-8 string
 }
 
 /// Unique identifier for a lexical scope (used for hygiene)
@@ -305,6 +306,7 @@ enum TokenKind {
     RParen,
     Symbol(String),
     Number(NumericToken),
+    String(String),   // String literal
     Quasiquote,       // `
     Unquote,          // ,
     UnquoteSplice,    // ,@
@@ -325,6 +327,7 @@ enum SExpr {
     Sym(String, Span),
     Int { value: i64, ty: Type, span: Span },
     Float { value: f64, ty: Type, span: Span },
+    Str(String, Span),  // String literal
     List(Vec<SExpr>, Span),
     Quasiquote(Box<SExpr>, Span),
     Unquote(Box<SExpr>, Span),
@@ -342,6 +345,7 @@ impl SExpr {
             SExpr::Sym(_, span) => span,
             SExpr::Int { span, .. } => span,
             SExpr::Float { span, .. } => span,
+            SExpr::Str(_, span) => span,
             SExpr::List(_, span) => span,
             SExpr::Quasiquote(_, span) => span,
             SExpr::Unquote(_, span) => span,
@@ -364,6 +368,7 @@ enum Expr {
         value: f64,
         ty: Type,
     },
+    StringLiteral(String),
     Ascribe {
         expr: Box<Expr>,
         ty: Type,
@@ -449,6 +454,10 @@ enum Expr {
     },
     ListLen {
         list: Box<Expr>,
+    },
+    /// String operations
+    StringLen {
+        string: Box<Expr>,
     },
 }
 
@@ -600,8 +609,8 @@ fn type_size(ty: &Type) -> usize {
     match ty {
         Type::S32 | Type::F32 => 4,
         Type::S64 | Type::F64 => 8,
-        // Records, variants, options, results, and lists are pointer-sized
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => 4,
+        // Records, variants, options, results, lists, and strings are pointer-sized
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => 4,
     }
 }
 
@@ -609,7 +618,35 @@ fn type_size(ty: &Type) -> usize {
 fn type_needs_heap(ty: &Type) -> bool {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => false,
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => true,
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => true,
+    }
+}
+
+/// Check if an expression uses heap allocation
+fn expr_uses_heap(expr: &Expr) -> bool {
+    match expr {
+        Expr::Int { .. } | Expr::Float { .. } | Expr::Var(_) | Expr::GlobalGet { .. } => false,
+        Expr::StringLiteral(_) => true,
+        Expr::Ascribe { expr, .. } => expr_uses_heap(expr),
+        Expr::Call { args, .. } => args.iter().any(expr_uses_heap),
+        Expr::If { cond, then_branch, else_branch } => {
+            expr_uses_heap(cond) || expr_uses_heap(then_branch) || expr_uses_heap(else_branch)
+        }
+        Expr::Let { value, body, .. } => expr_uses_heap(value) || expr_uses_heap(body),
+        Expr::WasmInstr { args, .. } => args.iter().any(expr_uses_heap),
+        Expr::GlobalSet { value, .. } => expr_uses_heap(value),
+        Expr::RecordConstruct { fields, .. } => true, // records need heap
+        Expr::RecordAccess { expr, .. } => expr_uses_heap(expr),
+        Expr::VariantConstruct { .. } => true, // variants need heap
+        Expr::Match { expr, cases } => {
+            expr_uses_heap(expr) || cases.iter().any(|c| expr_uses_heap(&c.body))
+        }
+        Expr::Some { .. } | Expr::None { .. } => true,
+        Expr::Ok { .. } | Expr::Err { .. } => true,
+        Expr::ListNew { .. } | Expr::ListPush { .. } => true,
+        Expr::ListGet { list, index } => expr_uses_heap(list) || expr_uses_heap(index),
+        Expr::ListLen { list } => expr_uses_heap(list),
+        Expr::StringLen { string } => expr_uses_heap(string),
     }
 }
 
@@ -1049,6 +1086,7 @@ fn check_expr(
     match expr {
         Expr::Int { ty, .. } => Ok(ty.clone()),
         Expr::Float { ty, .. } => Ok(ty.clone()),
+        Expr::StringLiteral(_) => Ok(Type::Str),
         Expr::Ascribe { expr, ty } => {
             let inner_ty = check_expr(expr, env, signatures, globals, records, variants)?;
             ensure_numeric(&inner_ty, "ascribe requires numeric types")?;
@@ -1454,6 +1492,13 @@ fn check_expr(
                 _ => bail!("list-len expects a list, got {:?}", list_ty),
             }
         }
+        Expr::StringLen { string } => {
+            let str_ty = check_expr(string, env, signatures, globals, records, variants)?;
+            match &str_ty {
+                Type::Str => Ok(Type::S32),
+                _ => bail!("string-len expects a string, got {:?}", str_ty),
+            }
+        }
     }
 }
 
@@ -1465,6 +1510,7 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
         Type::Option(_) => bail!("{}: expected numeric type, got option", msg),
         Type::Result(_, _) => bail!("{}: expected numeric type, got result", msg),
         Type::List(_) => bail!("{}: expected numeric type, got list", msg),
+        Type::Str => bail!("{}: expected numeric type, got string", msg),
     }
 }
 
@@ -1586,6 +1632,47 @@ fn tokenize(input: &str) -> Vec<Token> {
                         column += 1;
                     }
                 }
+            }
+            '"' => {
+                // String literal
+                let start_col = column;
+                chars.next(); // consume opening quote
+                column += 1;
+                let mut content = String::new();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    column += 1;
+                    if c == '"' {
+                        break;
+                    } else if c == '\\' {
+                        // Handle escape sequences
+                        if let Some(&escaped) = chars.peek() {
+                            chars.next();
+                            column += 1;
+                            match escaped {
+                                'n' => content.push('\n'),
+                                't' => content.push('\t'),
+                                'r' => content.push('\r'),
+                                '"' => content.push('"'),
+                                '\\' => content.push('\\'),
+                                _ => {
+                                    content.push('\\');
+                                    content.push(escaped);
+                                }
+                            }
+                        }
+                    } else if c == '\n' {
+                        content.push(c);
+                        line += 1;
+                        column = 1;
+                    } else {
+                        content.push(c);
+                    }
+                }
+                tokens.push(Token {
+                    kind: TokenKind::String(content),
+                    span: Span::new(line, start_col, column - start_col),
+                });
             }
             '\n' => {
                 chars.next();
@@ -1710,6 +1797,7 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
             },
             pos + 1,
         ),
+        Some((TokenKind::String(s), span)) => (SExpr::Str(s.clone(), span.clone()), pos + 1),
         Some((TokenKind::Quasiquote, span)) => {
             let (inner, next) = parse_sexpr(tokens, pos + 1);
             (SExpr::Quasiquote(Box::new(inner), span.clone()), next)
@@ -2971,6 +3059,7 @@ fn add_scope_to_sexpr(sexpr: &SExpr, scope: ScopeId) -> SExpr {
             ty: ty.clone(),
             span: span.with_scope(scope),
         },
+        SExpr::Str(s, span) => SExpr::Str(s.clone(), span.with_scope(scope)),
         SExpr::List(items, span) => SExpr::List(
             items.iter().map(|i| add_scope_to_sexpr(i, scope)).collect(),
             span.with_scope(scope),
@@ -3087,6 +3176,7 @@ fn eval_quasiquote(
             ty: ty.clone(),
             span: add_scope_to_span(float_span, macro_scope),
         },
+        SExpr::Str(s, str_span) => SExpr::Str(s.clone(), add_scope_to_span(str_span, macro_scope)),
         // New syntax forms - pass through with scope
         SExpr::SyntaxQuote(inner, sq_span) => SExpr::SyntaxQuote(
             Box::new(eval_quasiquote(inner, subs, span, macro_scope)),
@@ -3617,6 +3707,7 @@ fn parse_type_symbol(sym: &str, variant_names: &HashSet<String>, _span: &Span, _
         "s64" => Ok(Type::S64),
         "f32" => Ok(Type::F32),
         "f64" => Ok(Type::F64),
+        "string" => Ok(Type::Str),
         // Check if this is a variant type name
         other if variant_names.contains(other) => Ok(Type::Variant(other.to_string())),
         // Otherwise treat as a record type name
@@ -3626,7 +3717,7 @@ fn parse_type_symbol(sym: &str, variant_names: &HashSet<String>, _span: &Span, _
 }
 
 fn is_type_symbol(sym: &str) -> bool {
-    matches!(sym, "s32" | "s64" | "f32" | "f64")
+    matches!(sym, "s32" | "s64" | "f32" | "f64" | "string")
 }
 
 fn parse_expr(
@@ -3646,6 +3737,7 @@ fn parse_expr(
             value: *value,
             ty: ty.clone(),
         }),
+        SExpr::Str(s, _) => Ok(Expr::StringLiteral(s.clone())),
         SExpr::Sym(s, span) => {
             // Hygienic variable resolution: find bindings with matching name
             // where the binding's scopes are a subset of the reference's scopes
@@ -3980,6 +4072,19 @@ fn parse_expr(
                         list: Box::new(list),
                     })
                 }
+                SExpr::Sym(sym, _sym_span) if sym == "string-len" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-len' expression",
+                            list_span,
+                            "expected: (string-len string)"
+                        ));
+                    }
+                    let string = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringLen {
+                        string: Box::new(string),
+                    })
+                }
                 _ => {
                     if let SExpr::Sym(sym, sym_span) = op {
                         // Check if this is a WASM instruction
@@ -4143,6 +4248,7 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         || prog.functions.iter().any(|f| {
             type_needs_heap(&f.return_type)
                 || f.params.iter().any(|p| type_needs_heap(&p.ty))
+                || expr_uses_heap(&f.body)
         });
     if needs_heap {
         // Start heap at byte 0 (first page of memory)
@@ -4215,6 +4321,39 @@ fn gen_expr(
                 _ => panic!("float literal not supported for {:?}", ty),
             }
             ty.clone()
+        }
+        Expr::StringLiteral(s) => {
+            // String layout in memory: 4 bytes length + UTF-8 bytes
+            let bytes = s.as_bytes();
+            let len = bytes.len();
+            let total_size = 4 + len; // 4 bytes for length + string data
+
+            // Allocate space for the string
+            let ptr_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, total_size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store length at ptr
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            out.push_str(&format!("{}i32.const {}\n", pad, len));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Store each byte of the string
+            for (i, byte) in bytes.iter().enumerate() {
+                out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+                out.push_str(&format!("{}i32.const {}\n", pad, 4 + i)); // offset past length
+                out.push_str(&format!("{}i32.add\n", pad));
+                out.push_str(&format!("{}i32.const {}\n", pad, *byte));
+                out.push_str(&format!("{}i32.store8\n", pad));
+            }
+
+            // Return pointer to string
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Str
         }
         Expr::Ascribe { expr, ty } => {
             let from_ty = gen_expr(expr, out, indent, env, signatures, globals, records, variants);
@@ -4390,7 +4529,7 @@ fn gen_expr(
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     // All compound types are pointers
-                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.store",
+                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
             }
@@ -4428,7 +4567,7 @@ fn gen_expr(
                 Type::F32 => "f32.load",
                 Type::F64 => "f64.load",
                 // All compound types are pointers
-                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
+                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
             field_def.ty.clone()
@@ -4476,7 +4615,7 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
-                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.store",
+                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
                 payload_offset += type_size(payload_ty);
@@ -4539,7 +4678,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -4619,7 +4758,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -4721,7 +4860,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32.load",
+                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -5064,6 +5203,13 @@ fn gen_expr(
             out.push_str(&format!("{}i32.load\n", pad));
             Type::S32
         }
+        // String: len - return length
+        Expr::StringLen { string } => {
+            gen_expr(string, out, indent, env, signatures, globals, records, variants);
+            // Load len field at offset 0 (string layout: 4 bytes len + data)
+            out.push_str(&format!("{}i32.load\n", pad));
+            Type::S32
+        }
     }
 }
 
@@ -5168,7 +5314,7 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::F32 => "f32",
         Type::F64 => "f64",
         // All compound types are pointer-sized
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) => "i32",
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32",
     }
 }
 
@@ -5182,6 +5328,7 @@ fn wit_type(ty: &Type) -> String {
         Type::Option(inner) => format!("option<{}>", wit_type(inner)),
         Type::Result(ok, err) => format!("result<{}, {}>", wit_type(ok), wit_type(err)),
         Type::List(inner) => format!("list<{}>", wit_type(inner)),
+        Type::Str => "string".to_string(),
     }
 }
 

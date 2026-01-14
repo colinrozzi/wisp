@@ -1,6 +1,6 @@
 # Phase 6: WIT Types
 
-**Status**: In Progress (Phase 6.1-6.3 complete)
+**Status**: In Progress (Phase 6.1-6.4 complete)
 **Started**: 2025-01-12
 **Prerequisites**: Phase 5 (syntax-case) complete
 
@@ -267,10 +267,10 @@ For macro components (future Phase 7), `sexpr` becomes a real WIT variant that c
 - [x] Pattern matching for options/results
 
 ### Phase 6.4: Strings
-- [ ] Add `string` as built-in type
-- [ ] String literals create string values (not raw memory)
-- [ ] Basic string operations
-- [ ] Proper WIT string handling
+- [x] Add `string` as built-in type
+- [x] String literals create string values (not raw memory)
+- [x] Basic string operations (string-len)
+- [x] Proper WIT string handling
 
 ### Phase 6.5: Component ABI
 - [ ] Implement canonical ABI lowering for records
