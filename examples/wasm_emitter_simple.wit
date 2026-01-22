@@ -1,0 +1,7 @@
+package example:wisp;
+
+world wisp {
+  export byte-count: func() -> s32;
+  export wasm-magic: func() -> s32;
+  export wasm-version: func() -> s32;
+}

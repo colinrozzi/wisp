@@ -1,0 +1,21 @@
+[package]
+name = "wisp-actor"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace to avoid being picked up by parent
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Composite guest library for Theater integration
+composite-guest = { path = "../../composite/crates/composite-guest" }
+
+# Memory allocator for no_std
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

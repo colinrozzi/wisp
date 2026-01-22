@@ -1,0 +1,36 @@
+// WIT definition for the Wisp compiler actor
+//
+// This actor provides compilation services for Wisp code,
+// turning Wisp source into composite-compatible WASM modules.
+
+// Compilation result - either WASM bytes or an error message
+variant compile-result {
+    // Successfully compiled WASM module bytes
+    ok(list<u8>),
+    // Compilation error message
+    err(string),
+}
+
+// The Wisp compiler interface
+interface compiler {
+    // Compile Wisp source code to a composite-compatible WASM module
+    //
+    // The input is Wisp source code (a single expression for now).
+    // The output is raw WASM module bytes that follow the composite
+    // calling convention (functions take in_ptr, in_len, out_ptr, out_cap).
+    //
+    // Returns compile-result::ok with WASM bytes on success,
+    // or compile-result::err with an error message on failure.
+    compile: func(source: string) -> compile-result;
+}
+
+world wisp-actor {
+    // Export the compiler interface
+    export compiler;
+
+    // Export theater:simple/actor for lifecycle management
+    export theater:simple/actor;
+
+    // Import runtime for logging
+    import theater:simple/runtime;
+}

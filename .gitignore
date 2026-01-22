@@ -1,2 +1,8 @@
 /target
 result
+wisp-actor/target
+
+# Compiled examples (can be regenerated)
+examples/*.wasm
+examples/*.wat
+examples/*.wit

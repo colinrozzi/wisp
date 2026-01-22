@@ -1,0 +1,7 @@
+package example:wisp;
+
+world wisp {
+  export emit-wasm: func() -> s32;
+  export emit-and-get-byte: func(index: s32) -> s32;
+  export emit-and-get-magic: func() -> s32;
+}
