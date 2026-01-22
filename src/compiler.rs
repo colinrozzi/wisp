@@ -947,6 +947,19 @@ fn lookup_wasm_instr(name: &str) -> Option<WasmInstrInfo> {
             result: Type::F64,
         }),
 
+        // i32 bitwise operations
+        "i32.and" | "i32.or" | "i32.xor" | "i32.shl" | "i32.shr_s" | "i32.shr_u"
+        | "i32.rotl" | "i32.rotr" => Some(WasmInstrInfo {
+            params: vec![Type::S32, Type::S32],
+            result: Type::S32,
+        }),
+        // i64 bitwise operations
+        "i64.and" | "i64.or" | "i64.xor" | "i64.shl" | "i64.shr_s" | "i64.shr_u"
+        | "i64.rotl" | "i64.rotr" => Some(WasmInstrInfo {
+            params: vec![Type::S64, Type::S64],
+            result: Type::S64,
+        }),
+
         // i32 comparisons (return i32)
         "i32.eq" | "i32.ne" | "i32.lt_s" | "i32.lt_u" | "i32.gt_s" | "i32.gt_u" | "i32.le_s"
         | "i32.le_u" | "i32.ge_s" | "i32.ge_u" => Some(WasmInstrInfo {
