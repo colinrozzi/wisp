@@ -8,7 +8,7 @@ use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 use wit_parser::Resolve;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Type {
+pub enum Type {
     S32,
     S64,
     F32,
@@ -21,6 +21,66 @@ enum Type {
     Str,                          // UTF-8 string
     Resource(String),             // resource handle (opaque i32)
     Borrow(Box<Type>),            // borrow<T> - borrowed reference
+}
+
+/// A value that can be inlined during REPL compilation
+#[derive(Debug, Clone)]
+pub enum InlineValue {
+    // Scalars
+    S32(i32),
+    S64(i64),
+    F32(f32),
+    F64(f64),
+
+    // String
+    Str(String),
+
+    // Compound types
+    List(Vec<InlineValue>),
+    Option(Option<Box<InlineValue>>),
+    Result(std::result::Result<Box<InlineValue>, Box<InlineValue>>),
+
+    // User-defined types
+    Record {
+        type_name: String,
+        fields: HashMap<String, InlineValue>,
+    },
+    Variant {
+        type_name: String,
+        case: String,
+        payload: Option<Box<InlineValue>>,
+    },
+}
+
+impl InlineValue {
+    /// Get the type of this value
+    pub fn get_type(&self) -> Type {
+        match self {
+            InlineValue::S32(_) => Type::S32,
+            InlineValue::S64(_) => Type::S64,
+            InlineValue::F32(_) => Type::F32,
+            InlineValue::F64(_) => Type::F64,
+            InlineValue::Str(_) => Type::Str,
+            InlineValue::List(items) => {
+                // Infer element type from first item, or default to S32
+                let elem_type = items.first().map(|v| v.get_type()).unwrap_or(Type::S32);
+                Type::List(Box::new(elem_type))
+            }
+            InlineValue::Option(inner) => {
+                let inner_type = inner.as_ref().map(|v| v.get_type()).unwrap_or(Type::S32);
+                Type::Option(Box::new(inner_type))
+            }
+            InlineValue::Result(res) => {
+                let (ok_type, err_type) = match res {
+                    Ok(v) => (v.get_type(), Type::Str),  // Default error type
+                    Err(v) => (Type::S32, v.get_type()), // Default ok type
+                };
+                Type::Result(Box::new(ok_type), Box::new(err_type))
+            }
+            InlineValue::Record { type_name, .. } => Type::Record(type_name.clone()),
+            InlineValue::Variant { type_name, .. } => Type::Variant(type_name.clone()),
+        }
+    }
 }
 
 /// Unique identifier for a lexical scope (used for hygiene)
@@ -42,7 +102,9 @@ struct ScopeSet {
 
 impl ScopeSet {
     fn new() -> Self {
-        Self { scopes: HashSet::new() }
+        Self {
+            scopes: HashSet::new(),
+        }
     }
 
     /// Create a scope set with the base scope (scope 0)
@@ -67,21 +129,31 @@ impl ScopeSet {
 
 /// Source location information for error reporting and hygiene
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Span {
-    line: usize,
-    column: usize,
-    length: usize,
+pub struct Span {
+    pub line: usize,
+    pub column: usize,
+    pub length: usize,
     scopes: ScopeSet,
 }
 
 impl Span {
     fn new(line: usize, column: usize, length: usize) -> Self {
-        Self { line, column, length, scopes: ScopeSet::base() }
+        Self {
+            line,
+            column,
+            length,
+            scopes: ScopeSet::base(),
+        }
     }
 
     /// Create a dummy span for generated code
     fn dummy() -> Self {
-        Self { line: 0, column: 0, length: 0, scopes: ScopeSet::base() }
+        Self {
+            line: 0,
+            column: 0,
+            length: 0,
+            scopes: ScopeSet::base(),
+        }
     }
 
     /// Create a span with additional scope (for macro hygiene)
@@ -181,7 +253,11 @@ impl CompileError {
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} at line {}, column {}", self.message, self.span.line, self.span.column)
+        write!(
+            f,
+            "{} at line {}, column {}",
+            self.message, self.span.line, self.span.column
+        )
     }
 }
 
@@ -203,7 +279,12 @@ impl CompileContext {
         anyhow::anyhow!("{}", err.format(&self.source, &self.file_path))
     }
 
-    fn error_with_note(&self, message: impl Into<String>, span: &Span, note: impl Into<String>) -> anyhow::Error {
+    fn error_with_note(
+        &self,
+        message: impl Into<String>,
+        span: &Span,
+        note: impl Into<String>,
+    ) -> anyhow::Error {
         let err = CompileError::new(message, span.clone()).with_note(note);
         anyhow::anyhow!("{}", err.format(&self.source, &self.file_path))
     }
@@ -297,39 +378,39 @@ fn encode_component(module: &[u8], wit_source: &str) -> Result<Vec<u8>> {
 }
 
 #[derive(Debug, Clone)]
-struct Token {
-    kind: TokenKind,
-    span: Span,
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
-enum TokenKind {
+pub enum TokenKind {
     LParen,
     RParen,
     Symbol(String),
     Number(NumericToken),
-    String(String),   // String literal
-    Quasiquote,       // `
-    Unquote,          // ,
-    UnquoteSplice,    // ,@
-    SyntaxQuote,      // #'
-    Quasisyntax,      // #`
-    Unsyntax,         // #,
-    UnsyntaxSplice,   // #,@
+    String(String), // String literal
+    Quasiquote,     // `
+    Unquote,        // ,
+    UnquoteSplice,  // ,@
+    SyntaxQuote,    // #'
+    Quasisyntax,    // #`
+    Unsyntax,       // #,
+    UnsyntaxSplice, // #,@
 }
 
 #[derive(Debug, Clone)]
-enum NumericToken {
+pub enum NumericToken {
     Int { value: i64, ty: Type },
     Float { value: f64, ty: Type },
 }
 
 #[derive(Debug, Clone)]
-enum SExpr {
+pub enum SExpr {
     Sym(String, Span),
     Int { value: i64, ty: Type, span: Span },
     Float { value: f64, ty: Type, span: Span },
-    Str(String, Span),  // String literal
+    Str(String, Span), // String literal
     List(Vec<SExpr>, Span),
     Quasiquote(Box<SExpr>, Span),
     Unquote(Box<SExpr>, Span),
@@ -360,8 +441,8 @@ impl SExpr {
     }
 }
 
-#[derive(Debug)]
-enum Expr {
+#[derive(Debug, Clone)]
+pub enum Expr {
     Int {
         value: i64,
         ty: Type,
@@ -464,19 +545,19 @@ enum Expr {
 }
 
 /// A single arm in a match expression
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MatchArm {
     case_name: String,
     bindings: Vec<String>, // Variable names to bind payload values
     body: Expr,
 }
 
-#[derive(Debug)]
-struct Function {
-    name: String,
-    params: Vec<Parameter>,
-    return_type: Type,
-    body: Expr,
+#[derive(Debug, Clone)]
+pub struct Function {
+    pub name: String,
+    pub params: Vec<Parameter>,
+    pub return_type: Type,
+    pub body: Expr,
 }
 
 /// A variable binding for hygiene tracking
@@ -507,55 +588,63 @@ impl Binding {
             self.name.clone()
         } else {
             // Include non-base scopes in the name
-            let mut scope_ids: Vec<_> = self.scopes.scopes.iter()
+            let mut scope_ids: Vec<_> = self
+                .scopes
+                .scopes
+                .iter()
                 .filter(|&&s| s != 0)
                 .cloned()
                 .collect();
             scope_ids.sort();
-            format!("{}__hyg{}", self.name, scope_ids.iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join("_"))
+            format!(
+                "{}__hyg{}",
+                self.name,
+                scope_ids
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join("_")
+            )
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct Parameter {
-    name: String,
-    ty: Type,
+pub struct Parameter {
+    pub name: String,
+    pub ty: Type,
     scopes: ScopeSet,
 }
 
 #[derive(Debug, Clone)]
-struct Import {
-    module: String,
-    name: String,
-    params: Vec<Parameter>,
-    return_type: Type,
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    pub params: Vec<Parameter>,
+    pub return_type: Type,
     span: Span,
 }
 
 #[derive(Debug, Clone)]
-struct Global {
-    name: String,
-    ty: Type,
-    mutable: bool,
-    init_value: i64, // For simplicity, we'll only support integer constants initially
+pub struct Global {
+    pub name: String,
+    pub ty: Type,
+    pub mutable: bool,
+    pub init_value: i64, // For simplicity, we'll only support integer constants initially
 }
 
 /// A field in a record type
 #[derive(Debug, Clone)]
-struct RecordField {
-    name: String,
-    ty: Type,
+pub struct RecordField {
+    pub name: String,
+    pub ty: Type,
 }
 
 /// A record type definition
 #[derive(Debug, Clone)]
-struct RecordDef {
-    name: String,
-    fields: Vec<RecordField>,
+pub struct RecordDef {
+    pub name: String,
+    pub fields: Vec<RecordField>,
 }
 
 impl RecordDef {
@@ -572,23 +661,25 @@ impl RecordDef {
 
 /// A case in a variant type
 #[derive(Debug, Clone)]
-struct VariantCase {
-    name: String,
-    payload: Vec<Type>, // Can have 0, 1, or more payload types
+pub struct VariantCase {
+    pub name: String,
+    pub payload: Vec<Type>, // Can have 0, 1, or more payload types
 }
 
 /// A variant type definition (sum type)
 #[derive(Debug, Clone)]
-struct VariantDef {
-    name: String,
-    cases: Vec<VariantCase>,
+pub struct VariantDef {
+    pub name: String,
+    pub cases: Vec<VariantCase>,
 }
 
 impl VariantDef {
     /// Calculate the size of this variant in bytes (discriminant + max payload)
     fn size(&self) -> usize {
         let discriminant_size = 4; // i32 discriminant
-        let max_payload_size = self.cases.iter()
+        let max_payload_size = self
+            .cases
+            .iter()
             .map(|c| c.payload.iter().map(type_size).sum::<usize>())
             .max()
             .unwrap_or(0);
@@ -602,14 +693,17 @@ impl VariantDef {
 }
 
 /// Find a variant definition that contains a case with the given name
-fn find_variant_by_case<'a>(case_name: &str, variants: &'a HashMap<String, VariantDef>) -> Option<&'a VariantDef> {
+fn find_variant_by_case<'a>(
+    case_name: &str,
+    variants: &'a HashMap<String, VariantDef>,
+) -> Option<&'a VariantDef> {
     variants.values().find(|v| v.find_case(case_name).is_some())
 }
 
 /// A resource type definition (opaque handle managed externally)
 #[derive(Debug, Clone)]
-struct ResourceDef {
-    name: String,
+pub struct ResourceDef {
+    pub name: String,
 }
 
 /// Get the size of a type in bytes (for memory layout)
@@ -618,7 +712,12 @@ fn type_size(ty: &Type) -> usize {
         Type::S32 | Type::F32 => 4,
         Type::S64 | Type::F64 => 8,
         // Records, variants, options, results, lists, and strings are pointer-sized
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => 4,
+        Type::Record(_)
+        | Type::Variant(_)
+        | Type::Option(_)
+        | Type::Result(_, _)
+        | Type::List(_)
+        | Type::Str => 4,
         // Resources and borrows are i32 handles
         Type::Resource(_) | Type::Borrow(_) => 4,
     }
@@ -628,7 +727,12 @@ fn type_size(ty: &Type) -> usize {
 fn type_needs_heap(ty: &Type) -> bool {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => false,
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => true,
+        Type::Record(_)
+        | Type::Variant(_)
+        | Type::Option(_)
+        | Type::Result(_, _)
+        | Type::List(_)
+        | Type::Str => true,
         // Resources don't need heap - they're opaque handles managed externally
         Type::Resource(_) | Type::Borrow(_) => false,
     }
@@ -641,9 +745,11 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::StringLiteral(_) => true,
         Expr::Ascribe { expr, .. } => expr_uses_heap(expr),
         Expr::Call { args, .. } => args.iter().any(expr_uses_heap),
-        Expr::If { cond, then_branch, else_branch } => {
-            expr_uses_heap(cond) || expr_uses_heap(then_branch) || expr_uses_heap(else_branch)
-        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => expr_uses_heap(cond) || expr_uses_heap(then_branch) || expr_uses_heap(else_branch),
         Expr::Let { value, body, .. } => expr_uses_heap(value) || expr_uses_heap(body),
         Expr::WasmInstr { args, .. } => args.iter().any(expr_uses_heap),
         Expr::GlobalSet { value, .. } => expr_uses_heap(value),
@@ -741,7 +847,7 @@ struct SyntaxCaseClause {
 #[derive(Debug, Clone)]
 struct SyntaxCaseMacro {
     name: String,
-    param: String,       // The stx parameter name
+    param: String, // The stx parameter name
     literals: Vec<String>,
     clauses: Vec<SyntaxCaseClause>,
 }
@@ -794,14 +900,14 @@ struct PendingFunction {
 }
 
 #[derive(Debug)]
-struct Program {
-    functions: Vec<Function>,
-    imports: Vec<Import>,
-    exports: Vec<String>,
-    globals: Vec<Global>,
-    records: Vec<RecordDef>,
-    variants: Vec<VariantDef>,
-    resources: Vec<ResourceDef>,
+pub struct Program {
+    pub functions: Vec<Function>,
+    pub imports: Vec<Import>,
+    pub exports: Vec<String>,
+    pub globals: Vec<Global>,
+    pub records: Vec<RecordDef>,
+    pub variants: Vec<VariantDef>,
+    pub resources: Vec<ResourceDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -1028,7 +1134,11 @@ fn lookup_wasm_instr(name: &str) -> Option<WasmInstrInfo> {
     }
 }
 
-fn type_check(prog: &Program, signatures: &HashMap<String, Signature>, _ctx: &CompileContext) -> Result<()> {
+fn type_check(
+    prog: &Program,
+    signatures: &HashMap<String, Signature>,
+    _ctx: &CompileContext,
+) -> Result<()> {
     // Build global type map
     let mut globals_map = HashMap::new();
     for global in &prog.globals {
@@ -1036,11 +1146,13 @@ fn type_check(prog: &Program, signatures: &HashMap<String, Signature>, _ctx: &Co
     }
 
     // Build records and variants maps for type checking
-    let records_map: HashMap<String, RecordDef> = prog.records
+    let records_map: HashMap<String, RecordDef> = prog
+        .records
         .iter()
         .map(|r| (r.name.clone(), r.clone()))
         .collect();
-    let variants_map: HashMap<String, VariantDef> = prog.variants
+    let variants_map: HashMap<String, VariantDef> = prog
+        .variants
         .iter()
         .map(|v| (v.name.clone(), v.clone()))
         .collect();
@@ -1050,7 +1162,14 @@ fn type_check(prog: &Program, signatures: &HashMap<String, Signature>, _ctx: &Co
         for param in &func.params {
             env.insert(param.name.clone(), param.ty.clone());
         }
-        let body_ty = check_expr(&func.body, &env, signatures, &globals_map, &records_map, &variants_map)?;
+        let body_ty = check_expr(
+            &func.body,
+            &env,
+            signatures,
+            &globals_map,
+            &records_map,
+            &variants_map,
+        )?;
         if body_ty != func.return_type {
             bail!(
                 "function '{}' returns {:?} but body has type {:?}",
@@ -1223,7 +1342,10 @@ fn check_expr(
             }
             Ok(value_ty)
         }
-        Expr::RecordConstruct { record_name, fields } => {
+        Expr::RecordConstruct {
+            record_name,
+            fields,
+        } => {
             let record_def = records
                 .get(record_name)
                 .ok_or_else(|| anyhow!("unknown record type '{}'", record_name))?;
@@ -1249,11 +1371,16 @@ fn check_expr(
             }
             Ok(Type::Record(record_name.clone()))
         }
-        Expr::RecordAccess { record_name, field_name, expr } => {
+        Expr::RecordAccess {
+            record_name,
+            field_name,
+            expr,
+        } => {
             let record_def = records
                 .get(record_name)
                 .ok_or_else(|| anyhow!("unknown record type '{}'", record_name))?;
-            let field = record_def.fields
+            let field = record_def
+                .fields
                 .iter()
                 .find(|f| f.name == *field_name)
                 .ok_or_else(|| anyhow!("record '{}' has no field '{}'", record_name, field_name))?;
@@ -1267,11 +1394,16 @@ fn check_expr(
             }
             Ok(field.ty.clone())
         }
-        Expr::VariantConstruct { variant_name, case_name, payload } => {
+        Expr::VariantConstruct {
+            variant_name,
+            case_name,
+            payload,
+        } => {
             let variant_def = variants
                 .get(variant_name)
                 .ok_or_else(|| anyhow!("unknown variant type '{}'", variant_name))?;
-            let (_, case) = variant_def.find_case(case_name)
+            let (_, case) = variant_def
+                .find_case(case_name)
                 .ok_or_else(|| anyhow!("variant '{}' has no case '{}'", variant_name, case_name))?;
             if case.payload.len() != payload.len() {
                 bail!(
@@ -1309,7 +1441,10 @@ fn check_expr(
                         let expected_bindings = match arm.case_name.as_str() {
                             "some" => 1,
                             "none" => 0,
-                            other => bail!("option match: unknown case '{}', expected 'some' or 'none'", other),
+                            other => bail!(
+                                "option match: unknown case '{}', expected 'some' or 'none'",
+                                other
+                            ),
                         };
                         if arm.bindings.len() != expected_bindings {
                             bail!(
@@ -1326,7 +1461,9 @@ fn check_expr(
                             arm_env.insert(arm.bindings[0].clone(), (**inner_ty).clone());
                         }
 
-                        let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
+                        let arm_ty = check_expr(
+                            &arm.body, &arm_env, signatures, globals, records, variants,
+                        )?;
                         match &result_ty {
                             None => result_ty = Some(arm_ty),
                             Some(expected) => {
@@ -1340,7 +1477,8 @@ fn check_expr(
                             }
                         }
                     }
-                    return result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"));
+                    return result_ty
+                        .ok_or_else(|| anyhow!("match expression must have at least one case"));
                 }
                 Type::Result(ok_ty, err_ty) => {
                     // Result can match on 'ok' and 'err'
@@ -1350,7 +1488,10 @@ fn check_expr(
                         let (expected_bindings, payload_ty) = match arm.case_name.as_str() {
                             "ok" => (1, (**ok_ty).clone()),
                             "err" => (1, (**err_ty).clone()),
-                            other => bail!("result match: unknown case '{}', expected 'ok' or 'err'", other),
+                            other => bail!(
+                                "result match: unknown case '{}', expected 'ok' or 'err'",
+                                other
+                            ),
                         };
                         if arm.bindings.len() != expected_bindings {
                             bail!(
@@ -1367,7 +1508,9 @@ fn check_expr(
                             arm_env.insert(arm.bindings[0].clone(), payload_ty);
                         }
 
-                        let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
+                        let arm_ty = check_expr(
+                            &arm.body, &arm_env, signatures, globals, records, variants,
+                        )?;
                         match &result_ty {
                             None => result_ty = Some(arm_ty),
                             Some(expected) => {
@@ -1381,7 +1524,8 @@ fn check_expr(
                             }
                         }
                     }
-                    return result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"));
+                    return result_ty
+                        .ok_or_else(|| anyhow!("match expression must have at least one case"));
                 }
                 Type::Variant(variant_name) => {
                     // User-defined variant
@@ -1392,8 +1536,9 @@ fn check_expr(
                     // Check that all cases exist and have correct bindings
                     let mut result_ty: Option<Type> = None;
                     for arm in cases {
-                        let (_, case) = variant_def.find_case(&arm.case_name)
-                            .ok_or_else(|| anyhow!("variant '{}' has no case '{}'", variant_name, arm.case_name))?;
+                        let (_, case) = variant_def.find_case(&arm.case_name).ok_or_else(|| {
+                            anyhow!("variant '{}' has no case '{}'", variant_name, arm.case_name)
+                        })?;
                         if arm.bindings.len() != case.payload.len() {
                             bail!(
                                 "match arm for '{}' expects {} bindings but {} were provided",
@@ -1409,7 +1554,9 @@ fn check_expr(
                             arm_env.insert(binding_name.clone(), ty.clone());
                         }
 
-                        let arm_ty = check_expr(&arm.body, &arm_env, signatures, globals, records, variants)?;
+                        let arm_ty = check_expr(
+                            &arm.body, &arm_env, signatures, globals, records, variants,
+                        )?;
                         match &result_ty {
                             None => result_ty = Some(arm_ty),
                             Some(expected) => {
@@ -1423,9 +1570,13 @@ fn check_expr(
                             }
                         }
                     }
-                    return result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"));
+                    return result_ty
+                        .ok_or_else(|| anyhow!("match expression must have at least one case"));
                 }
-                _ => bail!("match expression must be a variant, option, or result type, got {:?}", expr_ty),
+                _ => bail!(
+                    "match expression must be a variant, option, or result type, got {:?}",
+                    expr_ty
+                ),
             }
         }
         // Option constructors
@@ -1440,11 +1591,13 @@ fn check_expr(
             }
             Ok(Type::Option(Box::new(inner_type.clone())))
         }
-        Expr::None { inner_type } => {
-            Ok(Type::Option(Box::new(inner_type.clone())))
-        }
+        Expr::None { inner_type } => Ok(Type::Option(Box::new(inner_type.clone()))),
         // Result constructors
-        Expr::Ok { ok_type, err_type, value } => {
+        Expr::Ok {
+            ok_type,
+            err_type,
+            value,
+        } => {
             let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
             if value_ty != *ok_type {
                 bail!(
@@ -1453,9 +1606,16 @@ fn check_expr(
                     value_ty
                 );
             }
-            Ok(Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone())))
+            Ok(Type::Result(
+                Box::new(ok_type.clone()),
+                Box::new(err_type.clone()),
+            ))
         }
-        Expr::Err { ok_type, err_type, value } => {
+        Expr::Err {
+            ok_type,
+            err_type,
+            value,
+        } => {
             let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
             if value_ty != *err_type {
                 bail!(
@@ -1464,12 +1624,13 @@ fn check_expr(
                     value_ty
                 );
             }
-            Ok(Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone())))
+            Ok(Type::Result(
+                Box::new(ok_type.clone()),
+                Box::new(err_type.clone()),
+            ))
         }
         // List operations
-        Expr::ListNew { elem_type } => {
-            Ok(Type::List(Box::new(elem_type.clone())))
-        }
+        Expr::ListNew { elem_type } => Ok(Type::List(Box::new(elem_type.clone()))),
         Expr::ListPush { list, value } => {
             let list_ty = check_expr(list, env, signatures, globals, records, variants)?;
             let elem_type = match &list_ty {
@@ -1529,7 +1690,7 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
     }
 }
 
-fn tokenize(input: &str) -> Vec<Token> {
+pub fn tokenize(input: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
     let mut line = 1usize;
@@ -1621,7 +1782,14 @@ fn tokenize(input: &str) -> Vec<Token> {
                         // Treat # as start of a symbol (e.g., #t, #f)
                         let mut lexeme = String::from("#");
                         while let Some(&c2) = chars.peek() {
-                            if c2.is_whitespace() || c2 == '(' || c2 == ')' || c2 == '`' || c2 == ',' || c2 == ';' || c2 == '\'' {
+                            if c2.is_whitespace()
+                                || c2 == '('
+                                || c2 == ')'
+                                || c2 == '`'
+                                || c2 == ','
+                                || c2 == ';'
+                                || c2 == '\''
+                            {
                                 break;
                             }
                             lexeme.push(c2);
@@ -1769,7 +1937,7 @@ fn strip_numeric_suffix(raw: &str) -> Option<(&str, Option<Type>)> {
     Some((raw, None))
 }
 
-fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
+pub fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
     let token = tokens.get(pos);
     match token.map(|t| (&t.kind, &t.span)) {
         Some((TokenKind::LParen, start_span)) => {
@@ -1787,13 +1955,19 @@ fn parse_sexpr(tokens: &[Token], pos: usize) -> (SExpr, usize) {
                         i = next;
                     }
                     None => {
-                        panic!("Unclosed parenthesis at line {}, column {}", start_span.line, start_span.column);
+                        panic!(
+                            "Unclosed parenthesis at line {}, column {}",
+                            start_span.line, start_span.column
+                        );
                     }
                 }
             }
         }
         Some((TokenKind::RParen, span)) => {
-            panic!("Unexpected closing parenthesis at line {}, column {}", span.line, span.column);
+            panic!(
+                "Unexpected closing parenthesis at line {}, column {}",
+                span.line, span.column
+            );
         }
         Some((TokenKind::Symbol(s), span)) => (SExpr::Sym(s.clone(), span.clone()), pos + 1),
         Some((TokenKind::Number(NumericToken::Int { value, ty }), span)) => (
@@ -1884,7 +2058,11 @@ fn collect_macros(forms: &[SExpr]) -> CollectedMacros {
         }
     }
 
-    CollectedMacros { defmacros, syntax_rules, syntax_case }
+    CollectedMacros {
+        defmacros,
+        syntax_rules,
+        syntax_case,
+    }
 }
 
 fn parse_defmacro_form(items: &[SExpr]) -> Macro {
@@ -1962,14 +2140,13 @@ fn parse_define_syntax_form(items: &[SExpr]) -> Option<SyntaxRulesMacro> {
 
     // Parse literals list
     let literals: Vec<String> = match &syntax_rules_form[1] {
-        SExpr::List(lits, _) => {
-            lits.iter()
-                .filter_map(|l| match l {
-                    SExpr::Sym(s, _) => Some(s.clone()),
-                    _ => None,
-                })
-                .collect()
-        }
+        SExpr::List(lits, _) => lits
+            .iter()
+            .filter_map(|l| match l {
+                SExpr::Sym(s, _) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
         _ => {
             eprintln!("syntax-rules literals must be a list");
             return None;
@@ -1987,7 +2164,11 @@ fn parse_define_syntax_form(items: &[SExpr]) -> Option<SyntaxRulesMacro> {
         }
     }
 
-    Some(SyntaxRulesMacro { name, literals, rules })
+    Some(SyntaxRulesMacro {
+        name,
+        literals,
+        rules,
+    })
 }
 
 /// Parse a define-syntax form with syntax-case-lambda
@@ -2036,15 +2217,13 @@ fn parse_syntax_case_form(items: &[SExpr]) -> Option<SyntaxCaseMacro> {
 
     // Parse parameter: (stx)
     let param = match &scl_form[1] {
-        SExpr::List(params, _) if params.len() == 1 => {
-            match &params[0] {
-                SExpr::Sym(s, _) => s.clone(),
-                _ => {
-                    eprintln!("syntax-case-lambda parameter must be a symbol");
-                    return None;
-                }
+        SExpr::List(params, _) if params.len() == 1 => match &params[0] {
+            SExpr::Sym(s, _) => s.clone(),
+            _ => {
+                eprintln!("syntax-case-lambda parameter must be a symbol");
+                return None;
             }
-        }
+        },
         _ => {
             eprintln!("syntax-case-lambda requires exactly one parameter");
             return None;
@@ -2058,14 +2237,13 @@ fn parse_syntax_case_form(items: &[SExpr]) -> Option<SyntaxCaseMacro> {
                 if s == "syntax-case" && inner.len() >= 3 {
                     // (syntax-case stx (literals) clauses...)
                     let lits = match &inner[2] {
-                        SExpr::List(lits, _) => {
-                            lits.iter()
-                                .filter_map(|l| match l {
-                                    SExpr::Sym(s, _) => Some(s.clone()),
-                                    _ => None,
-                                })
-                                .collect()
-                        }
+                        SExpr::List(lits, _) => lits
+                            .iter()
+                            .filter_map(|l| match l {
+                                SExpr::Sym(s, _) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect(),
                         _ => vec![],
                     };
                     (lits, &inner[3..])
@@ -2092,11 +2270,20 @@ fn parse_syntax_case_form(items: &[SExpr]) -> Option<SyntaxCaseMacro> {
         }
     }
 
-    Some(SyntaxCaseMacro { name, param, literals, clauses })
+    Some(SyntaxCaseMacro {
+        name,
+        param,
+        literals,
+        clauses,
+    })
 }
 
 /// Parse a syntax-case clause: (pattern template) or (pattern guard template)
-fn parse_syntax_case_clause(form: &SExpr, macro_name: &str, literals: &[String]) -> Option<SyntaxCaseClause> {
+fn parse_syntax_case_clause(
+    form: &SExpr,
+    macro_name: &str,
+    literals: &[String],
+) -> Option<SyntaxCaseClause> {
     let items = match form {
         SExpr::List(items, _) => items,
         _ => {
@@ -2117,17 +2304,28 @@ fn parse_syntax_case_clause(form: &SExpr, macro_name: &str, literals: &[String])
     if items.len() == 2 {
         // No guard: (pattern template)
         let template = parse_compile_time_expr(&items[1], &pattern_vars)?;
-        Some(SyntaxCaseClause { pattern, guard: None, template })
+        Some(SyntaxCaseClause {
+            pattern,
+            guard: None,
+            template,
+        })
     } else {
         // With guard: (pattern guard template)
         let guard = parse_compile_time_expr(&items[1], &pattern_vars)?;
         let template = parse_compile_time_expr(&items[2], &pattern_vars)?;
-        Some(SyntaxCaseClause { pattern, guard: Some(guard), template })
+        Some(SyntaxCaseClause {
+            pattern,
+            guard: Some(guard),
+            template,
+        })
     }
 }
 
 /// Parse a compile-time expression from an S-expression
-fn parse_compile_time_expr(sexpr: &SExpr, pattern_vars: &HashSet<String>) -> Option<CompileTimeExpr> {
+fn parse_compile_time_expr(
+    sexpr: &SExpr,
+    pattern_vars: &HashSet<String>,
+) -> Option<CompileTimeExpr> {
     match sexpr {
         SExpr::SyntaxQuote(inner, _) => {
             // #'expr - syntax quote
@@ -2141,9 +2339,7 @@ fn parse_compile_time_expr(sexpr: &SExpr, pattern_vars: &HashSet<String>) -> Opt
             // Variable reference (could be pattern var or builtin)
             Some(CompileTimeExpr::Var(name.clone()))
         }
-        SExpr::Int { .. } | SExpr::Float { .. } => {
-            Some(CompileTimeExpr::Literal(sexpr.clone()))
-        }
+        SExpr::Int { .. } | SExpr::Float { .. } => Some(CompileTimeExpr::Literal(sexpr.clone())),
         SExpr::List(items, _) => {
             if items.is_empty() {
                 return Some(CompileTimeExpr::Literal(sexpr.clone()));
@@ -2259,9 +2455,9 @@ fn parse_pattern(
         }
         SExpr::List(items, _) => {
             // Check for ellipsis in the list
-            let ellipsis_pos = items.iter().position(|item| {
-                matches!(item, SExpr::Sym(s, _) if s == "...")
-            });
+            let ellipsis_pos = items
+                .iter()
+                .position(|item| matches!(item, SExpr::Sym(s, _) if s == "..."));
 
             if let Some(pos) = ellipsis_pos {
                 // Pattern has ellipsis
@@ -2319,9 +2515,7 @@ fn parse_template(sexpr: &SExpr, pattern_vars: &HashSet<String>) -> Option<Templ
                 Some(Template::Symbol(s.clone()))
             }
         }
-        SExpr::Int { .. } | SExpr::Float { .. } => {
-            Some(Template::Atom(sexpr.clone()))
-        }
+        SExpr::Int { .. } | SExpr::Float { .. } => Some(Template::Atom(sexpr.clone())),
         SExpr::List(items, _) => {
             // Check for ellipsis patterns like (t ...)
             let mut templates = Vec::new();
@@ -2359,9 +2553,10 @@ fn expand_all_macros(forms: Vec<SExpr>, macros: &CollectedMacros) -> Vec<SExpr> 
         .filter(|form| {
             // Filter out defmacro and define-syntax forms (they're already collected)
             if let SExpr::List(items, _) = form
-                && let Some(SExpr::Sym(sym, _)) = items.first() {
-                    return sym != "defmacro" && sym != "define-syntax";
-                }
+                && let Some(SExpr::Sym(sym, _)) = items.first()
+            {
+                return sym != "defmacro" && sym != "define-syntax";
+            }
             true
         })
         .map(|form| expand_macros(form, macros, 0))
@@ -2404,7 +2599,8 @@ fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
                         SExpr::Quasiquote(inner, _) => inner.as_ref(),
                         other => other,
                     };
-                    let expanded = eval_quasiquote(template_inner, &substitutions, &span, Some(macro_scope));
+                    let expanded =
+                        eval_quasiquote(template_inner, &substitutions, &span, Some(macro_scope));
 
                     // Recursively expand the result
                     return expand_macros(expanded, macros, depth + 1);
@@ -2415,26 +2611,34 @@ fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
                     // Try to match against each rule in order
                     let input = SExpr::List(items.clone(), span.clone());
                     for rule in &sr_mac.rules {
-                        if let Some(bindings) = match_pattern(&rule.pattern, &input, &sr_mac.literals) {
+                        if let Some(bindings) =
+                            match_pattern(&rule.pattern, &input, &sr_mac.literals)
+                        {
                             // Generate fresh scope for hygiene
                             let macro_scope = fresh_scope();
 
                             // Expand the template with bindings
-                            let expanded = expand_template(&rule.template, &bindings, &span, macro_scope);
+                            let expanded =
+                                expand_template(&rule.template, &bindings, &span, macro_scope);
 
                             // Recursively expand the result
                             return expand_macros(expanded, macros, depth + 1);
                         }
                     }
                     // No rule matched
-                    panic!("No matching rule for macro '{}' with input {:?}", name, items);
+                    panic!(
+                        "No matching rule for macro '{}' with input {:?}",
+                        name, items
+                    );
                 }
 
                 // Then check syntax-case
                 if let Some(sc_mac) = macros.syntax_case.get(name) {
                     let input = SExpr::List(items.clone(), span.clone());
                     for clause in &sc_mac.clauses {
-                        if let Some(bindings) = match_pattern(&clause.pattern, &input, &sc_mac.literals) {
+                        if let Some(bindings) =
+                            match_pattern(&clause.pattern, &input, &sc_mac.literals)
+                        {
                             // Generate fresh scope for hygiene
                             let macro_scope = fresh_scope();
 
@@ -2443,10 +2647,14 @@ fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
                             for (name, binding) in &bindings {
                                 match binding {
                                     PatternBinding::Single(sexpr) => {
-                                        ct_env.insert(name.clone(), CompileTimeValue::Syntax(sexpr.clone()));
+                                        ct_env.insert(
+                                            name.clone(),
+                                            CompileTimeValue::Syntax(sexpr.clone()),
+                                        );
                                     }
                                     PatternBinding::List(sexprs) => {
-                                        let vals = sexprs.iter()
+                                        let vals = sexprs
+                                            .iter()
                                             .map(|s| CompileTimeValue::Syntax(s.clone()))
                                             .collect();
                                         ct_env.insert(name.clone(), CompileTimeValue::List(vals));
@@ -2466,12 +2674,20 @@ fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
 
                             if guard_result {
                                 // Evaluate the template
-                                let result = eval_compile_time_expr(&clause.template, &ct_env, &span, macro_scope);
+                                let result = eval_compile_time_expr(
+                                    &clause.template,
+                                    &ct_env,
+                                    &span,
+                                    macro_scope,
+                                );
 
                                 // Convert result to SExpr
                                 let expanded = match result {
                                     CompileTimeValue::Syntax(sexpr) => sexpr,
-                                    other => panic!("syntax-case template must return syntax, got {:?}", other),
+                                    other => panic!(
+                                        "syntax-case template must return syntax, got {:?}",
+                                        other
+                                    ),
                                 };
 
                                 // Recursively expand the result
@@ -2480,7 +2696,10 @@ fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
                         }
                     }
                     // No clause matched
-                    panic!("No matching clause for syntax-case macro '{}' with input {:?}", name, items);
+                    panic!(
+                        "No matching clause for syntax-case macro '{}' with input {:?}",
+                        name, items
+                    );
                 }
             }
 
@@ -2516,15 +2735,21 @@ fn substitute_pattern_vars_in_syntax(
             // Check if this is a pattern variable
             if let Some(val) = env.get(name) {
                 match val {
-                    CompileTimeValue::Syntax(s) => s.clone(),  // Keep original scopes (from call site)
+                    CompileTimeValue::Syntax(s) => s.clone(), // Keep original scopes (from call site)
                     CompileTimeValue::Int(i) => SExpr::Int {
                         value: *i,
                         ty: Type::S32,
                         span: sym_span.clone(),
                     },
-                    CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), sym_span.with_scope(macro_scope)),
-                    CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), sym_span.with_scope(macro_scope)),
-                    CompileTimeValue::List(_) => panic!("Cannot substitute list value as single syntax"),
+                    CompileTimeValue::Bool(true) => {
+                        SExpr::Sym("#t".to_string(), sym_span.with_scope(macro_scope))
+                    }
+                    CompileTimeValue::Bool(false) => {
+                        SExpr::Sym("#f".to_string(), sym_span.with_scope(macro_scope))
+                    }
+                    CompileTimeValue::List(_) => {
+                        panic!("Cannot substitute list value as single syntax")
+                    }
                 }
             } else {
                 // Not a pattern variable - add macro scope for hygiene
@@ -2532,17 +2757,26 @@ fn substitute_pattern_vars_in_syntax(
             }
         }
         SExpr::List(items, list_span) => {
-            let substituted: Vec<_> = items.iter()
+            let substituted: Vec<_> = items
+                .iter()
                 .map(|item| substitute_pattern_vars_in_syntax(item, env, span, macro_scope))
                 .collect();
             SExpr::List(substituted, list_span.with_scope(macro_scope))
         }
-        SExpr::Int { value, ty, span: int_span } => SExpr::Int {
+        SExpr::Int {
+            value,
+            ty,
+            span: int_span,
+        } => SExpr::Int {
             value: *value,
             ty: ty.clone(),
             span: int_span.with_scope(macro_scope),
         },
-        SExpr::Float { value, ty, span: float_span } => SExpr::Float {
+        SExpr::Float {
+            value,
+            ty,
+            span: float_span,
+        } => SExpr::Float {
             value: *value,
             ty: ty.clone(),
             span: float_span.with_scope(macro_scope),
@@ -2578,15 +2812,17 @@ fn eval_compile_time_expr(
                 CompileTimeValue::Syntax(SExpr::Sym(name.clone(), span.with_scope(macro_scope)))
             }
         }
-        CompileTimeExpr::Literal(sexpr) => {
-            match sexpr {
-                SExpr::Int { value, .. } => CompileTimeValue::Int(*value),
-                SExpr::Sym(s, _) if s == "#t" || s == "true" => CompileTimeValue::Bool(true),
-                SExpr::Sym(s, _) if s == "#f" || s == "false" => CompileTimeValue::Bool(false),
-                other => CompileTimeValue::Syntax(other.clone()),
-            }
-        }
-        CompileTimeExpr::If { cond, then_branch, else_branch } => {
+        CompileTimeExpr::Literal(sexpr) => match sexpr {
+            SExpr::Int { value, .. } => CompileTimeValue::Int(*value),
+            SExpr::Sym(s, _) if s == "#t" || s == "true" => CompileTimeValue::Bool(true),
+            SExpr::Sym(s, _) if s == "#f" || s == "false" => CompileTimeValue::Bool(false),
+            other => CompileTimeValue::Syntax(other.clone()),
+        },
+        CompileTimeExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             let cond_val = eval_compile_time_expr(cond, env, span, macro_scope);
             let is_true = match cond_val {
                 CompileTimeValue::Bool(b) => b,
@@ -2607,7 +2843,8 @@ fn eval_compile_time_expr(
         }
         CompileTimeExpr::App { func, args } => {
             // Evaluate builtin compile-time functions
-            let arg_vals: Vec<_> = args.iter()
+            let arg_vals: Vec<_> = args
+                .iter()
                 .map(|a| eval_compile_time_expr(a, env, span, macro_scope))
                 .collect();
 
@@ -2623,8 +2860,12 @@ fn eval_compile_time_expr(
                 "number?" => {
                     // Check if argument is a number syntax
                     match arg_vals.first() {
-                        Some(CompileTimeValue::Syntax(SExpr::Int { .. })) => CompileTimeValue::Bool(true),
-                        Some(CompileTimeValue::Syntax(SExpr::Float { .. })) => CompileTimeValue::Bool(true),
+                        Some(CompileTimeValue::Syntax(SExpr::Int { .. })) => {
+                            CompileTimeValue::Bool(true)
+                        }
+                        Some(CompileTimeValue::Syntax(SExpr::Float { .. })) => {
+                            CompileTimeValue::Bool(true)
+                        }
                         Some(CompileTimeValue::Int(_)) => CompileTimeValue::Bool(true),
                         _ => CompileTimeValue::Bool(false),
                     }
@@ -2632,7 +2873,9 @@ fn eval_compile_time_expr(
                 "syntax->datum" => {
                     // Extract the datum from syntax
                     match arg_vals.first() {
-                        Some(CompileTimeValue::Syntax(SExpr::Int { value, .. })) => CompileTimeValue::Int(*value),
+                        Some(CompileTimeValue::Syntax(SExpr::Int { value, .. })) => {
+                            CompileTimeValue::Int(*value)
+                        }
                         Some(CompileTimeValue::Syntax(SExpr::Sym(s, _))) => {
                             CompileTimeValue::Syntax(SExpr::Sym(s.clone(), Span::dummy()))
                         }
@@ -2640,13 +2883,11 @@ fn eval_compile_time_expr(
                         None => panic!("syntax->datum requires an argument"),
                     }
                 }
-                "not" => {
-                    match arg_vals.first() {
-                        Some(CompileTimeValue::Bool(b)) => CompileTimeValue::Bool(!b),
-                        Some(CompileTimeValue::Int(0)) => CompileTimeValue::Bool(true),
-                        _ => CompileTimeValue::Bool(false),
-                    }
-                }
+                "not" => match arg_vals.first() {
+                    Some(CompileTimeValue::Bool(b)) => CompileTimeValue::Bool(!b),
+                    Some(CompileTimeValue::Int(0)) => CompileTimeValue::Bool(true),
+                    _ => CompileTimeValue::Bool(false),
+                },
                 "and" => {
                     let result = arg_vals.iter().all(|v| match v {
                         CompileTimeValue::Bool(b) => *b,
@@ -2664,11 +2905,14 @@ fn eval_compile_time_expr(
                     CompileTimeValue::Bool(result)
                 }
                 "+" => {
-                    let sum: i64 = arg_vals.iter().map(|v| match v {
-                        CompileTimeValue::Int(i) => *i,
-                        CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
-                        _ => 0,
-                    }).sum();
+                    let sum: i64 = arg_vals
+                        .iter()
+                        .map(|v| match v {
+                            CompileTimeValue::Int(i) => *i,
+                            CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
+                            _ => 0,
+                        })
+                        .sum();
                     CompileTimeValue::Int(sum)
                 }
                 "-" => {
@@ -2683,23 +2927,26 @@ fn eval_compile_time_expr(
                             CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
                             _ => 0,
                         };
-                        let rest: i64 = arg_vals[1..].iter().map(|v| match v {
-                            CompileTimeValue::Int(i) => *i,
-                            CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
-                            _ => 0,
-                        }).sum();
+                        let rest: i64 = arg_vals[1..]
+                            .iter()
+                            .map(|v| match v {
+                                CompileTimeValue::Int(i) => *i,
+                                CompileTimeValue::Syntax(SExpr::Int { value, .. }) => *value,
+                                _ => 0,
+                            })
+                            .sum();
                         CompileTimeValue::Int(first - rest)
                     } else {
                         CompileTimeValue::Int(0)
                     }
                 }
-                "integer?" => {
-                    match arg_vals.first() {
-                        Some(CompileTimeValue::Int(_)) => CompileTimeValue::Bool(true),
-                        Some(CompileTimeValue::Syntax(SExpr::Int { .. })) => CompileTimeValue::Bool(true),
-                        _ => CompileTimeValue::Bool(false),
+                "integer?" => match arg_vals.first() {
+                    Some(CompileTimeValue::Int(_)) => CompileTimeValue::Bool(true),
+                    Some(CompileTimeValue::Syntax(SExpr::Int { .. })) => {
+                        CompileTimeValue::Bool(true)
                     }
-                }
+                    _ => CompileTimeValue::Bool(false),
+                },
                 "syntax-error" => {
                     let msg = match arg_vals.first() {
                         Some(CompileTimeValue::Syntax(SExpr::Sym(s, _))) => s.clone(),
@@ -2710,19 +2957,36 @@ fn eval_compile_time_expr(
                 _ => {
                     // Unknown function - return as syntax application
                     let func_sym = SExpr::Sym(func.clone(), span.with_scope(macro_scope));
-                    let arg_sexprs: Vec<_> = arg_vals.iter().map(|v| match v {
-                        CompileTimeValue::Syntax(s) => s.clone(),
-                        CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), span.with_scope(macro_scope)),
-                        CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), span.with_scope(macro_scope)),
-                        CompileTimeValue::Int(i) => SExpr::Int { value: *i, ty: Type::S32, span: span.with_scope(macro_scope) },
-                        CompileTimeValue::List(items) => {
-                            let sexprs: Vec<_> = items.iter().map(|item| match item {
-                                CompileTimeValue::Syntax(s) => s.clone(),
-                                _ => SExpr::Sym("?".to_string(), span.with_scope(macro_scope)),
-                            }).collect();
-                            SExpr::List(sexprs, span.with_scope(macro_scope))
-                        }
-                    }).collect();
+                    let arg_sexprs: Vec<_> = arg_vals
+                        .iter()
+                        .map(|v| match v {
+                            CompileTimeValue::Syntax(s) => s.clone(),
+                            CompileTimeValue::Bool(true) => {
+                                SExpr::Sym("#t".to_string(), span.with_scope(macro_scope))
+                            }
+                            CompileTimeValue::Bool(false) => {
+                                SExpr::Sym("#f".to_string(), span.with_scope(macro_scope))
+                            }
+                            CompileTimeValue::Int(i) => SExpr::Int {
+                                value: *i,
+                                ty: Type::S32,
+                                span: span.with_scope(macro_scope),
+                            },
+                            CompileTimeValue::List(items) => {
+                                let sexprs: Vec<_> = items
+                                    .iter()
+                                    .map(|item| match item {
+                                        CompileTimeValue::Syntax(s) => s.clone(),
+                                        _ => SExpr::Sym(
+                                            "?".to_string(),
+                                            span.with_scope(macro_scope),
+                                        ),
+                                    })
+                                    .collect();
+                                SExpr::List(sexprs, span.with_scope(macro_scope))
+                            }
+                        })
+                        .collect();
                     let mut all_items = vec![func_sym];
                     all_items.extend(arg_sexprs);
                     CompileTimeValue::Syntax(SExpr::List(all_items, span.with_scope(macro_scope)))
@@ -2747,10 +3011,20 @@ fn eval_quasisyntax(
                     if let Some(val) = env.get(name) {
                         match val {
                             CompileTimeValue::Syntax(s) => s.clone(),
-                            CompileTimeValue::Int(i) => SExpr::Int { value: *i, ty: Type::S32, span: span.with_scope(macro_scope) },
-                            CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), span.with_scope(macro_scope)),
-                            CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), span.with_scope(macro_scope)),
-                            CompileTimeValue::List(_) => panic!("Cannot unsyntax a list directly, use #,@"),
+                            CompileTimeValue::Int(i) => SExpr::Int {
+                                value: *i,
+                                ty: Type::S32,
+                                span: span.with_scope(macro_scope),
+                            },
+                            CompileTimeValue::Bool(true) => {
+                                SExpr::Sym("#t".to_string(), span.with_scope(macro_scope))
+                            }
+                            CompileTimeValue::Bool(false) => {
+                                SExpr::Sym("#f".to_string(), span.with_scope(macro_scope))
+                            }
+                            CompileTimeValue::List(_) => {
+                                panic!("Cannot unsyntax a list directly, use #,@")
+                            }
                         }
                     } else {
                         // Unbound - keep as symbol
@@ -2795,15 +3069,21 @@ fn eval_quasisyntax(
             // Check if this is a pattern variable that should be substituted
             if let Some(val) = env.get(s) {
                 match val {
-                    CompileTimeValue::Syntax(syntax) => syntax.clone(),  // Keep original scopes
+                    CompileTimeValue::Syntax(syntax) => syntax.clone(), // Keep original scopes
                     CompileTimeValue::Int(i) => SExpr::Int {
                         value: *i,
                         ty: Type::S32,
                         span: sym_span.clone(),
                     },
-                    CompileTimeValue::Bool(true) => SExpr::Sym("#t".to_string(), sym_span.with_scope(macro_scope)),
-                    CompileTimeValue::Bool(false) => SExpr::Sym("#f".to_string(), sym_span.with_scope(macro_scope)),
-                    CompileTimeValue::List(_) => panic!("Cannot substitute list as single syntax in quasisyntax"),
+                    CompileTimeValue::Bool(true) => {
+                        SExpr::Sym("#t".to_string(), sym_span.with_scope(macro_scope))
+                    }
+                    CompileTimeValue::Bool(false) => {
+                        SExpr::Sym("#f".to_string(), sym_span.with_scope(macro_scope))
+                    }
+                    CompileTimeValue::List(_) => {
+                        panic!("Cannot substitute list as single syntax in quasisyntax")
+                    }
                 }
             } else {
                 // Not a pattern variable - add macro scope for hygiene
@@ -2847,23 +3127,25 @@ fn match_pattern_impl(
                 _ => false,
             }
         }
-        Pattern::List(patterns) => {
-            match input {
-                SExpr::List(items, _) => {
-                    if items.len() != patterns.len() {
+        Pattern::List(patterns) => match input {
+            SExpr::List(items, _) => {
+                if items.len() != patterns.len() {
+                    return false;
+                }
+                for (pat, item) in patterns.iter().zip(items.iter()) {
+                    if !match_pattern_impl(pat, item, literals, bindings) {
                         return false;
                     }
-                    for (pat, item) in patterns.iter().zip(items.iter()) {
-                        if !match_pattern_impl(pat, item, literals, bindings) {
-                            return false;
-                        }
-                    }
-                    true
                 }
-                _ => false,
+                true
             }
-        }
-        Pattern::ListWithEllipsis { before, repeated, after } => {
+            _ => false,
+        },
+        Pattern::ListWithEllipsis {
+            before,
+            repeated,
+            after,
+        } => {
             match input {
                 SExpr::List(items, _) => {
                     let min_len = before.len() + after.len();
@@ -2995,12 +3277,10 @@ fn expand_ellipsis_template(
 /// Find the number of elements in ellipsis bindings
 fn find_ellipsis_count(template: &Template, bindings: &HashMap<String, PatternBinding>) -> usize {
     match template {
-        Template::Variable(name) => {
-            match bindings.get(name) {
-                Some(PatternBinding::List(items)) => items.len(),
-                _ => 0,
-            }
-        }
+        Template::Variable(name) => match bindings.get(name) {
+            Some(PatternBinding::List(items)) => items.len(),
+            _ => 0,
+        },
         Template::List(templates) => {
             // Find the first list binding
             for t in templates {
@@ -3024,23 +3304,16 @@ fn expand_template_at_index(
     index: usize,
 ) -> SExpr {
     match template {
-        Template::Variable(name) => {
-            match bindings.get(name) {
-                Some(PatternBinding::List(items)) => {
-                    items.get(index).cloned().unwrap_or_else(|| {
-                        SExpr::List(vec![], span.clone())
-                    })
-                }
-                Some(PatternBinding::Single(expr)) => expr.clone(),
-                None => SExpr::Sym(name.clone(), span.with_scope(macro_scope)),
-            }
-        }
-        Template::Symbol(name) => {
-            SExpr::Sym(name.clone(), span.with_scope(macro_scope))
-        }
-        Template::Atom(sexpr) => {
-            add_scope_to_sexpr(sexpr, macro_scope)
-        }
+        Template::Variable(name) => match bindings.get(name) {
+            Some(PatternBinding::List(items)) => items
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| SExpr::List(vec![], span.clone())),
+            Some(PatternBinding::Single(expr)) => expr.clone(),
+            None => SExpr::Sym(name.clone(), span.with_scope(macro_scope)),
+        },
+        Template::Symbol(name) => SExpr::Sym(name.clone(), span.with_scope(macro_scope)),
+        Template::Atom(sexpr) => add_scope_to_sexpr(sexpr, macro_scope),
         Template::List(templates) => {
             let items: Vec<_> = templates
                 .iter()
@@ -3181,12 +3454,20 @@ fn eval_quasiquote(
             // This makes it distinct from same-named symbols at the call site
             SExpr::Sym(name.clone(), add_scope_to_span(sym_span, macro_scope))
         }
-        SExpr::Int { value, ty, span: int_span } => SExpr::Int {
+        SExpr::Int {
+            value,
+            ty,
+            span: int_span,
+        } => SExpr::Int {
             value: *value,
             ty: ty.clone(),
             span: add_scope_to_span(int_span, macro_scope),
         },
-        SExpr::Float { value, ty, span: float_span } => SExpr::Float {
+        SExpr::Float {
+            value,
+            ty,
+            span: float_span,
+        } => SExpr::Float {
             value: *value,
             ty: ty.clone(),
             span: add_scope_to_span(float_span, macro_scope),
@@ -3247,7 +3528,9 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                     if items.len() >= 2 {
                         if let SExpr::Sym(name, _) = &items[1] {
                             if !record_names.insert(name.clone()) {
-                                return Err(ctx.error(format!("duplicate record type '{}'", name), span));
+                                return Err(
+                                    ctx.error(format!("duplicate record type '{}'", name), span)
+                                );
                             }
                         }
                     }
@@ -3256,7 +3539,9 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                     if items.len() >= 2 {
                         if let SExpr::Sym(name, _) = &items[1] {
                             if !variant_names.insert(name.clone()) {
-                                return Err(ctx.error(format!("duplicate variant type '{}'", name), span));
+                                return Err(
+                                    ctx.error(format!("duplicate variant type '{}'", name), span)
+                                );
                             }
                         }
                     }
@@ -3265,7 +3550,9 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                     if items.len() >= 2 {
                         if let SExpr::Sym(name, _) = &items[1] {
                             if !resource_names.insert(name.clone()) {
-                                return Err(ctx.error(format!("duplicate resource type '{}'", name), span));
+                                return Err(
+                                    ctx.error(format!("duplicate resource type '{}'", name), span)
+                                );
                             }
                         }
                     }
@@ -3284,9 +3571,16 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                 }
                 match &items[0] {
                     SExpr::Sym(sym, _) if sym == "fn" => {
-                        let func = parse_fn_form(SExpr::List(items, span.clone()), &variant_names, &resource_names, ctx)?;
+                        let func = parse_fn_form(
+                            SExpr::List(items, span.clone()),
+                            &variant_names,
+                            &resource_names,
+                            ctx,
+                        )?;
                         if !defined.insert(func.name.clone()) {
-                            return Err(ctx.error(format!("duplicate function '{}'", func.name), &span));
+                            return Err(
+                                ctx.error(format!("duplicate function '{}'", func.name), &span)
+                            );
                         }
                         pending.push(func);
                     }
@@ -3301,45 +3595,69 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                                 }
                             }
                             SExpr::List(_, inner_span) => {
-                                let func = parse_fn_form(items[1].clone(), &variant_names, &resource_names, ctx)?;
+                                let func = parse_fn_form(
+                                    items[1].clone(),
+                                    &variant_names,
+                                    &resource_names,
+                                    ctx,
+                                )?;
                                 if !defined.insert(func.name.clone()) {
-                                    return Err(ctx.error(format!("duplicate function '{}'", func.name), inner_span));
+                                    return Err(ctx.error(
+                                        format!("duplicate function '{}'", func.name),
+                                        inner_span,
+                                    ));
                                 }
                                 if export_set.insert(func.name.clone()) {
                                     exports.push(func.name.clone());
                                 }
                                 pending.push(func);
                             }
-                            other => return Err(ctx.error("export argument must be a symbol or (fn ...)", other.span())),
+                            other => {
+                                return Err(ctx.error(
+                                    "export argument must be a symbol or (fn ...)",
+                                    other.span(),
+                                ));
+                            }
                         }
                     }
                     SExpr::Sym(sym, _) if sym == "import" => {
-                        let import = parse_import_form(&items, &variant_names, &resource_names, ctx)?;
+                        let import =
+                            parse_import_form(&items, &variant_names, &resource_names, ctx)?;
                         if defined.contains(&import.name) {
                             return Err(ctx.error(
-                                format!("function '{}' is already defined and cannot be imported", import.name),
-                                &span
+                                format!(
+                                    "function '{}' is already defined and cannot be imported",
+                                    import.name
+                                ),
+                                &span,
                             ));
                         }
                         if !imported.insert(import.name.clone()) {
-                            return Err(ctx.error(format!("duplicate import '{}'", import.name), &span));
+                            return Err(
+                                ctx.error(format!("duplicate import '{}'", import.name), &span)
+                            );
                         }
                         imports.push(import);
                     }
                     SExpr::Sym(sym, _) if sym == "global" => {
-                        let global = parse_global_form(&items, &variant_names, &resource_names, ctx)?;
+                        let global =
+                            parse_global_form(&items, &variant_names, &resource_names, ctx)?;
                         if !global_names.insert(global.name.clone()) {
-                            return Err(ctx.error(format!("duplicate global '{}'", global.name), &span));
+                            return Err(
+                                ctx.error(format!("duplicate global '{}'", global.name), &span)
+                            );
                         }
                         globals.push(global);
                     }
                     SExpr::Sym(sym, _) if sym == "record" => {
-                        let record = parse_record_form(&items, &variant_names, &resource_names, ctx)?;
+                        let record =
+                            parse_record_form(&items, &variant_names, &resource_names, ctx)?;
                         // Already checked for duplicates in first pass
                         records.push(record);
                     }
                     SExpr::Sym(sym, _) if sym == "variant" => {
-                        let variant = parse_variant_form(&items, &variant_names, &resource_names, ctx)?;
+                        let variant =
+                            parse_variant_form(&items, &variant_names, &resource_names, ctx)?;
                         // Already checked for duplicates in first pass
                         variants.push(variant);
                     }
@@ -3382,16 +3700,25 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
             result: import.return_type.clone(),
         };
         if signatures.insert(import.name.clone(), sig).is_some() {
-            return Err(ctx.error(format!("duplicate function '{}'", import.name), &import.span));
+            return Err(ctx.error(
+                format!("duplicate function '{}'", import.name),
+                &import.span,
+            ));
         }
     }
 
     for (export, export_span) in exports.iter().zip(export_set.iter()) {
         if !signatures.contains_key(export) {
-            return Err(ctx.error(format!("cannot export undefined function '{}'", export), &Span::dummy()));
+            return Err(ctx.error(
+                format!("cannot export undefined function '{}'", export),
+                &Span::dummy(),
+            ));
         }
         if imported.contains(export) {
-            return Err(ctx.error(format!("cannot export imported function '{}'", export), &Span::dummy()));
+            return Err(ctx.error(
+                format!("cannot export imported function '{}'", export),
+                &Span::dummy(),
+            ));
         }
     }
 
@@ -3413,7 +3740,14 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
             .iter()
             .map(|p| Binding::new(p.name.clone(), p.scopes.clone()))
             .collect::<Vec<_>>();
-        let body_expr = parse_expr(&func.body, &param_bindings, &signatures, &records_map, &variants_map, ctx)?;
+        let body_expr = parse_expr(
+            &func.body,
+            &param_bindings,
+            &signatures,
+            &records_map,
+            &variants_map,
+            ctx,
+        )?;
         functions.push(Function {
             name: func.name,
             params: func.params,
@@ -3433,7 +3767,12 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     })
 }
 
-fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<PendingFunction> {
+fn parse_fn_form(
+    form: SExpr,
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    ctx: &CompileContext,
+) -> Result<PendingFunction> {
     let (items, span) = match form {
         SExpr::List(items, span) => (items, span),
         other => return Err(ctx.error("function definition must be a list", other.span())),
@@ -3442,7 +3781,7 @@ fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, resource_names: &
         return Err(ctx.error_with_note(
             "invalid function definition",
             &span,
-            "expected: (fn name ((param type) ...) return-type body)"
+            "expected: (fn name ((param type) ...) return-type body)",
         ));
     }
     match &items[0] {
@@ -3464,13 +3803,18 @@ fn parse_fn_form(form: SExpr, variant_names: &HashSet<String>, resource_names: &
     })
 }
 
-fn parse_import_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Import> {
+fn parse_import_form(
+    items: &[SExpr],
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    ctx: &CompileContext,
+) -> Result<Import> {
     let span = items[0].span().clone();
     if items.len() != 5 {
         return Err(ctx.error_with_note(
             "invalid import declaration",
             &span,
-            "expected: (import module name ((param type) ...) return-type)"
+            "expected: (import module name ((param type) ...) return-type)",
         ));
     }
 
@@ -3494,13 +3838,18 @@ fn parse_import_form(items: &[SExpr], variant_names: &HashSet<String>, resource_
     })
 }
 
-fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Global> {
+fn parse_global_form(
+    items: &[SExpr],
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    ctx: &CompileContext,
+) -> Result<Global> {
     let span = items[0].span().clone();
     if items.len() != 5 {
         return Err(ctx.error_with_note(
             "invalid global declaration",
             &span,
-            "expected: (global $name type mutability init-value)"
+            "expected: (global $name type mutability init-value)",
         ));
     }
 
@@ -3510,12 +3859,14 @@ fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, resource_
                 return Err(ctx.error_with_note(
                     "global name must start with '$'",
                     sym_span,
-                    "e.g., $heap-ptr, $counter"
+                    "e.g., $heap-ptr, $counter",
                 ));
             }
             s.clone()
         }
-        other => return Err(ctx.error("global name must be a symbol starting with $", other.span())),
+        other => {
+            return Err(ctx.error("global name must be a symbol starting with $", other.span()));
+        }
     };
 
     let ty = parse_type_expr(&items[2], variant_names, resource_names, ctx)?;
@@ -3524,18 +3875,25 @@ fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, resource_
         SExpr::Sym(s, sym_span) => match s.as_str() {
             "mut" => true,
             "const" => false,
-            _ => return Err(ctx.error_with_note(
-                "invalid mutability specifier",
-                sym_span,
-                "expected 'mut' or 'const'"
-            )),
+            _ => {
+                return Err(ctx.error_with_note(
+                    "invalid mutability specifier",
+                    sym_span,
+                    "expected 'mut' or 'const'",
+                ));
+            }
         },
         other => return Err(ctx.error("mutability must be 'mut' or 'const'", other.span())),
     };
 
     let init_value = match &items[4] {
         SExpr::Int { value, .. } => *value,
-        other => return Err(ctx.error("global init value must be an integer constant", other.span())),
+        other => {
+            return Err(ctx.error(
+                "global init value must be an integer constant",
+                other.span(),
+            ));
+        }
     };
 
     Ok(Global {
@@ -3547,14 +3905,19 @@ fn parse_global_form(items: &[SExpr], variant_names: &HashSet<String>, resource_
 }
 
 /// Parse a record definition: (record name (field1 type1) (field2 type2) ...)
-fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<RecordDef> {
+fn parse_record_form(
+    items: &[SExpr],
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    ctx: &CompileContext,
+) -> Result<RecordDef> {
     let span = items[0].span().clone();
 
     if items.len() < 2 {
         return Err(ctx.error_with_note(
             "invalid record declaration",
             &span,
-            "expected: (record name (field type) ...)"
+            "expected: (record name (field type) ...)",
         ));
     }
 
@@ -3571,7 +3934,7 @@ fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, resource_
                     return Err(ctx.error_with_note(
                         "invalid field declaration",
                         field_span,
-                        "expected: (field-name type)"
+                        "expected: (field-name type)",
                     ));
                 }
                 let field_name = match &parts[0] {
@@ -3592,21 +3955,26 @@ fn parse_record_form(items: &[SExpr], variant_names: &HashSet<String>, resource_
         return Err(ctx.error_with_note(
             "record must have at least one field",
             &span,
-            "add fields like: (record point (x s32) (y s32))"
+            "add fields like: (record point (x s32) (y s32))",
         ));
     }
 
     Ok(RecordDef { name, fields })
 }
 
-fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<VariantDef> {
+fn parse_variant_form(
+    items: &[SExpr],
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    ctx: &CompileContext,
+) -> Result<VariantDef> {
     let span = items[0].span().clone();
 
     if items.len() < 2 {
         return Err(ctx.error_with_note(
             "invalid variant declaration",
             &span,
-            "expected: (variant name (case payload...) ...)"
+            "expected: (variant name (case payload...) ...)",
         ));
     }
 
@@ -3628,14 +3996,24 @@ fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, resource
                 };
                 let mut payload = Vec::new();
                 for ty_expr in &parts[1..] {
-                    payload.push(parse_type_expr(ty_expr, variant_names, resource_names, ctx)?);
+                    payload.push(parse_type_expr(
+                        ty_expr,
+                        variant_names,
+                        resource_names,
+                        ctx,
+                    )?);
                 }
                 cases.push(VariantCase {
                     name: case_name,
                     payload,
                 });
             }
-            other => return Err(ctx.error("variant case must be a list (case-name type...)", other.span())),
+            other => {
+                return Err(ctx.error(
+                    "variant case must be a list (case-name type...)",
+                    other.span(),
+                ));
+            }
         }
     }
 
@@ -3643,7 +4021,7 @@ fn parse_variant_form(items: &[SExpr], variant_names: &HashSet<String>, resource
         return Err(ctx.error_with_note(
             "variant must have at least one case",
             &span,
-            "add cases like: (variant shape (circle s32) (rectangle s32 s32) (point))"
+            "add cases like: (variant shape (circle s32) (rectangle s32 s32) (point))",
         ));
     }
 
@@ -3657,7 +4035,7 @@ fn parse_resource_form(items: &[SExpr], ctx: &CompileContext) -> Result<Resource
         return Err(ctx.error_with_note(
             "invalid resource declaration",
             &span,
-            "expected: (resource name)"
+            "expected: (resource name)",
         ));
     }
 
@@ -3669,7 +4047,12 @@ fn parse_resource_form(items: &[SExpr], ctx: &CompileContext) -> Result<Resource
     Ok(ResourceDef { name })
 }
 
-fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Vec<Parameter>> {
+fn parse_typed_params(
+    expr: &SExpr,
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    ctx: &CompileContext,
+) -> Result<Vec<Parameter>> {
     match expr {
         SExpr::List(params, _) => {
             let mut result = Vec::new();
@@ -3680,21 +4063,27 @@ fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, resource_na
                             return Err(ctx.error_with_note(
                                 "invalid parameter",
                                 param_span,
-                                "expected: (name type)"
+                                "expected: (name type)",
                             ));
                         }
                         let (name, scopes) = match &parts[0] {
                             SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
-                            other => return Err(ctx.error("parameter name must be a symbol", other.span())),
+                            other => {
+                                return Err(
+                                    ctx.error("parameter name must be a symbol", other.span())
+                                );
+                            }
                         };
                         let ty = parse_type_expr(&parts[1], variant_names, resource_names, ctx)?;
                         result.push(Parameter { name, ty, scopes });
                     }
-                    other => return Err(ctx.error_with_note(
-                        "invalid parameter",
-                        other.span(),
-                        "expected: (name type)"
-                    )),
+                    other => {
+                        return Err(ctx.error_with_note(
+                            "invalid parameter",
+                            other.span(),
+                            "expected: (name type)",
+                        ));
+                    }
                 }
             }
             Ok(result)
@@ -3703,7 +4092,12 @@ fn parse_typed_params(expr: &SExpr, variant_names: &HashSet<String>, resource_na
     }
 }
 
-fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, resource_names: &HashSet<String>, ctx: &CompileContext) -> Result<Type> {
+fn parse_type_expr(
+    expr: &SExpr,
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    ctx: &CompileContext,
+) -> Result<Type> {
     match expr {
         SExpr::Sym(s, span) => parse_type_symbol(s, variant_names, resource_names, span, ctx),
         SExpr::List(items, span) => {
@@ -3716,7 +4110,7 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, resource_names
                         return Err(ctx.error_with_note(
                             "invalid option type",
                             span,
-                            "expected: (option T)"
+                            "expected: (option T)",
                         ));
                     }
                     let inner = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
@@ -3727,7 +4121,7 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, resource_names
                         return Err(ctx.error_with_note(
                             "invalid result type",
                             span,
-                            "expected: (result T E)"
+                            "expected: (result T E)",
                         ));
                     }
                     let ok_ty = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
@@ -3739,7 +4133,7 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, resource_names
                         return Err(ctx.error_with_note(
                             "invalid list type",
                             span,
-                            "expected: (list T)"
+                            "expected: (list T)",
                         ));
                     }
                     let inner = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
@@ -3750,7 +4144,7 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, resource_names
                         return Err(ctx.error_with_note(
                             "invalid borrow type",
                             span,
-                            "expected: (borrow T)"
+                            "expected: (borrow T)",
                         ));
                     }
                     let inner = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
@@ -3763,7 +4157,13 @@ fn parse_type_expr(expr: &SExpr, variant_names: &HashSet<String>, resource_names
     }
 }
 
-fn parse_type_symbol(sym: &str, variant_names: &HashSet<String>, resource_names: &HashSet<String>, _span: &Span, _ctx: &CompileContext) -> Result<Type> {
+fn parse_type_symbol(
+    sym: &str,
+    variant_names: &HashSet<String>,
+    resource_names: &HashSet<String>,
+    _span: &Span,
+    _ctx: &CompileContext,
+) -> Result<Type> {
     match sym {
         "s32" => Ok(Type::S32),
         "s64" => Ok(Type::S64),
@@ -3855,12 +4255,14 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'if' expression",
                             list_span,
-                            "expected: (if condition then-expr else-expr)"
+                            "expected: (if condition then-expr else-expr)",
                         ));
                     }
                     let cond = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
-                    let then_branch = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
-                    let else_branch = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
+                    let then_branch =
+                        parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    let else_branch =
+                        parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::If {
                         cond: Box::new(cond),
                         then_branch: Box::new(then_branch),
@@ -3872,7 +4274,7 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'global.get' expression",
                             list_span,
-                            "expected: (global.get $name)"
+                            "expected: (global.get $name)",
                         ));
                     }
                     let name = match &items[1] {
@@ -3882,7 +4284,12 @@ fn parse_expr(
                             }
                             s.clone()
                         }
-                        other => return Err(ctx.error("global.get argument must be a global name starting with $", other.span())),
+                        other => {
+                            return Err(ctx.error(
+                                "global.get argument must be a global name starting with $",
+                                other.span(),
+                            ));
+                        }
                     };
                     Ok(Expr::GlobalGet { name })
                 }
@@ -3891,7 +4298,7 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'global.set' expression",
                             list_span,
-                            "expected: (global.set $name value)"
+                            "expected: (global.set $name value)",
                         ));
                     }
                     let name = match &items[1] {
@@ -3901,7 +4308,12 @@ fn parse_expr(
                             }
                             s.clone()
                         }
-                        other => return Err(ctx.error("global.set first argument must be a global name starting with $", other.span())),
+                        other => {
+                            return Err(ctx.error(
+                                "global.set first argument must be a global name starting with $",
+                                other.span(),
+                            ));
+                        }
                     };
                     let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
                     Ok(Expr::GlobalSet {
@@ -3914,37 +4326,45 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'let' expression",
                             list_span,
-                            "expected: (let (name value) body)"
+                            "expected: (let (name value) body)",
                         ));
                     }
                     let binding = match &items[1] {
                         SExpr::List(parts, _) => parts,
-                        other => return Err(ctx.error_with_note(
-                            "let binding must be a list",
-                            other.span(),
-                            "expected: (name value)"
-                        )),
+                        other => {
+                            return Err(ctx.error_with_note(
+                                "let binding must be a list",
+                                other.span(),
+                                "expected: (name value)",
+                            ));
+                        }
                     };
                     if binding.len() != 2 {
                         return Err(ctx.error_with_note(
                             "invalid let binding",
                             items[1].span(),
-                            "expected: (name value)"
+                            "expected: (name value)",
                         ));
                     }
                     let (name, name_scopes) = match &binding[0] {
                         SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
-                        other => return Err(ctx.error("let binding name must be a symbol", other.span())),
+                        other => {
+                            return Err(
+                                ctx.error("let binding name must be a symbol", other.span())
+                            );
+                        }
                     };
-                    let value_expr = parse_expr(&binding[1], vars, functions, records, variants, ctx)?;
+                    let value_expr =
+                        parse_expr(&binding[1], vars, functions, records, variants, ctx)?;
                     // Create a new binding with the name and its scopes for hygienic resolution
                     let new_binding = Binding::new(name, name_scopes);
                     let mangled_name = new_binding.mangled_name();
                     let mut next_vars = vars.to_vec();
                     next_vars.push(new_binding);
-                    let body_expr = parse_expr(&items[2], &next_vars, functions, records, variants, ctx)?;
+                    let body_expr =
+                        parse_expr(&items[2], &next_vars, functions, records, variants, ctx)?;
                     Ok(Expr::Let {
-                        name: mangled_name,  // Use mangled name for codegen
+                        name: mangled_name, // Use mangled name for codegen
                         value: Box::new(value_expr),
                         body: Box::new(body_expr),
                     })
@@ -3955,39 +4375,48 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'match' expression",
                             list_span,
-                            "expected: (match expr ((case-name bindings...) body) ...)"
+                            "expected: (match expr ((case-name bindings...) body) ...)",
                         ));
                     }
-                    let match_expr = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let match_expr =
+                        parse_expr(&items[1], vars, functions, records, variants, ctx)?;
                     let mut arms = Vec::new();
 
                     for case_item in &items[2..] {
                         let case_parts = match case_item {
                             SExpr::List(parts, _) => parts,
-                            other => return Err(ctx.error("match arm must be a list", other.span())),
+                            other => {
+                                return Err(ctx.error("match arm must be a list", other.span()));
+                            }
                         };
 
                         if case_parts.len() != 2 {
                             return Err(ctx.error_with_note(
                                 "invalid match arm",
                                 case_item.span(),
-                                "expected: ((case-name bindings...) body)"
+                                "expected: ((case-name bindings...) body)",
                             ));
                         }
 
                         // Parse pattern: (case-name binding1 binding2 ...)
                         let pattern = match &case_parts[0] {
                             SExpr::List(pat_parts, _) => pat_parts,
-                            other => return Err(ctx.error("match pattern must be a list", other.span())),
+                            other => {
+                                return Err(ctx.error("match pattern must be a list", other.span()));
+                            }
                         };
 
                         if pattern.is_empty() {
-                            return Err(ctx.error("match pattern cannot be empty", case_parts[0].span()));
+                            return Err(
+                                ctx.error("match pattern cannot be empty", case_parts[0].span())
+                            );
                         }
 
                         let case_name = match &pattern[0] {
                             SExpr::Sym(s, _) => s.clone(),
-                            other => return Err(ctx.error("case name must be a symbol", other.span())),
+                            other => {
+                                return Err(ctx.error("case name must be a symbol", other.span()));
+                            }
                         };
 
                         // Collect bindings
@@ -3996,7 +4425,9 @@ fn parse_expr(
                         for binding in &pattern[1..] {
                             let (name, name_scopes) = match binding {
                                 SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
-                                other => return Err(ctx.error("binding must be a symbol", other.span())),
+                                other => {
+                                    return Err(ctx.error("binding must be a symbol", other.span()));
+                                }
                             };
                             let new_binding = Binding::new(name, name_scopes);
                             let mangled_name = new_binding.mangled_name();
@@ -4005,7 +4436,14 @@ fn parse_expr(
                         }
 
                         // Parse body with extended bindings
-                        let body = parse_expr(&case_parts[1], &next_vars, functions, records, variants, ctx)?;
+                        let body = parse_expr(
+                            &case_parts[1],
+                            &next_vars,
+                            functions,
+                            records,
+                            variants,
+                            ctx,
+                        )?;
 
                         arms.push(MatchArm {
                             case_name,
@@ -4025,10 +4463,11 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'some' expression",
                             list_span,
-                            "expected: (some inner-type value)"
+                            "expected: (some inner-type value)",
                         ));
                     }
-                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let inner_type =
+                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Some {
                         inner_type,
@@ -4040,10 +4479,11 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'none' expression",
                             list_span,
-                            "expected: (none inner-type)"
+                            "expected: (none inner-type)",
                         ));
                     }
-                    let inner_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let inner_type =
+                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
                     Ok(Expr::None { inner_type })
                 }
                 // Result constructors: (ok T E value) and (err T E value)
@@ -4052,11 +4492,13 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'ok' expression",
                             list_span,
-                            "expected: (ok ok-type err-type value)"
+                            "expected: (ok ok-type err-type value)",
                         ));
                     }
-                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
-                    let err_type = parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let ok_type =
+                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let err_type =
+                        parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Ok {
                         ok_type,
@@ -4069,11 +4511,13 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'err' expression",
                             list_span,
-                            "expected: (err ok-type err-type value)"
+                            "expected: (err ok-type err-type value)",
                         ));
                     }
-                    let ok_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
-                    let err_type = parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let ok_type =
+                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let err_type =
+                        parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Err {
                         ok_type,
@@ -4087,10 +4531,11 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'list-new' expression",
                             list_span,
-                            "expected: (list-new elem-type)"
+                            "expected: (list-new elem-type)",
                         ));
                     }
-                    let elem_type = parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                    let elem_type =
+                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
                     Ok(Expr::ListNew { elem_type })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "list-push" => {
@@ -4098,7 +4543,7 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'list-push' expression",
                             list_span,
-                            "expected: (list-push list value)"
+                            "expected: (list-push list value)",
                         ));
                     }
                     let list = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
@@ -4113,7 +4558,7 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'list-get' expression",
                             list_span,
-                            "expected: (list-get list index)"
+                            "expected: (list-get list index)",
                         ));
                     }
                     let list = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
@@ -4128,7 +4573,7 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'list-len' expression",
                             list_span,
-                            "expected: (list-len list)"
+                            "expected: (list-len list)",
                         ));
                     }
                     let list = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
@@ -4141,7 +4586,7 @@ fn parse_expr(
                         return Err(ctx.error_with_note(
                             "invalid 'string-len' expression",
                             list_span,
-                            "expected: (string-len string)"
+                            "expected: (string-len string)",
                         ));
                     }
                     let string = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
@@ -4155,7 +4600,9 @@ fn parse_expr(
                         if lookup_wasm_instr(sym).is_some() {
                             let mut args = Vec::new();
                             for arg in &items[1..] {
-                                args.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
+                                args.push(parse_expr(
+                                    arg, vars, functions, records, variants, ctx,
+                                )?);
                             }
                             Ok(Expr::WasmInstr {
                                 name: sym.clone(),
@@ -4171,12 +4618,14 @@ fn parse_expr(
                                         expected.params.len(),
                                         items.len() - 1
                                     ),
-                                    list_span
+                                    list_span,
                                 ));
                             }
                             let mut args = Vec::new();
                             for arg in &items[1..] {
-                                args.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
+                                args.push(parse_expr(
+                                    arg, vars, functions, records, variants, ctx,
+                                )?);
                             }
                             Ok(Expr::Call {
                                 name: sym.clone(),
@@ -4192,12 +4641,14 @@ fn parse_expr(
                                         record_def.fields.len(),
                                         items.len() - 1
                                     ),
-                                    list_span
+                                    list_span,
                                 ));
                             }
                             let mut fields = Vec::new();
                             for arg in &items[1..] {
-                                fields.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
+                                fields.push(parse_expr(
+                                    arg, vars, functions, records, variants, ctx,
+                                )?);
                             }
                             Ok(Expr::RecordConstruct {
                                 record_name: sym.clone(),
@@ -4214,12 +4665,14 @@ fn parse_expr(
                                         case.payload.len(),
                                         items.len() - 1
                                     ),
-                                    list_span
+                                    list_span,
                                 ));
                             }
                             let mut payload = Vec::new();
                             for arg in &items[1..] {
-                                payload.push(parse_expr(arg, vars, functions, records, variants, ctx)?);
+                                payload.push(parse_expr(
+                                    arg, vars, functions, records, variants, ctx,
+                                )?);
                             }
                             Ok(Expr::VariantConstruct {
                                 variant_name: variant_def.name.clone(),
@@ -4237,23 +4690,35 @@ fn parse_expr(
                                         return Err(ctx.error_with_note(
                                             "invalid field access",
                                             list_span,
-                                            format!("expected: ({}.{} record-expr)", record_name, field_name)
+                                            format!(
+                                                "expected: ({}.{} record-expr)",
+                                                record_name, field_name
+                                            ),
                                         ));
                                     }
-                                    let expr = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                                    let expr = parse_expr(
+                                        &items[1], vars, functions, records, variants, ctx,
+                                    )?;
                                     Ok(Expr::RecordAccess {
                                         record_name: record_name.to_string(),
                                         field_name: field_name.to_string(),
                                         expr: Box::new(expr),
                                     })
                                 } else {
-                                    Err(ctx.error(format!("unknown record type '{}'", record_name), sym_span))
+                                    Err(ctx.error(
+                                        format!("unknown record type '{}'", record_name),
+                                        sym_span,
+                                    ))
                                 }
                             } else {
-                                Err(ctx.error(format!("unknown function or operator '{}'", sym), sym_span))
+                                Err(ctx.error(
+                                    format!("unknown function or operator '{}'", sym),
+                                    sym_span,
+                                ))
                             }
                         } else {
-                            Err(ctx.error(format!("unknown function or operator '{}'", sym), sym_span))
+                            Err(ctx
+                                .error(format!("unknown function or operator '{}'", sym), sym_span))
                         }
                     } else {
                         Err(ctx.error("expression must start with a symbol", op.span()))
@@ -4262,12 +4727,18 @@ fn parse_expr(
             }
         }
         SExpr::Quasiquote(_, span) | SExpr::Unquote(_, span) | SExpr::UnquoteSplice(_, span) => {
-            Err(ctx.error("quasiquote/unquote should have been expanded before parsing", span))
+            Err(ctx.error(
+                "quasiquote/unquote should have been expanded before parsing",
+                span,
+            ))
         }
-        SExpr::SyntaxQuote(_, span) | SExpr::Quasisyntax(_, span) |
-        SExpr::Unsyntax(_, span) | SExpr::UnsyntaxSplice(_, span) => {
-            Err(ctx.error("syntax forms (#', #`, #,, #,@) should have been expanded before parsing", span))
-        }
+        SExpr::SyntaxQuote(_, span)
+        | SExpr::Quasisyntax(_, span)
+        | SExpr::Unsyntax(_, span)
+        | SExpr::UnsyntaxSplice(_, span) => Err(ctx.error(
+            "syntax forms (#', #`, #,, #,@) should have been expanded before parsing",
+            span,
+        )),
     }
 }
 
@@ -4297,11 +4768,13 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
     }
 
     // Build records and variants maps for codegen
-    let records_map: HashMap<String, RecordDef> = prog.records
+    let records_map: HashMap<String, RecordDef> = prog
+        .records
         .iter()
         .map(|r| (r.name.clone(), r.clone()))
         .collect();
-    let variants_map: HashMap<String, VariantDef> = prog.variants
+    let variants_map: HashMap<String, VariantDef> = prog
+        .variants
         .iter()
         .map(|v| (v.name.clone(), v.clone()))
         .collect();
@@ -4348,7 +4821,16 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
 
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
-        gen_expr(&func.body, &mut body, 4, &mut env, signatures, &globals_map, &records_map, &variants_map);
+        gen_expr(
+            &func.body,
+            &mut body,
+            4,
+            &mut env,
+            signatures,
+            &globals_map,
+            &records_map,
+            &variants_map,
+        );
 
         out.push_str(&format!("  (func ${} ", internal_name));
         for param in &func.params {
@@ -4474,7 +4956,9 @@ fn gen_expr(
             Type::Str
         }
         Expr::Ascribe { expr, ty } => {
-            let from_ty = gen_expr(expr, out, indent, env, signatures, globals, records, variants);
+            let from_ty = gen_expr(
+                expr, out, indent, env, signatures, globals, records, variants,
+            );
             if from_ty == *ty {
                 return from_ty;
             }
@@ -4493,7 +4977,9 @@ fn gen_expr(
                 .get(name)
                 .unwrap_or_else(|| panic!("Missing signature for {}", name));
             for arg in args {
-                gen_expr(arg, out, indent, env, signatures, globals, records, variants);
+                gen_expr(
+                    arg, out, indent, env, signatures, globals, records, variants,
+                );
             }
             out.push_str(&format!("{}call ${}\n", pad, name));
             sig.result.clone()
@@ -4503,17 +4989,37 @@ fn gen_expr(
             then_branch,
             else_branch,
         } => {
-            let cond_ty = gen_expr(cond, out, indent, env, signatures, globals, records, variants);
+            let cond_ty = gen_expr(
+                cond, out, indent, env, signatures, globals, records, variants,
+            );
             if cond_ty != Type::S32 {
                 panic!("if condition must be s32");
             }
             let result_ty = expr_type(then_branch, env, signatures, globals, records, variants);
             out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
             out.push_str(&format!("{}  (then\n", pad));
-            gen_expr(then_branch, out, indent + 4, env, signatures, globals, records, variants);
+            gen_expr(
+                then_branch,
+                out,
+                indent + 4,
+                env,
+                signatures,
+                globals,
+                records,
+                variants,
+            );
             out.push_str(&format!("{}  )\n", pad));
             out.push_str(&format!("{}  (else\n", pad));
-            let else_ty = gen_expr(else_branch, out, indent + 4, env, signatures, globals, records, variants);
+            let else_ty = gen_expr(
+                else_branch,
+                out,
+                indent + 4,
+                env,
+                signatures,
+                globals,
+                records,
+                variants,
+            );
             if else_ty != result_ty {
                 panic!(
                     "if branches must match types: {:?} vs {:?}",
@@ -4525,11 +5031,15 @@ fn gen_expr(
             result_ty
         }
         Expr::Let { name, value, body } => {
-            let value_ty = gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            let value_ty = gen_expr(
+                value, out, indent, env, signatures, globals, records, variants,
+            );
             let idx = env.declare_local(value_ty);
             out.push_str(&format!("{}local.set {}\n", pad, idx));
             env.push_binding(name.clone(), idx);
-            let body_ty = gen_expr(body, out, indent, env, signatures, globals, records, variants);
+            let body_ty = gen_expr(
+                body, out, indent, env, signatures, globals, records, variants,
+            );
             env.pop_binding();
             body_ty
         }
@@ -4566,12 +5076,16 @@ fn gen_expr(
                 }
 
                 // Emit and save the value first
-                let value_ty = gen_expr(&args[1], out, indent, env, signatures, globals, records, variants);
+                let value_ty = gen_expr(
+                    &args[1], out, indent, env, signatures, globals, records, variants,
+                );
                 let value_local = env.declare_local(value_ty);
                 out.push_str(&format!("{}local.set {}\n", pad, value_local));
 
                 // Emit the address
-                gen_expr(&args[0], out, indent, env, signatures, globals, records, variants);
+                gen_expr(
+                    &args[0], out, indent, env, signatures, globals, records, variants,
+                );
 
                 // Get the value back
                 out.push_str(&format!("{}local.get {}\n", pad, value_local));
@@ -4584,7 +5098,9 @@ fn gen_expr(
             } else {
                 // Normal instructions - emit args then instruction
                 for arg in args {
-                    gen_expr(arg, out, indent, env, signatures, globals, records, variants);
+                    gen_expr(
+                        arg, out, indent, env, signatures, globals, records, variants,
+                    );
                 }
                 out.push_str(&format!("{}{}\n", pad, name));
             }
@@ -4598,7 +5114,9 @@ fn gen_expr(
         Expr::GlobalSet { name, value } => {
             // Global.set consumes the value, so we save it to a local first
             // and restore it after to return the value for composability
-            let value_ty = gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            let value_ty = gen_expr(
+                value, out, indent, env, signatures, globals, records, variants,
+            );
             let value_local = env.declare_local(value_ty.clone());
             out.push_str(&format!("{}local.set {}\n", pad, value_local));
             out.push_str(&format!("{}local.get {}\n", pad, value_local));
@@ -4606,10 +5124,11 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, value_local));
             value_ty
         }
-        Expr::RecordConstruct { record_name, fields } => {
-            let record_def = records
-                .get(record_name)
-                .expect("record should exist");
+        Expr::RecordConstruct {
+            record_name,
+            fields,
+        } => {
+            let record_def = records.get(record_name).expect("record should exist");
             let size = record_def.size();
 
             // Bump allocate: get current heap_ptr, advance it by record size
@@ -4627,7 +5146,9 @@ fn gen_expr(
             out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store each field at the appropriate offset
-            for (i, (field_expr, field_def)) in fields.iter().zip(record_def.fields.iter()).enumerate() {
+            for (i, (field_expr, field_def)) in
+                fields.iter().zip(record_def.fields.iter()).enumerate()
+            {
                 let offset = record_def.field_offset(i);
 
                 // Compute address: ptr + offset
@@ -4638,7 +5159,9 @@ fn gen_expr(
                 }
 
                 // Evaluate the field expression
-                gen_expr(field_expr, out, indent, env, signatures, globals, records, variants);
+                gen_expr(
+                    field_expr, out, indent, env, signatures, globals, records, variants,
+                );
 
                 // Store based on field type
                 let store_instr = match &field_def.ty {
@@ -4647,7 +5170,14 @@ fn gen_expr(
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     // All compound types are pointers, resources are i32 handles
-                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.store",
+                    Type::Record(_)
+                    | Type::Variant(_)
+                    | Type::Option(_)
+                    | Type::Result(_, _)
+                    | Type::List(_)
+                    | Type::Str
+                    | Type::Resource(_)
+                    | Type::Borrow(_) => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
             }
@@ -4656,13 +5186,16 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             Type::Record(record_name.clone())
         }
-        Expr::RecordAccess { record_name, field_name, expr } => {
-            let record_def = records
-                .get(record_name)
-                .expect("record should exist");
+        Expr::RecordAccess {
+            record_name,
+            field_name,
+            expr,
+        } => {
+            let record_def = records.get(record_name).expect("record should exist");
 
             // Find the field and its offset
-            let (field_idx, field_def) = record_def.fields
+            let (field_idx, field_def) = record_def
+                .fields
                 .iter()
                 .enumerate()
                 .find(|(_, f)| f.name == *field_name)
@@ -4670,7 +5203,9 @@ fn gen_expr(
             let offset = record_def.field_offset(field_idx);
 
             // Evaluate the record expression (gives us the pointer)
-            gen_expr(expr, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                expr, out, indent, env, signatures, globals, records, variants,
+            );
 
             // Add offset if non-zero
             if offset > 0 {
@@ -4685,17 +5220,25 @@ fn gen_expr(
                 Type::F32 => "f32.load",
                 Type::F64 => "f64.load",
                 // All compound types are pointers, resources are i32 handles
-                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
+                Type::Record(_)
+                | Type::Variant(_)
+                | Type::Option(_)
+                | Type::Result(_, _)
+                | Type::List(_)
+                | Type::Str
+                | Type::Resource(_)
+                | Type::Borrow(_) => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
             field_def.ty.clone()
         }
-        Expr::VariantConstruct { variant_name, case_name, payload } => {
-            let variant_def = variants
-                .get(variant_name)
-                .expect("variant should exist");
-            let (case_idx, case) = variant_def.find_case(case_name)
-                .expect("case should exist");
+        Expr::VariantConstruct {
+            variant_name,
+            case_name,
+            payload,
+        } => {
+            let variant_def = variants.get(variant_name).expect("variant should exist");
+            let (case_idx, case) = variant_def.find_case(case_name).expect("case should exist");
             let size = variant_def.size();
 
             // Bump allocate: get current heap_ptr, advance it by variant size
@@ -4725,7 +5268,16 @@ fn gen_expr(
                 out.push_str(&format!("{}i32.add\n", pad));
 
                 // Evaluate the payload expression
-                gen_expr(payload_expr, out, indent, env, signatures, globals, records, variants);
+                gen_expr(
+                    payload_expr,
+                    out,
+                    indent,
+                    env,
+                    signatures,
+                    globals,
+                    records,
+                    variants,
+                );
 
                 // Store based on payload type
                 let store_instr = match payload_ty {
@@ -4733,7 +5285,14 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
-                    Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.store",
+                    Type::Record(_)
+                    | Type::Variant(_)
+                    | Type::Option(_)
+                    | Type::Result(_, _)
+                    | Type::List(_)
+                    | Type::Str
+                    | Type::Resource(_)
+                    | Type::Borrow(_) => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
                 payload_offset += type_size(payload_ty);
@@ -4745,7 +5304,9 @@ fn gen_expr(
         }
         Expr::Match { expr, cases } => {
             // Evaluate the expression to get the pointer
-            let expr_ty = gen_expr(expr, out, indent, env, signatures, globals, records, variants);
+            let expr_ty = gen_expr(
+                expr, out, indent, env, signatures, globals, records, variants,
+            );
 
             // Save the pointer to a local
             let value_ptr = env.declare_local(Type::S32);
@@ -4780,7 +5341,11 @@ fn gen_expr(
 
                         let is_last = i == num_cases - 1;
                         if !is_last || (is_last && num_cases > 1) {
-                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!(
+                                "{}(if (result {})\n",
+                                pad,
+                                wat_type(&result_ty)
+                            ));
                             out.push_str(&format!("{}  (then\n", pad));
                         }
 
@@ -4796,7 +5361,14 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
+                                Type::Record(_)
+                                | Type::Variant(_)
+                                | Type::Option(_)
+                                | Type::Result(_, _)
+                                | Type::List(_)
+                                | Type::Str
+                                | Type::Resource(_)
+                                | Type::Borrow(_) => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -4806,7 +5378,16 @@ fn gen_expr(
                         }
 
                         // Generate arm body
-                        gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
+                        gen_expr(
+                            &arm.body,
+                            out,
+                            indent + 4,
+                            env,
+                            signatures,
+                            globals,
+                            records,
+                            variants,
+                        );
 
                         // Pop bindings
                         while env.bindings.len() > saved_binding_count {
@@ -4860,7 +5441,11 @@ fn gen_expr(
 
                         let is_last = i == num_cases - 1;
                         if !is_last || (is_last && num_cases > 1) {
-                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!(
+                                "{}(if (result {})\n",
+                                pad,
+                                wat_type(&result_ty)
+                            ));
                             out.push_str(&format!("{}  (then\n", pad));
                         }
 
@@ -4876,7 +5461,14 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
+                                Type::Record(_)
+                                | Type::Variant(_)
+                                | Type::Option(_)
+                                | Type::Result(_, _)
+                                | Type::List(_)
+                                | Type::Str
+                                | Type::Resource(_)
+                                | Type::Borrow(_) => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -4886,7 +5478,16 @@ fn gen_expr(
                         }
 
                         // Generate arm body
-                        gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
+                        gen_expr(
+                            &arm.body,
+                            out,
+                            indent + 4,
+                            env,
+                            signatures,
+                            globals,
+                            records,
+                            variants,
+                        );
 
                         // Pop bindings
                         while env.bindings.len() > saved_binding_count {
@@ -4914,9 +5515,7 @@ fn gen_expr(
                     result_ty
                 }
                 Type::Variant(variant_name) => {
-                    let variant_def = variants
-                        .get(variant_name)
-                        .expect("variant should exist");
+                    let variant_def = variants.get(variant_name).expect("variant should exist");
 
                     // Load discriminant
                     out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
@@ -4925,9 +5524,13 @@ fn gen_expr(
                     // Determine result type from first arm
                     let result_ty = if let Some(first_arm) = cases.first() {
                         // Build environment for first arm to get its type
-                        let (_, first_case) = variant_def.find_case(&first_arm.case_name).expect("case should exist");
+                        let (_, first_case) = variant_def
+                            .find_case(&first_arm.case_name)
+                            .expect("case should exist");
                         let mut arm_env = HashMap::new();
-                        for (binding, ty) in first_arm.bindings.iter().zip(first_case.payload.iter()) {
+                        for (binding, ty) in
+                            first_arm.bindings.iter().zip(first_case.payload.iter())
+                        {
                             arm_env.insert(binding.clone(), ty.clone());
                         }
                         // Get type from body - simplified, assumes type checking passed
@@ -4944,7 +5547,8 @@ fn gen_expr(
                     // For simplicity, use nested if-else for now
                     let num_cases = cases.len();
                     for (i, arm) in cases.iter().enumerate() {
-                        let (case_idx, case) = variant_def.find_case(&arm.case_name)
+                        let (case_idx, case) = variant_def
+                            .find_case(&arm.case_name)
                             .expect("case should exist");
 
                         // Compare discriminant with case index
@@ -4957,10 +5561,18 @@ fn gen_expr(
 
                         let is_last = i == num_cases - 1;
                         if is_last && num_cases > 1 {
-                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!(
+                                "{}(if (result {})\n",
+                                pad,
+                                wat_type(&result_ty)
+                            ));
                             out.push_str(&format!("{}  (then\n", pad));
                         } else if !is_last {
-                            out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
+                            out.push_str(&format!(
+                                "{}(if (result {})\n",
+                                pad,
+                                wat_type(&result_ty)
+                            ));
                             out.push_str(&format!("{}  (then\n", pad));
                         }
 
@@ -4978,7 +5590,14 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
-                                Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
+                                Type::Record(_)
+                                | Type::Variant(_)
+                                | Type::Option(_)
+                                | Type::Result(_, _)
+                                | Type::List(_)
+                                | Type::Str
+                                | Type::Resource(_)
+                                | Type::Borrow(_) => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -4991,7 +5610,16 @@ fn gen_expr(
                         }
 
                         // Generate arm body
-                        gen_expr(&arm.body, out, indent + 4, env, signatures, globals, records, variants);
+                        gen_expr(
+                            &arm.body,
+                            out,
+                            indent + 4,
+                            env,
+                            signatures,
+                            globals,
+                            records,
+                            variants,
+                        );
 
                         // Pop bindings
                         while env.bindings.len() > saved_binding_count {
@@ -5045,7 +5673,9 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
-            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants,
+            );
             let store_instr = match inner_type {
                 Type::S32 => "i32.store",
                 Type::S64 => "i64.store",
@@ -5084,7 +5714,11 @@ fn gen_expr(
             Type::Option(Box::new(inner_type.clone()))
         }
         // Result: ok - allocate, store discriminant 0, store value
-        Expr::Ok { ok_type, err_type, value } => {
+        Expr::Ok {
+            ok_type,
+            err_type,
+            value,
+        } => {
             let max_payload = std::cmp::max(type_size(ok_type), type_size(err_type));
             let size = 4 + max_payload; // discriminant + max payload
             let ptr_local = env.declare_local(Type::S32);
@@ -5108,7 +5742,9 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
-            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants,
+            );
             let store_instr = match ok_type {
                 Type::S32 => "i32.store",
                 Type::S64 => "i64.store",
@@ -5123,7 +5759,11 @@ fn gen_expr(
             Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
         }
         // Result: err - allocate, store discriminant 1, store value
-        Expr::Err { ok_type, err_type, value } => {
+        Expr::Err {
+            ok_type,
+            err_type,
+            value,
+        } => {
             let max_payload = std::cmp::max(type_size(ok_type), type_size(err_type));
             let size = 4 + max_payload; // discriminant + max payload
             let ptr_local = env.declare_local(Type::S32);
@@ -5147,7 +5787,9 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
-            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants,
+            );
             let store_instr = match err_type {
                 Type::S32 => "i32.store",
                 Type::S64 => "i64.store",
@@ -5201,7 +5843,9 @@ fn gen_expr(
         }
         // List: push - simplified version that reallocates every time
         Expr::ListPush { list, value } => {
-            let list_ty = gen_expr(list, out, indent, env, signatures, globals, records, variants);
+            let list_ty = gen_expr(
+                list, out, indent, env, signatures, globals, records, variants,
+            );
             let elem_type = match &list_ty {
                 Type::List(inner) => inner.as_ref().clone(),
                 _ => panic!("list-push expects a list"),
@@ -5247,7 +5891,9 @@ fn gen_expr(
             out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
             out.push_str(&format!("{}i32.mul\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
-            gen_expr(value, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants,
+            );
             let store_instr = match &elem_type {
                 Type::S32 => "i32.store",
                 Type::S64 => "i64.store",
@@ -5277,7 +5923,9 @@ fn gen_expr(
         }
         // List: get - load element at index
         Expr::ListGet { list, index } => {
-            let list_ty = gen_expr(list, out, indent, env, signatures, globals, records, variants);
+            let list_ty = gen_expr(
+                list, out, indent, env, signatures, globals, records, variants,
+            );
             let elem_type = match &list_ty {
                 Type::List(inner) => inner.as_ref().clone(),
                 _ => panic!("list-get expects a list"),
@@ -5287,7 +5935,9 @@ fn gen_expr(
             out.push_str(&format!("{}local.set {}\n", pad, list_local));
 
             // Evaluate index
-            gen_expr(index, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                index, out, indent, env, signatures, globals, records, variants,
+            );
             let index_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.set {}\n", pad, index_local));
 
@@ -5316,14 +5966,18 @@ fn gen_expr(
         }
         // List: len - return length
         Expr::ListLen { list } => {
-            gen_expr(list, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                list, out, indent, env, signatures, globals, records, variants,
+            );
             // Load len field at offset 0
             out.push_str(&format!("{}i32.load\n", pad));
             Type::S32
         }
         // String: len - return length
         Expr::StringLen { string } => {
-            gen_expr(string, out, indent, env, signatures, globals, records, variants);
+            gen_expr(
+                string, out, indent, env, signatures, globals, records, variants,
+            );
             // Load len field at offset 0 (string layout: 4 bytes len + data)
             out.push_str(&format!("{}i32.load\n", pad));
             Type::S32
@@ -5401,7 +6055,8 @@ fn expr_type(
         };
         vars.insert(name.clone(), ty);
     }
-    check_expr(expr, &vars, signatures, globals, records, variants).expect("type checking already performed")
+    check_expr(expr, &vars, signatures, globals, records, variants)
+        .expect("type checking already performed")
 }
 
 fn conversion_instr(from: &Type, to: &Type) -> Option<&'static str> {
@@ -5432,7 +6087,12 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::F32 => "f32",
         Type::F64 => "f64",
         // All compound types are pointer-sized (i32 handles)
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str => "i32",
+        Type::Record(_)
+        | Type::Variant(_)
+        | Type::Option(_)
+        | Type::Result(_, _)
+        | Type::List(_)
+        | Type::Str => "i32",
         // Resources are i32 handles
         Type::Resource(_) | Type::Borrow(_) => "i32",
     }
@@ -5456,7 +6116,11 @@ fn wit_type(ty: &Type) -> String {
 
 /// Returns the flattened canonical ABI types for a given type.
 /// Records are flattened into their fields, variants into discriminant + max payload.
-fn flatten_type(ty: &Type, records: &HashMap<String, RecordDef>, variants: &HashMap<String, VariantDef>) -> Vec<Type> {
+fn flatten_type(
+    ty: &Type,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
+) -> Vec<Type> {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => vec![ty.clone()],
         Type::Record(name) => {
@@ -5473,10 +6137,15 @@ fn flatten_type(ty: &Type, records: &HashMap<String, RecordDef>, variants: &Hash
             let mut result = vec![Type::S32]; // discriminant
 
             // Find max payload size (in number of flattened fields)
-            let max_payload_size = variant.cases.iter()
-                .map(|c| c.payload.iter()
-                    .map(|t| flatten_type(t, records, variants).len())
-                    .sum::<usize>())
+            let max_payload_size = variant
+                .cases
+                .iter()
+                .map(|c| {
+                    c.payload
+                        .iter()
+                        .map(|t| flatten_type(t, records, variants).len())
+                        .sum::<usize>()
+                })
                 .max()
                 .unwrap_or(0);
 
@@ -5521,7 +6190,10 @@ fn flatten_type(ty: &Type, records: &HashMap<String, RecordDef>, variants: &Hash
 /// Check if a type needs ABI wrapper (is not a simple scalar or handle)
 fn needs_abi_wrapper(ty: &Type) -> bool {
     // Scalars and resource handles don't need ABI wrappers - they pass directly as primitives
-    !matches!(ty, Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Resource(_) | Type::Borrow(_))
+    !matches!(
+        ty,
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Resource(_) | Type::Borrow(_)
+    )
 }
 
 /// Check if a function needs an ABI wrapper for export
@@ -5599,7 +6271,10 @@ fn generate_abi_wrapper(
                         out.push_str(&format!("{}i32.const {}\n", pad, offset));
                         out.push_str(&format!("{}i32.add\n", pad));
                     }
-                    out.push_str(&format!("{}local.get ${}\n", pad, flat_params[flat_param_idx].0));
+                    out.push_str(&format!(
+                        "{}local.get ${}\n",
+                        pad, flat_params[flat_param_idx].0
+                    ));
                     out.push_str(&format!("{}{}\n", pad, store_instr(&field.ty)));
                     offset += type_size(&field.ty);
                     flat_param_idx += 1;
@@ -5622,12 +6297,17 @@ fn generate_abi_wrapper(
 
                 // Store discriminant (first flat param)
                 out.push_str(&format!("{}local.get {}\n", pad, complex_local_idx));
-                out.push_str(&format!("{}local.get ${}\n", pad, flat_params[flat_param_idx].0));
+                out.push_str(&format!(
+                    "{}local.get ${}\n",
+                    pad, flat_params[flat_param_idx].0
+                ));
                 out.push_str(&format!("{}i32.store\n", pad));
                 flat_param_idx += 1;
 
                 // Find max payload size for this variant
-                let max_payload_count = variant.cases.iter()
+                let max_payload_count = variant
+                    .cases
+                    .iter()
                     .map(|c| c.payload.len())
                     .max()
                     .unwrap_or(0);
@@ -5637,7 +6317,10 @@ fn generate_abi_wrapper(
                     out.push_str(&format!("{}local.get {}\n", pad, complex_local_idx));
                     out.push_str(&format!("{}i32.const {}\n", pad, 4 + i * 4));
                     out.push_str(&format!("{}i32.add\n", pad));
-                    out.push_str(&format!("{}local.get ${}\n", pad, flat_params[flat_param_idx].0));
+                    out.push_str(&format!(
+                        "{}local.get ${}\n",
+                        pad, flat_params[flat_param_idx].0
+                    ));
                     out.push_str(&format!("{}i32.store\n", pad));
                     flat_param_idx += 1;
                 }
@@ -5681,7 +6364,14 @@ fn store_instr(ty: &Type) -> &'static str {
         Type::F32 => "f32.store",
         Type::F64 => "f64.store",
         // Compound types are pointer-sized, resources are i32 handles
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.store",
+        Type::Record(_)
+        | Type::Variant(_)
+        | Type::Option(_)
+        | Type::Result(_, _)
+        | Type::List(_)
+        | Type::Str
+        | Type::Resource(_)
+        | Type::Borrow(_) => "i32.store",
     }
 }
 
@@ -5693,7 +6383,14 @@ fn load_instr(ty: &Type) -> &'static str {
         Type::F32 => "f32.load",
         Type::F64 => "f64.load",
         // Compound types are pointer-sized, resources are i32 handles
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) | Type::List(_) | Type::Str | Type::Resource(_) | Type::Borrow(_) => "i32.load",
+        Type::Record(_)
+        | Type::Variant(_)
+        | Type::Option(_)
+        | Type::Result(_, _)
+        | Type::List(_)
+        | Type::Str
+        | Type::Resource(_)
+        | Type::Borrow(_) => "i32.load",
     }
 }
 
@@ -5720,11 +6417,19 @@ fn generate_wit(prog: &Program) -> String {
                 out.push_str(&format!("    {},\n", case.name));
             } else if case.payload.len() == 1 {
                 // Case with single payload: name(type)
-                out.push_str(&format!("    {}({}),\n", case.name, wit_type(&case.payload[0])));
+                out.push_str(&format!(
+                    "    {}({}),\n",
+                    case.name,
+                    wit_type(&case.payload[0])
+                ));
             } else {
                 // Case with multiple payloads: name(tuple<type1, type2, ...>)
                 let types: Vec<String> = case.payload.iter().map(wit_type).collect();
-                out.push_str(&format!("    {}(tuple<{}>),\n", case.name, types.join(", ")));
+                out.push_str(&format!(
+                    "    {}(tuple<{}>),\n",
+                    case.name,
+                    types.join(", ")
+                ));
             }
         }
         out.push_str("  }\n\n");
@@ -5776,4 +6481,786 @@ fn find_function<'a>(prog: &'a Program, name: &str) -> &'a Function {
         .iter()
         .find(|f| f.name == name)
         .unwrap_or_else(|| panic!("Function '{}' not found during codegen", name))
+}
+
+// ============================================================================
+// REPL Compilation Support
+// ============================================================================
+
+/// Compile an expression for REPL evaluation.
+///
+/// Takes an expression string, variable bindings to inline, and function
+/// definitions to include. Returns WASM component bytes with an exported
+/// `eval` function that evaluates the expression.
+pub fn compile_repl_expr(
+    expr_source: &str,
+    bindings: &HashMap<String, InlineValue>,
+    functions: &[Function],
+) -> Result<Vec<u8>> {
+    let ctx = CompileContext::new(expr_source.to_string(), "<repl>".to_string());
+
+    // Parse the expression
+    let tokens = tokenize(expr_source);
+    if tokens.is_empty() {
+        bail!("empty expression");
+    }
+
+    let (sexpr, _) = parse_sexpr(&tokens, 0);
+
+    // Inline variable bindings by transforming the SExpr
+    let inlined_sexpr = inline_bindings(&sexpr, bindings);
+
+    // Build function signatures from provided functions
+    let mut signatures: HashMap<String, Signature> = HashMap::new();
+    for func in functions {
+        signatures.insert(
+            func.name.clone(),
+            Signature {
+                params: func.params.iter().map(|p| p.ty.clone()).collect(),
+                result: func.return_type.clone(),
+            },
+        );
+    }
+
+    // Parse the expression into an Expr AST
+    let expr = parse_expr(
+        &inlined_sexpr,
+        &[], // No local variables initially
+        &signatures,
+        &HashMap::new(), // No records for now
+        &HashMap::new(), // No variants for now
+        &ctx,
+    )?;
+
+    // Infer the return type by type-checking the expression
+    let return_type = check_expr(
+        &expr,
+        &HashMap::new(), // No local variables
+        &signatures,
+        &HashMap::new(), // No globals
+        &HashMap::new(), // No records
+        &HashMap::new(), // No variants
+    )?;
+
+    // Create the eval function
+    let eval_fn = Function {
+        name: "eval".to_string(),
+        params: vec![],
+        return_type,
+        body: expr,
+    };
+
+    // Build the program with all functions + eval
+    let mut all_functions = functions.to_vec();
+    all_functions.push(eval_fn);
+
+    let prog = Program {
+        functions: all_functions,
+        imports: vec![],
+        exports: vec!["eval".to_string()],
+        globals: vec![],
+        records: vec![],
+        variants: vec![],
+        resources: vec![],
+    };
+
+    // Type check the full program
+    let full_signatures = collect_signatures(&prog)?;
+    type_check(&prog, &full_signatures, &ctx)?;
+
+    // Generate WAT and WIT
+    let wat = generate_wat(&prog, &full_signatures);
+    let wit = generate_wit(&prog);
+
+    // Encode to WASM component
+    let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
+    let component_bytes = encode_component(&wasm_bytes, &wit)?;
+
+    Ok(component_bytes)
+}
+
+/// Transform an SExpr by inlining variable bindings as literal values
+fn inline_bindings(sexpr: &SExpr, bindings: &HashMap<String, InlineValue>) -> SExpr {
+    match sexpr {
+        SExpr::Sym(name, span) => {
+            if let Some(value) = bindings.get(name) {
+                value_to_sexpr(value, span)
+            } else {
+                sexpr.clone()
+            }
+        }
+        SExpr::List(items, span) => {
+            let inlined_items: Vec<SExpr> = items
+                .iter()
+                .map(|item| inline_bindings(item, bindings))
+                .collect();
+            SExpr::List(inlined_items, span.clone())
+        }
+        SExpr::Quasiquote(inner, span) => {
+            SExpr::Quasiquote(Box::new(inline_bindings(inner, bindings)), span.clone())
+        }
+        SExpr::Unquote(inner, span) => {
+            SExpr::Unquote(Box::new(inline_bindings(inner, bindings)), span.clone())
+        }
+        SExpr::UnquoteSplice(inner, span) => {
+            SExpr::UnquoteSplice(Box::new(inline_bindings(inner, bindings)), span.clone())
+        }
+        // Literals don't need inlining
+        SExpr::Int { .. } | SExpr::Float { .. } | SExpr::Str(..) => sexpr.clone(),
+        // Syntax forms - recurse into them
+        SExpr::SyntaxQuote(inner, span) => {
+            SExpr::SyntaxQuote(Box::new(inline_bindings(inner, bindings)), span.clone())
+        }
+        SExpr::Quasisyntax(inner, span) => {
+            SExpr::Quasisyntax(Box::new(inline_bindings(inner, bindings)), span.clone())
+        }
+        SExpr::Unsyntax(inner, span) => {
+            SExpr::Unsyntax(Box::new(inline_bindings(inner, bindings)), span.clone())
+        }
+        SExpr::UnsyntaxSplice(inner, span) => {
+            SExpr::UnsyntaxSplice(Box::new(inline_bindings(inner, bindings)), span.clone())
+        }
+    }
+}
+
+/// Convert an InlineValue to an SExpr literal
+fn value_to_sexpr(value: &InlineValue, span: &Span) -> SExpr {
+    match value {
+        InlineValue::S32(n) => SExpr::Int {
+            value: *n as i64,
+            ty: Type::S32,
+            span: span.clone(),
+        },
+        InlineValue::S64(n) => SExpr::Int {
+            value: *n,
+            ty: Type::S64,
+            span: span.clone(),
+        },
+        InlineValue::F32(n) => SExpr::Float {
+            value: *n as f64,
+            ty: Type::F32,
+            span: span.clone(),
+        },
+        InlineValue::F64(n) => SExpr::Float {
+            value: *n,
+            ty: Type::F64,
+            span: span.clone(),
+        },
+        InlineValue::Str(s) => SExpr::Str(s.clone(), span.clone()),
+        // Compound types need constructor calls - for now, panic with a clear message
+        InlineValue::List(_) => {
+            panic!("TODO: inline list values as constructor calls")
+        }
+        InlineValue::Option(_) => {
+            panic!("TODO: inline option values as constructor calls")
+        }
+        InlineValue::Result(_) => {
+            panic!("TODO: inline result values as constructor calls")
+        }
+        InlineValue::Record { .. } => {
+            panic!("TODO: inline record values as constructor calls")
+        }
+        InlineValue::Variant { .. } => {
+            panic!("TODO: inline variant values as constructor calls")
+        }
+    }
+}
+
+// ============================================================================
+// Composite Component Generation
+// ============================================================================
+
+/// CGRF format constants
+const CGRF_MAGIC: u32 = 0x46524743; // "CGRF" in little-endian
+const CGRF_VERSION: u16 = 1;
+
+/// CGRF node kinds
+const CGRF_S32: u8 = 0x02;
+const CGRF_S64: u8 = 0x03;
+const CGRF_F32: u8 = 0x04;
+const CGRF_F64: u8 = 0x05;
+
+/// Memory layout for composite components
+const INPUT_BUFFER_OFFSET: i32 = 0x0000;
+const OUTPUT_BUFFER_OFFSET: i32 = 0x4000;
+const HEAP_START_OFFSET: i32 = 0xC000;
+
+/// Generate WAT for a composite-compatible component.
+///
+/// This produces WASM with:
+/// - Export functions using composite calling convention: (i32, i32, i32, i32) -> i32
+/// - CGRF encoding for input/output values
+/// - Memory layout with input buffer at 0x0, output at 0x4000
+fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature>) -> String {
+    let mut out = String::new();
+    out.push_str("(module\n");
+
+    // Memory: at least 1 page (64KB), exported as "memory"
+    out.push_str("  (memory (export \"memory\") 1 100)\n");
+
+    // Heap pointer for allocations, starts after output buffer
+    out.push_str(&format!(
+        "  (global $__heap_ptr (mut i32) (i32.const {}))\n",
+        HEAP_START_OFFSET
+    ));
+
+    // Build maps for codegen
+    let globals_map: HashMap<String, (Type, bool)> = HashMap::new();
+    let records_map: HashMap<String, RecordDef> = prog
+        .records
+        .iter()
+        .map(|r| (r.name.clone(), r.clone()))
+        .collect();
+    let variants_map: HashMap<String, VariantDef> = prog
+        .variants
+        .iter()
+        .map(|v| (v.name.clone(), v.clone()))
+        .collect();
+
+    // Generate internal functions (not exported directly)
+    for func in &prog.functions {
+        let internal_name = format!("$__{}_internal", func.name);
+
+        let mut body = String::new();
+        let mut env = CodegenEnv::new(&func.params);
+        gen_expr(
+            &func.body,
+            &mut body,
+            4,
+            &mut env,
+            signatures,
+            &globals_map,
+            &records_map,
+            &variants_map,
+        );
+
+        out.push_str(&format!("  (func {} ", internal_name));
+        for param in &func.params {
+            out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
+        }
+        out.push_str(&format!("(result {})\n", wat_type(&func.return_type)));
+        for local in &env.locals {
+            out.push_str(&format!("    (local {})\n", wat_type(local)));
+        }
+        out.push_str(&body);
+        out.push_str("  )\n");
+    }
+
+    // Generate composite wrappers for exported functions
+    for export in &prog.exports {
+        let func = find_function(prog, export);
+        generate_composite_wrapper(&mut out, func);
+    }
+
+    out.push_str(")\n");
+    out
+}
+
+/// Generate a composite-compatible export wrapper for a function.
+///
+/// The wrapper has signature: (in_ptr, in_len, out_ptr, out_cap) -> bytes_written
+/// It decodes input (if any), calls the internal function, encodes the result.
+fn generate_composite_wrapper(out: &mut String, func: &Function) {
+    let wrapper_name = &func.name;
+    let internal_name = format!("$__{}_internal", func.name);
+
+    out.push_str(&format!(
+        "  (func ${} (export \"{}\") (param $in_ptr i32) (param $in_len i32) (param $out_ptr i32) (param $out_cap i32) (result i32)\n",
+        wrapper_name, wrapper_name
+    ));
+
+    // For now, only support functions with no parameters (like eval)
+    // TODO: Add parameter decoding for functions with inputs
+    if !func.params.is_empty() {
+        out.push_str("    ;; TODO: decode input parameters from CGRF\n");
+        out.push_str("    unreachable\n");
+        out.push_str("  )\n");
+        return;
+    }
+
+    // Declare local for the result value (locals must be at the top)
+    match &func.return_type {
+        Type::S32 => out.push_str("    (local $value i32)\n"),
+        Type::S64 => out.push_str("    (local $value i64)\n"),
+        Type::F32 => out.push_str("    (local $value f32)\n"),
+        Type::F64 => out.push_str("    (local $value f64)\n"),
+        _ => {}
+    }
+
+    // Call the internal function and save result
+    out.push_str(&format!("    call {}\n", internal_name));
+    out.push_str("    local.set $value\n");
+
+    // Encode result based on return type
+    match &func.return_type {
+        Type::S32 => {
+            generate_cgrf_encode_s32(out);
+        }
+        Type::S64 => {
+            generate_cgrf_encode_s64(out);
+        }
+        Type::F32 => {
+            generate_cgrf_encode_f32(out);
+        }
+        Type::F64 => {
+            generate_cgrf_encode_f64(out);
+        }
+        _ => {
+            out.push_str("    ;; TODO: encode non-scalar return types\n");
+            out.push_str("    i32.const -1\n");
+        }
+    }
+
+    out.push_str("  )\n");
+}
+
+/// Generate WAT code to encode an i32 value on the stack to CGRF at $out_ptr.
+/// Leaves bytes_written (i32) on the stack.
+fn generate_cgrf_encode_s32(out: &mut String) {
+    // Assumes $value local is already declared and contains the value to encode
+    // Assumes $out_ptr contains the output buffer pointer
+
+    // Write CGRF header (16 bytes)
+    // Magic: "CGRF" = 0x46524743
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+    out.push_str("    i32.store\n");
+
+    // Version (u16) + Flags (u16) = 0x00000001
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+    out.push_str("    i32.store16\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 6\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n"); // flags
+    out.push_str("    i32.store16\n");
+
+    // Node count: 1
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.store\n");
+
+    // Root index: 0
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store\n");
+
+    // Write node (8 bytes header + 4 bytes payload = 12 bytes)
+    // Kind: S32 = 0x02, flags: 0, reserved: 0
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 16\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_S32 as i32));
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 17\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n"); // flags
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 18\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n"); // reserved
+    out.push_str("    i32.store16\n");
+
+    // Payload length: 4
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 20\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.store\n");
+
+    // Payload: the i32 value
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 24\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $value\n");
+    out.push_str("    i32.store\n");
+
+    // Return bytes written: 16 (header) + 8 (node header) + 4 (payload) = 28
+    out.push_str("    i32.const 28\n");
+}
+
+/// Generate WAT code to encode an i64 value on the stack to CGRF at $out_ptr.
+fn generate_cgrf_encode_s64(out: &mut String) {
+    // Assumes $value local is already declared and contains the value to encode
+    // Assumes $out_ptr contains the output buffer pointer
+
+    // Write CGRF header (16 bytes)
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+    out.push_str("    i32.store\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+    out.push_str("    i32.store16\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 6\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.store\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store\n");
+
+    // Write node - kind S64 = 0x03
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 16\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_S64 as i32));
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 17\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 18\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+
+    // Payload length: 8
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 20\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.store\n");
+
+    // Payload: the i64 value
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 24\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $value\n");
+    out.push_str("    i64.store\n");
+
+    // Return bytes written: 16 + 8 + 8 = 32
+    out.push_str("    i32.const 32\n");
+}
+
+/// Generate WAT code to encode an f32 value on the stack to CGRF at $out_ptr.
+fn generate_cgrf_encode_f32(out: &mut String) {
+    // Assumes $value local is already declared and contains the value to encode
+    // Assumes $out_ptr contains the output buffer pointer
+
+    // Write CGRF header
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+    out.push_str("    i32.store\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+    out.push_str("    i32.store16\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 6\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.store\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store\n");
+
+    // Write node - kind F32 = 0x04
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 16\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_F32 as i32));
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 17\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 18\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+
+    // Payload length: 4
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 20\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.store\n");
+
+    // Payload: the f32 value
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 24\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $value\n");
+    out.push_str("    f32.store\n");
+
+    // Return bytes written: 16 + 8 + 4 = 28
+    out.push_str("    i32.const 28\n");
+}
+
+/// Generate WAT code to encode an f64 value on the stack to CGRF at $out_ptr.
+fn generate_cgrf_encode_f64(out: &mut String) {
+    // Assumes $value local is already declared and contains the value to encode
+    // Assumes $out_ptr contains the output buffer pointer
+
+    // Write CGRF header
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+    out.push_str("    i32.store\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+    out.push_str("    i32.store16\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 6\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.store\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store\n");
+
+    // Write node - kind F64 = 0x05
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 16\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_F64 as i32));
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 17\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store8\n");
+
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 18\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+
+    // Payload length: 8
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 20\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.store\n");
+
+    // Payload: the f64 value
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 24\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $value\n");
+    out.push_str("    f64.store\n");
+
+    // Return bytes written: 16 + 8 + 8 = 32
+    out.push_str("    i32.const 32\n");
+}
+
+/// Compile an expression for REPL evaluation, producing a composite component.
+///
+/// This generates a WASM module (not a full component) with composite calling convention.
+/// The module exports an `eval` function with signature (i32, i32, i32, i32) -> i32.
+pub fn compile_repl_expr_composite(
+    expr_source: &str,
+    bindings: &HashMap<String, InlineValue>,
+    functions: &[Function],
+) -> Result<Vec<u8>> {
+    let ctx = CompileContext::new(expr_source.to_string(), "<repl>".to_string());
+
+    // Parse the expression
+    let tokens = tokenize(expr_source);
+    if tokens.is_empty() {
+        bail!("empty expression");
+    }
+
+    let (sexpr, _) = parse_sexpr(&tokens, 0);
+
+    // Inline variable bindings by transforming the SExpr
+    let inlined_sexpr = inline_bindings(&sexpr, bindings);
+
+    // Build function signatures from provided functions
+    let mut signatures: HashMap<String, Signature> = HashMap::new();
+    for func in functions {
+        signatures.insert(
+            func.name.clone(),
+            Signature {
+                params: func.params.iter().map(|p| p.ty.clone()).collect(),
+                result: func.return_type.clone(),
+            },
+        );
+    }
+
+    // Parse the expression into an Expr AST
+    let expr = parse_expr(
+        &inlined_sexpr,
+        &[],
+        &signatures,
+        &HashMap::new(),
+        &HashMap::new(),
+        &ctx,
+    )?;
+
+    // Infer the return type
+    let return_type = check_expr(
+        &expr,
+        &HashMap::new(),
+        &signatures,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )?;
+
+    // Create the eval function
+    let eval_fn = Function {
+        name: "eval".to_string(),
+        params: vec![],
+        return_type,
+        body: expr,
+    };
+
+    // Build the program
+    let mut all_functions = functions.to_vec();
+    all_functions.push(eval_fn);
+
+    let prog = Program {
+        functions: all_functions,
+        imports: vec![],
+        exports: vec!["eval".to_string()],
+        globals: vec![],
+        records: vec![],
+        variants: vec![],
+        resources: vec![],
+    };
+
+    // Type check
+    let full_signatures = collect_signatures(&prog)?;
+    type_check(&prog, &full_signatures, &ctx)?;
+
+    // Generate composite WAT
+    let wat = generate_wat_composite(&prog, &full_signatures);
+
+    // Convert WAT to WASM bytes (raw module, not component)
+    let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
+
+    Ok(wasm_bytes)
+}
+
+/// Like compile_repl_expr_composite but returns WAT string instead of WASM bytes.
+/// Useful for debugging and testing.
+pub fn compile_repl_expr_composite_wat(
+    expr_source: &str,
+    bindings: &HashMap<String, InlineValue>,
+    functions: &[Function],
+) -> Result<String> {
+    let ctx = CompileContext::new(expr_source.to_string(), "<repl>".to_string());
+
+    let tokens = tokenize(expr_source);
+    if tokens.is_empty() {
+        bail!("empty expression");
+    }
+
+    let (sexpr, _) = parse_sexpr(&tokens, 0);
+    let inlined_sexpr = inline_bindings(&sexpr, bindings);
+
+    let mut signatures: HashMap<String, Signature> = HashMap::new();
+    for func in functions {
+        signatures.insert(
+            func.name.clone(),
+            Signature {
+                params: func.params.iter().map(|p| p.ty.clone()).collect(),
+                result: func.return_type.clone(),
+            },
+        );
+    }
+
+    let expr = parse_expr(
+        &inlined_sexpr,
+        &[],
+        &signatures,
+        &HashMap::new(),
+        &HashMap::new(),
+        &ctx,
+    )?;
+
+    let return_type = check_expr(
+        &expr,
+        &HashMap::new(),
+        &signatures,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )?;
+
+    let eval_fn = Function {
+        name: "eval".to_string(),
+        params: vec![],
+        return_type,
+        body: expr,
+    };
+
+    let mut all_functions = functions.to_vec();
+    all_functions.push(eval_fn);
+
+    let prog = Program {
+        functions: all_functions,
+        imports: vec![],
+        exports: vec!["eval".to_string()],
+        globals: vec![],
+        records: vec![],
+        variants: vec![],
+        resources: vec![],
+    };
+
+    let full_signatures = collect_signatures(&prog)?;
+    type_check(&prog, &full_signatures, &ctx)?;
+
+    Ok(generate_wat_composite(&prog, &full_signatures))
 }
