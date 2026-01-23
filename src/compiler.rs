@@ -7087,9 +7087,9 @@ fn generate_composite_wrapper(
         out.push_str("    (local $str_ptr i32)\n");
     }
 
-    // Additional locals needed for record/option decoding
+    // Additional locals needed for record/option/variant/result decoding
     let needs_compound_decode = func.params.iter().any(|p| {
-        matches!(p.ty, Type::Record(_) | Type::Option(_) | Type::Variant(_))
+        matches!(p.ty, Type::Record(_) | Type::Option(_) | Type::Variant(_) | Type::Result(_, _))
     });
     if needs_compound_decode {
         out.push_str("    (local $rec_ptr i32)\n");
@@ -9123,6 +9123,72 @@ fn generate_cgrf_decode_variant(
     out.push_str(&format!("    local.set $param_{}\n", param_name));
 }
 
+/// Generate WAT code to decode a result<T, E> parameter from CGRF.
+/// For now, supports result<s32, s32>.
+///
+/// CGRF result encoding:
+/// - If Ok(val) or Err(val): child node at offset 16, result node after
+/// - Result node has: tag (0=ok, 1=err) and child_index if has payload
+///
+/// Wisp result layout: [tag: i32 (0=ok, 1=err), payload]
+fn generate_cgrf_decode_result(
+    out: &mut String,
+    ok_ty: &Type,
+    err_ty: &Type,
+    param_name: &str,
+) {
+    out.push_str("    ;; Decode result from CGRF\n");
+
+    // Calculate result size for allocation
+    // For now, assume both ok and err have same size (s32)
+    let payload_size = match (ok_ty, err_ty) {
+        (Type::S64, _) | (_, Type::S64) | (Type::F64, _) | (_, Type::F64) => 8,
+        _ => 4,
+    };
+    let result_size = 4 + payload_size; // tag + payload
+
+    // Allocate wisp result on heap
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", result_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // CGRF Result encoding:
+    // - Node 0: payload value (S32) at offset 16
+    // - Node 1: Result node at offset 28
+    //   - Result payload: [tag: u32, child_index: u32]
+    //
+    // The tag tells us if it's Ok (0) or Err (1)
+
+    // Read tag from result node payload (offset 28 + 8 = 36)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    i32.const 36\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $field_val\n"); // tag value (0=ok, 1=err)
+
+    // Store tag in wisp result
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str("    local.get $field_val\n");
+    out.push_str("    i32.store\n");
+
+    // Read payload value from child node (offset 16 + 8 = 24)
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    i32.const 24\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    i32.store\n");
+
+    // Return the result pointer
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
 /// Generate WAT code to decode a list<T> parameter from CGRF.
 /// For now, only supports list<s32>.
 ///
@@ -9401,6 +9467,9 @@ fn generate_cgrf_decode_param(
         }
         Type::Variant(variant_name) => {
             generate_cgrf_decode_variant(out, variant_name, param_name, variants);
+        }
+        Type::Result(ok_ty, err_ty) => {
+            generate_cgrf_decode_result(out, ok_ty, err_ty, param_name);
         }
         _ => {
             // For complex types, we'd need more sophisticated decoding
