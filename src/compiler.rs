@@ -6931,8 +6931,29 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
         HEAP_START_OFFSET
     ));
 
+    // Emit user-defined globals
+    for global in &prog.globals {
+        let mutability = if global.mutable { "mut" } else { "" };
+        let wasm_type = wat_type(&global.ty);
+        if global.mutable {
+            out.push_str(&format!(
+                "  (global {} ({} {}) ({}.const {}))\n",
+                global.name, mutability, wasm_type, wasm_type, global.init_value
+            ));
+        } else {
+            out.push_str(&format!(
+                "  (global {} {} ({}.const {}))\n",
+                global.name, wasm_type, wasm_type, global.init_value
+            ));
+        }
+    }
+
     // Build maps for codegen
-    let globals_map: HashMap<String, (Type, bool)> = HashMap::new();
+    let globals_map: HashMap<String, (Type, bool)> = prog
+        .globals
+        .iter()
+        .map(|g| (g.name.clone(), (g.ty.clone(), g.mutable)))
+        .collect();
     let records_map: HashMap<String, RecordDef> = prog
         .records
         .iter()
@@ -6950,10 +6971,9 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
         generate_import_wrapper(&mut out, import);
     }
 
-    // Generate internal functions (not exported directly)
+    // Generate internal functions
+    // These use their original names ($name) so that gen_expr's function calls work correctly
     for func in &prog.functions {
-        let internal_name = format!("$__{}_internal", func.name);
-
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
         gen_expr(
@@ -6967,7 +6987,7 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
             &variants_map,
         );
 
-        out.push_str(&format!("  (func {} ", internal_name));
+        out.push_str(&format!("  (func ${} ", func.name));
         for param in &func.params {
             out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
         }
@@ -6994,12 +7014,13 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
 /// The wrapper has signature: (in_ptr, in_len, out_ptr, out_cap) -> bytes_written
 /// It decodes input (if any), calls the internal function, encodes the result.
 fn generate_composite_wrapper(out: &mut String, func: &Function) {
-    let wrapper_name = &func.name;
-    let internal_name = format!("$__{}_internal", func.name);
+    let export_name = &func.name;
+    let wrapper_name = format!("{}__export", func.name);
+    let internal_name = format!("${}", func.name);
 
     out.push_str(&format!(
         "  (func ${} (export \"{}\") (param $in_ptr i32) (param $in_len i32) (param $out_ptr i32) (param $out_cap i32) (result i32)\n",
-        wrapper_name, wrapper_name
+        wrapper_name, export_name
     ));
 
     // For now, only support functions with no parameters (like eval)
