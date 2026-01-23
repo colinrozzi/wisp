@@ -338,7 +338,7 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
         .with_context(|| format!("failed to write {}", wit_path.display()))?;
 
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
-    let component_bytes = encode_component(&wasm_bytes, &wit)?;
+    let component_bytes = encode_component(&wasm_bytes, &wit, prog.world_config.as_ref(), source_path)?;
     fs::write(&component_path, component_bytes)
         .with_context(|| format!("failed to write {}", component_path.display()))?;
 
@@ -349,8 +349,39 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     })
 }
 
-fn encode_component(module: &[u8], wit_source: &str) -> Result<Vec<u8>> {
+fn encode_component(
+    module: &[u8],
+    wit_source: &str,
+    world_config: Option<&WorldConfig>,
+    source_path: &Path,
+) -> Result<Vec<u8>> {
     let mut resolve = Resolve::new();
+
+    // If we have external WIT dependencies, load them first
+    if let Some(config) = world_config {
+        if let Some(wit_deps) = &config.wit_deps {
+            // Resolve wit_deps path relative to the source file
+            let deps_path = if wit_deps.is_absolute() {
+                wit_deps.clone()
+            } else {
+                source_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(wit_deps)
+            };
+
+            if deps_path.exists() {
+                // Load all WIT packages from the deps directory
+                resolve
+                    .push_path(&deps_path)
+                    .with_context(|| format!("failed to load WIT deps from {}", deps_path.display()))?;
+            } else {
+                bail!("WIT deps path not found: {}", deps_path.display());
+            }
+        }
+    }
+
+    // Parse our generated WIT (which may reference the loaded external packages)
     let pkg_id = resolve
         .push_str(Path::new("generated.wit"), wit_source)
         .context("failed to parse generated WIT")?;
@@ -899,6 +930,41 @@ struct PendingFunction {
     span: Span,
 }
 
+/// External WIT interface reference (e.g., "theater:simple/runtime")
+#[derive(Debug, Clone)]
+pub struct ExternalInterface {
+    pub package: String,      // e.g., "theater:simple"
+    pub interface: String,    // e.g., "runtime"
+}
+
+impl ExternalInterface {
+    fn parse(s: &str) -> Option<Self> {
+        // Parse "package:namespace/interface" format
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() == 2 {
+            Some(ExternalInterface {
+                package: parts[0].to_string(),
+                interface: parts[1].to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn to_wit_ref(&self) -> String {
+        format!("{}/{}", self.package, self.interface)
+    }
+}
+
+/// World configuration for external WIT
+#[derive(Debug, Clone, Default)]
+pub struct WorldConfig {
+    pub name: String,
+    pub wit_deps: Option<PathBuf>,           // Path to wit deps directory
+    pub external_imports: Vec<ExternalInterface>,  // e.g., theater:simple/runtime
+    pub external_exports: Vec<ExternalInterface>,  // e.g., theater:simple/actor
+}
+
 #[derive(Debug)]
 pub struct Program {
     pub functions: Vec<Function>,
@@ -908,6 +974,7 @@ pub struct Program {
     pub records: Vec<RecordDef>,
     pub variants: Vec<VariantDef>,
     pub resources: Vec<ResourceDef>,
+    pub world_config: Option<WorldConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -3529,6 +3596,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut variant_names: HashSet<String> = HashSet::new();
     let mut resources = Vec::new();
     let mut resource_names: HashSet<String> = HashSet::new();
+    let mut world_config: Option<WorldConfig> = None;
 
     // First pass: collect type names (records, variants, resources) so we can distinguish them
     for form in &forms {
@@ -3679,11 +3747,17 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         // Already checked for duplicates in first pass
                         resources.push(resource);
                     }
+                    SExpr::Sym(sym, _) if sym == "world" => {
+                        if world_config.is_some() {
+                            return Err(ctx.error("only one (world ...) declaration is allowed", &span));
+                        }
+                        world_config = Some(parse_world_form(&items, ctx)?);
+                    }
                     other => {
                         return Err(ctx.error_with_note(
                             "unknown top-level form",
                             other.span(),
-                            "expected 'fn', 'export', 'import', 'global', 'record', 'variant', or 'resource'"
+                            "expected 'fn', 'export', 'import', 'global', 'record', 'variant', 'resource', or 'world'"
                         ));
                     }
                 }
@@ -3777,6 +3851,104 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
         records,
         variants,
         resources,
+        world_config,
+    })
+}
+
+/// Parse (world name (wit-deps "path") (import pkg/iface) ... (export pkg/iface) ...)
+fn parse_world_form(items: &[SExpr], ctx: &CompileContext) -> Result<WorldConfig> {
+    let span = items[0].span().clone();
+    if items.len() < 2 {
+        return Err(ctx.error_with_note(
+            "invalid world declaration",
+            &span,
+            "expected: (world name (wit-deps \"path\") (import pkg/iface) ... (export pkg/iface) ...)",
+        ));
+    }
+
+    let name = match &items[1] {
+        SExpr::Sym(s, _) => s.clone(),
+        other => return Err(ctx.error("world name must be a symbol", other.span())),
+    };
+
+    let mut wit_deps = None;
+    let mut external_imports = Vec::new();
+    let mut external_exports = Vec::new();
+
+    for item in &items[2..] {
+        match item {
+            SExpr::List(sub_items, sub_span) => {
+                if sub_items.is_empty() {
+                    return Err(ctx.error("empty world clause", sub_span));
+                }
+                match &sub_items[0] {
+                    SExpr::Sym(sym, _) if sym == "wit-deps" => {
+                        if sub_items.len() != 2 {
+                            return Err(ctx.error("wit-deps expects a path string", sub_span));
+                        }
+                        match &sub_items[1] {
+                            SExpr::Sym(path, _) => {
+                                // Allow unquoted path for convenience
+                                wit_deps = Some(PathBuf::from(path));
+                            }
+                            other => {
+                                // Try to extract string literal if parser supports it
+                                return Err(ctx.error("wit-deps path must be a string or symbol", other.span()));
+                            }
+                        }
+                    }
+                    SExpr::Sym(sym, _) if sym == "import" => {
+                        if sub_items.len() != 2 {
+                            return Err(ctx.error("import expects an interface reference", sub_span));
+                        }
+                        match &sub_items[1] {
+                            SExpr::Sym(iface_ref, _) => {
+                                match ExternalInterface::parse(iface_ref) {
+                                    Some(ext) => external_imports.push(ext),
+                                    None => return Err(ctx.error(
+                                        format!("invalid interface reference '{}', expected 'pkg:ns/iface'", iface_ref),
+                                        sub_span,
+                                    )),
+                                }
+                            }
+                            other => return Err(ctx.error("import expects an interface reference", other.span())),
+                        }
+                    }
+                    SExpr::Sym(sym, _) if sym == "export" => {
+                        if sub_items.len() != 2 {
+                            return Err(ctx.error("export expects an interface reference", sub_span));
+                        }
+                        match &sub_items[1] {
+                            SExpr::Sym(iface_ref, _) => {
+                                match ExternalInterface::parse(iface_ref) {
+                                    Some(ext) => external_exports.push(ext),
+                                    None => return Err(ctx.error(
+                                        format!("invalid interface reference '{}', expected 'pkg:ns/iface'", iface_ref),
+                                        sub_span,
+                                    )),
+                                }
+                            }
+                            other => return Err(ctx.error("export expects an interface reference", other.span())),
+                        }
+                    }
+                    other => {
+                        return Err(ctx.error_with_note(
+                            "unknown world clause",
+                            other.span(),
+                            "expected 'wit-deps', 'import', or 'export'",
+                        ));
+                    }
+                }
+            }
+            other => return Err(ctx.error("world clause must be a list", other.span())),
+        }
+    }
+
+    Ok(WorldConfig {
+        name,
+        wit_deps,
+        external_imports,
+        external_exports,
     })
 }
 
@@ -6409,83 +6581,118 @@ fn load_instr(ty: &Type) -> &'static str {
 
 fn generate_wit(prog: &Program) -> String {
     let mut out = String::new();
-    out.push_str("package example:wisp;\n\n");
-    out.push_str("world wisp {\n");
 
-    // Generate record type declarations
-    for record in &prog.records {
-        out.push_str(&format!("  record {} {{\n", record.name));
-        for field in &record.fields {
-            out.push_str(&format!("    {}: {},\n", field.name, wit_type(&field.ty)));
+    // If we have a world_config with external interfaces, generate WIT that references them
+    if let Some(world_config) = &prog.world_config {
+        // Package name derived from world name
+        out.push_str(&format!("package component:{};\n\n", world_config.name));
+        out.push_str(&format!("world {} {{\n", world_config.name));
+
+        // External imports (e.g., theater:simple/runtime)
+        for ext_import in &world_config.external_imports {
+            out.push_str(&format!("  import {};\n", ext_import.to_wit_ref()));
         }
-        out.push_str("  }\n\n");
-    }
 
-    // Generate variant type declarations
-    for variant in &prog.variants {
-        out.push_str(&format!("  variant {} {{\n", variant.name));
-        for case in &variant.cases {
-            if case.payload.is_empty() {
-                // Case with no payload: just the name
-                out.push_str(&format!("    {},\n", case.name));
-            } else if case.payload.len() == 1 {
-                // Case with single payload: name(type)
-                out.push_str(&format!(
-                    "    {}({}),\n",
-                    case.name,
-                    wit_type(&case.payload[0])
-                ));
-            } else {
-                // Case with multiple payloads: name(tuple<type1, type2, ...>)
-                let types: Vec<String> = case.payload.iter().map(wit_type).collect();
-                out.push_str(&format!(
-                    "    {}(tuple<{}>),\n",
-                    case.name,
-                    types.join(", ")
-                ));
-            }
+        // External exports (e.g., theater:simple/actor)
+        for ext_export in &world_config.external_exports {
+            out.push_str(&format!("  export {};\n", ext_export.to_wit_ref()));
         }
-        out.push_str("  }\n\n");
-    }
 
-    // Generate resource type declarations
-    for resource in &prog.resources {
-        out.push_str(&format!("  resource {};\n\n", resource.name));
-    }
-
-    let mut imports_by_module: BTreeMap<&str, Vec<&Import>> = BTreeMap::new();
-    for import in &prog.imports {
-        imports_by_module
-            .entry(import.module.as_str())
-            .or_default()
-            .push(import);
-    }
-    for (module, imports) in imports_by_module {
-        out.push_str(&format!("  import {}: interface {{\n", module));
-        for import in imports {
-            out.push_str(&format!("    {}: func(", import.name));
-            for (i, param) in import.params.iter().enumerate() {
+        // Also include any local exports that aren't part of external interfaces
+        for export in &prog.exports {
+            let func = find_function(prog, export);
+            out.push_str(&format!("  export {}: func(", export));
+            for (i, param) in func.params.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
                 out.push_str(&format!("{}: {}", param.name, wit_type(&param.ty)));
             }
-            out.push_str(&format!(") -> {};\n", wit_type(&import.return_type)));
+            out.push_str(&format!(") -> {};\n", wit_type(&func.return_type)));
         }
-        out.push_str("  }\n");
-    }
-    for export in &prog.exports {
-        let func = find_function(prog, export);
-        out.push_str(&format!("  export {}: func(", export));
-        for (i, param) in func.params.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
+
+        out.push_str("}\n");
+    } else {
+        // Original behavior for standalone components
+        out.push_str("package example:wisp;\n\n");
+        out.push_str("world wisp {\n");
+
+        // Generate record type declarations
+        for record in &prog.records {
+            out.push_str(&format!("  record {} {{\n", record.name));
+            for field in &record.fields {
+                out.push_str(&format!("    {}: {},\n", field.name, wit_type(&field.ty)));
             }
-            out.push_str(&format!("{}: {}", param.name, wit_type(&param.ty)));
+            out.push_str("  }\n\n");
         }
-        out.push_str(&format!(") -> {};\n", wit_type(&func.return_type)));
+
+        // Generate variant type declarations
+        for variant in &prog.variants {
+            out.push_str(&format!("  variant {} {{\n", variant.name));
+            for case in &variant.cases {
+                if case.payload.is_empty() {
+                    // Case with no payload: just the name
+                    out.push_str(&format!("    {},\n", case.name));
+                } else if case.payload.len() == 1 {
+                    // Case with single payload: name(type)
+                    out.push_str(&format!(
+                        "    {}({}),\n",
+                        case.name,
+                        wit_type(&case.payload[0])
+                    ));
+                } else {
+                    // Case with multiple payloads: name(tuple<type1, type2, ...>)
+                    let types: Vec<String> = case.payload.iter().map(wit_type).collect();
+                    out.push_str(&format!(
+                        "    {}(tuple<{}>),\n",
+                        case.name,
+                        types.join(", ")
+                    ));
+                }
+            }
+            out.push_str("  }\n\n");
+        }
+
+        // Generate resource type declarations
+        for resource in &prog.resources {
+            out.push_str(&format!("  resource {};\n\n", resource.name));
+        }
+
+        let mut imports_by_module: BTreeMap<&str, Vec<&Import>> = BTreeMap::new();
+        for import in &prog.imports {
+            imports_by_module
+                .entry(import.module.as_str())
+                .or_default()
+                .push(import);
+        }
+        for (module, imports) in imports_by_module {
+            out.push_str(&format!("  import {}: interface {{\n", module));
+            for import in imports {
+                out.push_str(&format!("    {}: func(", import.name));
+                for (i, param) in import.params.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&format!("{}: {}", param.name, wit_type(&param.ty)));
+                }
+                out.push_str(&format!(") -> {};\n", wit_type(&import.return_type)));
+            }
+            out.push_str("  }\n");
+        }
+        for export in &prog.exports {
+            let func = find_function(prog, export);
+            out.push_str(&format!("  export {}: func(", export));
+            for (i, param) in func.params.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{}: {}", param.name, wit_type(&param.ty)));
+            }
+            out.push_str(&format!(") -> {};\n", wit_type(&func.return_type)));
+        }
+        out.push_str("}\n");
     }
-    out.push_str("}\n");
+
     out
 }
 
@@ -6575,6 +6782,7 @@ pub fn compile_repl_expr(
         records: vec![],
         variants: vec![],
         resources: vec![],
+        world_config: None,
     };
 
     // Type check the full program
@@ -6587,7 +6795,7 @@ pub fn compile_repl_expr(
 
     // Encode to WASM component
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
-    let component_bytes = encode_component(&wasm_bytes, &wit)?;
+    let component_bytes = encode_component(&wasm_bytes, &wit, None, Path::new("<repl>"))?;
 
     Ok(component_bytes)
 }
@@ -7191,6 +7399,7 @@ pub fn compile_repl_expr_composite(
         records: vec![],
         variants: vec![],
         resources: vec![],
+        world_config: None,
     };
 
     // Type check
@@ -7270,6 +7479,7 @@ pub fn compile_repl_expr_composite_wat(
         records: vec![],
         variants: vec![],
         resources: vec![],
+        world_config: None,
     };
 
     let full_signatures = collect_signatures(&prog)?;
