@@ -8352,6 +8352,10 @@ fn generate_cgrf_encode_variant(
         }
     };
 
+    // Analyze variant cases
+    let all_no_payload = variant_def.cases.iter().all(|c| c.payload.is_empty());
+    let all_have_payload = variant_def.cases.iter().all(|c| !c.payload.is_empty());
+
     // For simplicity, only support variants with single scalar payload or no payload
     let mut all_simple = true;
     for case in &variant_def.cases {
@@ -8375,127 +8379,213 @@ fn generate_cgrf_encode_variant(
 
     out.push_str(&format!("    ;; Encode variant '{}'\n", name));
 
-    // CGRF Variant format: [tag: u32, has_payload: u8, child_index?: u32]
-    // We need to determine at runtime which case it is
+    if all_no_payload {
+        // Simple case: no cases have payloads
+        // CGRF: header(16) + variant_node(8+5) = 29 bytes
+        // Variant payload: tag(4) + has_payload(1) = 5 bytes
 
-    // Write CGRF header
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
+        // Write CGRF header
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+        out.push_str("    i32.store16\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 6\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
 
-    // Determine node count based on whether there's a payload
-    // For now, check if the first case (index 0) has payload - need runtime check
-    // Simplified: always assume 2 nodes (variant + potential payload)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 2\n"); // node_count = 2 (variant + payload)
-    out.push_str("    i32.store\n");
+        // node_count = 1 (just the variant node)
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n");
+        out.push_str("    i32.store\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // root = variant node
-    out.push_str("    i32.store\n");
+        // root_index = 0
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store\n");
 
-    // Write variant node at offset 16
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VARIANT as i32));
-    out.push_str("    i32.store8\n");
+        // Write variant node at offset 16
+        // Node header: type(1) + flags(1) + reserved(2) + payload_len(4) = 8 bytes
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 16\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VARIANT as i32));
+        out.push_str("    i32.store8\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 17\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 18\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
 
-    // Payload length = 4 (tag) + 1 (has_payload) + 4 (child index) = 9
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 9\n");
-    out.push_str("    i32.store\n");
+        // Payload length = 4 (tag) + 1 (has_payload) = 5
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 20\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 5\n");
+        out.push_str("    i32.store\n");
 
-    // Write tag at offset 24 (read from value's discriminant)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n"); // load discriminant
-    out.push_str("    i32.store\n");
+        // Write tag at offset 24
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 24\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $value\n");
+        out.push_str("    i32.load\n");
+        out.push_str("    i32.store\n");
 
-    // Write has_payload = 1 at offset 28 (assume payload for simplicity)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 28\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store8\n");
+        // Write has_payload = 0 at offset 28
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 28\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
 
-    // Write child index = 1 at offset 29
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 29\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store\n");
+        // Return bytes written: 16 + 8 + 5 = 29
+        out.push_str("    i32.const 29\n");
+    } else if all_have_payload {
+        // All cases have payloads
+        // CGRF uses depth-first: payload node first, then variant node
+        // header(16) + payload_node(12) + variant_node(8+9) = 45 bytes
 
-    // Write payload node at offset 33 (16 + 8 + 9 = 33)
-    // For simplicity, always encode as s32
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 33\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_S32 as i32));
-    out.push_str("    i32.store8\n");
+        // Write CGRF header
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 34\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+        out.push_str("    i32.store16\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 35\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 6\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
 
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 37\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 4\n"); // payload_len = 4
-    out.push_str("    i32.store\n");
+        // node_count = 2 (payload + variant)
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 2\n");
+        out.push_str("    i32.store\n");
 
-    // Write payload value at offset 41
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 41\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.load\n"); // load payload from offset 4
-    out.push_str("    i32.store\n");
+        // root_index = 1 (variant node is after payload, depth-first)
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n");
+        out.push_str("    i32.store\n");
 
-    // Return bytes written: 16 + 8 + 9 + 8 + 4 = 45
-    out.push_str("    i32.const 45\n");
+        // Write payload node at offset 16 (depth-first: children first)
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 16\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_S32 as i32));
+        out.push_str("    i32.store8\n");
+
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 17\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 18\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 20\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 4\n"); // payload_len for s32
+        out.push_str("    i32.store\n");
+
+        // Write payload value at offset 24
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 24\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $value\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.load\n");
+        out.push_str("    i32.store\n");
+
+        // Write variant node at offset 28 (16 + 12)
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 28\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VARIANT as i32));
+        out.push_str("    i32.store8\n");
+
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 29\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 30\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+
+        // Variant payload length = 4 (tag) + 1 (has_payload) + 4 (child_index) = 9
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 32\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 9\n");
+        out.push_str("    i32.store\n");
+
+        // Write tag at offset 36
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 36\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $value\n");
+        out.push_str("    i32.load\n");
+        out.push_str("    i32.store\n");
+
+        // Write has_payload = 1 at offset 40
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 40\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n");
+        out.push_str("    i32.store8\n");
+
+        // Write child_index = 0 at offset 41
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 41\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store\n");
+
+        // Return bytes written: 16 + 12 + 17 = 45
+        out.push_str("    i32.const 45\n");
+    } else {
+        // Mixed case: need runtime check
+        // For now, use a simplified approach - TODO: implement proper runtime branching
+        out.push_str("    ;; TODO: encode variant with mixed payload cases\n");
+        out.push_str("    i32.const -1\n");
+    }
 }
 
 /// Generate WAT code to encode a result value to CGRF at $out_ptr.
