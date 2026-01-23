@@ -26,6 +26,9 @@
             rustfmt
             clippy
             rust-analyzer
+            # For theater dependency
+            pkg-config
+            openssl
           ];
 
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";

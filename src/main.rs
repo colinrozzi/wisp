@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compile an S-expression source file to WAT/WASM/WIT artifacts.
+    /// Compile an S-expression source file to WAT/WASM artifacts.
     Compile {
         /// Path to the input Lisp file.
         #[arg(value_name = "SOURCE")]
@@ -98,8 +98,7 @@ fn derive_out_base(source: &Path, out: Option<&str>) -> Result<PathBuf> {
 fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("Wrote:");
     println!("  {}", artifacts.wat.display());
-    println!("  {}", artifacts.component.display());
-    println!("  {}", artifacts.wit.display());
+    println!("  {}", artifacts.wasm.display());
 }
 
 fn run_component(

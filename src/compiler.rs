@@ -293,8 +293,7 @@ impl CompileContext {
 #[derive(Debug)]
 pub struct CompileArtifacts {
     pub wat: PathBuf,
-    pub wit: PathBuf,
-    pub component: PathBuf,
+    pub wasm: PathBuf,
 }
 
 pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> {
@@ -323,29 +322,26 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     let prog = parse_program(expanded_forms, &ctx)?;
     let signatures = collect_signatures(&prog)?;
     type_check(&prog, &signatures, &ctx)?;
-    let wat = generate_wat(&prog, &signatures);
-    let wit = generate_wit(&prog);
+
+    // Generate Composite-compatible WAT (raw module with Composite ABI)
+    let wat = generate_wat_composite(&prog, &signatures);
+
     let mut wat_path = out_base.to_path_buf();
     wat_path.set_extension("wat");
-    let mut component_path = out_base.to_path_buf();
-    component_path.set_extension("wasm");
-    let mut wit_path = out_base.to_path_buf();
-    wit_path.set_extension("wit");
+    let mut wasm_path = out_base.to_path_buf();
+    wasm_path.set_extension("wasm");
 
     fs::write(&wat_path, &wat)
         .with_context(|| format!("failed to write {}", wat_path.display()))?;
-    fs::write(&wit_path, &wit)
-        .with_context(|| format!("failed to write {}", wit_path.display()))?;
 
+    // Convert WAT to raw WASM module (not a component)
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
-    let component_bytes = encode_component(&wasm_bytes, &wit, prog.world_config.as_ref(), source_path)?;
-    fs::write(&component_path, component_bytes)
-        .with_context(|| format!("failed to write {}", component_path.display()))?;
+    fs::write(&wasm_path, &wasm_bytes)
+        .with_context(|| format!("failed to write {}", wasm_path.display()))?;
 
     Ok(CompileArtifacts {
         wat: wat_path,
-        wit: wit_path,
-        component: component_path,
+        wasm: wasm_path,
     })
 }
 
