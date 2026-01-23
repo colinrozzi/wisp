@@ -7087,7 +7087,35 @@ fn generate_composite_wrapper(
         out.push_str("    (local $str_ptr i32)\n");
     }
 
-    // No additional locals needed for tuple navigation - offsets are computed at compile time
+    // Additional locals needed for record/option decoding
+    let needs_compound_decode = func.params.iter().any(|p| {
+        matches!(p.ty, Type::Record(_) | Type::Option(_) | Type::Variant(_))
+    });
+    if needs_compound_decode {
+        out.push_str("    (local $rec_ptr i32)\n");
+        out.push_str("    (local $field_val i32)\n");
+    }
+
+    // Local for runtime offset tracking in tuple decoding
+    // Needed when any tuple element has variable size (strings, lists, etc.)
+    let needs_runtime_offset = func.params.len() > 1
+        && func.params
+            .iter()
+            .any(|p| matches!(p.ty, Type::Str | Type::List(_)));
+    if needs_runtime_offset {
+        out.push_str("    (local $node_offset i32)\n");
+        out.push_str("    (local $data_len i32)\n");
+    }
+
+    // Additional locals for list decoding
+    let needs_list_decode = func.params.iter().any(|p| matches!(p.ty, Type::List(_)));
+    if needs_list_decode {
+        out.push_str("    (local $list_ptr i32)\n");
+        out.push_str("    (local $list_len i32)\n");
+        out.push_str("    (local $list_data i32)\n");
+        out.push_str("    (local $list_i i32)\n");
+        out.push_str("    (local $elem_offset i32)\n");
+    }
 
     // Decode input parameters from CGRF
     if !func.params.is_empty() {
@@ -7096,17 +7124,28 @@ fn generate_composite_wrapper(
         if func.params.len() == 1 {
             // Single parameter: root node is the value directly
             let param = &func.params[0];
-            generate_cgrf_decode_param(out, &param.ty, &param.name, 0, false);
+            generate_cgrf_decode_param(out, &param.ty, &param.name, 0, false, records);
         } else {
             // Multiple parameters: root is a tuple, decode each element
-            // For now, we assume a simple flat structure where each param
-            // is a scalar and follows sequentially after the tuple header
             out.push_str("    ;; Multiple params - expecting tuple root\n");
+
+            if needs_runtime_offset {
+                // Initialize node offset to 16 (start of first child node)
+                out.push_str("    i32.const 16\n");
+                out.push_str("    local.set $node_offset\n");
+            }
 
             // Child nodes are encoded first (depth-first), so they start at offset 16
             // and are laid out sequentially by node index
             for (idx, param) in func.params.iter().enumerate() {
-                generate_cgrf_decode_tuple_param(out, &param.ty, &param.name, idx, &func.params);
+                generate_cgrf_decode_tuple_param(
+                    out,
+                    &param.ty,
+                    &param.name,
+                    idx,
+                    &func.params,
+                    needs_runtime_offset,
+                );
             }
         }
     }
@@ -8722,6 +8761,477 @@ fn generate_cgrf_decode_string(out: &mut String) {
     out.push_str("    local.get $str_ptr\n");
 }
 
+/// Generate WAT code to decode a record from CGRF input buffer.
+/// CGRF record layout (depth-first encoding):
+/// - Field nodes come first (node 0, 1, 2, ...)
+/// - Record node comes last (root)
+///
+/// For Record([S32(10), S32(20)]):
+/// - Node 0: S32(10) at offset 16
+/// - Node 1: S32(20) at offset 28
+/// - Node 2: Record (root) at offset 40, payload = [field_count=2, idx0=0, idx1=1]
+///
+/// We allocate heap space for the wisp record and copy field values into it.
+fn generate_cgrf_decode_record(
+    out: &mut String,
+    rec_name: &str,
+    param_name: &str,
+    records: &HashMap<String, RecordDef>,
+) {
+    let record_def = match records.get(rec_name) {
+        Some(r) => r,
+        None => {
+            out.push_str(&format!(
+                "    ;; ERROR: unknown record type '{}'\n",
+                rec_name
+            ));
+            out.push_str("    i32.const 0\n");
+            out.push_str(&format!("    local.set $param_{}\n", param_name));
+            return;
+        }
+    };
+
+    out.push_str(&format!("    ;; Decode record '{}'\n", rec_name));
+
+    // Calculate total size needed for wisp record
+    let record_size: usize = record_def
+        .fields
+        .iter()
+        .map(|f| type_size(&f.ty))
+        .sum();
+
+    // Allocate heap space
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", record_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Decode each field from its CGRF node and store into the wisp record
+    // Fields are at nodes 0, 1, 2, ... (depth-first order)
+    let mut cgrf_node_offset = 16; // Start after header
+    for (i, field) in record_def.fields.iter().enumerate() {
+        let wisp_field_offset = record_def.field_offset(i);
+
+        out.push_str(&format!("    ;; Field {} '{}' at wisp offset {}\n", i, field.name, wisp_field_offset));
+
+        // Calculate CGRF node payload offset
+        let payload_offset = cgrf_node_offset + 8; // Skip node header
+
+        match &field.ty {
+            Type::S32 => {
+                // Load from CGRF
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $field_val\n");
+
+                // Store to wisp record
+                out.push_str("    local.get $rec_ptr\n");
+                if wisp_field_offset > 0 {
+                    out.push_str(&format!("    i32.const {}\n", wisp_field_offset));
+                    out.push_str("    i32.add\n");
+                }
+                out.push_str("    local.get $field_val\n");
+                out.push_str("    i32.store\n");
+
+                cgrf_node_offset += 12; // 8 header + 4 payload
+            }
+            Type::S64 => {
+                out.push_str("    local.get $rec_ptr\n");
+                if wisp_field_offset > 0 {
+                    out.push_str(&format!("    i32.const {}\n", wisp_field_offset));
+                    out.push_str("    i32.add\n");
+                }
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    i64.load\n");
+                out.push_str("    i64.store\n");
+
+                cgrf_node_offset += 16; // 8 header + 8 payload
+            }
+            Type::F32 => {
+                out.push_str("    local.get $rec_ptr\n");
+                if wisp_field_offset > 0 {
+                    out.push_str(&format!("    i32.const {}\n", wisp_field_offset));
+                    out.push_str("    i32.add\n");
+                }
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    f32.load\n");
+                out.push_str("    f32.store\n");
+
+                cgrf_node_offset += 12;
+            }
+            Type::F64 => {
+                out.push_str("    local.get $rec_ptr\n");
+                if wisp_field_offset > 0 {
+                    out.push_str(&format!("    i32.const {}\n", wisp_field_offset));
+                    out.push_str("    i32.add\n");
+                }
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    f64.load\n");
+                out.push_str("    f64.store\n");
+
+                cgrf_node_offset += 16;
+            }
+            _ => {
+                out.push_str(&format!("    ;; TODO: decode non-scalar field '{}'\n", field.name));
+                cgrf_node_offset += 12; // Assume 12 as fallback
+            }
+        }
+    }
+
+    // Return the record pointer
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
+/// Generate WAT code to decode an option from CGRF input buffer.
+/// CGRF option layout:
+/// - For Some: child node first, then option node
+/// - For None: just option node
+///
+/// Option node payload: [has_value: u8, child_index: u32 (if has_value)]
+fn generate_cgrf_decode_option(
+    out: &mut String,
+    inner_ty: &Type,
+    param_name: &str,
+) {
+    out.push_str("    ;; Decode option\n");
+
+    // Wisp option layout: [tag: i32 (0=none, 1=some), payload if some]
+    let inner_size = type_size(inner_ty);
+    let option_size = 4 + inner_size; // tag + optional payload
+
+    // Allocate heap space
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", option_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // For a single option param:
+    // - If Some: node 0 is the inner value, node 1 is the option (root)
+    // - If None: node 0 is the option (root)
+    //
+    // We need to check the option node's payload to determine which case.
+    // The option node is the root, at variable offset depending on whether there's a child.
+    //
+    // Actually, we can read the root_index from header (offset 12) to find the option node.
+    // Then read its has_value byte from the payload.
+
+    // Read root_index
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $field_val\n"); // reuse as root_index
+
+    // Calculate option node offset: 16 + root_index * node_size
+    // For option node, we need to scan to find it. For simplicity, assume:
+    // - If root_index == 0, option is at offset 16 (None case, or Some with 0-sized inner)
+    // - If root_index == 1, there's one child node first
+
+    // Read has_value from option node payload
+    // Option node: header(8) + payload(1 byte has_value + optional 4 byte child_index)
+    // If Some(scalar): child at node 0, option at node 1
+    //   - Node 0 at offset 16 (inner value)
+    //   - Node 1 at offset 16 + inner_node_size (option)
+
+    // For simplicity, check node count to determine Some vs None
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n"); // node_count
+
+    // If node_count == 1, it's None (only option node)
+    // If node_count == 2, it's Some (child + option node)
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.eq\n");
+    out.push_str("    (if\n");
+    out.push_str("      (then\n");
+    out.push_str("        ;; None case: store tag = 0\n");
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 0\n");
+    out.push_str("        i32.store\n");
+    out.push_str("      )\n");
+    out.push_str("      (else\n");
+    out.push_str("        ;; Some case: store tag = 1 and decode inner value\n");
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 1\n");
+    out.push_str("        i32.store\n");
+
+    // Inner value is at node 0, offset 16, payload at 24
+    match inner_ty {
+        Type::S32 => {
+            out.push_str("        local.get $rec_ptr\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 24\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.load\n");
+            out.push_str("        i32.store\n");
+        }
+        Type::S64 => {
+            out.push_str("        local.get $rec_ptr\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 24\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i64.load\n");
+            out.push_str("        i64.store\n");
+        }
+        Type::F32 => {
+            out.push_str("        local.get $rec_ptr\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 24\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        f32.load\n");
+            out.push_str("        f32.store\n");
+        }
+        Type::F64 => {
+            out.push_str("        local.get $rec_ptr\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 24\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        f64.load\n");
+            out.push_str("        f64.store\n");
+        }
+        _ => {
+            out.push_str("        ;; TODO: decode non-scalar option inner\n");
+        }
+    }
+
+    out.push_str("      )\n");
+    out.push_str("    )\n");
+
+    // Return the option pointer
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
+/// Generate WAT code to decode a list<T> parameter from CGRF.
+/// For now, only supports list<s32>.
+///
+/// CGRF uses depth-first encoding:
+/// - Child nodes (elements) are encoded FIRST at nodes 0, 1, 2, ...
+/// - List node is encoded LAST (root)
+///
+/// For list [1, 2, 3]:
+/// - Node 0: S32(1) at offset 16
+/// - Node 1: S32(2) at offset 28
+/// - Node 2: S32(3) at offset 40
+/// - Node 3: List at offset 52 (root, contains indices [0, 1, 2])
+///
+/// Wisp list layout: { len: i32, cap: i32, data_ptr: i32 }
+fn generate_cgrf_decode_list(
+    out: &mut String,
+    elem_ty: &Type,
+    param_name: &str,
+) {
+    out.push_str("    ;; Decode list from CGRF (depth-first encoded)\n");
+
+    // Element nodes are encoded first, starting at offset 16
+    // The list node is at the end (root)
+
+    // Read root index from header (offset 12)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $elem_offset\n"); // reuse as root_index
+
+    // Calculate root node offset: 16 + root_index * node_size
+    // For list<s32>, element nodes are 12 bytes each
+    let elem_node_size = match elem_ty {
+        Type::S64 | Type::F64 => 16, // 8 header + 8 payload
+        _ => 12,                      // 8 header + 4 payload
+    };
+
+    // Root offset = 16 + root_index * elem_node_size
+    // (This assumes uniform node sizes, which works for homogeneous lists)
+    out.push_str("    i32.const 16\n");
+    out.push_str("    local.get $elem_offset\n");
+    out.push_str(&format!("    i32.const {}\n", elem_node_size));
+    out.push_str("    i32.mul\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.set $elem_offset\n"); // now holds root node offset
+
+    // Read element count from list node payload (root_offset + 8)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $elem_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $list_len\n");
+
+    // Allocate wisp list struct (12 bytes: len, cap, data_ptr)
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $list_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Store len
+    out.push_str("    local.get $list_ptr\n");
+    out.push_str("    local.get $list_len\n");
+    out.push_str("    i32.store\n");
+
+    // Store cap = len
+    out.push_str("    local.get $list_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $list_len\n");
+    out.push_str("    i32.store\n");
+
+    // Calculate element size in wisp data
+    let elem_size = match elem_ty {
+        Type::S64 | Type::F64 => 8,
+        _ => 4, // s32, f32, pointers
+    };
+
+    // Allocate element data: elem_size * len bytes
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $list_data\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", elem_size));
+    out.push_str("    local.get $list_len\n");
+    out.push_str("    i32.mul\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Store data_ptr
+    out.push_str("    local.get $list_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $list_data\n");
+    out.push_str("    i32.store\n");
+
+    // Element nodes are at offsets 16, 16+node_size, 16+2*node_size, ...
+    // Loop to copy elements from CGRF to wisp list data
+    out.push_str("    i32.const 0\n");
+    out.push_str("    local.set $list_i\n");
+
+    out.push_str("    block $break\n");
+    out.push_str("      loop $loop\n");
+    out.push_str("        local.get $list_i\n");
+    out.push_str("        local.get $list_len\n");
+    out.push_str("        i32.ge_u\n");
+    out.push_str("        br_if $break\n");
+
+    // Copy element i from CGRF node to wisp data
+    // CGRF element node i: at offset 16 + i * node_size, value at +8
+    // Wisp data: at $list_data + i * elem_size
+    match elem_ty {
+        Type::S32 => {
+            // Dest: $list_data + $list_i * 4
+            out.push_str("        local.get $list_data\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            // Src: load from $in_ptr + 16 + $list_i * 12 + 8
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 16\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str(&format!("        i32.const {}\n", elem_node_size));
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.const 8\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.load\n");
+            out.push_str("        i32.store\n");
+        }
+        Type::S64 => {
+            out.push_str("        local.get $list_data\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str("        i32.const 8\n");
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 16\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str(&format!("        i32.const {}\n", elem_node_size));
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.const 8\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i64.load\n");
+            out.push_str("        i64.store\n");
+        }
+        Type::F32 => {
+            out.push_str("        local.get $list_data\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 16\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str(&format!("        i32.const {}\n", elem_node_size));
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.const 8\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        f32.load\n");
+            out.push_str("        f32.store\n");
+        }
+        Type::F64 => {
+            out.push_str("        local.get $list_data\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str("        i32.const 8\n");
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        i32.const 16\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $list_i\n");
+            out.push_str(&format!("        i32.const {}\n", elem_node_size));
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.const 8\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        f64.load\n");
+            out.push_str("        f64.store\n");
+        }
+        _ => {
+            out.push_str("        ;; TODO: decode non-scalar list element\n");
+        }
+    }
+
+    // Increment loop counter
+    out.push_str("        local.get $list_i\n");
+    out.push_str("        i32.const 1\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $list_i\n");
+    out.push_str("        br $loop\n");
+    out.push_str("      end\n");
+    out.push_str("    end\n");
+
+    // Return the list pointer
+    out.push_str("    local.get $list_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
 /// Generate WAT code to decode a tuple element from CGRF.
 /// `element_idx` is the 0-based index of the tuple element.
 /// `node_offset` is the local variable holding the current node offset in the buffer.
@@ -8756,6 +9266,7 @@ fn generate_cgrf_decode_param(
     param_name: &str,
     _param_idx: usize,
     _is_tuple_element: bool,
+    records: &HashMap<String, RecordDef>,
 ) {
     // For single param, root node is at offset 16, payload at offset 24
     match param_ty {
@@ -8778,6 +9289,15 @@ fn generate_cgrf_decode_param(
         Type::Str => {
             generate_cgrf_decode_string(out);
             out.push_str(&format!("    local.set $param_{}\n", param_name));
+        }
+        Type::Record(rec_name) => {
+            generate_cgrf_decode_record(out, rec_name, param_name, records);
+        }
+        Type::Option(inner_ty) => {
+            generate_cgrf_decode_option(out, inner_ty, param_name);
+        }
+        Type::List(elem_ty) => {
+            generate_cgrf_decode_list(out, elem_ty, param_name);
         }
         _ => {
             // For complex types, we'd need more sophisticated decoding
@@ -8811,61 +9331,191 @@ fn generate_cgrf_decode_tuple_param(
     param_name: &str,
     param_idx: usize,
     all_params: &[Parameter],
+    use_runtime_offset: bool,
 ) {
     out.push_str(&format!(
         "    ;; Decode tuple param {} ({})\n",
         param_idx, param_name
     ));
 
-    // Calculate the byte offset of this parameter's node
-    // by summing sizes of all previous nodes
-    let mut node_offset = 16; // Start after header
-    for i in 0..param_idx {
-        node_offset += match &all_params[i].ty {
-            Type::S64 | Type::F64 => 16, // 8 header + 8 payload
-            _ => 12,                      // 8 header + 4 payload (s32, f32, etc.)
-        };
-    }
+    // When using runtime offsets, $node_offset holds the current position
+    // Otherwise, calculate compile-time offsets for fixed-size types
+    if use_runtime_offset {
+        // Runtime offset mode: use $node_offset local
+        match param_ty {
+            Type::S32 => {
+                // Load payload from $in_ptr + $node_offset + 8
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+                // Advance offset: node_offset += 12 (8 header + 4 payload)
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.set $node_offset\n");
+            }
+            Type::S64 => {
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i64.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+                // Advance offset: node_offset += 16 (8 header + 8 payload)
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.const 16\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.set $node_offset\n");
+            }
+            Type::F32 => {
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    f32.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.set $node_offset\n");
+            }
+            Type::F64 => {
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    f64.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.const 16\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.set $node_offset\n");
+            }
+            Type::Str => {
+                // String node: 8 byte header + 4 byte length + string bytes
+                // Read data_len from header (at offset + 4)
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $data_len\n");
 
-    // Payload is at node_offset + 8 (skip node header)
-    let payload_offset = node_offset + 8;
+                // Read string length from payload (at offset + 8)
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $str_len\n");
 
-    match param_ty {
-        Type::S32 => {
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", payload_offset));
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
-            out.push_str(&format!("    local.set $param_{}\n", param_name));
+                // Allocate wisp string: 4 bytes for length + string data
+                out.push_str("    global.get $__heap_ptr\n");
+                out.push_str("    local.set $str_ptr\n");
+                out.push_str("    global.get $__heap_ptr\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.get $str_len\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    global.set $__heap_ptr\n");
+
+                // Write length to wisp string
+                out.push_str("    local.get $str_ptr\n");
+                out.push_str("    local.get $str_len\n");
+                out.push_str("    i32.store\n");
+
+                // Copy string data from CGRF (at offset + 12) to wisp string (at str_ptr + 4)
+                out.push_str("    local.get $str_ptr\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n"); // dest
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n"); // src
+                out.push_str("    local.get $str_len\n"); // len
+                out.push_str("    memory.copy\n");
+
+                // Set param to wisp string pointer
+                out.push_str("    local.get $str_ptr\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+
+                // Advance offset: node_offset += 8 + data_len
+                out.push_str("    local.get $node_offset\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.get $data_len\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.set $node_offset\n");
+            }
+            _ => {
+                out.push_str(&format!(
+                    "    ;; TODO: decode tuple element of complex type for {}\n",
+                    param_name
+                ));
+                out.push_str("    i32.const 0\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+            }
         }
-        Type::S64 => {
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", payload_offset));
-            out.push_str("    i32.add\n");
-            out.push_str("    i64.load\n");
-            out.push_str(&format!("    local.set $param_{}\n", param_name));
+    } else {
+        // Compile-time offset mode for fixed-size types only
+        let mut node_offset = 16; // Start after header
+        for i in 0..param_idx {
+            node_offset += match &all_params[i].ty {
+                Type::S64 | Type::F64 => 16, // 8 header + 8 payload
+                _ => 12,                      // 8 header + 4 payload (s32, f32, etc.)
+            };
         }
-        Type::F32 => {
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", payload_offset));
-            out.push_str("    i32.add\n");
-            out.push_str("    f32.load\n");
-            out.push_str(&format!("    local.set $param_{}\n", param_name));
-        }
-        Type::F64 => {
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", payload_offset));
-            out.push_str("    i32.add\n");
-            out.push_str("    f64.load\n");
-            out.push_str(&format!("    local.set $param_{}\n", param_name));
-        }
-        _ => {
-            out.push_str(&format!(
-                "    ;; TODO: decode tuple element of complex type for {}\n",
-                param_name
-            ));
-            out.push_str("    i32.const 0\n");
-            out.push_str(&format!("    local.set $param_{}\n", param_name));
+
+        // Payload is at node_offset + 8 (skip node header)
+        let payload_offset = node_offset + 8;
+
+        match param_ty {
+            Type::S32 => {
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+            }
+            Type::S64 => {
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    i64.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+            }
+            Type::F32 => {
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    f32.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+            }
+            Type::F64 => {
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str(&format!("    i32.const {}\n", payload_offset));
+                out.push_str("    i32.add\n");
+                out.push_str("    f64.load\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+            }
+            _ => {
+                out.push_str(&format!(
+                    "    ;; TODO: decode tuple element of complex type for {}\n",
+                    param_name
+                ));
+                out.push_str("    i32.const 0\n");
+                out.push_str(&format!("    local.set $param_{}\n", param_name));
+            }
         }
     }
 }
