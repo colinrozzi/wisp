@@ -7124,7 +7124,7 @@ fn generate_composite_wrapper(
         if func.params.len() == 1 {
             // Single parameter: root node is the value directly
             let param = &func.params[0];
-            generate_cgrf_decode_param(out, &param.ty, &param.name, 0, false, records);
+            generate_cgrf_decode_param(out, &param.ty, &param.name, 0, false, records, variants);
         } else {
             // Multiple parameters: root is a tuple, decode each element
             out.push_str("    ;; Multiple params - expecting tuple root\n");
@@ -9024,6 +9024,105 @@ fn generate_cgrf_decode_option(
     out.push_str(&format!("    local.set $param_{}\n", param_name));
 }
 
+/// Generate WAT code to decode a variant parameter from CGRF.
+///
+/// CGRF variant encoding (depth-first):
+/// - No payload: variant node is at index 0 (offset 16)
+///   - Node payload: tag (4 bytes) + has_payload (1 byte, value=0)
+/// - With payload: child node first, then variant node
+///   - Child node at offset 16
+///   - Variant node at offset 16 + child_size
+///   - Node payload: tag (4 bytes) + has_payload (1 byte, value=1) + child_index (4 bytes)
+///
+/// Wisp variant layout: [discriminant: i32, payload...]
+fn generate_cgrf_decode_variant(
+    out: &mut String,
+    variant_name: &str,
+    param_name: &str,
+    variants: &HashMap<String, VariantDef>,
+) {
+    let variant_def = match variants.get(variant_name) {
+        Some(v) => v,
+        None => {
+            out.push_str(&format!(
+                "    ;; ERROR: unknown variant '{}'\n",
+                variant_name
+            ));
+            out.push_str("    i32.const 0\n");
+            out.push_str(&format!("    local.set $param_{}\n", param_name));
+            return;
+        }
+    };
+
+    out.push_str(&format!(
+        "    ;; Decode variant '{}' from CGRF\n",
+        variant_name
+    ));
+
+    // Calculate variant size for allocation
+    let variant_size = variant_def.size();
+
+    // Allocate wisp variant on heap
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", variant_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Use node_count to determine if there's a payload
+    // node_count == 1: no payload (just variant node at offset 16)
+    // node_count == 2: has payload (child at offset 16, variant after)
+
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n"); // node_count
+    out.push_str("    local.set $field_val\n");
+
+    out.push_str("    local.get $field_val\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.eq\n");
+    out.push_str("    (if\n");
+    out.push_str("      (then\n");
+    out.push_str("        ;; No payload case: variant node at offset 16\n");
+    // Read tag from offset 16 + 8 (node header is 8 bytes, payload starts at +8)
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        i32.const 24\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        i32.store\n"); // store tag as discriminant
+    out.push_str("      )\n");
+    out.push_str("      (else\n");
+    out.push_str("        ;; Has payload case: child at offset 16, variant node after\n");
+    // For simplicity, assume payload is a single s32
+    // Child node (s32) is at offset 16, size 12 (8 header + 4 payload)
+    // Variant node is at offset 28
+    // Read tag from variant node payload (offset 28 + 8 = 36)
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        i32.const 36\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        i32.store\n"); // store tag as discriminant
+    // Read payload value from child node (offset 16 + 8 = 24)
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n"); // payload at offset 4
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        i32.const 24\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        i32.store\n"); // store payload value
+    out.push_str("      )\n");
+    out.push_str("    )\n");
+
+    // Return the variant pointer
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
 /// Generate WAT code to decode a list<T> parameter from CGRF.
 /// For now, only supports list<s32>.
 ///
@@ -9267,6 +9366,7 @@ fn generate_cgrf_decode_param(
     _param_idx: usize,
     _is_tuple_element: bool,
     records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
 ) {
     // For single param, root node is at offset 16, payload at offset 24
     match param_ty {
@@ -9298,6 +9398,9 @@ fn generate_cgrf_decode_param(
         }
         Type::List(elem_ty) => {
             generate_cgrf_decode_list(out, elem_ty, param_name);
+        }
+        Type::Variant(variant_name) => {
+            generate_cgrf_decode_variant(out, variant_name, param_name, variants);
         }
         _ => {
             // For complex types, we'd need more sophisticated decoding
