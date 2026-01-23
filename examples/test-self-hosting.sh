@@ -151,9 +151,42 @@ B4=$(run run examples/codegen.wasm get-code-byte 4)
   fail "Wrong bytecode: $B0 $B1 $B2 $B3 $B4"
 
 echo ""
+
+# 7. Test emit-runnable (full WASM module generation!)
+echo "7. Testing full module emitter (emit-runnable.wisp)"
+echo "   -------------------------------------------------"
+run compile examples/emit-runnable.wisp examples/emit-runnable
+
+SIZE=$(run run examples/emit-runnable.wasm test-emit)
+[ "$SIZE" = "40" ] && pass "emit-module produces 40-byte WASM module" || fail "emit-module expected 40, got $SIZE"
+
+# Extract the generated module and verify it runs correctly
+BYTES=""
+for i in $(seq 0 39); do
+  B=$(run run examples/emit-runnable.wasm get-module-byte $i)
+  BYTES="$BYTES$(printf "%02X" $B)"
+done
+echo "$BYTES" | xxd -r -p > /tmp/emit_test.wasm
+
+# Verify the module returns 42 (40 + 2)
+cat > /tmp/test_emit.js << 'EOF'
+const fs = require("fs");
+const wasm = fs.readFileSync("/tmp/emit_test.wasm");
+const mod = new WebAssembly.Module(wasm);
+const instance = new WebAssembly.Instance(mod);
+console.log(instance.exports.eval());
+EOF
+
+RESULT=$(nix-shell -p nodejs --run "node /tmp/test_emit.js" 2>/dev/null)
+[ "$RESULT" = "42" ] && pass "Generated module eval() returns 42 (40+2)!" || fail "eval() expected 42, got $RESULT"
+
+echo ""
 echo "=========================================="
 echo -e "${GREEN}All tests passed!${NC}"
 echo "=========================================="
 echo ""
 echo "The wisp self-hosting compiler pipeline works:"
 echo "  Source -> Tokenizer -> Parser -> CodeGen -> WASM"
+echo ""
+echo "Key achievement: emit-runnable.wisp compiles wisp expressions"
+echo "into standalone executable WASM modules!"
