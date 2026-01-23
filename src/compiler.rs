@@ -7117,6 +7117,22 @@ fn generate_composite_wrapper(
         out.push_str("    (local $elem_offset i32)\n");
     }
 
+    // Additional locals for tree traversal (multi-param with complex types)
+    let needs_tree_traversal = func.params.len() > 1
+        && func.params.iter().any(|p| {
+            matches!(
+                p.ty,
+                Type::Record(_) | Type::Option(_) | Type::Variant(_) | Type::Result(_, _)
+            )
+        });
+    if needs_tree_traversal {
+        out.push_str("    (local $tuple_offset i32)\n");
+        out.push_str("    (local $child_idx i32)\n");
+        out.push_str("    (local $child_offset i32)\n");
+        out.push_str("    (local $scan_i i32)\n");
+        out.push_str("    (local $payload_len i32)\n");
+    }
+
     // Decode input parameters from CGRF
     if !func.params.is_empty() {
         out.push_str("    ;; Decode input parameters from CGRF\n");
@@ -7145,6 +7161,8 @@ fn generate_composite_wrapper(
                     idx,
                     &func.params,
                     needs_runtime_offset,
+                    records,
+                    variants,
                 );
             }
         }
@@ -9573,6 +9591,376 @@ fn generate_cgrf_decode_param(
     }
 }
 
+/// Generate WAT code to find a node by index in CGRF.
+/// Scans from offset 16, counting nodes until reaching the target index.
+/// Result is stored in $child_offset.
+///
+/// Requires locals: $scan_i, $child_offset, $payload_len
+/// Input: target index in $child_idx
+fn generate_find_node_by_index(out: &mut String) {
+    out.push_str("    ;; Find node at index $child_idx\n");
+
+    // Start at offset 16 (after CGRF header)
+    out.push_str("    i32.const 16\n");
+    out.push_str("    local.set $child_offset\n");
+
+    // Loop counter = 0
+    out.push_str("    i32.const 0\n");
+    out.push_str("    local.set $scan_i\n");
+
+    // Loop: while scan_i < child_idx
+    out.push_str("    (block $break\n");
+    out.push_str("      (loop $continue\n");
+
+    // Check if scan_i >= child_idx, break if so
+    out.push_str("        local.get $scan_i\n");
+    out.push_str("        local.get $child_idx\n");
+    out.push_str("        i32.ge_u\n");
+    out.push_str("        br_if $break\n");
+
+    // Read payload_len from current node header (at child_offset + 4)
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $payload_len\n");
+
+    // Advance child_offset by 8 + payload_len
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.const 8\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.get $payload_len\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $child_offset\n");
+
+    // Increment scan_i
+    out.push_str("        local.get $scan_i\n");
+    out.push_str("        i32.const 1\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $scan_i\n");
+
+    // Continue loop
+    out.push_str("        br $continue\n");
+    out.push_str("      )\n");
+    out.push_str("    )\n");
+
+    // Now $child_offset points to node at index $child_idx
+}
+
+/// Decode a record from the node at $child_offset.
+/// The record node contains child indices for each field.
+fn generate_decode_record_at_offset(
+    out: &mut String,
+    rec_name: &str,
+    param_name: &str,
+    records: &HashMap<String, RecordDef>,
+) {
+    let rec_def = match records.get(rec_name) {
+        Some(r) => r,
+        None => {
+            out.push_str(&format!("    ;; ERROR: unknown record '{}'\n", rec_name));
+            out.push_str("    i32.const 0\n");
+            out.push_str(&format!("    local.set $param_{}\n", param_name));
+            return;
+        }
+    };
+
+    out.push_str(&format!("    ;; Decode record '{}' at $child_offset\n", rec_name));
+
+    // Allocate wisp record on heap
+    let rec_size = rec_def.size();
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", rec_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Record node payload: [child_count: u32, child_indices: [u32; child_count]]
+    // For each field, read the child index, find that node, read its value
+    for (field_idx, field) in rec_def.fields.iter().enumerate() {
+        // Read child_indices[field_idx] from record node
+        // At: in_ptr + child_offset + 8 (header) + 4 (count) + field_idx * 4
+        out.push_str("    local.get $in_ptr\n");
+        out.push_str("    local.get $child_offset\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", 12 + field_idx * 4));
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.load\n");
+        out.push_str("    local.set $child_idx\n");
+
+        // Save current child_offset (we'll need it for other fields)
+        out.push_str("    local.get $child_offset\n");
+        out.push_str("    local.set $tuple_offset\n"); // reuse as temp
+
+        // Find the field's node
+        generate_find_node_by_index(out);
+
+        // Read field value from that node (at child_offset + 8)
+        out.push_str("    local.get $rec_ptr\n");
+        out.push_str(&format!("    i32.const {}\n", field_idx * 4));
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $in_ptr\n");
+        out.push_str("    local.get $child_offset\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        match &field.ty {
+            Type::S32 | Type::F32 => out.push_str("    i32.load\n"),
+            Type::S64 | Type::F64 => out.push_str("    i64.load\n"),
+            _ => out.push_str("    i32.load\n"), // default to i32 for now
+        }
+        out.push_str("    i32.store\n");
+
+        // Restore child_offset for next field
+        out.push_str("    local.get $tuple_offset\n");
+        out.push_str("    local.set $child_offset\n");
+    }
+
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
+/// Decode an option from the node at $child_offset.
+fn generate_decode_option_at_offset(
+    out: &mut String,
+    inner_ty: &Type,
+    param_name: &str,
+) {
+    out.push_str("    ;; Decode option at $child_offset\n");
+
+    let inner_size = type_size(inner_ty);
+    let option_size = 4 + inner_size;
+
+    // Allocate wisp option on heap
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", option_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Option node payload: [has_value: u8, child_index?: u32]
+    // Read has_value from option node (at child_offset + 8)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load8_u\n");
+    out.push_str("    local.set $field_val\n");
+
+    out.push_str("    local.get $field_val\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.eq\n");
+    out.push_str("    (if\n");
+    out.push_str("      (then\n");
+    out.push_str("        ;; None case: store tag = 0\n");
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 0\n");
+    out.push_str("        i32.store\n");
+    out.push_str("      )\n");
+    out.push_str("      (else\n");
+    out.push_str("        ;; Some case: store tag = 1 and decode inner value\n");
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 1\n");
+    out.push_str("        i32.store\n");
+
+    // Read child_index from option node (at child_offset + 9)
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.const 9\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $child_idx\n");
+
+    // Save option node offset
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        local.set $tuple_offset\n");
+
+    // Find the inner value node
+    generate_find_node_by_index(out);
+
+    // Read inner value and store in option payload
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.const 8\n");
+    out.push_str("        i32.add\n");
+    match inner_ty {
+        Type::S32 | Type::F32 => out.push_str("        i32.load\n"),
+        Type::S64 | Type::F64 => out.push_str("        i64.load\n"),
+        _ => out.push_str("        i32.load\n"),
+    }
+    out.push_str("        i32.store\n");
+
+    out.push_str("      )\n");
+    out.push_str("    )\n");
+
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
+/// Decode a variant from the node at $child_offset.
+fn generate_decode_variant_at_offset(
+    out: &mut String,
+    var_name: &str,
+    param_name: &str,
+    variants: &HashMap<String, VariantDef>,
+) {
+    let var_def = match variants.get(var_name) {
+        Some(v) => v,
+        None => {
+            out.push_str(&format!("    ;; ERROR: unknown variant '{}'\n", var_name));
+            out.push_str("    i32.const 0\n");
+            out.push_str(&format!("    local.set $param_{}\n", param_name));
+            return;
+        }
+    };
+
+    out.push_str(&format!("    ;; Decode variant '{}' at $child_offset\n", var_name));
+
+    let var_size = var_def.size();
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", var_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Variant node payload: [tag: u32, has_payload: u8, child_index?: u32]
+    // Read tag from variant node (at child_offset + 8)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $field_val\n"); // tag
+
+    // Store tag as discriminant
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str("    local.get $field_val\n");
+    out.push_str("    i32.store\n");
+
+    // Read has_payload from variant node (at child_offset + 12)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load8_u\n");
+
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.eq\n");
+    out.push_str("    (if\n");
+    out.push_str("      (then\n");
+    out.push_str("        ;; Has payload - read child_index and decode\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.const 13\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $child_idx\n");
+
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        local.set $tuple_offset\n");
+
+    generate_find_node_by_index(out);
+
+    // Read payload value
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.const 8\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        i32.store\n");
+
+    out.push_str("      )\n");
+    out.push_str("    )\n");
+
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
+/// Decode a result from the node at $child_offset.
+fn generate_decode_result_at_offset(
+    out: &mut String,
+    ok_ty: &Type,
+    _err_ty: &Type,
+    param_name: &str,
+) {
+    out.push_str("    ;; Decode result at $child_offset\n");
+
+    let payload_size = match ok_ty {
+        Type::S64 | Type::F64 => 8,
+        _ => 4,
+    };
+    let result_size = 4 + payload_size;
+
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str("    local.set $rec_ptr\n");
+    out.push_str("    global.get $__heap_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", result_size));
+    out.push_str("    i32.add\n");
+    out.push_str("    global.set $__heap_ptr\n");
+
+    // Result is encoded like a variant: [tag: u32, has_payload: u8, child_index: u32]
+    // Read tag from result node (at child_offset + 8)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $field_val\n");
+
+    // Store tag
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str("    local.get $field_val\n");
+    out.push_str("    i32.store\n");
+
+    // Read child_index (at child_offset + 13)
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 13\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $child_idx\n");
+
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    local.set $tuple_offset\n");
+
+    generate_find_node_by_index(out);
+
+    // Read payload value
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    i32.store\n");
+
+    out.push_str("    local.get $rec_ptr\n");
+    out.push_str(&format!("    local.set $param_{}\n", param_name));
+}
+
 /// Generate WAT code to decode a parameter from a tuple in CGRF.
 /// For multi-param functions, the root is a tuple with child nodes.
 ///
@@ -9594,6 +9982,8 @@ fn generate_cgrf_decode_tuple_param(
     param_idx: usize,
     all_params: &[Parameter],
     use_runtime_offset: bool,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
 ) {
     out.push_str(&format!(
         "    ;; Decode tuple param {} ({})\n",
@@ -9769,6 +10159,59 @@ fn generate_cgrf_decode_tuple_param(
                 out.push_str("    i32.add\n");
                 out.push_str("    f64.load\n");
                 out.push_str(&format!("    local.set $param_{}\n", param_name));
+            }
+            Type::Record(_) | Type::Option(_) | Type::Variant(_) | Type::Result(_, _) => {
+                // Complex types need tree traversal
+                out.push_str(&format!(
+                    "    ;; Decode tuple element {} ({}) via tree traversal\n",
+                    param_idx, param_name
+                ));
+
+                // Step 1: Find the tuple node (root)
+                // Read root_index from header (offset 12)
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $child_idx\n"); // temporarily store root_index
+
+                // Find root node offset
+                generate_find_node_by_index(out);
+                // Now $child_offset points to the tuple node
+
+                // Step 2: Read child_indices[param_idx] from tuple payload
+                // Tuple payload: [child_count: u32, child_indices: [u32; child_count]]
+                // child_indices[param_idx] is at tuple_offset + 8 (header) + 4 (count) + param_idx * 4
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $child_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 12\n"); // 8 header + 4 for child_count
+                out.push_str("    i32.add\n");
+                out.push_str(&format!("    i32.const {}\n", param_idx * 4));
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $child_idx\n");
+
+                // Step 3: Find that child node
+                generate_find_node_by_index(out);
+                // Now $child_offset points to the child node for this param
+
+                // Step 4: Decode based on type
+                match param_ty {
+                    Type::Record(rec_name) => {
+                        generate_decode_record_at_offset(out, rec_name, param_name, records);
+                    }
+                    Type::Option(inner_ty) => {
+                        generate_decode_option_at_offset(out, inner_ty, param_name);
+                    }
+                    Type::Variant(var_name) => {
+                        generate_decode_variant_at_offset(out, var_name, param_name, variants);
+                    }
+                    Type::Result(ok_ty, err_ty) => {
+                        generate_decode_result_at_offset(out, ok_ty, err_ty, param_name);
+                    }
+                    _ => unreachable!(),
+                }
             }
             _ => {
                 out.push_str(&format!(
