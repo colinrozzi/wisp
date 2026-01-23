@@ -6912,6 +6912,16 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
     let mut out = String::new();
     out.push_str("(module\n");
 
+    // Generate import declarations with Composite ABI signature
+    // Each import is declared as (i32, i32, i32, i32) -> i32
+    for import in &prog.imports {
+        // Raw import with Composite calling convention
+        out.push_str(&format!(
+            "  (import \"{}\" \"{}\" (func $__raw_{} (param i32 i32 i32 i32) (result i32)))\n",
+            import.module, import.name, import.name
+        ));
+    }
+
     // Memory: at least 1 page (64KB), exported as "memory"
     out.push_str("  (memory (export \"memory\") 1 100)\n");
 
@@ -6933,6 +6943,12 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
         .iter()
         .map(|v| (v.name.clone(), v.clone()))
         .collect();
+
+    // Generate import wrapper functions
+    // These have the original wisp signature but internally encode args and call the raw import
+    for import in &prog.imports {
+        generate_import_wrapper(&mut out, import);
+    }
 
     // Generate internal functions (not exported directly)
     for func in &prog.functions {
@@ -7026,6 +7042,219 @@ fn generate_composite_wrapper(out: &mut String, func: &Function) {
             out.push_str("    ;; TODO: encode non-scalar return types\n");
             out.push_str("    i32.const -1\n");
         }
+    }
+
+    out.push_str("  )\n");
+}
+
+/// Generate an import wrapper function.
+///
+/// The wrapper has the original wisp signature but internally:
+/// 1. Encodes arguments to CGRF in a buffer
+/// 2. Calls the raw import (which has Composite ABI signature)
+/// 3. Decodes the result (if any)
+fn generate_import_wrapper(out: &mut String, import: &Import) {
+    let wrapper_name = &import.name;
+    let raw_name = format!("$__raw_{}", import.name);
+
+    // Start function with original signature
+    out.push_str(&format!("  (func ${} ", wrapper_name));
+    for param in &import.params {
+        out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
+    }
+
+    // For now, imports that return "nothing" return s32 (0 for success)
+    // This matches Theater's log which returns unit
+    let result_type = wat_type(&import.return_type);
+    out.push_str(&format!("(result {})\n", result_type));
+
+    // Local variables for encoding
+    out.push_str("    (local $in_buf i32)\n");
+    out.push_str("    (local $in_len i32)\n");
+    out.push_str("    (local $out_buf i32)\n");
+    out.push_str("    (local $result i32)\n");
+
+    // Use fixed buffer locations for import calls
+    // Import input buffer at 0x8000, output at 0x9000
+    let import_in_buf = 0x8000;
+    let import_out_buf = 0x9000;
+    let buf_cap = 0x1000; // 4KB
+
+    out.push_str(&format!("    i32.const {}\n", import_in_buf));
+    out.push_str("    local.set $in_buf\n");
+    out.push_str(&format!("    i32.const {}\n", import_out_buf));
+    out.push_str("    local.set $out_buf\n");
+
+    // Encode arguments to CGRF
+    // For single string argument (like log), encode as a string node
+    if import.params.len() == 1 && matches!(import.params[0].ty, Type::Str) {
+        // String is passed as (ptr, len) in WASM
+        // We need to encode it as CGRF string node
+        let param_name = &import.params[0].name;
+
+        // Write CGRF header
+        out.push_str("    ;; Write CGRF header for string argument\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC)); // "CGRF"
+        out.push_str("    i32.store\n");
+
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION)); // version
+        out.push_str("    i32.store16\n");
+
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 6\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n"); // flags
+        out.push_str("    i32.store16\n");
+
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n"); // node_count
+        out.push_str("    i32.store\n");
+
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n"); // root_index
+        out.push_str("    i32.store\n");
+
+        // Write string node (kind=0x06 for String)
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 16\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 6\n"); // kind = String
+        out.push_str("    i32.store8\n");
+
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 17\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n"); // flags
+        out.push_str("    i32.store8\n");
+
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 18\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n"); // reserved
+        out.push_str("    i32.store16\n");
+
+        // Payload length = 4 (length prefix) + string length
+        // CGRF string format: payload_len includes a 4-byte length prefix
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 20\n");
+        out.push_str("    i32.add\n");
+        // String in wisp is a pointer to (len: i32, data: bytes...)
+        // Payload length = 4 + string_len
+        out.push_str(&format!("    local.get ${}\n", param_name));
+        out.push_str("    i32.load\n"); // load string length
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n"); // payload_len = 4 + string_len
+        out.push_str("    i32.store\n");
+
+        // Write string length at offset 24 (part of payload)
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 24\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    local.get ${}\n", param_name));
+        out.push_str("    i32.load\n"); // string length
+        out.push_str("    i32.store\n");
+
+        // Copy string data to offset 28
+        out.push_str("    ;; Copy string data to CGRF buffer\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 28\n");
+        out.push_str("    i32.add\n"); // destination (after length prefix)
+        out.push_str(&format!("    local.get ${}\n", param_name)); // source ptr (string data location)
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n"); // skip wisp string length prefix
+        out.push_str(&format!("    local.get ${}\n", param_name));
+        out.push_str("    i32.load\n"); // load length
+        out.push_str("    memory.copy\n");
+
+        // Calculate total buffer length: 16 (header) + 8 (node header) + 4 (string len) + string_len
+        // = 28 + string_len
+        out.push_str("    i32.const 28\n"); // header + node header + length prefix
+        out.push_str(&format!("    local.get ${}\n", param_name));
+        out.push_str("    i32.load\n"); // string length
+        out.push_str("    i32.add\n");
+        out.push_str("    local.set $in_len\n");
+    } else if import.params.is_empty() {
+        // No arguments - encode empty tuple
+        out.push_str("    ;; No arguments - encode empty tuple\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 6\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n"); // one node (empty tuple)
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store\n");
+        // Tuple node with 0 children
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 16\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 8\n"); // kind = Tuple
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 17\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 18\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 20\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n"); // payload_len = 0
+        out.push_str("    i32.store\n");
+        out.push_str("    i32.const 24\n"); // total length
+        out.push_str("    local.set $in_len\n");
+    } else {
+        // TODO: support other argument patterns
+        out.push_str("    ;; TODO: encode arguments for this import\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    local.set $in_len\n");
+    }
+
+    // Call the raw import
+    out.push_str("    ;; Call raw import\n");
+    out.push_str("    local.get $in_buf\n");
+    out.push_str("    local.get $in_len\n");
+    out.push_str("    local.get $out_buf\n");
+    out.push_str(&format!("    i32.const {}\n", buf_cap));
+    out.push_str(&format!("    call {}\n", raw_name));
+    out.push_str("    local.set $result\n");
+
+    // For now, just return 0 (success) for void-returning imports
+    // TODO: decode result for non-void imports
+    out.push_str("    ;; Return result\n");
+    match &import.return_type {
+        Type::S32 => out.push_str("    i32.const 0\n"),
+        Type::S64 => out.push_str("    i64.const 0\n"),
+        Type::F32 => out.push_str("    f32.const 0\n"),
+        Type::F64 => out.push_str("    f64.const 0\n"),
+        _ => out.push_str("    i32.const 0\n"),
     }
 
     out.push_str("  )\n");
