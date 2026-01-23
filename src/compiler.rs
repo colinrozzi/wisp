@@ -7087,11 +7087,7 @@ fn generate_composite_wrapper(
         out.push_str("    (local $str_ptr i32)\n");
     }
 
-    // Additional locals for tuple navigation (multiple params)
-    if func.params.len() > 1 {
-        out.push_str("    (local $tuple_count i32)\n");
-        out.push_str("    (local $elem_offset i32)\n");
-    }
+    // No additional locals needed for tuple navigation - offsets are computed at compile time
 
     // Decode input parameters from CGRF
     if !func.params.is_empty() {
@@ -7107,11 +7103,10 @@ fn generate_composite_wrapper(
             // is a scalar and follows sequentially after the tuple header
             out.push_str("    ;; Multiple params - expecting tuple root\n");
 
-            // Calculate node offsets for each parameter in the tuple
-            // Tuple layout: header(16) + node_header(8) + payload(4 + N*4 for indices)
-            // Child nodes follow sequentially after that
+            // Child nodes are encoded first (depth-first), so they start at offset 16
+            // and are laid out sequentially by node index
             for (idx, param) in func.params.iter().enumerate() {
-                generate_cgrf_decode_tuple_param(out, &param.ty, &param.name, idx);
+                generate_cgrf_decode_tuple_param(out, &param.ty, &param.name, idx, &func.params);
             }
         }
     }
@@ -8798,179 +8793,68 @@ fn generate_cgrf_decode_param(
 
 /// Generate WAT code to decode a parameter from a tuple in CGRF.
 /// For multi-param functions, the root is a tuple with child nodes.
+///
+/// CGRF encoding order (depth-first):
+/// - Child nodes are encoded FIRST (node 0, 1, 2, ...)
+/// - Tuple node is encoded LAST (root)
+///
+/// For Tuple([S32(3), S32(5)]):
+/// - Node 0: S32(3) at offset 16
+/// - Node 1: S32(5) at offset 28
+/// - Node 2: Tuple (root) at offset 40
+///
+/// So child i is at offset: 16 + sum(sizes of nodes 0..i-1)
+/// For uniform scalars: 16 + i * node_size
 fn generate_cgrf_decode_tuple_param(
     out: &mut String,
     param_ty: &Type,
     param_name: &str,
     param_idx: usize,
+    all_params: &[Parameter],
 ) {
-    // For tuple elements, we need to navigate to the child node.
-    // CGRF tuple layout:
-    // - Header (16 bytes)
-    // - Tuple node header (8 bytes) at offset 16
-    // - Tuple payload: count (4 bytes) + indices (4 bytes each)
-    // - Child nodes follow the tuple node
-    //
-    // For simplicity, assume scalar elements are packed sequentially:
-    // - Tuple header ends at 16 + 8 + 4 + N*4 where N is element count
-    // - Each child node is at that offset + (idx * node_size)
-
-    // Calculate where child nodes start: after tuple header + payload
-    // Tuple node: 8 byte header + 4 byte count + N * 4 byte indices
-    // But for Theater's encoding, child nodes have indices pointing to them,
-    // so we need to read the index and calculate the offset.
-
     out.push_str(&format!(
         "    ;; Decode tuple param {} ({})\n",
         param_idx, param_name
     ));
 
-    // For now, assume a simplified layout where scalars are sequential in the tuple payload
-    // This works for simple cases. Full CGRF would require following node indices.
-    //
-    // Actually, let's use the node index approach:
-    // 1. Read the node index from tuple payload
-    // 2. Calculate node offset from the index
-    // 3. Read the value from that node
+    // Calculate the byte offset of this parameter's node
+    // by summing sizes of all previous nodes
+    let mut node_offset = 16; // Start after header
+    for i in 0..param_idx {
+        node_offset += match &all_params[i].ty {
+            Type::S64 | Type::F64 => 16, // 8 header + 8 payload
+            _ => 12,                      // 8 header + 4 payload (s32, f32, etc.)
+        };
+    }
 
-    // For Theater, the tuple's child node indices tell us where each element is.
-    // Node index i means the node is at: header_end + sum(sizes of nodes 0..i-1)
-    //
-    // For simplicity with scalar-only tuples, let's calculate offsets directly:
-    // Tuple node (at offset 16): 8 + 4 + N*4 bytes (header + count + indices)
-    // First child node is right after that.
-    //
-    // Let's compute the base offset where child nodes start
-    // For a tuple with N elements: 16 + 8 + 4 + N*4 = 28 + N*4
-
-    // For scalar types, each node is 8 (header) + size bytes
-    // s32/f32: 8 + 4 = 12 bytes per node
-    // s64/f64: 8 + 8 = 16 bytes per node
-
-    // Compute offset to this parameter's node
-    // This assumes all prior params have been decoded and we know their sizes
-    // For mixed types this gets complex. For now, handle common cases.
+    // Payload is at node_offset + 8 (skip node header)
+    let payload_offset = node_offset + 8;
 
     match param_ty {
         Type::S32 => {
-            // Offset: tuple_end + param_idx * 12 (for s32 nodes)
-            // But this assumes all params are s32. For mixed, need accumulator.
-            // For now, use a simple formula that works for uniform s32 tuples.
-            // tuple_end = 28 + num_params * 4 (for the index array)
-            // Then child nodes at: tuple_end + 8 (node header) + 4 (payload)
-            //
-            // Actually, let's calculate it properly:
-            // Read node index from tuple payload at offset 28 + param_idx * 4
-            let index_offset = 28 + param_idx * 4;
-            out.push_str(&format!("    ;; Read node index for element {}\n", param_idx));
             out.push_str("    local.get $in_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", index_offset));
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
-            out.push_str("    local.set $elem_offset\n"); // This is the node INDEX, not byte offset
-
-            // For simplicity, assume nodes are laid out sequentially and each s32 node is 12 bytes
-            // Node byte offset = header_size + tuple_node_size + node_index * ???
-            // This is getting complex. Let's use a simpler heuristic:
-            // Assume Theater lays out nodes sequentially by index, each s32 node is 12 bytes
-            // So node i is at offset: 16 + (tuple_node_size) + prev_nodes_size
-            //
-            // For a tuple of N s32s:
-            // - Tuple node: 8 + 4 + N*4 bytes (at offset 16)
-            // - Child nodes: each 12 bytes (8 header + 4 payload)
-            // - First child at: 16 + 8 + 4 + N*4 = 28 + N*4
-            // - Child i at: (28 + N*4) + i*12
-            //
-            // But we need N at runtime. Let's read it:
-            out.push_str("    ;; Read tuple element count\n");
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 24\n"); // Tuple count is at offset 16 + 8 = 24
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
-            out.push_str("    local.set $tuple_count\n");
-
-            // Calculate child node base offset
-            out.push_str("    ;; Calculate child node offset\n");
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 28\n"); // Base: 16 + 8 + 4
-            out.push_str("    i32.add\n");
-            out.push_str("    local.get $tuple_count\n");
-            out.push_str("    i32.const 4\n");
-            out.push_str("    i32.mul\n");
-            out.push_str("    i32.add\n"); // Now at first child node
-
-            // Add offset for this parameter's node (assuming 12 bytes per s32 node)
-            out.push_str(&format!("    i32.const {}\n", param_idx * 12));
-            out.push_str("    i32.add\n");
-
-            // Read payload (at +8 from node start)
-            out.push_str("    i32.const 8\n");
+            out.push_str(&format!("    i32.const {}\n", payload_offset));
             out.push_str("    i32.add\n");
             out.push_str("    i32.load\n");
             out.push_str(&format!("    local.set $param_{}\n", param_name));
         }
         Type::S64 => {
-            // Similar to s32 but 16 bytes per node (8 header + 8 payload)
             out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 24\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
-            out.push_str("    local.set $tuple_count\n");
-
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 28\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    local.get $tuple_count\n");
-            out.push_str("    i32.const 4\n");
-            out.push_str("    i32.mul\n");
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", param_idx * 16));
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.const 8\n");
+            out.push_str(&format!("    i32.const {}\n", payload_offset));
             out.push_str("    i32.add\n");
             out.push_str("    i64.load\n");
             out.push_str(&format!("    local.set $param_{}\n", param_name));
         }
         Type::F32 => {
-            // 12 bytes per node (8 header + 4 payload)
             out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 24\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
-            out.push_str("    local.set $tuple_count\n");
-
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 28\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    local.get $tuple_count\n");
-            out.push_str("    i32.const 4\n");
-            out.push_str("    i32.mul\n");
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", param_idx * 12));
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.const 8\n");
+            out.push_str(&format!("    i32.const {}\n", payload_offset));
             out.push_str("    i32.add\n");
             out.push_str("    f32.load\n");
             out.push_str(&format!("    local.set $param_{}\n", param_name));
         }
         Type::F64 => {
-            // 16 bytes per node (8 header + 8 payload)
             out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 24\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
-            out.push_str("    local.set $tuple_count\n");
-
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 28\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    local.get $tuple_count\n");
-            out.push_str("    i32.const 4\n");
-            out.push_str("    i32.mul\n");
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", param_idx * 16));
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.const 8\n");
+            out.push_str(&format!("    i32.const {}\n", payload_offset));
             out.push_str("    i32.add\n");
             out.push_str("    f64.load\n");
             out.push_str(&format!("    local.set $param_{}\n", param_name));
