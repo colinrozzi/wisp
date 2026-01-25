@@ -1,4 +1,4 @@
-# Phase 7: Macro Components
+# Phase 7: Macro Packages
 
 **Status**: Design Phase
 **Started**: 2025-01-12
@@ -7,8 +7,8 @@
 
 ## Objective
 
-Enable macros to be implemented as separate WebAssembly components that receive and return syntax trees via resource handles. This allows:
-- Macros written in any language that compiles to WASM components
+Enable macros to be implemented as separate WebAssembly packages that receive and return syntax trees via resource handles. This allows:
+- Macros written in any language that compiles to WASM packages
 - Sandboxed macro execution
 - Potential for distributed/cached macro compilation
 
@@ -23,7 +23,7 @@ Enable macros to be implemented as separate WebAssembly components that receive 
   (lst (list sexpr) span))  ; ERROR: recursive reference
 ```
 
-Instead, we use **resources** with a handle-based API. The host (compiler) owns all syntax tree data, and macro components manipulate it through opaque handles.
+Instead, we use **resources** with a handle-based API. The host (compiler) owns all syntax tree data, and macro packages manipulate it through opaque handles.
 
 ## Architecture Overview
 
@@ -48,7 +48,7 @@ Instead, we use **resources** with a handle-based API. The host (compiler) owns 
 │                              │ i32 handles            │
 │                              ▼                        │
 │  ┌──────────────────────────────────────────────────┐ │
-│  │              Macro Component (Guest)             │ │
+│  │              Macro Package (Guest)               │ │
 │  │                                                  │ │
 │  │  import syntax: interface { ... }                │ │
 │  │  export expand: func(stx: borrow<sexpr>) ->      │ │
@@ -147,7 +147,7 @@ interface macro {
   expand: func(stx: borrow<sexpr>) -> result<sexpr, string>;
 }
 
-world macro-component {
+world macro-package {
   import syntax;
   export macro;
 }
@@ -155,14 +155,14 @@ world macro-component {
 
 ## Runtime Prerequisites
 
-Before implementing macro components, the runtime (`src/main.rs`) needs:
+Before implementing macro packages, the runtime (`src/main.rs`) needs:
 
 ### 1. Resource Table Implementation
 
 ```rust
 use std::collections::HashMap;
 
-/// Manages sexpr handles for component interaction
+/// Manages sexpr handles for package interaction
 pub struct ResourceTable {
     /// Maps handle (u32) -> SExpr
     entries: HashMap<u32, SExpr>,
@@ -260,7 +260,7 @@ fn syntax_get_symbol(
 
     match sexpr {
         SExpr::Sym(name, _) => {
-            // Allocate string in component memory and return ptr/len
+            // Allocate string in package memory and return ptr/len
             // (Details depend on canonical ABI string handling)
             todo!("implement string return")
         }
@@ -310,7 +310,7 @@ fn setup_macro_linker(engine: &Engine) -> Result<Linker<MacroHostState>> {
 
     // Inspection functions
     linker.func_wrap("wisp:syntax/syntax", "[resource-drop]sexpr", |_, _: u32| {
-        // Handle cleanup when component drops a handle
+        // Handle cleanup when package drops a handle
         Ok(())
     })?;
     linker.func_wrap("wisp:syntax/syntax", "get-kind", syntax_get_kind)?;
@@ -395,18 +395,18 @@ pub fn expand_macro(
 - [ ] Handle canonical ABI string/list marshaling
 - [ ] Handle `borrow<sexpr>` vs owned `sexpr` semantics
 
-### Phase 7.3: Component Linker Setup (PREREQUISITE)
+### Phase 7.3: Package Linker Setup (PREREQUISITE)
 - [ ] Set up Wasmtime linker with syntax interface
 - [ ] Handle resource drop callbacks
-- [ ] Test with a hand-written WAT macro component
+- [ ] Test with a hand-written WAT macro package
 
 ### Phase 7.4: Macro Loading in Compiler
 - [ ] Parse `(import-macro name "path.wasm")` syntax
-- [ ] Load and cache macro components
-- [ ] Build registry of macro name -> component
+- [ ] Load and cache macro packages
+- [ ] Build registry of macro name -> package
 
 ### Phase 7.5: Expansion Integration
-- [ ] Call macro component's expand function
+- [ ] Call macro package's expand function
 - [ ] Handle result (ok/err)
 - [ ] Recursively expand results
 - [ ] Report errors with source locations
@@ -414,7 +414,7 @@ pub fn expand_macro(
 ### Phase 7.6: Wisp Macro Authoring
 - [ ] Add imports for syntax interface to wisp
 - [ ] Write example macro in wisp
-- [ ] Test full round-trip: wisp -> component -> used as macro
+- [ ] Test full round-trip: wisp -> package -> used as macro
 
 ## Example: A Simple Macro in Wisp
 
@@ -473,8 +473,8 @@ Usage:
 
 Phase 7 is complete when:
 - [ ] Runtime implements resource table and host functions
-- [ ] Macro components can be loaded and instantiated
-- [ ] A macro written in wisp compiles to a component and works
+- [ ] Macro packages can be loaded and instantiated
+- [ ] A macro written in wisp compiles to a package and works
 - [ ] Error messages include source locations
 - [ ] At least `double` and one list-manipulating macro work
 

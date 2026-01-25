@@ -6581,7 +6581,7 @@ fn generate_wit(prog: &Program) -> String {
     // If we have a world_config with external interfaces, generate WIT that references them
     if let Some(world_config) = &prog.world_config {
         // Package name derived from world name
-        out.push_str(&format!("package component:{};\n\n", world_config.name));
+        out.push_str(&format!("package package:{};\n\n", world_config.name));
         out.push_str(&format!("world {} {{\n", world_config.name));
 
         // External imports (e.g., theater:simple/runtime)
@@ -6609,7 +6609,7 @@ fn generate_wit(prog: &Program) -> String {
 
         out.push_str("}\n");
     } else {
-        // Original behavior for standalone components
+        // Original behavior for standalone packages
         out.push_str("package example:wisp;\n\n");
         out.push_str("world wisp {\n");
 
@@ -6706,7 +6706,7 @@ fn find_function<'a>(prog: &'a Program, name: &str) -> &'a Function {
 /// Compile an expression for REPL evaluation.
 ///
 /// Takes an expression string, variable bindings to inline, and function
-/// definitions to include. Returns WASM component bytes with an exported
+/// definitions to include. Returns WASM package bytes with an exported
 /// `eval` function that evaluates the expression.
 pub fn compile_repl_expr(
     expr_source: &str,
@@ -6912,12 +6912,12 @@ const CGRF_S16: u8 = 0x11;
 const CGRF_CHAR: u8 = 0x12;
 const CGRF_FLAGS: u8 = 0x13;
 
-/// Memory layout for composite components
+/// Memory layout for composite packages
 const INPUT_BUFFER_OFFSET: i32 = 0x0000;
 const OUTPUT_BUFFER_OFFSET: i32 = 0x4000;
 const HEAP_START_OFFSET: i32 = 0xC000;
 
-/// Generate WAT for a composite-compatible component.
+/// Generate WAT for a composite-compatible package.
 ///
 /// This produces WASM with:
 /// - Export functions using composite calling convention: (i32, i32, i32, i32) -> i32
@@ -10225,9 +10225,9 @@ fn generate_cgrf_decode_tuple_param(
     }
 }
 
-/// Compile an expression for REPL evaluation, producing a composite component.
+/// Compile an expression for REPL evaluation, producing a composite package.
 ///
-/// This generates a WASM module (not a full component) with composite calling convention.
+/// This generates a WASM module (not a full package) with composite calling convention.
 /// The module exports an `eval` function with signature (i32, i32, i32, i32) -> i32.
 pub fn compile_repl_expr_composite(
     expr_source: &str,

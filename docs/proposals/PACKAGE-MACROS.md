@@ -1,15 +1,15 @@
-# Component-Based Macro System
+# Package-Based Macro System
 
 ## The Big Idea
 
-**Unify compile-time and runtime into a single component model.**
+**Unify compile-time and runtime into a single package model.**
 
-Instead of having two packaging systems (one for macros, one for runtime code), macros themselves are WASM components. The build process loads macro components and calls their `expand` function until the program reaches bedrock (pure WASM instructions).
+Instead of having two packaging systems (one for macros, one for runtime code), macros themselves are WASM packages. The build process loads macro packages and calls their `expand` function until the program reaches bedrock (pure WASM instructions).
 
 ### Why This Is Awesome
 
 1. **Single packaging system** - Distribute macros as `.wasm` files, just like any other library
-2. **Component model handles everything** - Versioning, linking, sandboxing all built-in
+2. **Package model handles everything** - Versioning, linking, sandboxing all built-in
 3. **Macros are Wisp programs** - Once bootstrapped, you write macros in Wisp itself
 4. **No special cases** - The compiler doesn't distinguish "macro imports" from "runtime imports" at the syntax level
 5. **Hybrid libraries possible** - A library can export both macros (compile-time) and functions (runtime)
@@ -97,7 +97,7 @@ interface expander-v2 {
        │
        ▼
 ┌──────────────────────────┐
-│ Load Macro Libraries     │ ◄─── math-macros.wasm
+│ Load Macro Packages      │ ◄─── math-macros.wasm
 │ (from imports)           │ ◄─── types.wasm
 └──────┬───────────────────┘ ◄─── gc-macros.wasm
        │
@@ -338,7 +338,7 @@ Now `expander-v2.wasm` can expand itself! 🎉
 
 ## S-Expression Serialization
 
-For passing S-expressions across component boundaries, we need a serialization format.
+For passing S-expressions across package boundaries, we need a serialization format.
 
 ### Option 1: WIT Variant (shown above)
 ```wit
@@ -522,7 +522,7 @@ Macros run arbitrary WASM code during compilation. This is:
 We'll know this works when:
 
 1. ✅ The core compiler doesn't handle `+` - it's a macro
-2. ✅ Macros are distributed as `.wasm` files on a registry
+2. ✅ Macros are distributed as `.wasm` packages on a registry
 3. ✅ A user can write a type checker as a macro library in a weekend
 4. ✅ The expander compiles itself
 5. ✅ Multiple incompatible macro sets coexist in different projects
@@ -532,19 +532,19 @@ We'll know this works when:
 
 ### Racket
 - **Racket**: Macros are Racket code, interpreted at compile-time
-- **Wisp**: Macros are WASM components, run in VM at compile-time
-- **Advantage**: Distribution/versioning via component model
-- **Disadvantage**: Component boundary overhead
+- **Wisp**: Macros are WASM packages, run in VM at compile-time
+- **Advantage**: Distribution/versioning via package model
+- **Disadvantage**: Package boundary overhead
 
 ### Rust
 - **Rust**: Procedural macros are compiled Rust code (separate crate)
-- **Wisp**: Macros are compiled Wisp code (components)
+- **Wisp**: Macros are compiled Wisp code (packages)
 - **Similar**: Both compile macros to native/bytecode
-- **Advantage**: We can use component model sandboxing
+- **Advantage**: We can use package model sandboxing
 
 ### Common Lisp
 - **CL**: Macros are Lisp functions, run in same image as compiler
-- **Wisp**: Macros are separate components
+- **Wisp**: Macros are separate packages
 - **Advantage**: Clear separation, safer
 - **Disadvantage**: Can't share compiler state with macros
 
@@ -560,4 +560,4 @@ We'll know this works when:
 
 ---
 
-**This is a novel approach** - I haven't seen macros-as-components done quite this way before. It unifies compile-time and runtime in an elegant way while leveraging WASM's sandboxing and component model's distribution. Worth experimenting with!
+**This is a novel approach** - I haven't seen macros-as-packages done quite this way before. It unifies compile-time and runtime in an elegant way while leveraging WASM's sandboxing and package model's distribution. Worth experimenting with!

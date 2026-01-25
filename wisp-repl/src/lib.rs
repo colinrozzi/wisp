@@ -121,7 +121,7 @@ impl Default for ReplState {
 }
 
 /// Compile an expression with REPL context
-/// Returns WASM component bytes (standard component model)
+/// Returns WASM package bytes (standard component model)
 pub fn compile_repl(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
     // Convert bindings to InlineValue
     let bindings: HashMap<String, InlineValue> = state
@@ -138,7 +138,7 @@ pub fn compile_repl(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Compile an expression with REPL context for composite runtime
-/// Returns raw WASM bytes (composite component with CGRF encoding)
+/// Returns raw WASM bytes (composite package with CGRF encoding)
 pub fn compile_repl_composite(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
     // Convert bindings to InlineValue
     let bindings: HashMap<String, InlineValue> = state
@@ -168,7 +168,7 @@ mod tests {
             result.err()
         );
         let bytes = result.unwrap();
-        assert!(!bytes.is_empty(), "Component bytes should not be empty");
+        assert!(!bytes.is_empty(), "Package bytes should not be empty");
     }
 
     #[test]
@@ -198,7 +198,7 @@ mod tests {
         );
     }
 
-    /// Helper to run a compiled component and get the i32 result
+    /// Helper to run a compiled package and get the i32 result
     fn run_eval_i32(wasm_bytes: &[u8]) -> anyhow::Result<i32> {
         use wasmtime::{component::Component, component::Linker, component::Val, Engine, Store};
 
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(result, 20);
     }
 
-    // Tests for composite component output
+    // Tests for composite package output
     #[test]
     fn test_compile_composite_literal() {
         use super::compile_repl_composite;

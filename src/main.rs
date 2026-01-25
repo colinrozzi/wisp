@@ -29,11 +29,11 @@ enum Command {
         #[arg(value_name = "OUT_STEM")]
         out: Option<String>,
     },
-    /// Run a function exported from a compiled WebAssembly component.
+    /// Run a function exported from a compiled WebAssembly package.
     Run {
-        /// Path to the wasm component produced by `tinyc compile`.
+        /// Path to the wasm package produced by `wisp compile`.
         #[arg(value_name = "WASM")]
-        component: PathBuf,
+        package: PathBuf,
         /// Name of the exported function to invoke.
         #[arg(value_name = "FUNC")]
         func: String,
@@ -52,11 +52,11 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Compile { source, out } => run_compile(&source, out.as_deref())?,
         Command::Run {
-            component,
+            package,
             func,
             args,
             dep,
-        } => run_component(&component, &func, &args, dep.as_deref())?,
+        } => run_package(&package, &func, &args, dep.as_deref())?,
     }
 
     Ok(())
@@ -101,15 +101,15 @@ fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("  {}", artifacts.wasm.display());
 }
 
-fn run_component(
-    component_path: &Path,
+fn run_package(
+    package_path: &Path,
     func: &str,
     args: &[String],
     dep: Option<&str>,
 ) -> Result<()> {
     let engine = Engine::default();
-    let component = Component::from_file(&engine, component_path)
-        .with_context(|| format!("failed to load component {}", component_path.display()))?;
+    let component = Component::from_file(&engine, package_path)
+        .with_context(|| format!("failed to load package {}", package_path.display()))?;
     let mut store = Store::new(&engine, ());
     let mut linker = Linker::new(&engine);
 
@@ -141,7 +141,7 @@ fn run_component(
 
     let instance = linker
         .instantiate(&mut store, &component)
-        .context("failed to instantiate component")?;
+        .context("failed to instantiate package")?;
     let func_ref = instance
         .get_func(&mut store, func)
         .with_context(|| format!("export '{}' not found", func))?;
@@ -165,7 +165,7 @@ fn run_component(
         .with_context(|| format!("failed to invoke '{}'", func))?;
     func_ref
         .post_return(&mut store)
-        .context("failed to complete component call cleanup")?;
+        .context("failed to complete package call cleanup")?;
 
     if let Some((ty, value)) = result_types.into_vec().into_iter().zip(results).next() {
         match (ty, value) {
