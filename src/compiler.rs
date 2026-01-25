@@ -35,25 +35,25 @@ pub enum InlineValue {
     // String
     Str(String),
 
-    // Compound types
-    List(Vec<InlineValue>),
-    Option(Option<Box<InlineValue>>),
-    Result(std::result::Result<Box<InlineValue>, Box<InlineValue>>),
+    // Compound types WITH explicit type info
+    List { elem_type: Type, items: Vec<InlineValue> },
+    Option { inner_type: Type, value: Option<Box<InlineValue>> },
+    Result { ok_type: Type, err_type: Type, value: std::result::Result<Box<InlineValue>, Box<InlineValue>> },
 
-    // User-defined types
+    // User-defined types - ordered fields, multi-value payload
     Record {
         type_name: String,
-        fields: HashMap<String, InlineValue>,
+        fields: Vec<(String, InlineValue)>,
     },
     Variant {
         type_name: String,
         case: String,
-        payload: Option<Box<InlineValue>>,
+        payload: Vec<InlineValue>,
     },
 }
 
 impl InlineValue {
-    /// Get the type of this value
+    /// Get the type of this value - uses explicit type fields
     pub fn get_type(&self) -> Type {
         match self {
             InlineValue::S32(_) => Type::S32,
@@ -61,21 +61,10 @@ impl InlineValue {
             InlineValue::F32(_) => Type::F32,
             InlineValue::F64(_) => Type::F64,
             InlineValue::Str(_) => Type::Str,
-            InlineValue::List(items) => {
-                // Infer element type from first item, or default to S32
-                let elem_type = items.first().map(|v| v.get_type()).unwrap_or(Type::S32);
-                Type::List(Box::new(elem_type))
-            }
-            InlineValue::Option(inner) => {
-                let inner_type = inner.as_ref().map(|v| v.get_type()).unwrap_or(Type::S32);
-                Type::Option(Box::new(inner_type))
-            }
-            InlineValue::Result(res) => {
-                let (ok_type, err_type) = match res {
-                    Ok(v) => (v.get_type(), Type::Str),  // Default error type
-                    Err(v) => (Type::S32, v.get_type()), // Default ok type
-                };
-                Type::Result(Box::new(ok_type), Box::new(err_type))
+            InlineValue::List { elem_type, .. } => Type::List(Box::new(elem_type.clone())),
+            InlineValue::Option { inner_type, .. } => Type::Option(Box::new(inner_type.clone())),
+            InlineValue::Result { ok_type, err_type, .. } => {
+                Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
             }
             InlineValue::Record { type_name, .. } => Type::Record(type_name.clone()),
             InlineValue::Variant { type_name, .. } => Type::Variant(type_name.clone()),
@@ -569,6 +558,27 @@ pub enum Expr {
     StringLen {
         string: Box<Expr>,
     },
+    /// Get character at index: (string-ref s idx) -> s32
+    StringRef {
+        string: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// Extract substring: (substring s start end) -> string
+    Substring {
+        string: Box<Expr>,
+        start: Box<Expr>,
+        end: Box<Expr>,
+    },
+    /// Concatenate strings: (string-append s1 s2) -> string
+    StringAppend {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// String equality: (string=? s1 s2) -> s32
+    StringEq {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
 }
 
 /// A single arm in a match expression
@@ -792,6 +802,9 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::ListGet { list, index } => expr_uses_heap(list) || expr_uses_heap(index),
         Expr::ListLen { list } => expr_uses_heap(list),
         Expr::StringLen { string } => expr_uses_heap(string),
+        Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
+        Expr::Substring { .. } | Expr::StringAppend { .. } => true, // allocate new strings
+        Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
     }
 }
 
@@ -1748,6 +1761,54 @@ fn check_expr(
                 Type::Str => Ok(Type::S32),
                 _ => bail!("string-len expects a string, got {:?}", str_ty),
             }
+        }
+        Expr::StringRef { string, index } => {
+            let str_ty = check_expr(string, env, signatures, globals, records, variants)?;
+            if str_ty != Type::Str {
+                bail!("string-ref expects a string, got {:?}", str_ty);
+            }
+            let idx_ty = check_expr(index, env, signatures, globals, records, variants)?;
+            if idx_ty != Type::S32 {
+                bail!("string-ref index must be s32, got {:?}", idx_ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::Substring { string, start, end } => {
+            let str_ty = check_expr(string, env, signatures, globals, records, variants)?;
+            if str_ty != Type::Str {
+                bail!("substring expects a string, got {:?}", str_ty);
+            }
+            let start_ty = check_expr(start, env, signatures, globals, records, variants)?;
+            if start_ty != Type::S32 {
+                bail!("substring start index must be s32, got {:?}", start_ty);
+            }
+            let end_ty = check_expr(end, env, signatures, globals, records, variants)?;
+            if end_ty != Type::S32 {
+                bail!("substring end index must be s32, got {:?}", end_ty);
+            }
+            Ok(Type::Str)
+        }
+        Expr::StringAppend { left, right } => {
+            let left_ty = check_expr(left, env, signatures, globals, records, variants)?;
+            if left_ty != Type::Str {
+                bail!("string-append expects strings, got {:?}", left_ty);
+            }
+            let right_ty = check_expr(right, env, signatures, globals, records, variants)?;
+            if right_ty != Type::Str {
+                bail!("string-append expects strings, got {:?}", right_ty);
+            }
+            Ok(Type::Str)
+        }
+        Expr::StringEq { left, right } => {
+            let left_ty = check_expr(left, env, signatures, globals, records, variants)?;
+            if left_ty != Type::Str {
+                bail!("string=? expects strings, got {:?}", left_ty);
+            }
+            let right_ty = check_expr(right, env, signatures, globals, records, variants)?;
+            if right_ty != Type::Str {
+                bail!("string=? expects strings, got {:?}", right_ty);
+            }
+            Ok(Type::S32)
         }
     }
 }
@@ -4415,6 +4476,8 @@ fn parse_expr(
             if items.is_empty() {
                 return Err(ctx.error("empty list is not a valid expression", list_span));
             }
+            // Create variant name set for type parsing
+            let variant_names: HashSet<String> = variants.keys().cloned().collect();
             let op = &items[0];
             match op {
                 SExpr::Sym(sym, sym_span) if is_type_symbol(sym) && items.len() == 2 => {
@@ -4648,7 +4711,7 @@ fn parse_expr(
                         ));
                     }
                     let inner_type =
-                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                        parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Some {
                         inner_type,
@@ -4664,7 +4727,7 @@ fn parse_expr(
                         ));
                     }
                     let inner_type =
-                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                        parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
                     Ok(Expr::None { inner_type })
                 }
                 // Result constructors: (ok T E value) and (err T E value)
@@ -4677,9 +4740,9 @@ fn parse_expr(
                         ));
                     }
                     let ok_type =
-                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                        parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
                     let err_type =
-                        parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
+                        parse_type_expr(&items[2], &variant_names, &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Ok {
                         ok_type,
@@ -4696,9 +4759,9 @@ fn parse_expr(
                         ));
                     }
                     let ok_type =
-                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                        parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
                     let err_type =
-                        parse_type_expr(&items[2], &HashSet::new(), &HashSet::new(), ctx)?;
+                        parse_type_expr(&items[2], &variant_names, &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::Err {
                         ok_type,
@@ -4716,7 +4779,7 @@ fn parse_expr(
                         ));
                     }
                     let elem_type =
-                        parse_type_expr(&items[1], &HashSet::new(), &HashSet::new(), ctx)?;
+                        parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
                     Ok(Expr::ListNew { elem_type })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "list-push" => {
@@ -4773,6 +4836,68 @@ fn parse_expr(
                     let string = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
                     Ok(Expr::StringLen {
                         string: Box::new(string),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string-ref" => {
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-ref' expression",
+                            list_span,
+                            "expected: (string-ref string index)",
+                        ));
+                    }
+                    let string = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let index = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringRef {
+                        string: Box::new(string),
+                        index: Box::new(index),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "substring" => {
+                    if items.len() != 4 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'substring' expression",
+                            list_span,
+                            "expected: (substring string start end)",
+                        ));
+                    }
+                    let string = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let start = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    let end = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::Substring {
+                        string: Box::new(string),
+                        start: Box::new(start),
+                        end: Box::new(end),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string-append" => {
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-append' expression",
+                            list_span,
+                            "expected: (string-append string1 string2)",
+                        ));
+                    }
+                    let left = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let right = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringAppend {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string=?" => {
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string=?' expression",
+                            list_span,
+                            "expected: (string=? string1 string2)",
+                        ));
+                    }
+                    let left = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    let right = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringEq {
+                        left: Box::new(left),
+                        right: Box::new(right),
                     })
                 }
                 _ => {
@@ -6163,6 +6288,253 @@ fn gen_expr(
             out.push_str(&format!("{}i32.load\n", pad));
             Type::S32
         }
+        // String: ref - get byte at index
+        Expr::StringRef { string, index } => {
+            // String layout: 4 bytes len + data bytes
+            // Result: byte at (string_ptr + 4 + index)
+            gen_expr(
+                string, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            gen_expr(
+                index, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.load8_u\n", pad));
+            Type::S32
+        }
+        // String: substring - extract portion of string
+        Expr::Substring { string, start, end } => {
+            // Evaluate string pointer
+            let str_local = env.declare_local(Type::S32);
+            gen_expr(
+                string, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, str_local));
+
+            // Evaluate start index
+            let start_local = env.declare_local(Type::S32);
+            gen_expr(
+                start, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, start_local));
+
+            // Evaluate end index
+            let end_local = env.declare_local(Type::S32);
+            gen_expr(
+                end, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, end_local));
+
+            // Calculate new length: end - start
+            let new_len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, end_local));
+            out.push_str(&format!("{}local.get {}\n", pad, start_local));
+            out.push_str(&format!("{}i32.sub\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_len_local));
+
+            // Allocate space for new string: 4 bytes len + new_len bytes
+            let new_ptr_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, new_len_local));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store new length at new_ptr
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}local.get {}\n", pad, new_len_local));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Copy bytes using memory.copy
+            // dst: new_ptr + 4
+            // src: str_local + 4 + start
+            // len: new_len
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, str_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, start_local));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, new_len_local));
+            out.push_str(&format!("{}memory.copy\n", pad));
+
+            // Return new string pointer
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            Type::Str
+        }
+        // String: append - concatenate two strings
+        Expr::StringAppend { left, right } => {
+            // Evaluate left string pointer
+            let left_local = env.declare_local(Type::S32);
+            gen_expr(
+                left, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, left_local));
+
+            // Evaluate right string pointer
+            let right_local = env.declare_local(Type::S32);
+            gen_expr(
+                right, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, right_local));
+
+            // Get left length
+            let left_len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, left_local));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, left_len_local));
+
+            // Get right length
+            let right_len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, right_local));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, right_len_local));
+
+            // Calculate total length
+            let total_len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, left_len_local));
+            out.push_str(&format!("{}local.get {}\n", pad, right_len_local));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, total_len_local));
+
+            // Allocate space for new string: 4 bytes len + total_len bytes
+            let new_ptr_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, total_len_local));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store total length at new_ptr
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}local.get {}\n", pad, total_len_local));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Copy left string bytes
+            // dst: new_ptr + 4
+            // src: left_local + 4
+            // len: left_len
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, left_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, left_len_local));
+            out.push_str(&format!("{}memory.copy\n", pad));
+
+            // Copy right string bytes
+            // dst: new_ptr + 4 + left_len
+            // src: right_local + 4
+            // len: right_len
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, left_len_local));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, right_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, right_len_local));
+            out.push_str(&format!("{}memory.copy\n", pad));
+
+            // Return new string pointer
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            Type::Str
+        }
+        // String: equality - compare two strings
+        Expr::StringEq { left, right } => {
+            // Evaluate left string pointer
+            let left_local = env.declare_local(Type::S32);
+            gen_expr(
+                left, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, left_local));
+
+            // Evaluate right string pointer
+            let right_local = env.declare_local(Type::S32);
+            gen_expr(
+                right, out, indent, env, signatures, globals, records, variants,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, right_local));
+
+            // Get left length
+            let left_len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, left_local));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, left_len_local));
+
+            // Get right length
+            let right_len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, right_local));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, right_len_local));
+
+            // First check if lengths are equal
+            // If lengths differ, strings can't be equal
+            // Use block/br structure for early return on length mismatch
+            out.push_str(&format!("{}block (result i32) ;; string-eq outer\n", pad));
+            out.push_str(&format!("{}  local.get {}\n", pad, left_len_local));
+            out.push_str(&format!("{}  local.get {}\n", pad, right_len_local));
+            out.push_str(&format!("{}  i32.ne\n", pad));
+            out.push_str(&format!("{}  if (result i32)\n", pad));
+            out.push_str(&format!("{}    i32.const 0\n", pad)); // lengths differ, not equal
+            out.push_str(&format!("{}  else\n", pad));
+            // Lengths match, compare byte by byte using loop
+            let idx_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}    i32.const 0\n", pad));
+            out.push_str(&format!("{}    local.set {}\n", pad, idx_local));
+            out.push_str(&format!("{}    block (result i32) ;; comparison result\n", pad));
+            out.push_str(&format!("{}      loop ;; compare loop\n", pad));
+            // Check if idx >= len (done comparing)
+            out.push_str(&format!("{}        local.get {}\n", pad, idx_local));
+            out.push_str(&format!("{}        local.get {}\n", pad, left_len_local));
+            out.push_str(&format!("{}        i32.ge_u\n", pad));
+            out.push_str(&format!("{}        if\n", pad));
+            out.push_str(&format!("{}          i32.const 1\n", pad)); // all bytes match
+            out.push_str(&format!("{}          br 2 ;; exit with 1\n", pad));
+            out.push_str(&format!("{}        end\n", pad));
+            // Compare bytes at idx
+            out.push_str(&format!("{}        local.get {}\n", pad, left_local));
+            out.push_str(&format!("{}        i32.const 4\n", pad));
+            out.push_str(&format!("{}        i32.add\n", pad));
+            out.push_str(&format!("{}        local.get {}\n", pad, idx_local));
+            out.push_str(&format!("{}        i32.add\n", pad));
+            out.push_str(&format!("{}        i32.load8_u\n", pad));
+            out.push_str(&format!("{}        local.get {}\n", pad, right_local));
+            out.push_str(&format!("{}        i32.const 4\n", pad));
+            out.push_str(&format!("{}        i32.add\n", pad));
+            out.push_str(&format!("{}        local.get {}\n", pad, idx_local));
+            out.push_str(&format!("{}        i32.add\n", pad));
+            out.push_str(&format!("{}        i32.load8_u\n", pad));
+            out.push_str(&format!("{}        i32.ne\n", pad));
+            out.push_str(&format!("{}        if\n", pad));
+            out.push_str(&format!("{}          i32.const 0\n", pad)); // bytes differ
+            out.push_str(&format!("{}          br 3 ;; exit with 0\n", pad));
+            out.push_str(&format!("{}        end\n", pad));
+            // Increment idx
+            out.push_str(&format!("{}        local.get {}\n", pad, idx_local));
+            out.push_str(&format!("{}        i32.const 1\n", pad));
+            out.push_str(&format!("{}        i32.add\n", pad));
+            out.push_str(&format!("{}        local.set {}\n", pad, idx_local));
+            out.push_str(&format!("{}        br 0 ;; continue loop\n", pad));
+            out.push_str(&format!("{}      end ;; loop\n", pad));
+            out.push_str(&format!("{}      i32.const 1 ;; fallback (empty strings)\n", pad));
+            out.push_str(&format!("{}    end ;; comparison result block\n", pad));
+            out.push_str(&format!("{}  end ;; if\n", pad));
+            out.push_str(&format!("{}end ;; string-eq outer\n", pad));
+            Type::S32
+        }
     }
 }
 
@@ -6865,13 +7237,13 @@ fn value_to_sexpr(value: &InlineValue, span: &Span) -> SExpr {
         },
         InlineValue::Str(s) => SExpr::Str(s.clone(), span.clone()),
         // Compound types need constructor calls - for now, panic with a clear message
-        InlineValue::List(_) => {
+        InlineValue::List { .. } => {
             panic!("TODO: inline list values as constructor calls")
         }
-        InlineValue::Option(_) => {
+        InlineValue::Option { .. } => {
             panic!("TODO: inline option values as constructor calls")
         }
-        InlineValue::Result(_) => {
+        InlineValue::Result { .. } => {
             panic!("TODO: inline result values as constructor calls")
         }
         InlineValue::Record { .. } => {
@@ -6889,9 +7261,9 @@ fn value_to_sexpr(value: &InlineValue, span: &Span) -> SExpr {
 
 /// CGRF format constants
 const CGRF_MAGIC: u32 = 0x46524743; // "CGRF" in little-endian
-const CGRF_VERSION: u16 = 1;
+const CGRF_VERSION: u16 = 2;
 
-/// CGRF node kinds (from composite crate)
+/// CGRF node kinds (also used as type tags for v2 encoding)
 const CGRF_BOOL: u8 = 0x01;
 const CGRF_S32: u8 = 0x02;
 const CGRF_S64: u8 = 0x03;
@@ -6911,11 +7283,89 @@ const CGRF_S8: u8 = 0x10;
 const CGRF_S16: u8 = 0x11;
 const CGRF_CHAR: u8 = 0x12;
 const CGRF_FLAGS: u8 = 0x13;
+const CGRF_RESULT: u8 = 0x14;
 
 /// Memory layout for composite packages
 const INPUT_BUFFER_OFFSET: i32 = 0x0000;
 const OUTPUT_BUFFER_OFFSET: i32 = 0x4000;
 const HEAP_START_OFFSET: i32 = 0xC000;
+
+/// Get the type tag byte for a type (for CGRF v2 encoding)
+fn type_to_tag(ty: &Type) -> u8 {
+    match ty {
+        Type::S32 => CGRF_S32,
+        Type::S64 => CGRF_S64,
+        Type::F32 => CGRF_F32,
+        Type::F64 => CGRF_F64,
+        Type::Str => CGRF_STRING,
+        Type::List(_) => CGRF_LIST,
+        Type::Option(_) => CGRF_OPTION,
+        Type::Result(_, _) => CGRF_RESULT,
+        Type::Record(_) => CGRF_RECORD,
+        Type::Variant(_) => CGRF_VARIANT,
+        Type::Resource(_) => CGRF_RECORD, // Resources are treated as records for now
+        Type::Borrow(inner) => type_to_tag(inner), // Borrow uses inner type's tag
+    }
+}
+
+/// Calculate the byte size of a type tag (for CGRF v2 encoding)
+/// Simple types are 1 byte, compound types include nested type info
+fn type_tag_size(ty: &Type) -> usize {
+    match ty {
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str => 1,
+        Type::List(inner) => 1 + type_tag_size(inner),
+        Type::Option(inner) => 1 + type_tag_size(inner),
+        Type::Result(ok, err) => 1 + type_tag_size(ok) + type_tag_size(err),
+        Type::Record(name) | Type::Variant(name) | Type::Resource(name) => 1 + 4 + name.len(),
+        Type::Borrow(inner) => type_tag_size(inner),
+    }
+}
+
+/// Generate WAT code to write a type tag at the given offset
+/// Returns the number of bytes written
+fn generate_write_type_tag(out: &mut String, ty: &Type, base_local: &str, offset: i32) -> usize {
+    let tag = type_to_tag(ty);
+    out.push_str(&format!("    local.get {}\n", base_local));
+    if offset != 0 {
+        out.push_str(&format!("    i32.const {}\n", offset));
+        out.push_str("    i32.add\n");
+    }
+    out.push_str(&format!("    i32.const {}\n", tag));
+    out.push_str("    i32.store8\n");
+
+    match ty {
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str => 1,
+        Type::List(inner) => {
+            1 + generate_write_type_tag(out, inner, base_local, offset + 1)
+        }
+        Type::Option(inner) => {
+            1 + generate_write_type_tag(out, inner, base_local, offset + 1)
+        }
+        Type::Result(ok, err) => {
+            let ok_size = generate_write_type_tag(out, ok, base_local, offset + 1);
+            let err_size = generate_write_type_tag(out, err, base_local, offset + 1 + ok_size as i32);
+            1 + ok_size + err_size
+        }
+        Type::Record(name) | Type::Variant(name) | Type::Resource(name) => {
+            // Write name length
+            out.push_str(&format!("    local.get {}\n", base_local));
+            out.push_str(&format!("    i32.const {}\n", offset + 1));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", name.len()));
+            out.push_str("    i32.store\n");
+            // Write name bytes
+            for (i, byte) in name.bytes().enumerate() {
+                out.push_str(&format!("    local.get {}\n", base_local));
+                out.push_str(&format!("    i32.const {}\n", offset + 5 + i as i32));
+                out.push_str("    i32.add\n");
+                out.push_str(&format!("    i32.const {}\n", byte));
+                out.push_str("    i32.store8\n");
+            }
+            1 + 4 + name.len()
+        }
+        Type::Borrow(inner) => generate_write_type_tag(out, inner, base_local, offset),
+    }
+}
 
 /// Generate WAT for a composite-compatible package.
 ///
@@ -7050,11 +7500,19 @@ fn generate_composite_wrapper(
         Type::S64 => out.push_str("    (local $value i64)\n"),
         Type::F32 => out.push_str("    (local $value f32)\n"),
         Type::F64 => out.push_str("    (local $value f64)\n"),
-        Type::Str
-        | Type::Record(_)
-        | Type::Variant(_)
-        | Type::Option(_)
-        | Type::Result(_, _) => out.push_str("    (local $value i32)\n"),
+        Type::Str | Type::Record(_) | Type::Option(_) => {
+            out.push_str("    (local $value i32)\n")
+        }
+        Type::Variant(_) => {
+            out.push_str("    (local $value i32)\n");
+            // $tag local needed for v2 case name lookup
+            out.push_str("    (local $tag i32)\n");
+        }
+        Type::Result(_, _) => {
+            out.push_str("    (local $value i32)\n");
+            // $tag local needed for result encoding (though not currently used)
+            out.push_str("    (local $tag i32)\n");
+        }
         Type::List(_) => {
             out.push_str("    (local $value i32)\n");
             // Additional locals needed for list encoding loop
@@ -7094,6 +7552,11 @@ fn generate_composite_wrapper(
     if needs_compound_decode {
         out.push_str("    (local $rec_ptr i32)\n");
         out.push_str("    (local $field_val i32)\n");
+        // Tree traversal locals needed for v2 format decoding
+        out.push_str("    (local $child_idx i32)\n");
+        out.push_str("    (local $child_offset i32)\n");
+        out.push_str("    (local $scan_i i32)\n");
+        out.push_str("    (local $payload_len i32)\n");
     }
 
     // Local for runtime offset tracking in tuple decoding
@@ -7131,6 +7594,9 @@ fn generate_composite_wrapper(
         out.push_str("    (local $child_offset i32)\n");
         out.push_str("    (local $scan_i i32)\n");
         out.push_str("    (local $payload_len i32)\n");
+        // Additional locals for v2 record decoding (reading type_name_len, field_name_len, etc.)
+        out.push_str("    (local $str_len i32)\n");
+        out.push_str("    (local $data_len i32)\n");
     }
 
     // Decode input parameters from CGRF
@@ -7816,10 +8282,14 @@ fn generate_cgrf_encode_string(out: &mut String) {
 /// Generate WAT code to encode an option value to CGRF at $out_ptr.
 /// Input: $value contains i32 pointer to option (tag: u8, value: T if some)
 /// Wisp option layout: byte 0 = tag (0=none, 1=some), bytes 4+ = payload if some
+/// CGRF v2 option payload: [inner_type:type_tag*, presence:u8, child_index?:u32]
 fn generate_cgrf_encode_option(out: &mut String, inner_ty: &Type) {
-    // For now, only support option<s32> as a start
-    // TODO: Support nested compound types
-    out.push_str("    ;; Encode option value\n");
+    let type_tag_sz = type_tag_size(inner_ty);
+    // v2 payload: type_tag + presence(1) + optional child_index(4)
+    let payload_none = type_tag_sz + 1;
+    let payload_some = type_tag_sz + 1 + 4;
+
+    out.push_str("    ;; Encode option value (CGRF v2)\n");
 
     // Write CGRF header (16 bytes)
     out.push_str("    local.get $out_ptr\n");
@@ -7857,6 +8327,7 @@ fn generate_cgrf_encode_option(out: &mut String, inner_ty: &Type) {
     out.push_str("    i32.store\n");
 
     // Write option node at offset 16
+    // Node header: kind(1) + flags(1) + reserved(2) + payload_len(4) = 8 bytes
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 16\n");
     out.push_str("    i32.add\n");
@@ -7875,69 +8346,76 @@ fn generate_cgrf_encode_option(out: &mut String, inner_ty: &Type) {
     out.push_str("    i32.const 0\n");
     out.push_str("    i32.store16\n");
 
-    // Payload length: 1 (has_value) + 4 (child index) if some, else just 1
+    // Payload length: type_tag + 1 (has_value) + 4 (child index) if some
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 20\n");
     out.push_str("    i32.add\n");
     out.push_str("    local.get $value\n");
     out.push_str("    i32.load8_u\n");
     out.push_str("    if (result i32)\n");
-    out.push_str("      i32.const 5\n"); // some: has_value(1) + child_index(4)
+    out.push_str(&format!("      i32.const {}\n", payload_some)); // some
     out.push_str("    else\n");
-    out.push_str("      i32.const 1\n"); // none: just has_value(1)
+    out.push_str(&format!("      i32.const {}\n", payload_none)); // none
     out.push_str("    end\n");
     out.push_str("    i32.store\n");
 
-    // Write has_value byte at offset 24
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
+    // Write inner_type tag at offset 24 (start of payload)
+    generate_write_type_tag(out, inner_ty, "$out_ptr", 24);
+
+    // Write has_value byte after type tag
+    let has_value_offset = 24 + type_tag_sz as i32;
+    out.push_str(&format!("    local.get $out_ptr\n"));
+    out.push_str(&format!("    i32.const {}\n", has_value_offset));
     out.push_str("    i32.add\n");
     out.push_str("    local.get $value\n");
     out.push_str("    i32.load8_u\n");
     out.push_str("    i32.store8\n");
 
     // If some, write child index (1) and the inner value node
+    let child_index_offset = has_value_offset + 1;
+    let inner_node_offset = 24 + payload_some as i32; // right after option payload
+
     out.push_str("    local.get $value\n");
     out.push_str("    i32.load8_u\n");
     out.push_str("    if\n");
-    // Write child index at offset 25
-    out.push_str("      local.get $out_ptr\n");
-    out.push_str("      i32.const 25\n");
+    // Write child index
+    out.push_str(&format!("      local.get $out_ptr\n"));
+    out.push_str(&format!("      i32.const {}\n", child_index_offset));
     out.push_str("      i32.add\n");
     out.push_str("      i32.const 1\n"); // child index = 1
     out.push_str("      i32.store\n");
 
-    // Write inner value node starting at offset 29 (16 + 8 + 5)
-    // For simplicity, only handle s32 inner type for now
+    // Write inner value node
     match inner_ty {
         Type::S32 => {
             out.push_str("      ;; Write s32 inner node\n");
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str("      i32.const 29\n");
+            // Node kind
+            out.push_str(&format!("      local.get $out_ptr\n"));
+            out.push_str(&format!("      i32.const {}\n", inner_node_offset));
             out.push_str("      i32.add\n");
             out.push_str(&format!("      i32.const {}\n", CGRF_S32 as i32));
             out.push_str("      i32.store8\n");
-
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str("      i32.const 30\n");
+            // Node flags
+            out.push_str(&format!("      local.get $out_ptr\n"));
+            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 1));
             out.push_str("      i32.add\n");
             out.push_str("      i32.const 0\n");
             out.push_str("      i32.store8\n");
-
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str("      i32.const 31\n");
+            // Reserved
+            out.push_str(&format!("      local.get $out_ptr\n"));
+            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 2));
             out.push_str("      i32.add\n");
             out.push_str("      i32.const 0\n");
             out.push_str("      i32.store16\n");
-
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str("      i32.const 33\n");
+            // Payload length
+            out.push_str(&format!("      local.get $out_ptr\n"));
+            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 4));
             out.push_str("      i32.add\n");
-            out.push_str("      i32.const 4\n"); // payload_len
+            out.push_str("      i32.const 4\n"); // payload_len for s32
             out.push_str("      i32.store\n");
-
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str("      i32.const 37\n");
+            // Payload (the s32 value)
+            out.push_str(&format!("      local.get $out_ptr\n"));
+            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 8));
             out.push_str("      i32.add\n");
             out.push_str("      local.get $value\n");
             out.push_str("      i32.const 4\n");
@@ -7952,18 +8430,26 @@ fn generate_cgrf_encode_option(out: &mut String, inner_ty: &Type) {
     out.push_str("    end\n");
 
     // Return bytes written
+    // For s32: header(16) + option_node(8 + payload_some) + inner_node(8 + 4)
+    let inner_node_size = match inner_ty {
+        Type::S32 => 8 + 4, // node header + s32 payload
+        _ => 8, // just node header as placeholder
+    };
+    let total_some = 16 + 8 + payload_some + inner_node_size;
+    let total_none = 16 + 8 + payload_none;
+
     out.push_str("    local.get $value\n");
     out.push_str("    i32.load8_u\n");
     out.push_str("    if (result i32)\n");
-    out.push_str("      i32.const 41\n"); // header(16) + option_node(13) + s32_node(12)
+    out.push_str(&format!("      i32.const {}\n", total_some));
     out.push_str("    else\n");
-    out.push_str("      i32.const 25\n"); // header(16) + option_node(9)
+    out.push_str(&format!("      i32.const {}\n", total_none));
     out.push_str("    end\n");
 }
 
 /// Generate WAT code to encode a list value to CGRF at $out_ptr.
 /// List layout in wisp: [len: i32, cap: i32, data_ptr: i32]
-/// CGRF List: [count: u32, child_indices...]
+/// CGRF v2 List payload: [elem_type:type_tag*, count:u32, child_indices:u32*]
 fn generate_cgrf_encode_list(
     out: &mut String,
     elem_ty: &Type,
@@ -7977,7 +8463,11 @@ fn generate_cgrf_encode_list(
         return;
     }
 
-    out.push_str("    ;; Encode list<s32> value\n");
+    let type_tag_sz = type_tag_size(elem_ty);
+    // v2 payload: type_tag + count(4) + child_indices(4 * len)
+    let payload_base = type_tag_sz + 4; // type_tag + count
+
+    out.push_str("    ;; Encode list<s32> value (CGRF v2)\n");
 
     // Write CGRF header
     out.push_str("    local.get $out_ptr\n");
@@ -8031,7 +8521,7 @@ fn generate_cgrf_encode_list(
     out.push_str("    i32.const 0\n");
     out.push_str("    i32.store16\n");
 
-    // Payload length = 4 (count) + 4*len (child indices)
+    // Payload length = type_tag + count(4) + child_indices(4*len)
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 20\n");
     out.push_str("    i32.add\n");
@@ -8039,21 +8529,25 @@ fn generate_cgrf_encode_list(
     out.push_str("    i32.load\n"); // len
     out.push_str("    i32.const 4\n");
     out.push_str("    i32.mul\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n"); // 4 + 4*len
+    out.push_str(&format!("    i32.const {}\n", payload_base)); // type_tag + count
+    out.push_str("    i32.add\n");
     out.push_str("    i32.store\n");
 
-    // Write element count at offset 24
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
+    // Write elem_type tag at offset 24 (start of payload)
+    generate_write_type_tag(out, elem_ty, "$out_ptr", 24);
+
+    // Write element count after type tag
+    let count_offset = 24 + type_tag_sz as i32;
+    out.push_str(&format!("    local.get $out_ptr\n"));
+    out.push_str(&format!("    i32.const {}\n", count_offset));
     out.push_str("    i32.add\n");
     out.push_str("    local.get $value\n");
     out.push_str("    i32.load\n");
     out.push_str("    i32.store\n");
 
-    // Write child indices at offset 28 (indices 1, 2, 3, ... len)
+    // Write child indices after count
+    let child_indices_offset = count_offset + 4;
     // Use a loop to write each child index
-    // Note: locals $i, $len, $data_ptr, $node_offset are declared at function top
     out.push_str("    local.get $value\n");
     out.push_str("    i32.load\n");
     out.push_str("    local.set $len\n");
@@ -8065,9 +8559,9 @@ fn generate_cgrf_encode_list(
     out.push_str("    i32.const 0\n");
     out.push_str("    local.set $i\n");
 
-    // Calculate where element nodes start: 16 (header) + 8 (list node header) + 4 + 4*len (list payload)
-    // = 28 + 4*len
-    out.push_str("    i32.const 28\n");
+    // Calculate where element nodes start: header(16) + node_header(8) + payload_base + 4*len
+    // = 24 + type_tag_sz + 4 + 4*len
+    out.push_str(&format!("    i32.const {}\n", child_indices_offset));
     out.push_str("    local.get $len\n");
     out.push_str("    i32.const 4\n");
     out.push_str("    i32.mul\n");
@@ -8081,9 +8575,9 @@ fn generate_cgrf_encode_list(
     out.push_str("        i32.ge_u\n");
     out.push_str("        br_if $break\n");
 
-    // Write child index (1 + i) at offset 28 + 4*i
+    // Write child index (1 + i) at child_indices_offset + 4*i
     out.push_str("        local.get $out_ptr\n");
-    out.push_str("        i32.const 28\n");
+    out.push_str(&format!("        i32.const {}\n", child_indices_offset));
     out.push_str("        local.get $i\n");
     out.push_str("        i32.const 4\n");
     out.push_str("        i32.mul\n");
@@ -8168,8 +8662,9 @@ fn generate_cgrf_encode_list(
     out.push_str("      end\n");
     out.push_str("    end\n");
 
-    // Return bytes written: 16 + 8 + 4 + 4*len + 12*len = 28 + 16*len
-    out.push_str("    i32.const 28\n");
+    // Return bytes written: header(16) + node_header(8) + payload_base + 4*len + element_nodes(12*len)
+    // = 24 + type_tag_sz + 4 + 4*len + 12*len = child_indices_offset + 16*len
+    out.push_str(&format!("    i32.const {}\n", child_indices_offset));
     out.push_str("    local.get $len\n");
     out.push_str("    i32.const 16\n");
     out.push_str("    i32.mul\n");
@@ -8178,7 +8673,8 @@ fn generate_cgrf_encode_list(
 
 /// Generate WAT code to encode a record value to CGRF at $out_ptr.
 /// Record layout in wisp: fields stored sequentially at known offsets
-/// CGRF Record: [count: u32, child_indices...]
+/// CGRF v2 Record payload: [type_name_len:u32, type_name:utf8, field_count:u32,
+///                          field_names:(len:u32, name:utf8)*, child_indices:u32*]
 fn generate_cgrf_encode_record(
     out: &mut String,
     name: &str,
@@ -8205,7 +8701,25 @@ fn generate_cgrf_encode_record(
 
     let field_count = record_def.fields.len();
 
-    out.push_str(&format!("    ;; Encode record '{}' with {} fields\n", name, field_count));
+    // Calculate field names size
+    let field_names_size: usize = record_def
+        .fields
+        .iter()
+        .map(|f| 4 + f.name.len())
+        .sum();
+
+    // CGRF v2 Record payload layout:
+    // - type_name_len: 4 bytes
+    // - type_name: N bytes
+    // - field_count: 4 bytes
+    // - field_names: (len:u32 + name:utf8) for each field
+    // - child_indices: 4 * field_count bytes
+    let payload_len = 4 + name.len() + 4 + field_names_size + 4 * field_count;
+
+    out.push_str(&format!(
+        "    ;; Encode record '{}' with {} fields (CGRF v2)\n",
+        name, field_count
+    ));
 
     // Write CGRF header
     out.push_str("    local.get $out_ptr\n");
@@ -8256,34 +8770,78 @@ fn generate_cgrf_encode_record(
     out.push_str("    i32.const 0\n");
     out.push_str("    i32.store16\n");
 
-    // Payload length = 4 (count) + 4*field_count
+    // Payload length
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 20\n");
     out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", 4 + 4 * field_count));
+    out.push_str(&format!("    i32.const {}\n", payload_len));
     out.push_str("    i32.store\n");
 
-    // Write field count at offset 24
+    // Payload starts at offset 24
+    let mut payload_offset = 24;
+
+    // Write type_name_len
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset));
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", name.len()));
+    out.push_str("    i32.store\n");
+    payload_offset += 4;
+
+    // Write type_name bytes
+    for (i, byte) in name.bytes().enumerate() {
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str(&format!("    i32.const {}\n", payload_offset + i));
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", byte));
+        out.push_str("    i32.store8\n");
+    }
+    payload_offset += name.len();
+
+    // Write field_count
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset));
     out.push_str("    i32.add\n");
     out.push_str(&format!("    i32.const {}\n", field_count));
     out.push_str("    i32.store\n");
+    payload_offset += 4;
+
+    // Write field names
+    for field in &record_def.fields {
+        // Write field name length
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str(&format!("    i32.const {}\n", payload_offset));
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", field.name.len()));
+        out.push_str("    i32.store\n");
+        payload_offset += 4;
+
+        // Write field name bytes
+        for (i, byte) in field.name.bytes().enumerate() {
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str(&format!("    i32.const {}\n", payload_offset + i));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", byte));
+            out.push_str("    i32.store8\n");
+        }
+        payload_offset += field.name.len();
+    }
 
     // Write child indices (1, 2, 3, ...)
     for i in 0..field_count {
         out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", 28 + 4 * i));
+        out.push_str(&format!("    i32.const {}\n", payload_offset + 4 * i));
         out.push_str("    i32.add\n");
         out.push_str(&format!("    i32.const {}\n", 1 + i)); // child index
         out.push_str("    i32.store\n");
     }
+    payload_offset += 4 * field_count;
 
-    // Write field nodes starting at offset 28 + 4*field_count
-    let mut node_offset = 28 + 4 * field_count;
+    // Write field nodes starting after the record node payload
+    let mut node_offset = payload_offset;
     for (i, field) in record_def.fields.iter().enumerate() {
         let field_offset = record_def.field_offset(i);
-        let (cgrf_kind, payload_size) = match field.ty {
+        let (cgrf_kind, field_payload_size) = match field.ty {
             Type::S32 => (CGRF_S32, 4),
             Type::S64 => (CGRF_S64, 8),
             Type::F32 => (CGRF_F32, 4),
@@ -8316,7 +8874,7 @@ fn generate_cgrf_encode_record(
         out.push_str("    local.get $out_ptr\n");
         out.push_str(&format!("    i32.const {}\n", node_offset + 4));
         out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", payload_size));
+        out.push_str(&format!("    i32.const {}\n", field_payload_size));
         out.push_str("    i32.store\n");
 
         // Load field value from record and store in payload
@@ -8345,7 +8903,7 @@ fn generate_cgrf_encode_record(
         };
         out.push_str(&format!("    {}\n", store_instr));
 
-        node_offset += 8 + payload_size;
+        node_offset += 8 + field_payload_size;
     }
 
     // Return total bytes written
@@ -8354,7 +8912,8 @@ fn generate_cgrf_encode_record(
 
 /// Generate WAT code to encode a variant value to CGRF at $out_ptr.
 /// Variant layout in wisp: [tag: i32, payload...]
-/// CGRF Variant: [tag: u32, has_payload: u8, child_index?: u32]
+/// CGRF v2 Variant payload: [type_name_len:u32, type_name:utf8, case_name_len:u32, case_name:utf8,
+///                          tag:u32, payload_count:u32, child_indices:u32*]
 fn generate_cgrf_encode_variant(
     out: &mut String,
     name: &str,
@@ -8395,12 +8954,15 @@ fn generate_cgrf_encode_variant(
         return;
     }
 
-    out.push_str(&format!("    ;; Encode variant '{}'\n", name));
+    // Find the max case name length for buffer sizing
+    let max_case_name_len = variant_def.cases.iter().map(|c| c.name.len()).max().unwrap_or(0);
+
+    out.push_str(&format!("    ;; Encode variant '{}' (CGRF v2)\n", name));
 
     if all_no_payload {
         // Simple case: no cases have payloads
-        // CGRF: header(16) + variant_node(8+5) = 29 bytes
-        // Variant payload: tag(4) + has_payload(1) = 5 bytes
+        // CGRF v2 Variant payload: type_name_len + type_name + case_name_len + case_name + tag + payload_count
+        // Payload size varies based on which case is active (case_name has different lengths)
 
         // Write CGRF header
         out.push_str("    local.get $out_ptr\n");
@@ -8434,7 +8996,6 @@ fn generate_cgrf_encode_variant(
         out.push_str("    i32.store\n");
 
         // Write variant node at offset 16
-        // Node header: type(1) + flags(1) + reserved(2) + payload_len(4) = 8 bytes
         out.push_str("    local.get $out_ptr\n");
         out.push_str("    i32.const 16\n");
         out.push_str("    i32.add\n");
@@ -8453,34 +9014,116 @@ fn generate_cgrf_encode_variant(
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store16\n");
 
-        // Payload length = 4 (tag) + 1 (has_payload) = 5
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 20\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 5\n");
-        out.push_str("    i32.store\n");
+        // Payload length is written inside each case branch (varies by case_name length)
+        // Payload starts at offset 24
+        let mut payload_offset = 24;
 
-        // Write tag at offset 24
+        // Write type_name_len
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 24\n");
+        out.push_str(&format!("    i32.const {}\n", payload_offset));
         out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", name.len()));
+        out.push_str("    i32.store\n");
+        payload_offset += 4;
+
+        // Write type_name bytes
+        for (i, byte) in name.bytes().enumerate() {
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str(&format!("    i32.const {}\n", payload_offset + i));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", byte));
+            out.push_str("    i32.store8\n");
+        }
+        payload_offset += name.len();
+
+        // Read tag from value to determine case_name
         out.push_str("    local.get $value\n");
         out.push_str("    i32.load\n");
-        out.push_str("    i32.store\n");
+        out.push_str("    local.set $tag\n");
 
-        // Write has_payload = 0 at offset 28
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 28\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store8\n");
+        // Write case_name based on tag using if/else chain
+        // Each branch writes: case_name_len, case_name, tag, payload_count
+        // And sets payload_len and returns the correct total size
+        let case_name_len_offset = payload_offset;
 
-        // Return bytes written: 16 + 8 + 5 = 29
-        out.push_str("    i32.const 29\n");
+        // Generate if/else chain for case names
+        // Each branch is a complete expression that returns (result i32)
+        for (i, case) in variant_def.cases.iter().enumerate() {
+            // Calculate this case's payload_len and total size
+            // payload = type_name_len(4) + type_name + case_name_len(4) + case_name + tag(4) + payload_count(4)
+            let case_payload_len = 4 + name.len() + 4 + case.name.len() + 4 + 4;
+            let case_total_size = 16 + 8 + case_payload_len;
+            let case_name_start = case_name_len_offset + 4;
+            let tag_offset = case_name_start + case.name.len();
+            let payload_count_offset = tag_offset + 4;
+
+            if i == 0 {
+                out.push_str("    local.get $tag\n");
+                out.push_str("    i32.const 0\n");
+                out.push_str("    i32.eq\n");
+                out.push_str("    if (result i32)\n");
+            } else {
+                out.push_str("    else\n");
+                if i < variant_def.cases.len() - 1 {
+                    out.push_str("      local.get $tag\n");
+                    out.push_str(&format!("      i32.const {}\n", i));
+                    out.push_str("      i32.eq\n");
+                    out.push_str("      if (result i32)\n");
+                }
+            }
+
+            // Write payload_len for this case (at offset 20)
+            out.push_str("      local.get $out_ptr\n");
+            out.push_str("      i32.const 20\n");
+            out.push_str("      i32.add\n");
+            out.push_str(&format!("      i32.const {}\n", case_payload_len));
+            out.push_str("      i32.store\n");
+
+            // Write case_name_len
+            out.push_str("      local.get $out_ptr\n");
+            out.push_str(&format!("      i32.const {}\n", case_name_len_offset));
+            out.push_str("      i32.add\n");
+            out.push_str(&format!("      i32.const {}\n", case.name.len()));
+            out.push_str("      i32.store\n");
+
+            // Write case_name bytes
+            for (j, byte) in case.name.bytes().enumerate() {
+                out.push_str("      local.get $out_ptr\n");
+                out.push_str(&format!("      i32.const {}\n", case_name_start + j));
+                out.push_str("      i32.add\n");
+                out.push_str(&format!("      i32.const {}\n", byte));
+                out.push_str("      i32.store8\n");
+            }
+
+            // Write tag immediately after case_name
+            out.push_str("      local.get $out_ptr\n");
+            out.push_str(&format!("      i32.const {}\n", tag_offset));
+            out.push_str("      i32.add\n");
+            out.push_str(&format!("      i32.const {}\n", i)); // tag value
+            out.push_str("      i32.store\n");
+
+            // Write payload_count = 0
+            out.push_str("      local.get $out_ptr\n");
+            out.push_str(&format!("      i32.const {}\n", payload_count_offset));
+            out.push_str("      i32.add\n");
+            out.push_str("      i32.const 0\n");
+            out.push_str("      i32.store\n");
+
+            // Return this case's total size
+            out.push_str(&format!("      i32.const {}\n", case_total_size));
+        }
+
+        // Close all the if/else blocks
+        // We have (cases.len() - 1) nested if statements
+        for _ in 0..(variant_def.cases.len() - 1) {
+            out.push_str("    end\n");
+        }
     } else if all_have_payload {
         // All cases have payloads
-        // CGRF uses depth-first: payload node first, then variant node
-        // header(16) + payload_node(12) + variant_node(8+9) = 45 bytes
+        // CGRF v2: payload node first (depth-first), then variant node
+
+        // Variant payload size: 4 + name.len() + 4 + max_case_name_len + 4 + 4 + 4 (one child index)
+        let variant_payload_len = 4 + name.len() + 4 + max_case_name_len + 4 + 4 + 4;
 
         // Write CGRF header
         out.push_str("    local.get $out_ptr\n");
@@ -8549,55 +9192,132 @@ fn generate_cgrf_encode_variant(
         out.push_str("    i32.store\n");
 
         // Write variant node at offset 28 (16 + 12)
+        let variant_node_offset = 28;
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 28\n");
+        out.push_str(&format!("    i32.const {}\n", variant_node_offset));
         out.push_str("    i32.add\n");
         out.push_str(&format!("    i32.const {}\n", CGRF_VARIANT as i32));
         out.push_str("    i32.store8\n");
 
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 29\n");
+        out.push_str(&format!("    i32.const {}\n", variant_node_offset + 1));
         out.push_str("    i32.add\n");
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store8\n");
 
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 30\n");
+        out.push_str(&format!("    i32.const {}\n", variant_node_offset + 2));
         out.push_str("    i32.add\n");
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store16\n");
 
-        // Variant payload length = 4 (tag) + 1 (has_payload) + 4 (child_index) = 9
+        // Variant payload length
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 32\n");
+        out.push_str(&format!("    i32.const {}\n", variant_node_offset + 4));
         out.push_str("    i32.add\n");
-        out.push_str("    i32.const 9\n");
+        out.push_str(&format!("    i32.const {}\n", variant_payload_len));
         out.push_str("    i32.store\n");
 
-        // Write tag at offset 36
+        // Variant payload starts at variant_node_offset + 8
+        let mut payload_offset = variant_node_offset + 8;
+
+        // Write type_name_len
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 36\n");
+        out.push_str(&format!("    i32.const {}\n", payload_offset));
         out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", name.len()));
+        out.push_str("    i32.store\n");
+        payload_offset += 4;
+
+        // Write type_name bytes
+        for (i, byte) in name.bytes().enumerate() {
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str(&format!("    i32.const {}\n", payload_offset + i));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", byte));
+            out.push_str("    i32.store8\n");
+        }
+        payload_offset += name.len();
+
+        // Read tag from value
         out.push_str("    local.get $value\n");
         out.push_str("    i32.load\n");
-        out.push_str("    i32.store\n");
+        out.push_str("    local.set $tag\n");
 
-        // Write has_payload = 1 at offset 40
+        // Write case_name based on tag using if/else chain
+        let case_name_len_offset = payload_offset;
+        payload_offset += 4;
+        let case_name_start = payload_offset;
+
+        // Generate if/else chain for case names
+        for (i, case) in variant_def.cases.iter().enumerate() {
+            if i == 0 {
+                out.push_str("    local.get $tag\n");
+                out.push_str("    i32.const 0\n");
+                out.push_str("    i32.eq\n");
+                out.push_str("    if\n");
+            } else {
+                out.push_str("    else\n");
+                if i < variant_def.cases.len() - 1 {
+                    out.push_str(&format!("      local.get $tag\n"));
+                    out.push_str(&format!("      i32.const {}\n", i));
+                    out.push_str("      i32.eq\n");
+                    out.push_str("      if\n");
+                }
+            }
+
+            // Write case_name_len
+            out.push_str("      local.get $out_ptr\n");
+            out.push_str(&format!("      i32.const {}\n", case_name_len_offset));
+            out.push_str("      i32.add\n");
+            out.push_str(&format!("      i32.const {}\n", case.name.len()));
+            out.push_str("      i32.store\n");
+
+            // Write case_name bytes
+            for (j, byte) in case.name.bytes().enumerate() {
+                out.push_str("      local.get $out_ptr\n");
+                out.push_str(&format!("      i32.const {}\n", case_name_start + j));
+                out.push_str("      i32.add\n");
+                out.push_str(&format!("      i32.const {}\n", byte));
+                out.push_str("      i32.store8\n");
+            }
+        }
+
+        // Close all the if/else blocks
+        // We have (cases.len() - 1) nested if statements
+        // (the last case has no 'if' because it's in the final 'else')
+        for _ in 0..(variant_def.cases.len() - 1) {
+            out.push_str("    end\n");
+        }
+
+        payload_offset += max_case_name_len;
+
+        // Write tag
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 40\n");
+        out.push_str(&format!("    i32.const {}\n", payload_offset));
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $tag\n");
+        out.push_str("    i32.store\n");
+        payload_offset += 4;
+
+        // Write payload_count = 1
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str(&format!("    i32.const {}\n", payload_offset));
         out.push_str("    i32.add\n");
         out.push_str("    i32.const 1\n");
-        out.push_str("    i32.store8\n");
+        out.push_str("    i32.store\n");
+        payload_offset += 4;
 
-        // Write child_index = 0 at offset 41
+        // Write child_index = 0
         out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 41\n");
+        out.push_str(&format!("    i32.const {}\n", payload_offset));
         out.push_str("    i32.add\n");
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store\n");
+        payload_offset += 4;
 
-        // Return bytes written: 16 + 12 + 17 = 45
-        out.push_str("    i32.const 45\n");
+        // Return bytes written
+        out.push_str(&format!("    i32.const {}\n", payload_offset));
     } else {
         // Mixed case: need runtime check
         // For now, use a simplified approach - TODO: implement proper runtime branching
@@ -8607,7 +9327,7 @@ fn generate_cgrf_encode_variant(
 }
 
 /// Generate WAT code to encode a result value to CGRF at $out_ptr.
-/// Result maps to Variant with tag 0 = Ok, tag 1 = Err
+/// CGRF v2 Result payload: [ok_type:type_tag*, err_type:type_tag*, tag:u32, has_payload:u8, child_index?:u32]
 fn generate_cgrf_encode_result(
     out: &mut String,
     ok_ty: &Type,
@@ -8615,7 +9335,7 @@ fn generate_cgrf_encode_result(
     _records: &HashMap<String, RecordDef>,
     _variants: &HashMap<String, VariantDef>,
 ) {
-    // Result is encoded as CGRF Variant with tag 0 = Ok, tag 1 = Err
+    // Result is encoded as CGRF_RESULT (0x14) with type tags
     // Memory layout: [tag: i32 (0 or 1), payload...]
 
     // For simplicity, only support scalar ok/err types for now
@@ -8627,7 +9347,14 @@ fn generate_cgrf_encode_result(
         return;
     }
 
-    out.push_str("    ;; Encode result value as variant\n");
+    // Calculate type tag sizes
+    let ok_type_tag_size = type_tag_size(ok_ty);
+    let err_type_tag_size = type_tag_size(err_ty);
+
+    // Result payload: ok_type_tag + err_type_tag + tag(4) + has_payload(1) + child_index(4)
+    let result_payload_len = ok_type_tag_size + err_type_tag_size + 4 + 1 + 4;
+
+    out.push_str("    ;; Encode result value (CGRF v2)\n");
 
     // Write CGRF header
     out.push_str("    local.get $out_ptr\n");
@@ -8646,7 +9373,7 @@ fn generate_cgrf_encode_result(
     out.push_str("    i32.const 0\n");
     out.push_str("    i32.store16\n");
 
-    // Node count = 2 (variant + payload)
+    // Node count = 2 (result + payload)
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 8\n");
     out.push_str("    i32.add\n");
@@ -8656,14 +9383,14 @@ fn generate_cgrf_encode_result(
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 12\n");
     out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // root = variant node
+    out.push_str("    i32.const 0\n"); // root = result node
     out.push_str("    i32.store\n");
 
-    // Write variant node at offset 16
+    // Write result node at offset 16
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 16\n");
     out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VARIANT as i32));
+    out.push_str(&format!("    i32.const {}\n", CGRF_RESULT as i32));
     out.push_str("    i32.store8\n");
 
     out.push_str("    local.get $out_ptr\n");
@@ -8678,39 +9405,53 @@ fn generate_cgrf_encode_result(
     out.push_str("    i32.const 0\n");
     out.push_str("    i32.store16\n");
 
-    // Payload length = 4 (tag) + 1 (has_payload) + 4 (child index) = 9
+    // Payload length
     out.push_str("    local.get $out_ptr\n");
     out.push_str("    i32.const 20\n");
     out.push_str("    i32.add\n");
-    out.push_str("    i32.const 9\n");
+    out.push_str(&format!("    i32.const {}\n", result_payload_len));
     out.push_str("    i32.store\n");
 
-    // Write tag at offset 24 (read from value's discriminant)
+    // Payload starts at offset 24
+    let mut payload_offset: i32 = 24;
+
+    // Write ok_type tag
+    let ok_tag_written = generate_write_type_tag(out, ok_ty, "$out_ptr", payload_offset);
+    payload_offset += ok_tag_written as i32;
+
+    // Write err_type tag
+    let err_tag_written = generate_write_type_tag(out, err_ty, "$out_ptr", payload_offset);
+    payload_offset += err_tag_written as i32;
+
+    // Write tag (read from value's discriminant: 0=ok, 1=err)
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset));
     out.push_str("    i32.add\n");
     out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n"); // load discriminant (0=ok, 1=err)
+    out.push_str("    i32.load\n");
     out.push_str("    i32.store\n");
+    payload_offset += 4;
 
-    // Write has_payload = 1 at offset 28
+    // Write has_payload = 1
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 28\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset));
     out.push_str("    i32.add\n");
     out.push_str("    i32.const 1\n");
     out.push_str("    i32.store8\n");
+    payload_offset += 1;
 
-    // Write child index = 1 at offset 29
+    // Write child index = 1
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 29\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset));
     out.push_str("    i32.add\n");
     out.push_str("    i32.const 1\n");
     out.push_str("    i32.store\n");
+    payload_offset += 4;
 
-    // Write payload node at offset 33
+    // Write payload node
     // Determine type based on tag (ok=0 uses ok_ty, err=1 uses err_ty)
     // For simplicity, assume both are same size (s32 for now)
-    let (cgrf_kind, payload_size) = match ok_ty {
+    let (cgrf_kind, value_payload_size) = match ok_ty {
         Type::S32 => (CGRF_S32, 4),
         Type::S64 => (CGRF_S64, 8),
         Type::F32 => (CGRF_F32, 4),
@@ -8719,32 +9460,32 @@ fn generate_cgrf_encode_result(
     };
 
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 33\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset));
     out.push_str("    i32.add\n");
     out.push_str(&format!("    i32.const {}\n", cgrf_kind as i32));
     out.push_str("    i32.store8\n");
 
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 34\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset + 1));
     out.push_str("    i32.add\n");
     out.push_str("    i32.const 0\n");
     out.push_str("    i32.store8\n");
 
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 35\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset + 2));
     out.push_str("    i32.add\n");
     out.push_str("    i32.const 0\n");
     out.push_str("    i32.store16\n");
 
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 37\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset + 4));
     out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", payload_size));
+    out.push_str(&format!("    i32.const {}\n", value_payload_size));
     out.push_str("    i32.store\n");
 
-    // Write payload value at offset 41
+    // Write payload value
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 41\n");
+    out.push_str(&format!("    i32.const {}\n", payload_offset + 8));
     out.push_str("    i32.add\n");
     out.push_str("    local.get $value\n");
     out.push_str("    i32.const 4\n");
@@ -8766,8 +9507,9 @@ fn generate_cgrf_encode_result(
     };
     out.push_str(&format!("    {}\n", store_instr));
 
-    // Return bytes written: 16 + 8 + 9 + 8 + payload_size
-    out.push_str(&format!("    i32.const {}\n", 41 + payload_size));
+    // Return bytes written
+    let total_bytes = payload_offset + 8 + value_payload_size as i32;
+    out.push_str(&format!("    i32.const {}\n", total_bytes));
 }
 
 // =============================================================================
@@ -8874,10 +9616,10 @@ fn generate_cgrf_decode_string(out: &mut String) {
 /// - Field nodes come first (node 0, 1, 2, ...)
 /// - Record node comes last (root)
 ///
-/// For Record([S32(10), S32(20)]):
-/// - Node 0: S32(10) at offset 16
-/// - Node 1: S32(20) at offset 28
-/// - Node 2: Record (root) at offset 40, payload = [field_count=2, idx0=0, idx1=1]
+/// For v2 Record([S32(10), S32(20)]):
+/// - Record node at offset 16 with v2 payload
+///   - Payload: [type_name_len, type_name, field_count, field_names, child_indices]
+/// - Field nodes start after record node payload
 ///
 /// We allocate heap space for the wisp record and copy field values into it.
 fn generate_cgrf_decode_record(
@@ -8899,7 +9641,7 @@ fn generate_cgrf_decode_record(
         }
     };
 
-    out.push_str(&format!("    ;; Decode record '{}'\n", rec_name));
+    out.push_str(&format!("    ;; Decode record '{}' (CGRF v2)\n", rec_name));
 
     // Calculate total size needed for wisp record
     let record_size: usize = record_def
@@ -8916,20 +9658,31 @@ fn generate_cgrf_decode_record(
     out.push_str("    i32.add\n");
     out.push_str("    global.set $__heap_ptr\n");
 
-    // Decode each field from its CGRF node and store into the wisp record
-    // Fields are at nodes 0, 1, 2, ... (depth-first order)
-    let mut cgrf_node_offset = 16; // Start after header
+    // In CGRF, children are encoded BEFORE their parent.
+    // For a record with N scalar fields, the layout is:
+    // - Header: 16 bytes (magic, version, flags, node_count, root)
+    // - Node 0: first child value
+    // - Node 1: second child value
+    // - ...
+    // - Node N-1: last child value
+    // - Node N: the record node (root)
+    //
+    // So children are at the BEGINNING of the node array, not after the record.
+
+    // Child nodes start at offset 16 (right after CGRF header)
+    let mut child_node_offset = 16;
+
     for (i, field) in record_def.fields.iter().enumerate() {
         let wisp_field_offset = record_def.field_offset(i);
 
         out.push_str(&format!("    ;; Field {} '{}' at wisp offset {}\n", i, field.name, wisp_field_offset));
 
-        // Calculate CGRF node payload offset
-        let payload_offset = cgrf_node_offset + 8; // Skip node header
+        // Calculate CGRF node payload offset (skip 8-byte node header)
+        let payload_offset = child_node_offset + 8;
 
         match &field.ty {
             Type::S32 => {
-                // Load from CGRF
+                // Load from CGRF child node
                 out.push_str("    local.get $in_ptr\n");
                 out.push_str(&format!("    i32.const {}\n", payload_offset));
                 out.push_str("    i32.add\n");
@@ -8945,7 +9698,7 @@ fn generate_cgrf_decode_record(
                 out.push_str("    local.get $field_val\n");
                 out.push_str("    i32.store\n");
 
-                cgrf_node_offset += 12; // 8 header + 4 payload
+                child_node_offset += 12; // 8 header + 4 payload for S32
             }
             Type::S64 => {
                 out.push_str("    local.get $rec_ptr\n");
@@ -8959,7 +9712,7 @@ fn generate_cgrf_decode_record(
                 out.push_str("    i64.load\n");
                 out.push_str("    i64.store\n");
 
-                cgrf_node_offset += 16; // 8 header + 8 payload
+                child_node_offset += 16; // 8 header + 8 payload for S64
             }
             Type::F32 => {
                 out.push_str("    local.get $rec_ptr\n");
@@ -8973,7 +9726,7 @@ fn generate_cgrf_decode_record(
                 out.push_str("    f32.load\n");
                 out.push_str("    f32.store\n");
 
-                cgrf_node_offset += 12;
+                child_node_offset += 12; // 8 header + 4 payload for F32
             }
             Type::F64 => {
                 out.push_str("    local.get $rec_ptr\n");
@@ -8987,11 +9740,11 @@ fn generate_cgrf_decode_record(
                 out.push_str("    f64.load\n");
                 out.push_str("    f64.store\n");
 
-                cgrf_node_offset += 16;
+                child_node_offset += 16; // 8 header + 8 payload for F64
             }
             _ => {
                 out.push_str(&format!("    ;; TODO: decode non-scalar field '{}'\n", field.name));
-                cgrf_node_offset += 12; // Assume 12 as fallback
+                child_node_offset += 12; // Assume 12 as fallback
             }
         }
     }
@@ -9134,13 +9887,15 @@ fn generate_cgrf_decode_option(
 
 /// Generate WAT code to decode a variant parameter from CGRF.
 ///
-/// CGRF variant encoding (depth-first):
+/// CGRF v2 variant encoding (depth-first):
 /// - No payload: variant node is at index 0 (offset 16)
-///   - Node payload: tag (4 bytes) + has_payload (1 byte, value=0)
+///   - Payload: [type_name_len:u32, type_name:utf8, case_name_len:u32, case_name:utf8,
+///              tag:u32, payload_count:u32]
 /// - With payload: child node first, then variant node
 ///   - Child node at offset 16
 ///   - Variant node at offset 16 + child_size
-///   - Node payload: tag (4 bytes) + has_payload (1 byte, value=1) + child_index (4 bytes)
+///   - Payload: [type_name_len:u32, type_name:utf8, case_name_len:u32, case_name:utf8,
+///              tag:u32, payload_count:u32, child_indices:u32*]
 ///
 /// Wisp variant layout: [discriminant: i32, payload...]
 fn generate_cgrf_decode_variant(
@@ -9163,7 +9918,7 @@ fn generate_cgrf_decode_variant(
     };
 
     out.push_str(&format!(
-        "    ;; Decode variant '{}' from CGRF\n",
+        "    ;; Decode variant '{}' from CGRF v2\n",
         variant_name
     ));
 
@@ -9194,23 +9949,74 @@ fn generate_cgrf_decode_variant(
     out.push_str("    (if\n");
     out.push_str("      (then\n");
     out.push_str("        ;; No payload case: variant node at offset 16\n");
-    // Read tag from offset 16 + 8 (node header is 8 bytes, payload starts at +8)
-    out.push_str("        local.get $rec_ptr\n");
+    // For v2, we need to skip type_name and case_name to find tag
+    // Payload starts at offset 24 (16 + 8 header)
+    // Read type_name_len at 24, skip type_name, read case_name_len, skip case_name, then read tag
+    out.push_str("        ;; Read type_name_len\n");
     out.push_str("        local.get $in_ptr\n");
     out.push_str("        i32.const 24\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $child_idx\n"); // reuse as type_name_len
+    out.push_str("        ;; Calculate case_name_len offset: 24 + 4 + type_name_len\n");
+    out.push_str("        i32.const 28\n");
+    out.push_str("        local.get $child_idx\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $child_offset\n"); // case_name_len offset
+    out.push_str("        ;; Read case_name_len\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $scan_i\n"); // reuse as case_name_len
+    out.push_str("        ;; Calculate tag offset: case_name_len_offset + 4 + case_name_len\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.get $scan_i\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $payload_len\n"); // reuse as tag_offset
+    out.push_str("        ;; Read tag\n");
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $payload_len\n");
     out.push_str("        i32.add\n");
     out.push_str("        i32.load\n");
     out.push_str("        i32.store\n"); // store tag as discriminant
     out.push_str("      )\n");
     out.push_str("      (else\n");
     out.push_str("        ;; Has payload case: child at offset 16, variant node after\n");
-    // For simplicity, assume payload is a single s32
     // Child node (s32) is at offset 16, size 12 (8 header + 4 payload)
     // Variant node is at offset 28
-    // Read tag from variant node payload (offset 28 + 8 = 36)
-    out.push_str("        local.get $rec_ptr\n");
+    // For v2, variant payload starts at offset 36 (28 + 8)
+    out.push_str("        ;; Read type_name_len from variant node\n");
     out.push_str("        local.get $in_ptr\n");
     out.push_str("        i32.const 36\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $child_idx\n"); // reuse as type_name_len
+    out.push_str("        ;; Calculate case_name_len offset: 36 + 4 + type_name_len\n");
+    out.push_str("        i32.const 40\n");
+    out.push_str("        local.get $child_idx\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $child_offset\n"); // case_name_len offset
+    out.push_str("        ;; Read case_name_len\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $scan_i\n"); // reuse as case_name_len
+    out.push_str("        ;; Calculate tag offset: case_name_len_offset + 4 + case_name_len\n");
+    out.push_str("        local.get $child_offset\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.get $scan_i\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $payload_len\n"); // reuse as tag_offset
+    out.push_str("        ;; Read tag\n");
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $payload_len\n");
     out.push_str("        i32.add\n");
     out.push_str("        i32.load\n");
     out.push_str("        i32.store\n"); // store tag as discriminant
@@ -9234,9 +10040,10 @@ fn generate_cgrf_decode_variant(
 /// Generate WAT code to decode a result<T, E> parameter from CGRF.
 /// For now, supports result<s32, s32>.
 ///
-/// CGRF result encoding:
-/// - If Ok(val) or Err(val): child node at offset 16, result node after
-/// - Result node has: tag (0=ok, 1=err) and child_index if has payload
+/// CGRF v2 result encoding:
+/// - Result node at offset 16 (root = 0)
+///   - Payload: [ok_type:type_tag*, err_type:type_tag*, tag:u32, has_payload:u8, child_index:u32]
+/// - Payload value node after result node
 ///
 /// Wisp result layout: [tag: i32 (0=ok, 1=err), payload]
 fn generate_cgrf_decode_result(
@@ -9245,15 +10052,30 @@ fn generate_cgrf_decode_result(
     err_ty: &Type,
     param_name: &str,
 ) {
-    out.push_str("    ;; Decode result from CGRF\n");
+    out.push_str("    ;; Decode result from CGRF v2 (depth-first encoded)\n");
 
     // Calculate result size for allocation
-    // For now, assume both ok and err have same size (s32)
     let payload_size = match (ok_ty, err_ty) {
         (Type::S64, _) | (_, Type::S64) | (Type::F64, _) | (_, Type::F64) => 8,
         _ => 4,
     };
     let result_size = 4 + payload_size; // tag + payload
+
+    // In CGRF depth-first encoding:
+    // - Node 0: payload value (if present) at offset 16
+    // - Node 1: Result node at offset 16 + payload_node_size (or 16 if no payload)
+    //
+    // Result payload v2: [ok_type:type_tag*, err_type:type_tag*, tag:u32, has_payload:u8, child_index?:u32]
+
+    // Calculate payload node size based on type
+    let payload_node_size = match (ok_ty, err_ty) {
+        (Type::S64, _) | (_, Type::S64) | (Type::F64, _) | (_, Type::F64) => 16, // 8 header + 8 payload
+        _ => 12, // 8 header + 4 payload
+    };
+
+    // Calculate offsets for v2 format
+    let ok_tag_size = type_tag_size(ok_ty);
+    let err_tag_size = type_tag_size(err_ty);
 
     // Allocate wisp result on heap
     out.push_str("    global.get $__heap_ptr\n");
@@ -9263,34 +10085,54 @@ fn generate_cgrf_decode_result(
     out.push_str("    i32.add\n");
     out.push_str("    global.set $__heap_ptr\n");
 
-    // CGRF Result encoding:
-    // - Node 0: payload value (S32) at offset 16
-    // - Node 1: Result node at offset 28
-    //   - Result payload: [tag: u32, child_index: u32]
-    //
-    // The tag tells us if it's Ok (0) or Err (1)
-
-    // Read tag from result node payload (offset 28 + 8 = 36)
+    // Use node_count to determine if there's a payload
+    // node_count == 1: just result node (at offset 16)
+    // node_count == 2: payload node first (at offset 16), then result node
     out.push_str("    local.get $in_ptr\n");
-    out.push_str("    i32.const 36\n");
+    out.push_str("    i32.const 8\n");
     out.push_str("    i32.add\n");
-    out.push_str("    i32.load\n");
-    out.push_str("    local.set $field_val\n"); // tag value (0=ok, 1=err)
+    out.push_str("    i32.load\n"); // node_count
+    out.push_str("    local.set $child_idx\n"); // reuse as node_count
 
-    // Store tag in wisp result
-    out.push_str("    local.get $rec_ptr\n");
-    out.push_str("    local.get $field_val\n");
-    out.push_str("    i32.store\n");
-
-    // Read payload value from child node (offset 16 + 8 = 24)
-    out.push_str("    local.get $rec_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $in_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.load\n");
-    out.push_str("    i32.store\n");
+    out.push_str("    local.get $child_idx\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.eq\n");
+    out.push_str("    (if\n");
+    out.push_str("      (then\n");
+    out.push_str("        ;; No payload: Result node at offset 16\n");
+    // tag is at: 16 (node start) + 8 (header) + ok_tag_size + err_tag_size
+    let tag_offset_no_payload = 24 + ok_tag_size + err_tag_size;
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str(&format!("        i32.const {}\n", tag_offset_no_payload));
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        i32.store\n"); // store tag
+    // No payload value to store
+    out.push_str("      )\n");
+    out.push_str("      (else\n");
+    out.push_str("        ;; Has payload: payload at offset 16, Result node after\n");
+    // Result node is at: 16 + payload_node_size
+    let result_node_offset = 16 + payload_node_size;
+    // tag is at: result_node_offset + 8 (header) + ok_tag_size + err_tag_size
+    let tag_offset_with_payload = result_node_offset + 8 + ok_tag_size + err_tag_size;
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str(&format!("        i32.const {}\n", tag_offset_with_payload));
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        i32.store\n"); // store tag
+    // Read payload value from payload node (at offset 16 + 8 = 24)
+    out.push_str("        local.get $rec_ptr\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        i32.const 24\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        i32.store\n");
+    out.push_str("      )\n");
+    out.push_str("    )\n");
 
     // Return the result pointer
     out.push_str("    local.get $rec_ptr\n");
@@ -9300,15 +10142,16 @@ fn generate_cgrf_decode_result(
 /// Generate WAT code to decode a list<T> parameter from CGRF.
 /// For now, only supports list<s32>.
 ///
-/// CGRF uses depth-first encoding:
+/// CGRF v2 uses depth-first encoding:
 /// - Child nodes (elements) are encoded FIRST at nodes 0, 1, 2, ...
 /// - List node is encoded LAST (root)
+/// - List payload: [elem_type:type_tag*, count:u32, child_indices:u32*]
 ///
 /// For list [1, 2, 3]:
 /// - Node 0: S32(1) at offset 16
 /// - Node 1: S32(2) at offset 28
 /// - Node 2: S32(3) at offset 40
-/// - Node 3: List at offset 52 (root, contains indices [0, 1, 2])
+/// - Node 3: List at offset 52 (root, contains type tag + count + indices)
 ///
 /// Wisp list layout: { len: i32, cap: i32, data_ptr: i32 }
 fn generate_cgrf_decode_list(
@@ -9316,7 +10159,7 @@ fn generate_cgrf_decode_list(
     elem_ty: &Type,
     param_name: &str,
 ) {
-    out.push_str("    ;; Decode list from CGRF (depth-first encoded)\n");
+    out.push_str("    ;; Decode list from CGRF v2 (depth-first encoded)\n");
 
     // Element nodes are encoded first, starting at offset 16
     // The list node is at the end (root)
@@ -9344,11 +10187,16 @@ fn generate_cgrf_decode_list(
     out.push_str("    i32.add\n");
     out.push_str("    local.set $elem_offset\n"); // now holds root node offset
 
-    // Read element count from list node payload (root_offset + 8)
+    // For v2, list payload is: [elem_type:type_tag*, count:u32, child_indices:u32*]
+    // The count is at offset: 8 (node header) + type_tag_size(elem_ty)
+    let elem_type_tag_size = type_tag_size(elem_ty);
+    let count_offset = 8 + elem_type_tag_size;
+
+    // Read element count from list node payload
     out.push_str("    local.get $in_ptr\n");
     out.push_str("    local.get $elem_offset\n");
     out.push_str("    i32.add\n");
-    out.push_str("    i32.const 8\n");
+    out.push_str(&format!("    i32.const {}\n", count_offset));
     out.push_str("    i32.add\n");
     out.push_str("    i32.load\n");
     out.push_str("    local.set $list_len\n");
@@ -9667,7 +10515,7 @@ fn generate_decode_record_at_offset(
         }
     };
 
-    out.push_str(&format!("    ;; Decode record '{}' at $child_offset\n", rec_name));
+    out.push_str(&format!("    ;; Decode record '{}' at $child_offset (CGRF v2)\n", rec_name));
 
     // Allocate wisp record on heap
     let rec_size = rec_def.size();
@@ -9678,15 +10526,85 @@ fn generate_decode_record_at_offset(
     out.push_str("    i32.add\n");
     out.push_str("    global.set $__heap_ptr\n");
 
-    // Record node payload: [child_count: u32, child_indices: [u32; child_count]]
-    // For each field, read the child index, find that node, read its value
-    for (field_idx, field) in rec_def.fields.iter().enumerate() {
-        // Read child_indices[field_idx] from record node
-        // At: in_ptr + child_offset + 8 (header) + 4 (count) + field_idx * 4
+    // v2 record payload: [type_name_len:u32, type_name:utf8, field_count:u32,
+    //                     field_names:(len:u32, name:utf8)*, child_indices:u32*]
+    //
+    // We need to calculate offset to child_indices:
+    // - 8 bytes: node header
+    // - 4 bytes: type_name_len
+    // - N bytes: type_name (use rec_name.len() since we know the type)
+    // - 4 bytes: field_count
+    // - For each field: 4 bytes len + field_name.len() bytes
+    // Then child_indices start
+    //
+    // Note: The encoded field names may differ from rec_def field names (e.g., "field0" vs "x"),
+    // but the field count and number of child_indices should match.
+
+    // Calculate offset to child_indices from start of node
+    // We read the actual type_name_len and field_name_lens from the payload at runtime
+    // because the encoder may use different names than the wisp source
+
+    // First, read type_name_len to know where field_count is
+    out.push_str("    local.get $in_ptr\n");
+    out.push_str("    local.get $child_offset\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 8\n"); // skip node header
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $str_len\n"); // type_name_len
+
+    // field_count is at: header(8) + type_name_len(4) + type_name($str_len) + 0
+    // = 12 + $str_len
+    // We'll read field_count to verify, but we know it from rec_def
+
+    // Calculate offset to field_names: 8 + 4 + $str_len + 4 = 16 + $str_len
+    // Then for each field, skip 4 + field_name_len bytes
+    // After all field names, child_indices start
+
+    // For simplicity with variable-length field names, read them at runtime
+    // Calculate base offset to payload data
+    // child_indices_offset = 8 + 4 + type_name_len + 4 + sum(4 + field_name_len for each field)
+
+    // Store base offset for child_indices calculation
+    // We need to scan through field names to find child_indices
+
+    // Start at offset for first field name: 8 + 4 + type_name_len + 4
+    out.push_str("    i32.const 16\n"); // 8 header + 4 type_name_len + 4 field_count
+    out.push_str("    local.get $str_len\n"); // type_name_len
+    out.push_str("    i32.add\n");
+    out.push_str("    local.set $data_len\n"); // offset to first field name
+
+    // Skip all field names
+    let field_count = rec_def.fields.len();
+    for _i in 0..field_count {
+        // Read field_name_len at current offset
         out.push_str("    local.get $in_ptr\n");
         out.push_str("    local.get $child_offset\n");
         out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", 12 + field_idx * 4));
+        out.push_str("    local.get $data_len\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.load\n");
+        out.push_str("    local.set $str_len\n"); // field_name_len
+
+        // Advance: data_len += 4 + field_name_len
+        out.push_str("    local.get $data_len\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $str_len\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.set $data_len\n");
+    }
+
+    // Now $data_len is the offset to child_indices from node start
+    // For each field, read child_index, find that node, read value
+    for (field_idx, field) in rec_def.fields.iter().enumerate() {
+        // Read child_indices[field_idx] from record node
+        out.push_str("    local.get $in_ptr\n");
+        out.push_str("    local.get $child_offset\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $data_len\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", field_idx * 4));
         out.push_str("    i32.add\n");
         out.push_str("    i32.load\n");
         out.push_str("    local.set $child_idx\n");
@@ -9700,8 +10618,11 @@ fn generate_decode_record_at_offset(
 
         // Read field value from that node (at child_offset + 8)
         out.push_str("    local.get $rec_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", field_idx * 4));
-        out.push_str("    i32.add\n");
+        let field_offset = rec_def.field_offset(field_idx);
+        if field_offset > 0 {
+            out.push_str(&format!("    i32.const {}\n", field_offset));
+            out.push_str("    i32.add\n");
+        }
         out.push_str("    local.get $in_ptr\n");
         out.push_str("    local.get $child_offset\n");
         out.push_str("    i32.add\n");
@@ -9729,10 +10650,16 @@ fn generate_decode_option_at_offset(
     inner_ty: &Type,
     param_name: &str,
 ) {
-    out.push_str("    ;; Decode option at $child_offset\n");
+    out.push_str("    ;; Decode option at $child_offset (CGRF v2)\n");
 
     let inner_size = type_size(inner_ty);
     let option_size = 4 + inner_size;
+
+    // v2 option payload: [inner_type:type_tag*, presence:u8, child_index?:u32]
+    // Calculate offset to presence byte (after node header + type tag)
+    let inner_type_tag_size = type_tag_size(inner_ty);
+    let presence_offset = 8 + inner_type_tag_size; // 8 = node header
+    let child_index_offset = presence_offset + 1;
 
     // Allocate wisp option on heap
     out.push_str("    global.get $__heap_ptr\n");
@@ -9742,12 +10669,11 @@ fn generate_decode_option_at_offset(
     out.push_str("    i32.add\n");
     out.push_str("    global.set $__heap_ptr\n");
 
-    // Option node payload: [has_value: u8, child_index?: u32]
-    // Read has_value from option node (at child_offset + 8)
+    // Read presence byte from option node
     out.push_str("    local.get $in_ptr\n");
     out.push_str("    local.get $child_offset\n");
     out.push_str("    i32.add\n");
-    out.push_str("    i32.const 8\n");
+    out.push_str(&format!("    i32.const {}\n", presence_offset));
     out.push_str("    i32.add\n");
     out.push_str("    i32.load8_u\n");
     out.push_str("    local.set $field_val\n");
@@ -9768,11 +10694,11 @@ fn generate_decode_option_at_offset(
     out.push_str("        i32.const 1\n");
     out.push_str("        i32.store\n");
 
-    // Read child_index from option node (at child_offset + 9)
+    // Read child_index from option node
     out.push_str("        local.get $in_ptr\n");
     out.push_str("        local.get $child_offset\n");
     out.push_str("        i32.add\n");
-    out.push_str("        i32.const 9\n");
+    out.push_str(&format!("        i32.const {}\n", child_index_offset));
     out.push_str("        i32.add\n");
     out.push_str("        i32.load\n");
     out.push_str("        local.set $child_idx\n");

@@ -137,6 +137,30 @@ fn eval_expr(expr: &str, state: &ReplState, runtime: &Runtime) -> anyhow::Result
     composite_to_repl_value(&output)
 }
 
+use wisp::compiler::Type;
+
+/// Convert a composite ValueType to a wisp Type
+fn composite_type_to_wisp_type(cvt: &composite::abi::ValueType) -> Type {
+    use composite::abi::ValueType;
+    match cvt {
+        ValueType::Bool | ValueType::S8 | ValueType::S16 | ValueType::S32 | ValueType::U8 | ValueType::U16 | ValueType::U32 => Type::S32,
+        ValueType::S64 | ValueType::U64 => Type::S64,
+        ValueType::F32 => Type::F32,
+        ValueType::F64 => Type::F64,
+        ValueType::Char | ValueType::String => Type::Str,
+        ValueType::List(elem) => Type::List(Box::new(composite_type_to_wisp_type(elem))),
+        ValueType::Option(inner) => Type::Option(Box::new(composite_type_to_wisp_type(inner))),
+        ValueType::Result { ok, err } => Type::Result(
+            Box::new(composite_type_to_wisp_type(ok)),
+            Box::new(composite_type_to_wisp_type(err)),
+        ),
+        ValueType::Record(name) => Type::Record(name.clone()),
+        ValueType::Variant(name) => Type::Variant(name.clone()),
+        ValueType::Tuple(_) => Type::S32, // Tuple doesn't have a direct mapping
+        ValueType::Flags => Type::S64,
+    }
+}
+
 fn composite_to_repl_value(cv: &CompositeValue) -> anyhow::Result<Value> {
     match cv {
         CompositeValue::S32(n) => Ok(Value::S32(*n)),
@@ -144,35 +168,47 @@ fn composite_to_repl_value(cv: &CompositeValue) -> anyhow::Result<Value> {
         CompositeValue::F32(n) => Ok(Value::F32(*n)),
         CompositeValue::F64(n) => Ok(Value::F64(*n)),
         CompositeValue::String(s) => Ok(Value::Str(s.clone())),
-        CompositeValue::Option(inner) => Ok(Value::Option(
-            inner
+        CompositeValue::Option { inner_type, value } => Ok(Value::Option {
+            inner_type: composite_type_to_wisp_type(inner_type),
+            value: value
                 .as_ref()
                 .map(|v| composite_to_repl_value(v).map(Box::new))
                 .transpose()?,
-        )),
-        CompositeValue::List(items) => Ok(Value::List(
-            items
+        }),
+        CompositeValue::List { elem_type, items } => Ok(Value::List {
+            elem_type: composite_type_to_wisp_type(elem_type),
+            items: items
                 .iter()
                 .map(composite_to_repl_value)
                 .collect::<anyhow::Result<Vec<_>>>()?,
-        )),
-        CompositeValue::Record(fields) => {
-            let mut field_map = std::collections::HashMap::new();
-            for (name, value) in fields {
-                field_map.insert(name.clone(), composite_to_repl_value(value)?);
-            }
+        }),
+        CompositeValue::Result { ok_type, err_type, value } => Ok(Value::Result {
+            ok_type: composite_type_to_wisp_type(ok_type),
+            err_type: composite_type_to_wisp_type(err_type),
+            value: match value {
+                Ok(v) => Ok(Box::new(composite_to_repl_value(v)?)),
+                Err(v) => Err(Box::new(composite_to_repl_value(v)?)),
+            },
+        }),
+        CompositeValue::Record { type_name, fields } => {
+            let converted_fields = fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((name.clone(), composite_to_repl_value(value)?))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
             Ok(Value::Record {
-                type_name: "record".to_string(), // We don't have type name in CGRF
-                fields: field_map,
+                type_name: type_name.clone(),
+                fields: converted_fields,
             })
         }
-        CompositeValue::Variant { tag, payload } => Ok(Value::Variant {
-            type_name: "variant".to_string(),
-            case: format!("case_{}", tag),
+        CompositeValue::Variant { type_name, case_name, tag: _, payload } => Ok(Value::Variant {
+            type_name: type_name.clone(),
+            case: case_name.clone(),
             payload: payload
-                .as_ref()
-                .map(|v| composite_to_repl_value(v).map(Box::new))
-                .transpose()?,
+                .iter()
+                .map(composite_to_repl_value)
+                .collect::<anyhow::Result<Vec<_>>>()?,
         }),
         other => Err(anyhow::anyhow!("Unsupported composite value: {:?}", other)),
     }

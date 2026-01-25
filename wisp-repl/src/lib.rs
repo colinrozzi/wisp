@@ -16,26 +16,26 @@ pub enum Value {
     // String
     Str(String),
 
-    // Compound types
-    List(Vec<Value>),
-    Option(Option<Box<Value>>),
-    Result(std::result::Result<Box<Value>, Box<Value>>),
+    // Compound types WITH explicit type info
+    List { elem_type: Type, items: Vec<Value> },
+    Option { inner_type: Type, value: Option<Box<Value>> },
+    Result { ok_type: Type, err_type: Type, value: std::result::Result<Box<Value>, Box<Value>> },
 
-    // User-defined types
+    // User-defined types - ordered fields, multi-value payload
     Record {
         type_name: String,
-        fields: HashMap<String, Value>,
+        fields: Vec<(String, Value)>,
     },
     Variant {
         type_name: String,
         case: String,
-        payload: Option<Box<Value>>,
+        payload: Vec<Value>,
     },
     // Note: Resources excluded for now
 }
 
 impl Value {
-    /// Get the wisp Type for this value
+    /// Get the wisp Type for this value - uses explicit type fields
     pub fn get_type(&self) -> Type {
         match self {
             Value::S32(_) => Type::S32,
@@ -43,27 +43,17 @@ impl Value {
             Value::F32(_) => Type::F32,
             Value::F64(_) => Type::F64,
             Value::Str(_) => Type::Str,
-            Value::List(items) => {
-                let elem_type = items.first().map(|v| v.get_type()).unwrap_or(Type::S32);
-                Type::List(Box::new(elem_type))
-            }
-            Value::Option(inner) => {
-                let inner_type = inner.as_ref().map(|v| v.get_type()).unwrap_or(Type::S32);
-                Type::Option(Box::new(inner_type))
-            }
-            Value::Result(res) => {
-                let (ok_type, err_type) = match res {
-                    Ok(v) => (v.get_type(), Type::Str),
-                    Err(v) => (Type::S32, v.get_type()),
-                };
-                Type::Result(Box::new(ok_type), Box::new(err_type))
+            Value::List { elem_type, .. } => Type::List(Box::new(elem_type.clone())),
+            Value::Option { inner_type, .. } => Type::Option(Box::new(inner_type.clone())),
+            Value::Result { ok_type, err_type, .. } => {
+                Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
             }
             Value::Record { type_name, .. } => Type::Record(type_name.clone()),
             Value::Variant { type_name, .. } => Type::Variant(type_name.clone()),
         }
     }
 
-    /// Convert to InlineValue for compiler inlining
+    /// Convert to InlineValue for compiler inlining - preserves type info
     pub fn to_inline(&self) -> InlineValue {
         match self {
             Value::S32(n) => InlineValue::S32(*n),
@@ -71,14 +61,22 @@ impl Value {
             Value::F32(n) => InlineValue::F32(*n),
             Value::F64(n) => InlineValue::F64(*n),
             Value::Str(s) => InlineValue::Str(s.clone()),
-            Value::List(items) => InlineValue::List(items.iter().map(|v| v.to_inline()).collect()),
-            Value::Option(inner) => {
-                InlineValue::Option(inner.as_ref().map(|v| Box::new(v.to_inline())))
-            }
-            Value::Result(res) => InlineValue::Result(match res {
-                Ok(v) => Ok(Box::new(v.to_inline())),
-                Err(v) => Err(Box::new(v.to_inline())),
-            }),
+            Value::List { elem_type, items } => InlineValue::List {
+                elem_type: elem_type.clone(),
+                items: items.iter().map(|v| v.to_inline()).collect(),
+            },
+            Value::Option { inner_type, value } => InlineValue::Option {
+                inner_type: inner_type.clone(),
+                value: value.as_ref().map(|v| Box::new(v.to_inline())),
+            },
+            Value::Result { ok_type, err_type, value } => InlineValue::Result {
+                ok_type: ok_type.clone(),
+                err_type: err_type.clone(),
+                value: match value {
+                    Ok(v) => Ok(Box::new(v.to_inline())),
+                    Err(v) => Err(Box::new(v.to_inline())),
+                },
+            },
             Value::Record { type_name, fields } => InlineValue::Record {
                 type_name: type_name.clone(),
                 fields: fields
@@ -93,7 +91,7 @@ impl Value {
             } => InlineValue::Variant {
                 type_name: type_name.clone(),
                 case: case.clone(),
-                payload: payload.as_ref().map(|v| Box::new(v.to_inline())),
+                payload: payload.iter().map(|v| v.to_inline()).collect(),
             },
         }
     }
