@@ -292,7 +292,7 @@ The full compiler integrates all previous milestones:
 ---
 
 ### M8: Full Bootstrap
-**Status**: In Progress
+**Status**: Partial (blocked by tokenizer recursion)
 
 Compile the Wisp compiler with itself.
 
@@ -302,7 +302,21 @@ Compile the Wisp compiler with itself.
 3. Use `wisp-v2.wasm` to compile Wisp compiler → `wisp-v3.wasm`
 4. Verify: `wisp-v2.wasm` == `wisp-v3.wasm` (fixed point)
 
-**Features Required for Bootstrap**:
+**Current State**:
+
+The self-hosted compiler can successfully compile programs up to ~5KB. Full bootstrap
+of the 42KB compiler source is blocked by the recursive tokenizer design:
+- The tokenizer calls `tokenize-acc` once per character position
+- A 42KB file requires ~40,000+ recursive calls
+- Each call allocates tokens via `list-push`
+- This exhausts the module's 6.4MB memory limit
+
+**Verified Working**:
+- ✓ `test_bootstrap_compile_simple`: Compiles identity function
+- ✓ `test_bootstrap_compile_medium`: Compiles factorial, fibonacci, is-even/is-odd
+- ✓ `test_bootstrap_compile_large`: Compiles ~3KB of tokenizer helpers + math functions
+
+**Features Implemented**:
 
 The self-hosted compiler currently supports:
 - ✓ `fn` definitions
@@ -312,37 +326,22 @@ The self-hosted compiler currently supports:
 - ✓ Function calls
 - ✓ `match` expressions
 - ✓ Built-in operations: `string-len`, `string-ref`, `list-len`, `list-get` (inlined)
-- ✓ Built-in operations: `string-append`, `string=?` (runtime helpers)
+- ✓ Built-in operations: `string-append`, `string=?`, `substring` (runtime helpers)
 - ✓ Built-in operations: `list-new`, `list-push` (runtime helpers)
 - ✓ Variant constructors: `sym`, `num`, `str`, `lst`, `lparen`, `rparen`, `number`, `symbol`, `str-lit`
 - ✓ Record constructors: `token-result`, `parse-result`
 - ✓ Record field access: `token-result.tok`, `token-result.new-pos`, `parse-result.expr`, `parse-result.new-pos`
+- ✓ Variant/record definitions (skipped in compilation - constructors are hardcoded)
 
-To compile itself, it still needs:
-- `variant` definitions (generates constructors and tag constants)
-- `record` definitions (generates struct layout)
-- `substring` operation
-- Additional built-ins used in the compiler source
-
-**Incremental Path**:
-1. ✓ Add `string-len`, `list-len` (simple loads)
-2. ✓ Add `string-ref`, `list-get` (indexed loads)
-3. ✓ Add `string-append` (heap allocation + copy)
-4. ✓ Add `string=?` (byte-by-byte comparison)
-5. ✓ Add `list-new`, `list-push` (heap allocation)
-6. ✓ Add `match` expression compilation
-7. ✓ Add variant constructors
-8. ✓ Add record constructors and field access
-9. Add `variant` definition parsing
-10. Add `record` definition parsing
-11. Add `substring` operation
-12. Verify bootstrap
+**To Achieve Full Bootstrap**:
+1. Rewrite tokenizer to use iteration instead of recursion, OR
+2. Implement WASM tail call optimization in the Wisp compiler, OR
+3. Increase WASM module memory limits significantly
 
 **Implementation Notes**:
-- Items 1-2 are inlined as simple WAT expressions
-- Items 3-8 use runtime helper functions with heap allocation
-- Items 9-10 require parsing type definitions and generating appropriate code
+- String/list operations are inlined as simple WAT expressions or use runtime helpers
 - Tests require larger stack: `RUST_MIN_STACK=16777216` due to deeply nested if-else chains
+- WASM stack configured to 128MB for bootstrap tests
 
 ---
 

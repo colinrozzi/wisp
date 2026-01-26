@@ -507,6 +507,15 @@
                               (string-append "(call $__string_eq "
                                 (string-append a-wat
                                   (string-append " " (string-append b-wat ")"))))))
+                          ; Built-in: substring -> (call $__substring s start end)
+                          (if (string=? name "substring")
+                            (let (s-wat (compile-expr (list-get items (i32.const 1))))
+                              (let (start-wat (compile-expr (list-get items (i32.const 2))))
+                                (let (end-wat (compile-expr (list-get items (i32.const 3))))
+                                  (string-append "(call $__substring "
+                                    (string-append s-wat
+                                      (string-append " " (string-append start-wat
+                                        (string-append " " (string-append end-wat ")")))))))))
                           ; Built-in: list-new -> (call $__list_new)
                           (if (string=? name "list-new")
                             "(call $__list_new)"
@@ -583,7 +592,7 @@
                                                                 (let (args (build-args-list items rest-start rest-len (list-new sexpr)))
                                                                   (if (is-wasm-instr name)
                                                                     (compile-wasm-call name args)
-                                                                    (compile-fn-call name args))))))))))))))))))))))))))))))))
+                                                                    (compile-fn-call name args)))))))))))))))))))))))))))))))))
         "(error: list head not symbol)"))))
 
 ; ============================================================
@@ -682,7 +691,12 @@
                 (compile-fn-def items)
                 (if (string=? name "export")
                   (compile-export items)
-                  "(error: unknown form)")))
+                  ; Skip variant and record definitions - constructors are hardcoded
+                  (if (string=? name "variant")
+                    ""
+                    (if (string=? name "record")
+                      ""
+                      "(error: unknown form)")))))
             "(error: not symbol)"))
         "(error: empty)"))
     "(error: not list)"))
@@ -700,7 +714,7 @@
 
 ; Runtime helpers for string, list, and variant operations
 (fn get-runtime () string
-  "  (global $__heap_ptr (mut i32) (i32.const 49152))\n  (func $__string_append (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $tot i32) (local $ptr i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb local.get $la local.get $lb i32.add local.set $tot global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $tot i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $tot i32.store local.get $ptr i32.const 4 i32.add local.get $a i32.const 4 i32.add local.get $la memory.copy local.get $ptr i32.const 4 i32.add local.get $la i32.add local.get $b i32.const 4 i32.add local.get $lb memory.copy local.get $ptr)\n  (func $__string_eq (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $i i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb block (result i32) local.get $la local.get $lb i32.ne if (result i32) i32.const 0 else i32.const 0 local.set $i block (result i32) loop local.get $i local.get $la i32.ge_u if i32.const 1 br 2 end local.get $a i32.const 4 i32.add local.get $i i32.add i32.load8_u local.get $b i32.const 4 i32.add local.get $i i32.add i32.load8_u i32.ne if i32.const 0 br 3 end local.get $i i32.const 1 i32.add local.set $i br 0 end i32.const 1 end end end)\n  (func $__list_new (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr i32.const 0 i32.store local.get $ptr i32.const 4 i32.add i32.const 0 i32.store local.get $ptr i32.const 8 i32.add i32.const 0 i32.store local.get $ptr)\n  (func $__list_push (param $lst i32) (param $item i32) (result i32) (local $len i32) (local $new_data i32) (local $old_data i32) local.get $lst i32.load local.set $len global.get $__heap_ptr local.set $new_data global.get $__heap_ptr local.get $len i32.const 1 i32.add i32.const 4 i32.mul i32.add global.set $__heap_ptr local.get $lst i32.const 8 i32.add i32.load local.set $old_data local.get $new_data local.get $old_data local.get $len i32.const 4 i32.mul memory.copy local.get $new_data local.get $len i32.const 4 i32.mul i32.add local.get $item i32.store local.get $lst local.get $len i32.const 1 i32.add i32.store local.get $lst i32.const 8 i32.add local.get $new_data i32.store local.get $lst)\n  (func $__make_variant_0 (param $tag i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr)\n  (func $__make_variant_1 (param $tag i32) (param $payload i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr i32.const 4 i32.add local.get $payload i32.store local.get $ptr)\n  (func $__make_record_2 (param $f0 i32) (param $f1 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr)\n")
+  "  (global $__heap_ptr (mut i32) (i32.const 49152))\n  (func $__string_append (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $tot i32) (local $ptr i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb local.get $la local.get $lb i32.add local.set $tot global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $tot i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $tot i32.store local.get $ptr i32.const 4 i32.add local.get $a i32.const 4 i32.add local.get $la memory.copy local.get $ptr i32.const 4 i32.add local.get $la i32.add local.get $b i32.const 4 i32.add local.get $lb memory.copy local.get $ptr)\n  (func $__string_eq (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $i i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb block (result i32) local.get $la local.get $lb i32.ne if (result i32) i32.const 0 else i32.const 0 local.set $i block (result i32) loop local.get $i local.get $la i32.ge_u if i32.const 1 br 2 end local.get $a i32.const 4 i32.add local.get $i i32.add i32.load8_u local.get $b i32.const 4 i32.add local.get $i i32.add i32.load8_u i32.ne if i32.const 0 br 3 end local.get $i i32.const 1 i32.add local.set $i br 0 end i32.const 1 end end end)\n  (func $__substring (param $s i32) (param $start i32) (param $end i32) (result i32) (local $new_len i32) (local $ptr i32) local.get $end local.get $start i32.sub local.set $new_len global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $new_len i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $new_len i32.store local.get $ptr i32.const 4 i32.add local.get $s i32.const 4 i32.add local.get $start i32.add local.get $new_len memory.copy local.get $ptr)\n  (func $__list_new (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr i32.const 0 i32.store local.get $ptr i32.const 4 i32.add i32.const 0 i32.store local.get $ptr i32.const 8 i32.add i32.const 0 i32.store local.get $ptr)\n  (func $__list_push (param $lst i32) (param $item i32) (result i32) (local $len i32) (local $new_data i32) (local $old_data i32) local.get $lst i32.load local.set $len global.get $__heap_ptr local.set $new_data global.get $__heap_ptr local.get $len i32.const 1 i32.add i32.const 4 i32.mul i32.add global.set $__heap_ptr local.get $lst i32.const 8 i32.add i32.load local.set $old_data local.get $new_data local.get $old_data local.get $len i32.const 4 i32.mul memory.copy local.get $new_data local.get $len i32.const 4 i32.mul i32.add local.get $item i32.store local.get $lst local.get $len i32.const 1 i32.add i32.store local.get $lst i32.const 8 i32.add local.get $new_data i32.store local.get $lst)\n  (func $__make_variant_0 (param $tag i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr)\n  (func $__make_variant_1 (param $tag i32) (param $payload i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr i32.const 4 i32.add local.get $payload i32.store local.get $ptr)\n  (func $__make_record_2 (param $f0 i32) (param $f1 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr)\n")
 
 ; Compile source to WAT module
 (fn compile ((src string)) string
@@ -738,3 +752,7 @@
 ; Get compiled WAT for factorial
 (export (fn get-factorial-wat () string
   (compile "(export (fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (i32.mul n (factorial (i32.sub n (i32.const 1)))))))")))
+
+; Bootstrap: compile arbitrary source code
+(export (fn compile-source ((src string)) string
+  (compile src)))
