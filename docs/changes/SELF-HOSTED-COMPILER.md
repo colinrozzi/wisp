@@ -164,29 +164,50 @@ The parser includes:
 ---
 
 ### M5: Code Generator for Simple Expressions
-**Status**: Not Started
+**Status**: Complete
 
 Generate WAT string for basic expressions.
 
 **Subset**:
-- Integer literals
-- WASM instructions (i32.add, etc.)
-- Variable references
+- Integer literals → `(i32.const N)`
+- WASM instructions → `(i32.add ...)`
+- Variable references → `(local.get $name)`
+- Function calls → `(call $name ...)`
 
-**Interface**:
+**Implementation** (`examples/wisp-codegen.lisp`):
+
+The codegen includes:
+- `i32-to-string`: Convert integers to strings (needed for code generation)
+- `is-wasm-instr`: Detect WASM instructions (i32., i64., f32., f64. prefixes)
+- `compile-number`: `42` → `(i32.const 42)`
+- `compile-var`: `x` → `(local.get $x)`
+- `compile-wasm-call`: `(i32.add a b)` → `(i32.add <compile a> <compile b>)`
+- `compile-fn-call`: `(foo a b)` → `(call $foo <compile a> <compile b>)`
+- `compile-expr`: Main dispatcher that handles all expression types
+
+**Example**:
 ```lisp
-(fn compile-expr ((expr sexpr)) string
-  (match expr
-    ((sym s) (compile-var s))
-    ((num n) (format "(i32.const ~a)" n))
-    ((lst items) (compile-call items))
-    ...))
+(compile-expr (num 42))
+; → "(i32.const 42)"
+
+(compile-expr (sym "x"))
+; → "(local.get $x)"
+
+; For (i32.add 1 2):
+(compile-expr (lst [(sym "i32.add"), (num 1), (num 2)]))
+; → "(i32.add (i32.const 1) (i32.const 2))"
+
+; For (foo 1 2):
+(compile-expr (lst [(sym "foo"), (num 1), (num 2)]))
+; → "(call $foo (i32.const 1) (i32.const 2))"
 ```
+
+**Tests**: 21 tests in `tests/codegen.rs`
 
 ---
 
 ### M6: Code Generator for Functions
-**Status**: Not Started
+**Status**: Complete
 
 Extend codegen to handle function definitions.
 
@@ -195,6 +216,33 @@ Extend codegen to handle function definitions.
 - `let` bindings
 - `if` conditionals
 - Function calls
+
+**Implementation** (extended `examples/wisp-codegen.lisp`):
+
+Added to M5 codegen:
+- `compile-if`: `(if c t e)` → `(if (result i32) <c> (then <t>) (else <e>))`
+- `compile-let`: `(let (x v) b)` → `(local.tee $x <v>) <b>`
+- `type-to-wat`: `s32` → `i32`, `s64` → `i64`, etc.
+- `compile-param`: `(x s32)` → `(param $x i32)`
+- `compile-params`: Compile list of parameters
+- `compile-fn`: `(fn name ((x s32)) s32 body)` → `(func $name (param $x i32) (result i32) <body>)`
+
+**Example**:
+```lisp
+; Compile (if x y z)
+(compile-expr (lst [(sym "if"), (sym "x"), (sym "y"), (sym "z")]))
+; → "(if (result i32) (local.get $x) (then (local.get $y)) (else (local.get $z)))"
+
+; Compile (let (x 42) x)
+(compile-expr (lst [(sym "let"), (lst [(sym "x"), (num 42)]), (sym "x")]))
+; → "(local.tee $x (i32.const 42)) (local.get $x)"
+
+; Compile (fn identity ((x s32)) s32 x)
+(compile-fn [(sym "fn"), (sym "identity"), (lst [(lst [(sym "x"), (sym "s32")])]), (sym "s32"), (sym "x")])
+; → "(func $identity (param $x i32) (result i32) (local.get $x))"
+```
+
+**Tests**: 28 tests in `tests/codegen.rs`
 
 ---
 
@@ -301,6 +349,8 @@ Compile the Wisp compiler with itself.
 - `tests/tokenizer.rs` - M3 tokenizer tests
 - `examples/wisp-parser.lisp` - M4 parser implementation (includes tokenizer)
 - `tests/parser.rs` - M4 parser tests
+- `examples/wisp-codegen.lisp` - M5 code generator implementation
+- `tests/codegen.rs` - M5 codegen tests
 
 ## Success Criteria
 
@@ -308,6 +358,7 @@ Compile the Wisp compiler with itself.
 2. ✓ Pattern matching for AST traversal (M2)
 3. ✓ Write a tokenizer in Wisp that tokenizes Wisp code (M3)
 4. ✓ Write a parser in Wisp that parses Wisp code (M4)
-5. Write a codegen in Wisp that generates valid WASM (M5-M6)
-6. Compile a simple Wisp program using the Wisp compiler (M7)
-7. Eventually: compile the Wisp compiler with itself (M8)
+5. ✓ Write a codegen for simple expressions (M5)
+6. ✓ Write a codegen for functions (M6)
+7. Compile a simple Wisp program using the Wisp compiler (M7)
+8. Eventually: compile the Wisp compiler with itself (M8)
