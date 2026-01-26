@@ -5064,8 +5064,9 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         out.push_str(&format!("(result {})))\n", wat_type(&import.return_type)));
     }
 
-    // Declare memory (1 page = 64KB, allow growth up to 100 pages)
-    out.push_str("  (memory 1 100)\n");
+    // Declare memory (10 pages = 640KB, allow growth up to 100 pages)
+    // Larger initial size needed for programs that do heavy string/list allocation
+    out.push_str("  (memory 10 100)\n");
 
     // Build global type map for codegen
     let mut globals_map = HashMap::new();
@@ -7402,8 +7403,9 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
         ));
     }
 
-    // Memory: at least 1 page (64KB), exported as "memory"
-    out.push_str("  (memory (export \"memory\") 1 100)\n");
+    // Memory: 10 pages (640KB) initial, 100 max, exported as "memory"
+    // Larger initial size needed for programs that do heavy string/list allocation
+    out.push_str("  (memory (export \"memory\") 10 100)\n");
 
     // Heap pointer for allocations, starts after output buffer
     out.push_str(&format!(

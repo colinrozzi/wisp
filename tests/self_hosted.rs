@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Instance, Module, Store};
 use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -26,7 +26,10 @@ fn compile_and_call_string(source: &str, func_name: &str) -> String {
     let wasm_path = out_base.with_extension("wasm");
     let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read wasm");
 
-    let engine = Engine::default();
+    // Use larger stack size for deeply nested self-hosted compiler
+    let mut config = Config::new();
+    config.max_wasm_stack(8 * 1024 * 1024); // 8MB stack
+    let engine = Engine::new(&config).expect("failed to create engine");
     let module = Module::new(&engine, &wasm_bytes).expect("failed to create module");
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).expect("failed to instantiate");
@@ -57,12 +60,14 @@ fn compile_and_call_string(source: &str, func_name: &str) -> String {
     )
     .expect("call failed");
 
-    // Result is at out_ptr + 24 (CGRF payload offset for string ptr)
-    let mut ptr_buf = [0u8; 4];
-    memory.read(&store, (out_ptr + 24) as usize, &mut ptr_buf).expect("failed to read result ptr");
-    let str_ptr = i32::from_le_bytes(ptr_buf);
+    // CGRF string format: offset 24 = string length, offset 28 = string bytes (inline)
+    let mut len_buf = [0u8; 4];
+    memory.read(&store, (out_ptr + 24) as usize, &mut len_buf).expect("failed to read string len");
+    let str_len = i32::from_le_bytes(len_buf) as usize;
 
-    read_string_from_memory(&memory, &store, str_ptr)
+    let mut str_buf = vec![0u8; str_len];
+    memory.read(&store, (out_ptr + 28) as usize, &mut str_buf).expect("failed to read string data");
+    String::from_utf8(str_buf).expect("invalid utf8")
 }
 
 // Read the self-hosted compiler source

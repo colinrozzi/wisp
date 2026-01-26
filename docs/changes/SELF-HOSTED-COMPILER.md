@@ -292,7 +292,7 @@ The full compiler integrates all previous milestones:
 ---
 
 ### M8: Full Bootstrap
-**Status**: Planning
+**Status**: In Progress
 
 Compile the Wisp compiler with itself.
 
@@ -310,25 +310,39 @@ The self-hosted compiler currently supports:
 - ✓ `if`, `let`
 - ✓ WASM instructions (i32.*, i64.*, etc.)
 - ✓ Function calls
+- ✓ `match` expressions
+- ✓ Built-in operations: `string-len`, `string-ref`, `list-len`, `list-get` (inlined)
+- ✓ Built-in operations: `string-append`, `string=?` (runtime helpers)
+- ✓ Built-in operations: `list-new`, `list-push` (runtime helpers)
+- ✓ Variant constructors: `sym`, `num`, `str`, `lst`, `lparen`, `rparen`, `number`, `symbol`, `str-lit`
+- ✓ Record constructors: `token-result`, `parse-result`
+- ✓ Record field access: `token-result.tok`, `token-result.new-pos`, `parse-result.expr`, `parse-result.new-pos`
 
-To compile itself, it needs to also support:
-- `variant` definitions (token, sexpr types)
-- `record` definitions (token-result, parse-result)
-- `match` expressions (used 11 times in compiler)
-- Built-in operations:
-  - `string-len`, `string-ref`, `substring` (inlined to i32.load/load8_u)
-  - `string-append` (complex: allocation + copy)
-  - `string=?` (byte-by-byte comparison)
-  - `list-new`, `list-push`, `list-get`, `list-len` (pointer operations)
+To compile itself, it still needs:
+- `variant` definitions (generates constructors and tag constants)
+- `record` definitions (generates struct layout)
+- `substring` operation
+- Additional built-ins used in the compiler source
 
 **Incremental Path**:
-1. Add `string-len`, `list-len` (simple loads)
-2. Add `string-ref`, `list-get` (indexed loads)
-3. Add `string-append` (requires memory allocation)
-4. Add `match` expression compilation
-5. Add `variant` definition (generates constructors)
-6. Add `record` definition (generates struct layout)
-7. Verify bootstrap
+1. ✓ Add `string-len`, `list-len` (simple loads)
+2. ✓ Add `string-ref`, `list-get` (indexed loads)
+3. ✓ Add `string-append` (heap allocation + copy)
+4. ✓ Add `string=?` (byte-by-byte comparison)
+5. ✓ Add `list-new`, `list-push` (heap allocation)
+6. ✓ Add `match` expression compilation
+7. ✓ Add variant constructors
+8. ✓ Add record constructors and field access
+9. Add `variant` definition parsing
+10. Add `record` definition parsing
+11. Add `substring` operation
+12. Verify bootstrap
+
+**Implementation Notes**:
+- Items 1-2 are inlined as simple WAT expressions
+- Items 3-8 use runtime helper functions with heap allocation
+- Items 9-10 require parsing type definitions and generating appropriate code
+- Tests require larger stack: `RUST_MIN_STACK=16777216` due to deeply nested if-else chains
 
 ---
 
