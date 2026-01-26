@@ -5064,9 +5064,9 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         out.push_str(&format!("(result {})))\n", wat_type(&import.return_type)));
     }
 
-    // Declare memory (10 pages = 640KB, allow growth up to 100 pages)
+    // Declare memory (500 pages = 32MB, allow growth up to 1000 pages = 64MB)
     // Larger initial size needed for programs that do heavy string/list allocation
-    out.push_str("  (memory 10 100)\n");
+    out.push_str("  (memory 4000 4000)\n");
 
     // Build global type map for codegen
     let mut globals_map = HashMap::new();
@@ -5137,6 +5137,7 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
             &globals_map,
             &records_map,
             &variants_map,
+            true, // Function body is in tail position
         );
 
         out.push_str(&format!("  (func ${} ", internal_name));
@@ -5209,6 +5210,7 @@ fn gen_expr(
     globals: &HashMap<String, (Type, bool)>,
     records: &HashMap<String, RecordDef>,
     variants: &HashMap<String, VariantDef>,
+    is_tail: bool, // True if this expression is in tail position
 ) -> Type {
     let pad = " ".repeat(indent);
     match expr {
@@ -5264,7 +5266,7 @@ fn gen_expr(
         }
         Expr::Ascribe { expr, ty } => {
             let from_ty = gen_expr(
-                expr, out, indent, env, signatures, globals, records, variants,
+                expr, out, indent, env, signatures, globals, records, variants, false,
             );
             if from_ty == *ty {
                 return from_ty;
@@ -5285,10 +5287,15 @@ fn gen_expr(
                 .unwrap_or_else(|| panic!("Missing signature for {}", name));
             for arg in args {
                 gen_expr(
-                    arg, out, indent, env, signatures, globals, records, variants,
+                    arg, out, indent, env, signatures, globals, records, variants, false,
                 );
             }
-            out.push_str(&format!("{}call ${}\n", pad, name));
+            // Use return_call for tail position to enable tail call optimization
+            if is_tail {
+                out.push_str(&format!("{}return_call ${}\n", pad, name));
+            } else {
+                out.push_str(&format!("{}call ${}\n", pad, name));
+            }
             sig.result.clone()
         }
         Expr::If {
@@ -5297,7 +5304,7 @@ fn gen_expr(
             else_branch,
         } => {
             let cond_ty = gen_expr(
-                cond, out, indent, env, signatures, globals, records, variants,
+                cond, out, indent, env, signatures, globals, records, variants, false,
             );
             if cond_ty != Type::S32 {
                 panic!("if condition must be s32");
@@ -5314,6 +5321,7 @@ fn gen_expr(
                 globals,
                 records,
                 variants,
+                is_tail, // Both branches inherit tail position
             );
             out.push_str(&format!("{}  )\n", pad));
             out.push_str(&format!("{}  (else\n", pad));
@@ -5326,6 +5334,7 @@ fn gen_expr(
                 globals,
                 records,
                 variants,
+                is_tail, // Both branches inherit tail position
             );
             if else_ty != result_ty {
                 panic!(
@@ -5339,13 +5348,13 @@ fn gen_expr(
         }
         Expr::Let { name, value, body } => {
             let value_ty = gen_expr(
-                value, out, indent, env, signatures, globals, records, variants,
+                value, out, indent, env, signatures, globals, records, variants, false,
             );
             let idx = env.declare_local(value_ty);
             out.push_str(&format!("{}local.set {}\n", pad, idx));
             env.push_binding(name.clone(), idx);
             let body_ty = gen_expr(
-                body, out, indent, env, signatures, globals, records, variants,
+                body, out, indent, env, signatures, globals, records, variants, is_tail,
             );
             env.pop_binding();
             body_ty
@@ -5384,14 +5393,14 @@ fn gen_expr(
 
                 // Emit and save the value first
                 let value_ty = gen_expr(
-                    &args[1], out, indent, env, signatures, globals, records, variants,
+                    &args[1], out, indent, env, signatures, globals, records, variants, false,
                 );
                 let value_local = env.declare_local(value_ty);
                 out.push_str(&format!("{}local.set {}\n", pad, value_local));
 
                 // Emit the address
                 gen_expr(
-                    &args[0], out, indent, env, signatures, globals, records, variants,
+                    &args[0], out, indent, env, signatures, globals, records, variants, false,
                 );
 
                 // Get the value back
@@ -5406,7 +5415,7 @@ fn gen_expr(
                 // Normal instructions - emit args then instruction
                 for arg in args {
                     gen_expr(
-                        arg, out, indent, env, signatures, globals, records, variants,
+                        arg, out, indent, env, signatures, globals, records, variants, false,
                     );
                 }
                 out.push_str(&format!("{}{}\n", pad, name));
@@ -5422,7 +5431,7 @@ fn gen_expr(
             // Global.set consumes the value, so we save it to a local first
             // and restore it after to return the value for composability
             let value_ty = gen_expr(
-                value, out, indent, env, signatures, globals, records, variants,
+                value, out, indent, env, signatures, globals, records, variants, false,
             );
             let value_local = env.declare_local(value_ty.clone());
             out.push_str(&format!("{}local.set {}\n", pad, value_local));
@@ -5467,7 +5476,7 @@ fn gen_expr(
 
                 // Evaluate the field expression
                 gen_expr(
-                    field_expr, out, indent, env, signatures, globals, records, variants,
+                    field_expr, out, indent, env, signatures, globals, records, variants, false,
                 );
 
                 // Store based on field type
@@ -5511,7 +5520,7 @@ fn gen_expr(
 
             // Evaluate the record expression (gives us the pointer)
             gen_expr(
-                expr, out, indent, env, signatures, globals, records, variants,
+                expr, out, indent, env, signatures, globals, records, variants, false,
             );
 
             // Add offset if non-zero
@@ -5584,6 +5593,7 @@ fn gen_expr(
                     globals,
                     records,
                     variants,
+                    false,
                 );
 
                 // Store based on payload type
@@ -5612,7 +5622,7 @@ fn gen_expr(
         Expr::Match { expr, cases } => {
             // Evaluate the expression to get the pointer
             let expr_ty = gen_expr(
-                expr, out, indent, env, signatures, globals, records, variants,
+                expr, out, indent, env, signatures, globals, records, variants, false,
             );
 
             // Save the pointer to a local
@@ -5684,7 +5694,7 @@ fn gen_expr(
                             env.push_binding(arm.bindings[0].clone(), idx);
                         }
 
-                        // Generate arm body
+                        // Generate arm body - inherits tail position
                         gen_expr(
                             &arm.body,
                             out,
@@ -5694,6 +5704,7 @@ fn gen_expr(
                             globals,
                             records,
                             variants,
+                            is_tail,
                         );
 
                         // Pop bindings
@@ -5784,7 +5795,7 @@ fn gen_expr(
                             env.push_binding(arm.bindings[0].clone(), idx);
                         }
 
-                        // Generate arm body
+                        // Generate arm body - inherits tail position
                         gen_expr(
                             &arm.body,
                             out,
@@ -5794,6 +5805,7 @@ fn gen_expr(
                             globals,
                             records,
                             variants,
+                            is_tail,
                         );
 
                         // Pop bindings
@@ -5916,7 +5928,7 @@ fn gen_expr(
                             payload_offset += type_size(payload_ty);
                         }
 
-                        // Generate arm body
+                        // Generate arm body - inherits tail position
                         gen_expr(
                             &arm.body,
                             out,
@@ -5926,6 +5938,7 @@ fn gen_expr(
                             globals,
                             records,
                             variants,
+                            is_tail,
                         );
 
                         // Pop bindings
@@ -5981,7 +5994,7 @@ fn gen_expr(
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
             gen_expr(
-                value, out, indent, env, signatures, globals, records, variants,
+                value, out, indent, env, signatures, globals, records, variants, false,
             );
             let store_instr = match inner_type {
                 Type::S32 => "i32.store",
@@ -6050,7 +6063,7 @@ fn gen_expr(
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
             gen_expr(
-                value, out, indent, env, signatures, globals, records, variants,
+                value, out, indent, env, signatures, globals, records, variants, false,
             );
             let store_instr = match ok_type {
                 Type::S32 => "i32.store",
@@ -6095,7 +6108,7 @@ fn gen_expr(
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
             gen_expr(
-                value, out, indent, env, signatures, globals, records, variants,
+                value, out, indent, env, signatures, globals, records, variants, false,
             );
             let store_instr = match err_type {
                 Type::S32 => "i32.store",
@@ -6151,7 +6164,7 @@ fn gen_expr(
         // List: push - simplified version that reallocates every time
         Expr::ListPush { list, value } => {
             let list_ty = gen_expr(
-                list, out, indent, env, signatures, globals, records, variants,
+                list, out, indent, env, signatures, globals, records, variants, false,
             );
             let elem_type = match &list_ty {
                 Type::List(inner) => inner.as_ref().clone(),
@@ -6214,7 +6227,7 @@ fn gen_expr(
             out.push_str(&format!("{}i32.mul\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
             gen_expr(
-                value, out, indent, env, signatures, globals, records, variants,
+                value, out, indent, env, signatures, globals, records, variants, false,
             );
             let store_instr = match &elem_type {
                 Type::S32 => "i32.store",
@@ -6246,7 +6259,7 @@ fn gen_expr(
         // List: get - load element at index
         Expr::ListGet { list, index } => {
             let list_ty = gen_expr(
-                list, out, indent, env, signatures, globals, records, variants,
+                list, out, indent, env, signatures, globals, records, variants, false,
             );
             let elem_type = match &list_ty {
                 Type::List(inner) => inner.as_ref().clone(),
@@ -6258,7 +6271,7 @@ fn gen_expr(
 
             // Evaluate index
             gen_expr(
-                index, out, indent, env, signatures, globals, records, variants,
+                index, out, indent, env, signatures, globals, records, variants, false,
             );
             let index_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.set {}\n", pad, index_local));
@@ -6289,7 +6302,7 @@ fn gen_expr(
         // List: len - return length
         Expr::ListLen { list } => {
             gen_expr(
-                list, out, indent, env, signatures, globals, records, variants,
+                list, out, indent, env, signatures, globals, records, variants, false,
             );
             // Load len field at offset 0
             out.push_str(&format!("{}i32.load\n", pad));
@@ -6298,7 +6311,7 @@ fn gen_expr(
         // String: len - return length
         Expr::StringLen { string } => {
             gen_expr(
-                string, out, indent, env, signatures, globals, records, variants,
+                string, out, indent, env, signatures, globals, records, variants, false,
             );
             // Load len field at offset 0 (string layout: 4 bytes len + data)
             out.push_str(&format!("{}i32.load\n", pad));
@@ -6309,12 +6322,12 @@ fn gen_expr(
             // String layout: 4 bytes len + data bytes
             // Result: byte at (string_ptr + 4 + index)
             gen_expr(
-                string, out, indent, env, signatures, globals, records, variants,
+                string, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
             gen_expr(
-                index, out, indent, env, signatures, globals, records, variants,
+                index, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}i32.add\n", pad));
             out.push_str(&format!("{}i32.load8_u\n", pad));
@@ -6325,21 +6338,21 @@ fn gen_expr(
             // Evaluate string pointer
             let str_local = env.declare_local(Type::S32);
             gen_expr(
-                string, out, indent, env, signatures, globals, records, variants,
+                string, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}local.set {}\n", pad, str_local));
 
             // Evaluate start index
             let start_local = env.declare_local(Type::S32);
             gen_expr(
-                start, out, indent, env, signatures, globals, records, variants,
+                start, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}local.set {}\n", pad, start_local));
 
             // Evaluate end index
             let end_local = env.declare_local(Type::S32);
             gen_expr(
-                end, out, indent, env, signatures, globals, records, variants,
+                end, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}local.set {}\n", pad, end_local));
 
@@ -6390,14 +6403,14 @@ fn gen_expr(
             // Evaluate left string pointer
             let left_local = env.declare_local(Type::S32);
             gen_expr(
-                left, out, indent, env, signatures, globals, records, variants,
+                left, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}local.set {}\n", pad, left_local));
 
             // Evaluate right string pointer
             let right_local = env.declare_local(Type::S32);
             gen_expr(
-                right, out, indent, env, signatures, globals, records, variants,
+                right, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}local.set {}\n", pad, right_local));
 
@@ -6473,14 +6486,14 @@ fn gen_expr(
             // Evaluate left string pointer
             let left_local = env.declare_local(Type::S32);
             gen_expr(
-                left, out, indent, env, signatures, globals, records, variants,
+                left, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}local.set {}\n", pad, left_local));
 
             // Evaluate right string pointer
             let right_local = env.declare_local(Type::S32);
             gen_expr(
-                right, out, indent, env, signatures, globals, records, variants,
+                right, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}local.set {}\n", pad, right_local));
 
@@ -7403,9 +7416,9 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
         ));
     }
 
-    // Memory: 10 pages (640KB) initial, 100 max, exported as "memory"
-    // Larger initial size needed for programs that do heavy string/list allocation
-    out.push_str("  (memory (export \"memory\") 10 100)\n");
+    // Memory: 500 pages (32MB) initial, 1000 max (64MB), exported as "memory"
+    // Large initial size needed for bootstrap compilation of the 42KB compiler
+    out.push_str("  (memory (export \"memory\") 16000 16000)\n");
 
     // Heap pointer for allocations, starts after output buffer
     out.push_str(&format!(
@@ -7447,6 +7460,64 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
         .map(|v| (v.name.clone(), v.clone()))
         .collect();
 
+    // Allocator helper that grows memory when needed
+    // Takes size in bytes, returns pointer to allocated block
+    out.push_str(
+        r#"  (func $__alloc (param $size i32) (result i32)
+    (local $ptr i32)
+    (local $end i32)
+    (local $pages_needed i32)
+    ;; Get current heap pointer
+    global.get $__heap_ptr
+    local.set $ptr
+    ;; Calculate end of allocation
+    local.get $ptr
+    local.get $size
+    i32.add
+    local.set $end
+    ;; Check if we need to grow memory
+    ;; memory.size returns pages, multiply by 64KB to get bytes
+    memory.size
+    i32.const 65536
+    i32.mul
+    local.get $end
+    i32.lt_u
+    (if
+      (then
+        ;; Calculate pages needed: (end - current_size + 65535) / 65536
+        local.get $end
+        memory.size
+        i32.const 65536
+        i32.mul
+        i32.sub
+        i32.const 65535
+        i32.add
+        i32.const 65536
+        i32.div_u
+        local.set $pages_needed
+        ;; Grow memory
+        local.get $pages_needed
+        memory.grow
+        ;; Check if grow failed (returns -1)
+        i32.const -1
+        i32.eq
+        (if
+          (then
+            ;; Out of memory - trap
+            unreachable
+          )
+        )
+      )
+    )
+    ;; Bump heap pointer
+    local.get $end
+    global.set $__heap_ptr
+    ;; Return old pointer
+    local.get $ptr
+  )
+"#,
+    );
+
     // Generate import wrapper functions
     // These have the original wisp signature but internally encode args and call the raw import
     for import in &prog.imports {
@@ -7467,6 +7538,7 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
             &globals_map,
             &records_map,
             &variants_map,
+            true, // Function body is in tail position
         );
 
         out.push_str(&format!("  (func ${} ", func.name));

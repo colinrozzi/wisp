@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Instance, Module, Store};
 use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -16,7 +16,9 @@ fn compile_and_run(source: &str) -> i32 {
     let wasm_path = out_base.with_extension("wasm");
     let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read wasm");
 
-    let engine = Engine::default();
+    let mut config = Config::new();
+    config.wasm_tail_call(true); // Enable tail call optimization
+    let engine = Engine::new(&config).expect("failed to create engine");
     let module = Module::new(&engine, &wasm_bytes).expect("failed to create module");
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).expect("failed to instantiate");

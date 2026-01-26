@@ -89,28 +89,48 @@
   (let (end (find-symbol-end src pos len))
     (token-result (symbol (substring src pos end)) end)))
 
+; Find the end of a string literal (position after closing quote)
+(fn find-string-end ((src string) (pos s32) (len s32)) s32
+  (if (i32.ge_s pos len)
+    pos
+    (let (c (string-ref src pos))
+      (if (i32.eq c (i32.const 34))  ; found closing "
+        (i32.add pos (i32.const 1))  ; return position after "
+        (if (i32.eq c (i32.const 92))  ; backslash escape
+          (find-string-end src (i32.add pos (i32.const 2)) len)  ; skip next char
+          (find-string-end src (i32.add pos (i32.const 1)) len))))))
+
+; Read a string literal, starting after the opening quote
+(fn read-string-lit ((src string) (pos s32) (len s32)) token-result
+  (let (start (i32.add pos (i32.const 1)))  ; skip opening "
+    (let (end-pos (find-string-end src start len))
+      (let (str-end (i32.sub end-pos (i32.const 1)))  ; exclude closing "
+        (token-result (str-lit (substring src start str-end)) end-pos)))))
+
 (fn read-token ((src string) (pos s32) (len s32)) token-result
   (let (c (string-ref src pos))
     (if (i32.eq c (i32.const 40))
       (token-result (lparen) (i32.add pos (i32.const 1)))
       (if (i32.eq c (i32.const 41))
         (token-result (rparen) (i32.add pos (i32.const 1)))
-        (if (is-digit c)
-          (read-number src pos len)
-          (if (i32.eq c (i32.const 45))
-            (if (i32.lt_s (i32.add pos (i32.const 1)) len)
-              (let (next-c (string-ref src (i32.add pos (i32.const 1))))
-                (if (is-digit next-c)
-                  (let (result (read-number src (i32.add pos (i32.const 1)) len))
-                    (match (token-result.tok result)
-                      ((number n) (token-result (number (i32.sub (i32.const 0) n)) (token-result.new-pos result)))
-                      ((lparen) result)
-                      ((rparen) result)
-                      ((symbol s) result)
-                      ((str-lit s) result)))
-                  (read-symbol src pos len)))
-              (read-symbol src pos len))
-            (read-symbol src pos len)))))))
+        (if (i32.eq c (i32.const 34))  ; " - string literal
+          (read-string-lit src pos len)
+          (if (is-digit c)
+            (read-number src pos len)
+            (if (i32.eq c (i32.const 45))
+              (if (i32.lt_s (i32.add pos (i32.const 1)) len)
+                (let (next-c (string-ref src (i32.add pos (i32.const 1))))
+                  (if (is-digit next-c)
+                    (let (result (read-number src (i32.add pos (i32.const 1)) len))
+                      (match (token-result.tok result)
+                        ((number n) (token-result (number (i32.sub (i32.const 0) n)) (token-result.new-pos result)))
+                        ((lparen) result)
+                        ((rparen) result)
+                        ((symbol s) result)
+                        ((str-lit s) result)))
+                    (read-symbol src pos len)))
+                (read-symbol src pos len))
+              (read-symbol src pos len))))))))
 
 (fn skip-ws ((src string) (pos s32) (len s32)) s32
   (if (i32.ge_s pos len)
@@ -298,6 +318,42 @@
 (fn compile-var ((name string)) string
   (string-append "(local.get $" (string-append name ")")))
 
+; Generate code to store bytes of a string starting at offset
+; Returns WAT code that stores bytes at (heap_ptr + offset)
+(fn compile-string-bytes ((s string) (idx s32) (len s32) (offset s32)) string
+  (if (i32.ge_s idx len)
+    ""
+    (let (byte (string-ref s idx))
+      (let (byte-code (string-append
+              "global.get $__heap_ptr i32.const " (string-append
+              (i32-to-string offset) (string-append
+              " i32.add i32.const " (string-append
+              (i32-to-string byte)
+              " i32.store8 ")))))
+        (string-append byte-code
+          (compile-string-bytes s (i32.add idx (i32.const 1)) len (i32.add offset (i32.const 1))))))))
+
+; Compile a string literal to WAT
+; String layout: 4 bytes length + bytes
+(fn compile-string ((s string)) string
+  (let (len (string-len s))
+    (let (total-size (i32.add (i32.const 4) len))
+      ; Generate code that:
+      ; 1. Pushes heap_ptr (the result pointer) on stack
+      ; 2. Stores length at heap_ptr
+      ; 3. Stores each byte
+      ; 4. Updates heap_ptr
+      (string-append
+        "global.get $__heap_ptr "
+        (string-append
+          "global.get $__heap_ptr i32.const " (string-append
+          (i32-to-string len) (string-append
+          " i32.store " (string-append
+          (compile-string-bytes s (i32.const 0) len (i32.const 4)) (string-append
+          "global.get $__heap_ptr i32.const " (string-append
+          (i32-to-string total-size)
+          " i32.add global.set $__heap_ptr"))))))))))
+
 (fn compile-args ((args (list sexpr)) (idx s32) (len s32) (acc string)) string
   (if (i32.ge_s idx len)
     acc
@@ -308,11 +364,25 @@
                         (string-append acc (string-append " " compiled))))
           (compile-args args (i32.add idx (i32.const 1)) len new-acc))))))
 
+; Check if instruction is a const (i32.const, i64.const, etc.)
+(fn is-const-instr ((s string)) s32
+  (if (string=? s "i32.const") (i32.const 1)
+    (if (string=? s "i64.const") (i32.const 1)
+      (if (string=? s "f32.const") (i32.const 1)
+        (if (string=? s "f64.const") (i32.const 1)
+          (i32.const 0))))))
+
 (fn compile-wasm-call ((instr string) (args (list sexpr))) string
   (if (i32.eq (list-len args) (i32.const 0))
     (string-append "(" (string-append instr ")"))
-    (let (compiled-args (compile-args args (i32.const 0) (list-len args) ""))
-      (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")")))))))
+    ; For const instructions, use the literal value directly
+    (if (is-const-instr instr)
+      (let (arg (list-get args (i32.const 0)))
+        (if (is-num arg)
+          (string-append "(" (string-append instr (string-append " " (string-append (i32-to-string (get-num arg)) ")"))))
+          (string-append "(" (string-append instr " (error: const expects number))"))))
+      (let (compiled-args (compile-args args (i32.const 0) (list-len args) ""))
+        (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")"))))))))
 
 (fn compile-fn-call ((name string) (args (list sexpr))) string
   (if (i32.eq (list-len args) (i32.const 0))
@@ -338,7 +408,7 @@
         (if (string=? s binding-name)
           (string-append "(i32.load (i32.add " (string-append scrutinee-wat " (i32.const 4)))"))
           (compile-var s))))
-    ((str s) "(error: strings not supported)")
+    ((str s) (compile-string s))
     ((lst items) (compile-list-sub items binding-name scrutinee-wat))))
 
 ; Compile list expression with substitution context
@@ -356,10 +426,16 @@
 
 (fn compile-wasm-call-sub ((instr string) (items (list sexpr)) (binding-name string) (scrutinee-wat string)) string
   (let (args (build-args-list items (i32.const 1) (i32.sub (list-len items) (i32.const 1)) (list-new sexpr)))
-    (let (compiled-args (compile-args-sub args (i32.const 0) (list-len args) "" binding-name scrutinee-wat))
-      (if (i32.eq (list-len args) (i32.const 0))
-        (string-append "(" (string-append instr ")"))
-        (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")"))))))))
+    (if (i32.eq (list-len args) (i32.const 0))
+      (string-append "(" (string-append instr ")"))
+      ; For const instructions, use the literal value directly
+      (if (is-const-instr instr)
+        (let (arg (list-get args (i32.const 0)))
+          (if (is-num arg)
+            (string-append "(" (string-append instr (string-append " " (string-append (i32-to-string (get-num arg)) ")"))))
+            (string-append "(" (string-append instr " (error: const expects number))"))))
+        (let (compiled-args (compile-args-sub args (i32.const 0) (list-len args) "" binding-name scrutinee-wat))
+          (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")")))))))))
 
 (fn compile-fn-call-sub ((name string) (items (list sexpr)) (binding-name string) (scrutinee-wat string)) string
   (let (args (build-args-list items (i32.const 1) (i32.sub (list-len items) (i32.const 1)) (list-new sexpr)))
@@ -398,10 +474,11 @@
                                              ""))
                           (let (cond-wat (string-append "(i32.eq (i32.load " (string-append scrutinee-wat (string-append ") (i32.const " (string-append (i32-to-string tag) "))")))))
                             (let (body-wat (compile-expr-sub body binding-name scrutinee-wat))
+                              ; Next case is at index case-idx + 3 (skip 'match' at 0, scrutinee at 1, cases start at 2)
                               (let (else-wat (if (i32.ge_s (i32.add case-idx (i32.const 1)) num-cases)
                                                "(unreachable)"
-                                               (compile-match-case (list-get remaining-cases (i32.add case-idx (i32.const 1))) scrutinee-wat remaining-cases (i32.add case-idx (i32.const 1)) num-cases)))
-                                (string-append "(if (result i32) " (string-append cond-wat (string-append " (then " (string-append body-wat (string-append ") (else " (string-append else-wat ")")))))))))))
+                                               (compile-match-case (list-get remaining-cases (i32.add case-idx (i32.const 3))) scrutinee-wat remaining-cases (i32.add case-idx (i32.const 1)) num-cases)))
+                                (string-append "(if (result i32) " (string-append cond-wat (string-append " (then " (string-append body-wat (string-append ") (else " (string-append else-wat "))")))))))))))
                       "(error: pattern constructor not symbol)"))
                   "(error: empty pattern)"))
               "(error: pattern not list)")))
@@ -422,7 +499,7 @@
   (match expr
     ((num n) (compile-number n))
     ((sym s) (compile-var s))
-    ((str s) "(error: strings not supported)")
+    ((str s) (compile-string s))
     ((lst items) (compile-list items))))
 
 (fn compile-list ((items (list sexpr))) string
@@ -613,10 +690,10 @@
         (let (name-expr (list-get items (i32.const 0)))
           (let (type-expr (list-get items (i32.const 1)))
             (if (is-sym name-expr)
-              (if (is-sym type-expr)
+              ; Type can be symbol (s32) or list ((list token)) - compound types compile to i32
+              (let (wat-type (if (is-sym type-expr) (type-to-wat (get-sym type-expr)) "i32"))
                 (string-append "(param $" (string-append (get-sym name-expr)
-                  (string-append " " (string-append (type-to-wat (get-sym type-expr)) ")"))))
-                "(error)")
+                  (string-append " " (string-append wat-type ")")))))
               "(error)")))
         "(error)"))
     "(error)"))
@@ -631,6 +708,100 @@
                         (string-append acc (string-append " " compiled))))
           (compile-params params (i32.add idx (i32.const 1)) len new-acc))))))
 
+; Collect all let-binding names from an expression
+(fn collect-locals ((expr sexpr) (acc (list string))) (list string)
+  (if (is-lst expr)
+    (let (items (get-lst expr))
+      (if (i32.gt_s (list-len items) (i32.const 0))
+        (let (head (list-get items (i32.const 0)))
+          (if (is-sym head)
+            (if (string=? (get-sym head) "let")
+              ; (let (name value) body) - add name and recurse into value and body
+              (if (i32.ge_s (list-len items) (i32.const 3))
+                (let (binding (list-get items (i32.const 1)))
+                  (if (is-lst binding)
+                    (let (binding-items (get-lst binding))
+                      (if (i32.ge_s (list-len binding-items) (i32.const 2))
+                        (let (name-expr (list-get binding-items (i32.const 0)))
+                          (if (is-sym name-expr)
+                            (let (name (get-sym name-expr))
+                              (let (value-expr (list-get binding-items (i32.const 1)))
+                                (let (body-expr (list-get items (i32.const 2)))
+                                  (let (acc2 (list-push acc name))
+                                    (let (acc3 (collect-locals value-expr acc2))
+                                      (collect-locals body-expr acc3))))))
+                            acc))
+                        acc))
+                    acc))
+                acc)
+              (if (string=? (get-sym head) "if")
+                ; (if cond then else) - recurse into all three
+                (if (i32.ge_s (list-len items) (i32.const 4))
+                  (let (cond-expr (list-get items (i32.const 1)))
+                    (let (then-expr (list-get items (i32.const 2)))
+                      (let (else-expr (list-get items (i32.const 3)))
+                        (let (acc2 (collect-locals cond-expr acc))
+                          (let (acc3 (collect-locals then-expr acc2))
+                            (collect-locals else-expr acc3))))))
+                  acc)
+                (if (string=? (get-sym head) "match")
+                  ; (match scrutinee case1 case2 ...) - recurse into scrutinee and case bodies
+                  (if (i32.ge_s (list-len items) (i32.const 3))
+                    (let (scrutinee (list-get items (i32.const 1)))
+                      (let (acc2 (collect-locals scrutinee acc))
+                        (collect-locals-match-cases items (i32.const 2) (list-len items) acc2)))
+                    acc)
+                  ; Other list form - recurse into all elements
+                  (collect-locals-list items (i32.const 0) (list-len items) acc))))
+            ; Head not a symbol - recurse into all elements
+            (collect-locals-list items (i32.const 0) (list-len items) acc)))
+        acc))
+    acc))
+
+; Collect locals from match cases
+(fn collect-locals-match-cases ((items (list sexpr)) (idx s32) (len s32) (acc (list string))) (list string)
+  (if (i32.ge_s idx len)
+    acc
+    (let (case-expr (list-get items idx))
+      (if (is-lst case-expr)
+        (let (case-items (get-lst case-expr))
+          (if (i32.ge_s (list-len case-items) (i32.const 2))
+            (let (pattern (list-get case-items (i32.const 0)))
+              (let (body (list-get case-items (i32.const 1)))
+                ; Add binding from pattern if exists
+                (let (acc2 (if (is-lst pattern)
+                             (let (pat-items (get-lst pattern))
+                               (if (i32.ge_s (list-len pat-items) (i32.const 2))
+                                 (let (binding-expr (list-get pat-items (i32.const 1)))
+                                   (if (is-sym binding-expr)
+                                     (list-push acc (get-sym binding-expr))
+                                     acc))
+                                 acc))
+                             acc))
+                  (let (acc3 (collect-locals body acc2))
+                    (collect-locals-match-cases items (i32.add idx (i32.const 1)) len acc3)))))
+            (collect-locals-match-cases items (i32.add idx (i32.const 1)) len acc)))
+        (collect-locals-match-cases items (i32.add idx (i32.const 1)) len acc)))))
+
+; Collect locals from a list of expressions
+(fn collect-locals-list ((items (list sexpr)) (idx s32) (len s32) (acc (list string))) (list string)
+  (if (i32.ge_s idx len)
+    acc
+    (let (item (list-get items idx))
+      (let (acc2 (collect-locals item acc))
+        (collect-locals-list items (i32.add idx (i32.const 1)) len acc2)))))
+
+; Generate local declarations from a list of names
+(fn gen-locals ((names (list string)) (idx s32) (len s32) (acc string)) string
+  (if (i32.ge_s idx len)
+    acc
+    (let (name (list-get names idx))
+      (let (decl (string-append "(local $" (string-append name " i32)")))
+        (let (new-acc (if (i32.eq idx (i32.const 0))
+                        decl
+                        (string-append acc (string-append " " decl))))
+          (gen-locals names (i32.add idx (i32.const 1)) len new-acc))))))
+
 ; Compile (fn name ((params...)) ret-type body)
 (fn compile-fn-def ((items (list sexpr))) string
   (if (i32.lt_s (list-len items) (i32.const 5))
@@ -641,18 +812,26 @@
           (let (body-expr (list-get items (i32.const 4)))
             (if (is-sym name-expr)
               (if (is-lst params-expr)
-                (if (is-sym ret-type-expr)
-                  (let (name (get-sym name-expr))
-                    (let (params (get-lst params-expr))
-                      (let (ret-type (get-sym ret-type-expr))
-                        (let (params-wat (compile-params params (i32.const 0) (list-len params) ""))
-                          (let (body-wat (compile-expr body-expr))
-                            (let (result-wat (string-append "(result " (string-append (type-to-wat ret-type) ")")))
-                              (string-append "  (func $" (string-append name
-                                (string-append " " (string-append params-wat
-                                  (string-append " " (string-append result-wat
-                                    (string-append "\n    " (string-append body-wat ")"))))))))))))))
-                  "(error: ret type)")
+                ; Return type can be a symbol (s32) or a list ((list token))
+                ; Lists/records/variants all compile to i32 pointers
+                (let (name (get-sym name-expr))
+                  (let (params (get-lst params-expr))
+                    (let (ret-type (if (is-sym ret-type-expr) (get-sym ret-type-expr) "s32"))
+                      (let (params-wat (compile-params params (i32.const 0) (list-len params) ""))
+                        ; Collect local variables from the body
+                        (let (locals (collect-locals body-expr (list-new string)))
+                          (let (locals-wat (gen-locals locals (i32.const 0) (list-len locals) ""))
+                            (let (body-wat (compile-expr body-expr))
+                              (let (result-wat (string-append "(result " (string-append (type-to-wat ret-type) ")")))
+                                ; Include locals after result type if any
+                                (let (locals-section (if (i32.gt_s (list-len locals) (i32.const 0))
+                                                       (string-append " " locals-wat)
+                                                       ""))
+                                  (string-append "  (func $" (string-append name
+                                    (string-append " " (string-append params-wat
+                                      (string-append " " (string-append result-wat
+                                        (string-append locals-section
+                                          (string-append "\n    " (string-append body-wat ")"))))))))))))))))))
                 "(error: params)")
               "(error: name)")))))))
 
@@ -679,27 +858,33 @@
             "(error: empty body)"))
         "(error: expected list)"))))
 
+; Helper to compile based on form name
+(fn compile-by-name ((name string) (items (list sexpr))) string
+  (if (string=? name "fn")
+    (compile-fn-def items)
+    (if (string=? name "export")
+      (compile-export items)
+      (if (string=? name "variant")
+        ""
+        (if (string=? name "record")
+          ""
+          "(error: unknown form)")))))
+
 ; Compile a top-level form
 (fn compile-toplevel ((form sexpr)) string
   (if (is-lst form)
-    (let (items (get-lst form))
-      (if (i32.gt_s (list-len items) (i32.const 0))
-        (let (head (list-get items (i32.const 0)))
-          (if (is-sym head)
-            (let (name (get-sym head))
-              (if (string=? name "fn")
-                (compile-fn-def items)
-                (if (string=? name "export")
-                  (compile-export items)
-                  ; Skip variant and record definitions - constructors are hardcoded
-                  (if (string=? name "variant")
-                    ""
-                    (if (string=? name "record")
-                      ""
-                      "(error: unknown form)")))))
-            "(error: not symbol)"))
-        "(error: empty)"))
+    (compile-toplevel-list (get-lst form))
     "(error: not list)"))
+
+(fn compile-toplevel-list ((items (list sexpr))) string
+  (if (i32.gt_s (list-len items) (i32.const 0))
+    (compile-toplevel-head items (list-get items (i32.const 0)))
+    "(error: empty)"))
+
+(fn compile-toplevel-head ((items (list sexpr)) (head sexpr)) string
+  (if (is-sym head)
+    (compile-by-name (get-sym head) items)
+    "(error: not symbol)"))
 
 ; Compile multiple top-level forms
 (fn compile-toplevels ((forms (list sexpr)) (idx s32) (len s32) (acc string)) string

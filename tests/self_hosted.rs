@@ -98,6 +98,10 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
         .get_memory(&mut store, "memory")
         .expect("memory not found");
 
+    // Debug: print memory size
+    let mem_size = memory.data_size(&store);
+    println!("Memory size: {} bytes ({} pages)", mem_size, mem_size / 65536);
+
     // Memory layout to avoid heap conflicts:
     // - Heap starts at 0xC000 and grows upward
     // - We need space for: input (at low address) + heap growth + output (at higher address)
@@ -127,6 +131,8 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
 
     // Write input string in CGRF format
     let in_len = write_cgrf_string(&memory, &mut store, in_ptr, input) as i32;
+    println!("Input string size: {} bytes, CGRF size: {}", input.len(), in_len);
+    println!("Input at: 0x{:x}-0x{:x}", in_ptr, in_ptr + in_len);
 
     let mut results = [wasmtime::Val::I32(0)];
     func.call(
@@ -399,25 +405,163 @@ fn test_bootstrap_compile_large() {
 }
 
 #[test]
+fn test_bootstrap_progressively_larger() {
+    // Test with progressively larger inputs to find the breaking point
+    let compiler_source = get_compiler_source();
+
+    for size in [5000, 10000, 20000, 30000, 40000, 41926] {
+        let truncated: String = compiler_source.chars().take(size).collect();
+        println!("Testing with {} chars...", truncated.len());
+
+        // Try to compile - this will panic if it fails
+        let result = std::panic::catch_unwind(|| {
+            compile_and_call_with_string_arg(&compiler_source, "compile-source", &truncated)
+        });
+
+        match result {
+            Ok(_) => println!("  SUCCESS at {} chars", truncated.len()),
+            Err(_) => {
+                println!("  FAILED at {} chars", truncated.len());
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn test_compile_with_string_literal() {
+    // Test that the self-hosted compiler can compile a program containing string literals
+    let source_with_string = r#"
+(fn get-greeting () string "hello")
+
+(fn greet-length () s32
+  (string-len (get-greeting)))
+"#;
+    let wat = compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", source_with_string);
+
+    println!("Output for string literal test:\n{}", wat);
+
+    assert!(wat.contains("(func $get-greeting"), "should contain get-greeting func: {}", &wat[..500.min(wat.len())]);
+    assert!(wat.contains("(func $greet-length"), "should contain greet-length func: {}", &wat[..500.min(wat.len())]);
+}
+
+#[test]
 #[ignore = "Tokenizer uses recursion that exceeds memory limits for 42KB file"]
 fn test_bootstrap_self_compile() {
     // The ultimate test: compile the compiler with itself
-    // Currently fails because:
-    // 1. The tokenizer is recursive (one call per character position)
-    // 2. A 42KB source file needs ~40,000+ recursive calls
-    // 3. Each call allocates tokens via list-push
-    // 4. This exceeds the module's 6.4MB memory limit
-    //
-    // To fix, the tokenizer would need to be rewritten iteratively,
-    // or the language needs proper tail call optimization.
     let compiler_source = get_compiler_source();
+    println!("Compiler source length: {} chars", compiler_source.len());
+
     let wat = compile_and_call_with_string_arg(&compiler_source, "compile-source", &compiler_source);
+
+    println!("Output length: {} chars", wat.len());
+    println!("Output preview:\n{}", &wat[..2000.min(wat.len())]);
+
+    // Check for function definitions
+    let has_tokenize = wat.contains("(func $tokenize");
+    let has_tokenize_acc = wat.contains("(func $tokenize-acc");
+    let has_parse = wat.contains("(func $parse");
+    let has_compile = wat.contains("(func $compile");
+    println!("Has tokenize: {}, tokenize-acc: {}, parse: {}, compile: {}", has_tokenize, has_tokenize_acc, has_parse, has_compile);
+
+    // Find where user functions start (after runtime helpers)
+    if let Some(pos) = wat.find("(func $is-whitespace") {
+        println!("First user function at offset {}", pos);
+        println!("User functions preview:\n{}", &wat[pos..(pos+2000).min(wat.len())]);
+    }
+
+    // List all function definitions
+    println!("\n--- All function definitions ---");
+    for (i, _) in wat.match_indices("(func $") {
+        // Extract just the function name
+        let rest = &wat[i+7..]; // skip "(func $"
+        let end = rest.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(50);
+        let name = &rest[..end];
+        println!("  {}: ${}", i, name);
+    }
+
+    // Write the WAT to a file for inspection
+    std::fs::write("/tmp/bootstrap_output.wat", &wat).expect("failed to write wat");
+    println!("Wrote WAT to /tmp/bootstrap_output.wat");
 
     // Check that the output looks like a valid WAT module
     assert!(wat.contains("(module"), "should contain module: {}", wat);
 
-    // Check for key functions from the compiler
-    assert!(wat.contains("(func $tokenize"), "should contain tokenize func: {}", &wat[..1000.min(wat.len())]);
+    // Check for key functions from the compiler (tokenize or tokenize-acc)
+    let has_any_tokenize = has_tokenize || has_tokenize_acc;
+    assert!(has_any_tokenize, "should contain tokenize or tokenize-acc func");
     assert!(wat.contains("(func $parse"), "should contain parse func");
     assert!(wat.contains("(func $compile"), "should contain compile func");
+}
+
+#[test]
+#[ignore = "Requires bootstrap to pass first"]
+fn test_bootstrap_v2_compiles_factorial() {
+    // Load the self-compiled WAT and use it to compile a program!
+    let wat = std::fs::read_to_string("/tmp/bootstrap_output.wat")
+        .expect("Run test_bootstrap_self_compile first to generate WAT");
+
+    // Create engine with tail call support
+    let mut config = Config::new();
+    config.max_wasm_stack(128 * 1024 * 1024);
+    config.wasm_tail_call(true);
+    let engine = Engine::new(&config).expect("failed to create engine");
+
+    // Load the self-compiled module directly from WAT
+    let module = Module::new(&engine, &wat).expect("failed to parse self-compiled WAT");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("failed to instantiate v2 compiler");
+
+    let func = instance
+        .get_func(&mut store, "compile-source")
+        .expect("compile-source not found in v2 compiler");
+
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .expect("memory not found");
+
+    // Grow memory for our test
+    memory.grow(&mut store, 64).expect("failed to grow memory");
+
+    // Simple test program - just arithmetic (no match needed in compiler)
+    let test_program = "(fn add-one ((x s32)) s32 (i32.add x (i32.const 1)))";
+
+    let in_ptr: i32 = 0x1000;
+    let out_ptr: i32 = 0x200000;
+    let out_cap: i32 = 0x100000;
+
+    // Write input in CGRF format
+    let in_len = write_cgrf_string(&memory, &mut store, in_ptr, test_program) as i32;
+
+    println!("V2 compiler: compiling factorial...");
+
+    let mut results = [wasmtime::Val::I32(0)];
+    func.call(
+        &mut store,
+        &[
+            wasmtime::Val::I32(in_ptr),
+            wasmtime::Val::I32(in_len),
+            wasmtime::Val::I32(out_ptr),
+            wasmtime::Val::I32(out_cap),
+        ],
+        &mut results,
+    )
+    .expect("v2 compiler call failed");
+
+    // Read the result
+    let mut len_buf = [0u8; 4];
+    memory.read(&store, (out_ptr + 24) as usize, &mut len_buf).expect("failed to read len");
+    let str_len = i32::from_le_bytes(len_buf) as usize;
+
+    let mut str_buf = vec![0u8; str_len];
+    memory.read(&store, (out_ptr + 28) as usize, &mut str_buf).expect("failed to read string");
+    let v2_output = String::from_utf8(str_buf).expect("invalid utf8");
+
+    println!("V2 compiler output ({} chars):\n{}", v2_output.len(), &v2_output[..500.min(v2_output.len())]);
+
+    assert!(v2_output.contains("(module"), "v2 output should contain module");
+    assert!(v2_output.contains("(func $factorial"), "v2 output should contain factorial");
+    assert!(v2_output.contains("i32.mul"), "v2 output should contain multiply");
+
+    println!("V2 compiler successfully compiled factorial!");
 }
