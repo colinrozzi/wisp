@@ -6188,8 +6188,23 @@ fn gen_expr(
             out.push_str(&format!("{}i32.add\n", pad));
             out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
-            // Copy old data if len > 0 (simplified: use memory.copy if available, else skip for now)
-            // For simplicity, we'll just update the list - old data is orphaned (no GC)
+            // Copy old data if len > 0
+            // Get old data pointer from list+8
+            let old_data_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}i32.const 8\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, old_data_local));
+
+            // Copy len * elem_size bytes from old_data to new_data
+            // memory.copy(dst, src, len)
+            out.push_str(&format!("{}local.get {}\n", pad, new_data_local)); // dst
+            out.push_str(&format!("{}local.get {}\n", pad, old_data_local)); // src
+            out.push_str(&format!("{}local.get {}\n", pad, len_local)); // len (in elements)
+            out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
+            out.push_str(&format!("{}i32.mul\n", pad)); // len * elem_size
+            out.push_str(&format!("{}memory.copy\n", pad));
 
             // Store new value at new_data + len * elem_size
             out.push_str(&format!("{}local.get {}\n", pad, new_data_local));

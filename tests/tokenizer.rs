@@ -741,6 +741,264 @@ fn test_string_literal() {
     assert_eq!(compile_and_run(&source), 5);
 }
 
+// Debug: verify list length is correct
+#[test]
+fn test_list_length_three() {
+    let source = format!(
+        r#"{}
+(export (fn test-func () s32
+  (let (tokens (tokenize "(abc)"))
+    ; Should be 3 tokens: lparen, symbol, rparen
+    (list-len tokens))))
+"#,
+        FULL_TOKENIZER
+    );
+    assert_eq!(compile_and_run(&source), 3);
+}
+
+// Debug: simple list push and get test with tokens
+#[test]
+fn test_simple_list_push_get() {
+    let source = r#"
+(variant token
+  (lparen)
+  (rparen)
+  (number s32)
+  (symbol string)
+  (str-lit string))
+
+(fn get-token-tag ((t token)) s32
+  (match t
+    ((lparen) (i32.const 0))
+    ((rparen) (i32.const 1))
+    ((number n) (i32.const 2))
+    ((symbol s) (i32.const 3))
+    ((str-lit s) (i32.const 4))))
+
+(export (fn test-func () s32
+  (let (l0 (list-new token))
+    (let (l1 (list-push l0 (lparen)))
+      (let (l2 (list-push l1 (symbol "a")))
+        (let (l3 (list-push l2 (rparen)))
+          ; l3 should have 3 elements: [lparen, symbol, rparen]
+          ; index 0 = lparen (tag 0)
+          ; index 1 = symbol (tag 3)
+          ; index 2 = rparen (tag 1)
+          (get-token-tag (list-get l3 (i32.const 1)))))))))
+"#;
+    assert_eq!(compile_and_run(&source), 3);
+}
+
+// Debug: verify index 0 gives correct value
+#[test]
+fn test_list_get_index0() {
+    let source = r#"
+(variant token
+  (lparen)
+  (rparen)
+  (number s32)
+  (symbol string)
+  (str-lit string))
+
+(fn get-token-tag ((t token)) s32
+  (match t
+    ((lparen) (i32.const 0))
+    ((rparen) (i32.const 1))
+    ((number n) (i32.const 2))
+    ((symbol s) (i32.const 3))
+    ((str-lit s) (i32.const 4))))
+
+(export (fn test-func () s32
+  (let (l0 (list-new token))
+    (let (l1 (list-push l0 (lparen)))
+      (let (l2 (list-push l1 (symbol "a")))
+        ; index 0 should be lparen (tag 0)
+        (get-token-tag (list-get l2 (i32.const 0))))))))
+"#;
+    assert_eq!(compile_and_run(&source), 0);
+}
+
+// Debug: verify index 1 after two pushes
+#[test]
+fn test_list_get_index1_two_items() {
+    let source = r#"
+(variant token
+  (lparen)
+  (rparen)
+  (number s32)
+  (symbol string)
+  (str-lit string))
+
+(fn get-token-tag ((t token)) s32
+  (match t
+    ((lparen) (i32.const 0))
+    ((rparen) (i32.const 1))
+    ((number n) (i32.const 2))
+    ((symbol s) (i32.const 3))
+    ((str-lit s) (i32.const 4))))
+
+(export (fn test-func () s32
+  (let (l0 (list-new token))
+    (let (l1 (list-push l0 (lparen)))
+      (let (l2 (list-push l1 (symbol "a")))
+        ; index 1 should be symbol (tag 3)
+        (get-token-tag (list-get l2 (i32.const 1))))))))
+"#;
+    assert_eq!(compile_and_run(&source), 3);
+}
+
+// Debug: verify index 1 after three pushes
+#[test]
+fn test_list_get_index1_three_items() {
+    let source = r#"
+(variant token
+  (lparen)
+  (rparen)
+  (number s32)
+  (symbol string)
+  (str-lit string))
+
+(fn get-token-tag ((t token)) s32
+  (match t
+    ((lparen) (i32.const 0))
+    ((rparen) (i32.const 1))
+    ((number n) (i32.const 2))
+    ((symbol s) (i32.const 3))
+    ((str-lit s) (i32.const 4))))
+
+(export (fn test-func () s32
+  (let (l0 (list-new token))
+    (let (l1 (list-push l0 (lparen)))
+      (let (l2 (list-push l1 (symbol "a")))
+        (let (l3 (list-push l2 (rparen)))
+          ; index 1 should be symbol (tag 3)
+          (get-token-tag (list-get l3 (i32.const 1)))))))))
+"#;
+    assert_eq!(compile_and_run(&source), 3);
+}
+
+// Debug: push symbol first, then lparen - does index 0 return symbol (3) or lparen (0)?
+#[test]
+fn test_list_push_order() {
+    let source = r#"
+(variant token
+  (lparen)
+  (rparen)
+  (number s32)
+  (symbol string)
+  (str-lit string))
+
+(fn get-token-tag ((t token)) s32
+  (match t
+    ((lparen) (i32.const 0))
+    ((rparen) (i32.const 1))
+    ((number n) (i32.const 2))
+    ((symbol s) (i32.const 3))
+    ((str-lit s) (i32.const 4))))
+
+(export (fn test-func () s32
+  (let (l0 (list-new token))
+    (let (l1 (list-push l0 (symbol "a")))
+      (let (l2 (list-push l1 (lparen)))
+        ; If list-push copies old data, index 0 should be symbol (3)
+        ; If list-push doesn't copy, index 0 might be garbage (0)
+        (get-token-tag (list-get l2 (i32.const 0))))))))
+"#;
+    // After pushing [symbol, lparen], index 0 SHOULD be symbol (tag 3)
+    // But if copy is broken, it will be uninitialized (likely 0)
+    assert_eq!(compile_and_run(&source), 3);
+}
+
+// Debug: three items but using only lparen/rparen (no data variants)
+#[test]
+fn test_list_three_items_no_data() {
+    let source = r#"
+(variant token
+  (lparen)
+  (rparen)
+  (number s32)
+  (symbol string)
+  (str-lit string))
+
+(fn get-token-tag ((t token)) s32
+  (match t
+    ((lparen) (i32.const 0))
+    ((rparen) (i32.const 1))
+    ((number n) (i32.const 2))
+    ((symbol s) (i32.const 3))
+    ((str-lit s) (i32.const 4))))
+
+(export (fn test-func () s32
+  (let (l0 (list-new token))
+    (let (l1 (list-push l0 (lparen)))
+      (let (l2 (list-push l1 (rparen)))
+        (let (l3 (list-push l2 (lparen)))
+          ; list: [lparen, rparen, lparen]
+          ; tag0=0, tag1=1, tag2=0
+          ; result = 0*100 + 1*10 + 0 = 10
+          (i32.add
+            (i32.mul (get-token-tag (list-get l3 (i32.const 0))) (i32.const 100))
+            (i32.add
+              (i32.mul (get-token-tag (list-get l3 (i32.const 1))) (i32.const 10))
+              (get-token-tag (list-get l3 (i32.const 2)))))))))))
+"#;
+    // lparen=0, rparen=1, lparen=0 -> 0*100 + 1*10 + 0 = 10
+    assert_eq!(compile_and_run(&source), 10);
+}
+
+// Debug: verify all indices with three items
+#[test]
+fn test_list_get_all_indices_three_items() {
+    let source = r#"
+(variant token
+  (lparen)
+  (rparen)
+  (number s32)
+  (symbol string)
+  (str-lit string))
+
+(fn get-token-tag ((t token)) s32
+  (match t
+    ((lparen) (i32.const 0))
+    ((rparen) (i32.const 1))
+    ((number n) (i32.const 2))
+    ((symbol s) (i32.const 3))
+    ((str-lit s) (i32.const 4))))
+
+(export (fn test-func () s32
+  (let (l0 (list-new token))
+    (let (l1 (list-push l0 (lparen)))
+      (let (l2 (list-push l1 (symbol "a")))
+        (let (l3 (list-push l2 (rparen)))
+          ; return packed result: tag0*100 + tag1*10 + tag2
+          ; expected: 0*100 + 3*10 + 1 = 31
+          (i32.add
+            (i32.mul (get-token-tag (list-get l3 (i32.const 0))) (i32.const 100))
+            (i32.add
+              (i32.mul (get-token-tag (list-get l3 (i32.const 1))) (i32.const 10))
+              (get-token-tag (list-get l3 (i32.const 2)))))))))))
+"#;
+    // tag0=0, tag1=3, tag2=1 -> 0*100 + 3*10 + 1 = 31
+    assert_eq!(compile_and_run(&source), 31);
+}
+
+// Test accessing index 1 - symbol after lparen
+#[test]
+fn test_symbol_at_index1() {
+    let source = format!(
+        r#"{}
+(export (fn test-func () s32
+  (let (tokens (tokenize "(abc)"))
+    ; tokens: [lparen, symbol "abc", rparen]
+    ; index 1 should be symbol "abc" with length 3
+    (let (tok (list-get tokens (i32.const 1)))
+      (get-symbol-len tok)))))
+"#,
+        FULL_TOKENIZER
+    );
+    assert_eq!(compile_and_run(&source), 3);
+}
+
 #[test]
 fn test_negative_number() {
     let source = format!(

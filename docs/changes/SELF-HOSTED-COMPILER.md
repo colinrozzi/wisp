@@ -126,25 +126,40 @@ The tokenizer includes:
 ---
 
 ### M4: Parser in Wisp
-**Status**: Not Started
+**Status**: Complete
 
 Convert token list to S-expression AST.
 
 **SExpr Type**:
 ```lisp
 (variant sexpr
-  (sym string)
-  (num s64)
-  (str string)
-  (lst (list sexpr)))
+  (sym string)            ; symbol/identifier
+  (num s32)               ; number literal
+  (str string)            ; string literal
+  (lst (list sexpr)))     ; list of s-expressions
 ```
 
-**Interface**:
+**Implementation** (`examples/wisp-parser.lisp`):
+
+The parser includes:
+- Token type (same as tokenizer)
+- Parser result record with expr and new-pos fields
+- Recursive descent parsing: `parse-list-items`, `parse-one`, `parse-atom`
+- Top-level functions: `parse`, `parse-all`, `read-sexpr`, `read-all`
+- Sexpr utilities: `is-sym`, `is-num`, `is-str`, `is-lst`, `get-sym`, `get-num`, `get-str`, `get-lst`
+
+**Example**:
 ```lisp
-(fn parse ((tokens (list token))) sexpr
-  ;; Recursive descent parser
-  ...)
+(read-sexpr "(add 1 2)")
+; → (lst [(sym "add"), (num 1), (num 2)])
+
+(read-all "(fn add ((x s32)) s32 x)")
+; → [(lst [(sym "fn"), (sym "add"), ...])]
 ```
+
+**Bug Fixed**: During development, discovered that `list-push` was not copying old data when reallocating. Fixed by adding `memory.copy` to copy existing elements before appending new one.
+
+**Tests**: 52 tests in `tests/parser.rs`
 
 ---
 
@@ -284,13 +299,15 @@ Compile the Wisp compiler with itself.
 - `tests/pattern_match.rs` - M2 pattern matching tests
 - `examples/wisp-tokenizer.lisp` - M3 tokenizer implementation
 - `tests/tokenizer.rs` - M3 tokenizer tests
+- `examples/wisp-parser.lisp` - M4 parser implementation (includes tokenizer)
+- `tests/parser.rs` - M4 parser tests
 
 ## Success Criteria
 
 1. ✓ String operations for source code manipulation (M1)
 2. ✓ Pattern matching for AST traversal (M2)
 3. ✓ Write a tokenizer in Wisp that tokenizes Wisp code (M3)
-4. Write a parser in Wisp that parses Wisp code (M4)
+4. ✓ Write a parser in Wisp that parses Wisp code (M4)
 5. Write a codegen in Wisp that generates valid WASM (M5-M6)
 6. Compile a simple Wisp program using the Wisp compiler (M7)
 7. Eventually: compile the Wisp compiler with itself (M8)
