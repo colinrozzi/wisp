@@ -362,6 +362,7 @@
                                               (string-append ") " body-wat))))))))
                                 "(error: let binding name must be symbol)")))))
                       "(error: let binding must be a list)"))))
+              ; Regular function call or WASM instruction
               (let (rest-start (i32.const 1))
                 (let (rest-len (i32.sub (list-len items) (i32.const 1)))
                   (let (args (build-args-list items rest-start rest-len (list-new sexpr)))

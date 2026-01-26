@@ -292,15 +292,43 @@ The full compiler integrates all previous milestones:
 ---
 
 ### M8: Full Bootstrap
-**Status**: Not Started
+**Status**: Planning
 
 Compile the Wisp compiler with itself.
 
-**Steps**:
+**Goal**:
 1. Use Rust compiler to compile Wisp compiler → `wisp-v1.wasm`
 2. Use `wisp-v1.wasm` to compile Wisp compiler → `wisp-v2.wasm`
 3. Use `wisp-v2.wasm` to compile Wisp compiler → `wisp-v3.wasm`
 4. Verify: `wisp-v2.wasm` == `wisp-v3.wasm` (fixed point)
+
+**Features Required for Bootstrap**:
+
+The self-hosted compiler currently supports:
+- ✓ `fn` definitions
+- ✓ `export`
+- ✓ `if`, `let`
+- ✓ WASM instructions (i32.*, i64.*, etc.)
+- ✓ Function calls
+
+To compile itself, it needs to also support:
+- `variant` definitions (token, sexpr types)
+- `record` definitions (token-result, parse-result)
+- `match` expressions (used 11 times in compiler)
+- Built-in operations:
+  - `string-len`, `string-ref`, `substring` (inlined to i32.load/load8_u)
+  - `string-append` (complex: allocation + copy)
+  - `string=?` (byte-by-byte comparison)
+  - `list-new`, `list-push`, `list-get`, `list-len` (pointer operations)
+
+**Incremental Path**:
+1. Add `string-len`, `list-len` (simple loads)
+2. Add `string-ref`, `list-get` (indexed loads)
+3. Add `string-append` (requires memory allocation)
+4. Add `match` expression compilation
+5. Add `variant` definition (generates constructors)
+6. Add `record` definition (generates struct layout)
+7. Verify bootstrap
 
 ---
 
