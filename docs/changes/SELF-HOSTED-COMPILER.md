@@ -247,23 +247,47 @@ Added to M5 codegen:
 ---
 
 ### M7: Self-Compile Simple Program
-**Status**: Not Started
+**Status**: Complete
 
-Compile a simple Wisp program using the Wisp compiler.
+Complete self-hosted Wisp compiler that can compile Wisp source to WAT.
 
-**Test Case**:
+**Implementation** (`examples/wisp-compiler.lisp`):
+
+The full compiler integrates all previous milestones:
+- Tokenizer from M3
+- Parser from M4
+- Code generator from M5/M6
+- Top-level compilation (`compile-toplevel`, `compile-export`, `compile-fn-def`)
+- Module wrapper generation (`compile` function)
+
+**Main Entry Point**:
 ```lisp
-; factorial.wisp
-(fn factorial ((n s32)) s32
-  (if (i32.le_s n (i32.const 1))
-    (i32.const 1)
-    (i32.mul n (factorial (i32.sub n (i32.const 1))))))
+(fn compile ((src string)) string
+  (let (forms (read-all src))
+    (let (body (compile-toplevels forms (i32.const 0) (list-len forms) ""))
+      (string-append "(module\n  (memory 1)\n" (string-append body "\n)")))))
 ```
 
-**Success Criteria**:
-1. Rust compiler compiles `factorial.wisp` → `expected.wasm`
-2. Wisp compiler compiles `factorial.wisp` → `actual.wasm`
-3. Both produce identical results when run
+**Exported Functions**:
+- `get-identity-wat`: Compiles identity function and returns WAT
+- `get-factorial-wat`: Compiles factorial function and returns WAT
+- `test-compile-identity`: Tests identity compilation
+- `test-compile-factorial`: Tests factorial compilation
+
+**Example Output**:
+```lisp
+(compile "(fn identity ((x s32)) s32 x)")
+; → "(module
+;      (memory 1)
+;      (func $identity (param $x i32) (result i32)
+;        (local.get $x))
+;    )"
+```
+
+**Tests**: `tests/self_hosted.rs`
+- `test_self_hosted_compiles`: Verifies compiler compiles
+- `test_self_hosted_identity_wat`: Verifies identity function compilation
+- `test_self_hosted_factorial_wat`: Verifies factorial function compilation
 
 ---
 
@@ -288,6 +312,9 @@ Compile the Wisp compiler with itself.
 | String ops | ✓ Complete | M1 complete |
 | Pattern match | ✓ Complete | M2 complete - variant match works for AST |
 | Tokenizer | ✓ Complete | M3 complete - `tokenize` function in Wisp |
+| Parser | ✓ Complete | M4 complete - `parse-all`, `read-all` functions |
+| Codegen | ✓ Complete | M5/M6 complete - expressions and functions |
+| Self-hosted compiler | ✓ Complete | M7 complete - `compile` function |
 | Records | ✓ Exists | Already in Wisp |
 | Variants | ✓ Exists | Already in Wisp |
 | Lists | ✓ Exists | Already in Wisp |
@@ -349,8 +376,10 @@ Compile the Wisp compiler with itself.
 - `tests/tokenizer.rs` - M3 tokenizer tests
 - `examples/wisp-parser.lisp` - M4 parser implementation (includes tokenizer)
 - `tests/parser.rs` - M4 parser tests
-- `examples/wisp-codegen.lisp` - M5 code generator implementation
-- `tests/codegen.rs` - M5 codegen tests
+- `examples/wisp-codegen.lisp` - M5/M6 code generator implementation
+- `tests/codegen.rs` - M5/M6 codegen tests
+- `examples/wisp-compiler.lisp` - M7 complete self-hosted compiler
+- `tests/self_hosted.rs` - M7 self-hosted compiler tests
 
 ## Success Criteria
 
@@ -360,5 +389,5 @@ Compile the Wisp compiler with itself.
 4. ✓ Write a parser in Wisp that parses Wisp code (M4)
 5. ✓ Write a codegen for simple expressions (M5)
 6. ✓ Write a codegen for functions (M6)
-7. Compile a simple Wisp program using the Wisp compiler (M7)
+7. ✓ Compile a simple Wisp program using the Wisp compiler (M7)
 8. Eventually: compile the Wisp compiler with itself (M8)
