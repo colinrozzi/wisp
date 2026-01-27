@@ -7,13 +7,40 @@ A Theater-native REPL for Wisp that compiles S-expressions to WebAssembly compon
 ## Status
 
 - [x] Design finalized
-- [ ] Wisp compiler updated for REPL mode
-- [ ] Theater wrapper component implemented
-- [ ] REPL Actor implemented with compile-and-run loop
-- [ ] Component composition (wrapper + compiled wisp)
-- [ ] Theater spawn/await integration
-- [ ] State persistence via Theater event chain
-- [ ] End-to-end testing
+- [x] Wisp compiler updated for REPL mode
+- [x] Theater wrapper component implemented
+- [x] REPL Actor implemented with compile-and-run loop
+- [x] Component composition (wrapper + compiled wisp)
+- [ ] Theater spawn/await integration (future)
+- [ ] State persistence via Theater event chain (future)
+- [x] End-to-end testing
+
+## Quick Start
+
+```bash
+# Run the REPL
+cargo run -p test-runtime -- --repl
+```
+
+**Example session:**
+```
+wisp> (i32.add (i32.const 40) (i32.const 2))
+42
+wisp> (define x 10)
+defined x = 10
+wisp> (define y 5)
+defined y = 5
+wisp> (i32.add x y)
+15
+wisp> (fn square ((n s32)) s32 (i32.mul n n))
+defined function square
+wisp> (square (i32.const 7))
+49
+wisp> (fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (i32.mul n (factorial (i32.sub n (i32.const 1))))))
+defined function factorial
+wisp> (factorial (i32.const 5))
+120
+```
 
 ## Key Insight
 
@@ -339,44 +366,44 @@ compiled: math.wasm (exports: double, quadruple)
 
 ## Implementation Plan
 
-### Phase 1: Wisp Compiler REPL Mode
-- [ ] Add `compile_repl()` function
-- [ ] Implement variable inlining
-- [ ] Implement context (bindings + functions) passing
-- [ ] Generate component with `eval` export
-- [ ] Test compilation with context
+### Phase 1: Wisp Compiler REPL Mode ✓
+- [x] Add `compile_repl()` function
+- [x] Implement variable inlining
+- [x] Implement context (bindings + functions) passing
+- [x] Generate component with `eval` export
+- [x] Test compilation with context
 
-### Phase 2: Theater Wrapper Component
-- [ ] Create wrapper component project
-- [ ] Import Theater reply primitive
-- [ ] Import `eval` from composed component
-- [ ] Implement `init` that calls eval and replies
-- [ ] Test wrapper in isolation
+### Phase 2: Theater Wrapper Component ✓
+- [x] Create wrapper component project (`examples/eval-wrapper.wisp`)
+- [x] Import Theater reply primitive
+- [x] Import `eval` from composed component
+- [x] Implement `init` that calls eval and replies
+- [x] Test wrapper in isolation
 
-### Phase 3: REPL Actor Core
-- [ ] Create `wisp-repl-actor` project
-- [ ] Implement state management (bindings, functions)
-- [ ] Implement `define` and `fn` handling
-- [ ] Implement component composition (wrapper + compiled)
-- [ ] Implement eval flow (compile → compose → spawn → await)
+### Phase 3: REPL Actor Core ✓
+- [x] Create `test-runtime` project (`crates/test-runtime`)
+- [x] Implement state management (bindings, functions)
+- [x] Implement `define` and `fn` handling
+- [x] Implement component composition (wrapper + compiled)
+- [x] Implement eval flow (compile → assemble → execute)
 
-### Phase 4: Theater Integration
+### Phase 4: Theater Integration (Future)
 - [ ] Add spawn capability to REPL actor
 - [ ] Implement await for eval result
 - [ ] Wire up message protocol
 
-### Phase 5: Build Mode
+### Phase 5: Build Mode (Future)
 - [ ] Implement `compile` command (unwrapped export)
 - [ ] Support selecting which functions to export
 - [ ] Test produced components work standalone
 
-### Phase 6: Persistence & Polish
+### Phase 6: Persistence & Polish ✓ (Partial)
 - [ ] Implement state serialization
 - [ ] Integrate with Theater event chain
 - [ ] Test restart recovery
-- [ ] `list` command
-- [ ] `clear` command
-- [ ] Error messages and UX
+- [x] `list` command
+- [x] `clear` command
+- [x] Error messages and UX
 
 ## Open Questions
 
@@ -396,7 +423,69 @@ compiled: math.wasm (exports: double, quadruple)
    - Each eval is fresh, no persistent memory
    - Could add `(define-memory ...)` that gets included in compilation
 
+## Test Runtime
+
+The REPL is implemented in `crates/test-runtime`. It provides multiple modes:
+
+### Usage
+
+```bash
+# Basic: Run a function from a WASM file
+cargo run -p test-runtime -- <wasm> <func> [arg]
+
+# Compile: Source → WAT → WASM (validates output)
+cargo run -p test-runtime -- --compile "(fn foo () s32 (i32.const 42))"
+
+# Compile and run: Compile, then execute a function
+cargo run -p test-runtime -- --compile-run "(export (fn foo () s32 (i32.const 42)))" foo
+
+# With arguments:
+cargo run -p test-runtime -- --compile-run "(export (fn factorial ((n s32)) s32 ...))" factorial 5
+
+# REPL: Interactive mode
+cargo run -p test-runtime -- --repl
+```
+
+### REPL Commands
+
+| Command | Description |
+|---------|-------------|
+| `(define x 42)` | Define a variable (inlined into expressions) |
+| `(fn name ...)` | Define a function (included in compilation) |
+| `(list)` | Show current bindings and function count |
+| `(clear)` | Clear all bindings and functions |
+| `quit` / `exit` | Exit the REPL |
+| *expression* | Compile and evaluate, print result |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    REPL Pipeline                        │
+│                                                         │
+│  1. User enters expression                             │
+│           │                                             │
+│           ▼                                             │
+│  2. Generate source with inlined variables             │
+│     and accumulated function definitions               │
+│           │                                             │
+│           ▼                                             │
+│  3. Self-hosted compiler (wisp-compiler.wasm)          │
+│     compiles source → WAT string                       │
+│           │                                             │
+│           ▼                                             │
+│  4. wat crate assembles WAT → WASM bytes               │
+│           │                                             │
+│           ▼                                             │
+│  5. Wasmtime executes WASM, returns result             │
+│           │                                             │
+│           ▼                                             │
+│  6. Print result                                        │
+└─────────────────────────────────────────────────────────┘
+```
+
 ## Related Documents
 
 - `docs/proposals/METAPROGRAMMING.md` - Macro system vision
 - `docs/changes/PHASE-1-MACROS.md` - Macro implementation (completed)
+- `docs/changes/SELF-HOSTED-COMPILER.md` - Self-hosted compiler (M1-M7)

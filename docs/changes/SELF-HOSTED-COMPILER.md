@@ -291,6 +291,40 @@ The full compiler integrates all previous milestones:
 
 ---
 
+### REPL Integration ✓
+**Status**: Complete
+
+The self-hosted compiler now powers an interactive REPL.
+
+**Usage**:
+```bash
+cargo run -p test-runtime -- --repl
+```
+
+**Example Session**:
+```
+wisp> (i32.add (i32.const 40) (i32.const 2))
+42
+wisp> (define x 10)
+defined x = 10
+wisp> (i32.mul x (i32.const 5))
+50
+wisp> (fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (i32.mul n (factorial (i32.sub n (i32.const 1))))))
+defined function factorial
+wisp> (factorial (i32.const 5))
+120
+```
+
+**Pipeline**:
+1. REPL generates source with inlined variables and accumulated functions
+2. Self-hosted compiler (`wisp-compiler.wasm`) compiles source → WAT
+3. `wat` crate assembles WAT → WASM
+4. Wasmtime executes WASM and returns result
+
+**Documentation**: [WISP-REPL-ARCHITECTURE.md](WISP-REPL-ARCHITECTURE.md)
+
+---
+
 ### M8: Full Bootstrap
 **Status**: Partial (blocked by tokenizer recursion)
 
@@ -410,6 +444,7 @@ The self-hosted compiler currently supports:
 ## Related Files
 
 - `docs/changes/STRING-OPERATIONS.md` - M1 documentation
+- `docs/changes/WISP-REPL-ARCHITECTURE.md` - REPL architecture and usage
 - `examples/string-test.lisp` - String operation examples
 - `tests/string_ops.rs` - String operation tests
 - `tests/pattern_match.rs` - M2 pattern matching tests
@@ -420,7 +455,10 @@ The self-hosted compiler currently supports:
 - `examples/wisp-codegen.lisp` - M5/M6 code generator implementation
 - `tests/codegen.rs` - M5/M6 codegen tests
 - `examples/wisp-compiler.lisp` - M7 complete self-hosted compiler
+- `examples/wisp-compiler.wasm` - Compiled self-hosted compiler
 - `tests/self_hosted.rs` - M7 self-hosted compiler tests
+- `crates/test-runtime/` - REPL and test runtime implementation
+- `crates/assembler-handler/` - WAT-to-WASM Theater handler
 
 ## Success Criteria
 
@@ -431,4 +469,5 @@ The self-hosted compiler currently supports:
 5. ✓ Write a codegen for simple expressions (M5)
 6. ✓ Write a codegen for functions (M6)
 7. ✓ Compile a simple Wisp program using the Wisp compiler (M7)
-8. Eventually: compile the Wisp compiler with itself (M8)
+8. ✓ Interactive REPL powered by self-hosted compiler
+9. Eventually: compile the Wisp compiler with itself (M8)

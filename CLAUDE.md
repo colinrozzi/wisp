@@ -23,6 +23,8 @@ The project uses a two-tier documentation system:
    - These are "on the ground" documents that drive current development
 
 **Recently completed**:
+- [SELF-HOSTED-COMPILER.md](docs/changes/SELF-HOSTED-COMPILER.md) - Self-hosted Wisp compiler (M1-M7 complete)
+- [WISP-REPL-ARCHITECTURE.md](docs/changes/WISP-REPL-ARCHITECTURE.md) - Interactive REPL powered by self-hosted compiler
 - [PHASE-1-MACROS.md](docs/changes/PHASE-1-MACROS.md) - Unhygienic macros with quasiquotation (complete)
 - [PHASE-0-WASM-INSTRUCTIONS.md](docs/changes/PHASE-0-WASM-INSTRUCTIONS.md) - Exposing core WASM instructions (complete)
 
@@ -42,6 +44,33 @@ cargo run -- run <component.wasm> <function-name> <args...>
 cargo run -- run <component.wasm> <function-name> <args...> --dep <module>=<dep.wasm>
 # Example: cargo run -- run examples/user.wasm run 5 --dep math=examples/math.wasm
 ```
+
+### Self-Hosted REPL
+```bash
+# Interactive REPL powered by the self-hosted Wisp compiler
+cargo run -p test-runtime -- --repl
+```
+
+**Example session:**
+```
+wisp> (i32.add (i32.const 40) (i32.const 2))
+42
+wisp> (define x 10)
+defined x = 10
+wisp> (i32.mul x (i32.const 5))
+50
+wisp> (fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (i32.mul n (factorial (i32.sub n (i32.const 1))))))
+defined function factorial
+wisp> (factorial (i32.const 5))
+120
+```
+
+**REPL commands:**
+- `(define x 42)` - define variable (inlined into expressions)
+- `(fn name ...)` - define function (included in compilation)
+- `(list)` - show current bindings and functions
+- `(clear)` - clear all definitions
+- `quit` - exit REPL
 
 ### Development
 ```bash
