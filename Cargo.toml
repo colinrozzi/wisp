@@ -1,5 +1,5 @@
 [workspace]
-members = ["wisp-repl", "wisp-theater-test", "crates/assembler-handler"]
+members = ["wisp-repl", "crates/assembler-handler", "crates/test-runtime"]
 
 [package]
 name = "wisp"

@@ -1,10 +1,13 @@
 [package]
-name = "wisp-theater-test"
+name = "test-runtime"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-theater = { path = "../../theater/crates/theater" }
+theater = { path = "../../../theater/crates/theater" }
+assembler-handler = { path = "../assembler-handler" }
+wat = "1.242.0"
+wasmtime = { version = "31.0", features = ["async"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 tracing = "0.1"

@@ -2983,6 +2983,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assembler-handler",
+ "theater",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wasmtime 31.0.0",
+ "wat",
+]
+
+[[package]]
 name = "theater"
 version = "0.2.1"
 dependencies = [
@@ -4894,17 +4908,6 @@ dependencies = [
  "rustyline",
  "wasmtime 21.0.2",
  "wisp",
-]
-
-[[package]]
-name = "wisp-theater-test"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "theater",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
