@@ -1,0 +1,35 @@
+package theater:simple;
+
+/// # Assembler Interface
+///
+/// Provides WebAssembly assembly capabilities to actors.
+/// This allows actors to convert WAT (WebAssembly Text) to WASM (binary).
+///
+/// ## Purpose
+///
+/// Enables self-hosted compilers and REPLs to generate executable WASM
+/// from text-based WAT output without needing to implement binary encoding.
+///
+/// ## Example
+///
+/// ```rust
+/// let wat = "(module (func (export \"add\") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))";
+/// match assembler::wat_to_wasm(wat) {
+///     Ok(wasm_bytes) => { /* use wasm_bytes */ }
+///     Err(e) => { /* handle parse error */ }
+/// }
+/// ```
+
+interface assembler {
+    /// Convert WAT (WebAssembly Text) to WASM binary.
+    ///
+    /// ## Parameters
+    ///
+    /// * `wat` - WebAssembly text format source code
+    ///
+    /// ## Returns
+    ///
+    /// * `Ok(list<u8>)` - The assembled WASM binary bytes
+    /// * `Err(string)` - Error message if assembly fails
+    wat-to-wasm: func(wat: string) -> result<list<u8>, string>;
+}

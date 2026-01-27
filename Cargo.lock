@@ -137,6 +137,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "assembler-handler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "theater",
+ "tokio",
+ "tracing",
+ "val-serde",
+ "wasmtime 31.0.0",
+ "wat",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
