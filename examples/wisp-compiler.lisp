@@ -24,6 +24,36 @@
   (lst (list sexpr)))
 
 ; ============================================================
+; Type Metadata (for dynamic variant/record support)
+; ============================================================
+
+; A single variant case: name, tag number, has-payload flag
+(record variant-case
+  (case-name string)
+  (case-tag s32)
+  (case-has-payload s32))
+
+; A variant definition: name and list of cases
+(record variant-def
+  (var-name string)
+  (var-cases (list variant-case)))
+
+; A record field: name and byte offset
+(record record-field
+  (field-name string)
+  (field-offset s32))
+
+; A record definition: name and list of fields
+(record record-def
+  (rec-name string)
+  (rec-fields (list record-field)))
+
+; Compilation context: holds all type definitions
+(record compile-ctx
+  (ctx-variants (list variant-def))
+  (ctx-records (list record-def)))
+
+; ============================================================
 ; Tokenizer
 ; ============================================================
 
@@ -254,6 +284,193 @@
   (match e ((sym s) (list-new sexpr)) ((num n) (list-new sexpr)) ((str s) (list-new sexpr)) ((lst l) l)))
 
 ; ============================================================
+; Type Definition Collection
+; ============================================================
+
+; Parse a single variant case from sexpr: (case-name) or (case-name type)
+(fn parse-variant-case ((case-expr sexpr) (tag s32)) variant-case
+  (if (is-lst case-expr)
+    (let (items (get-lst case-expr))
+      (if (i32.gt_s (list-len items) (i32.const 0))
+        (let (name-expr (list-get items (i32.const 0)))
+          (if (is-sym name-expr)
+            (let (case-name (get-sym name-expr))
+              (let (has-payload (if (i32.gt_s (list-len items) (i32.const 1)) (i32.const 1) (i32.const 0)))
+                (variant-case case-name tag has-payload)))
+            (variant-case "error" tag (i32.const 0))))
+        (variant-case "error" tag (i32.const 0))))
+    (variant-case "error" tag (i32.const 0))))
+
+; Parse variant cases starting at index
+(fn parse-variant-cases ((items (list sexpr)) (idx s32) (len s32) (tag s32) (cases (list variant-case))) (list variant-case)
+  (if (i32.ge_s idx len)
+    cases
+    (let (case-expr (list-get items idx))
+      (let (parsed-case (parse-variant-case case-expr tag))
+        (parse-variant-cases items (i32.add idx (i32.const 1)) len (i32.add tag (i32.const 1))
+          (list-push cases parsed-case))))))
+
+; Parse a variant declaration: (variant name (case1) (case2 type) ...)
+(fn parse-variant-def ((items (list sexpr))) variant-def
+  (if (i32.lt_s (list-len items) (i32.const 2))
+    (variant-def "error" (list-new variant-case))
+    (let (name-expr (list-get items (i32.const 1)))
+      (if (is-sym name-expr)
+        (let (var-name (get-sym name-expr))
+          (let (cases (parse-variant-cases items (i32.const 2) (list-len items) (i32.const 0) (list-new variant-case)))
+            (variant-def var-name cases)))
+        (variant-def "error" (list-new variant-case))))))
+
+; Parse a single record field from sexpr: (field-name type)
+(fn parse-record-field ((field-expr sexpr) (offset s32)) record-field
+  (if (is-lst field-expr)
+    (let (items (get-lst field-expr))
+      (if (i32.gt_s (list-len items) (i32.const 0))
+        (let (name-expr (list-get items (i32.const 0)))
+          (if (is-sym name-expr)
+            (record-field (get-sym name-expr) offset)
+            (record-field "error" offset)))
+        (record-field "error" offset)))
+    (record-field "error" offset)))
+
+; Parse record fields starting at index
+(fn parse-record-fields ((items (list sexpr)) (idx s32) (len s32) (offset s32) (fields (list record-field))) (list record-field)
+  (if (i32.ge_s idx len)
+    fields
+    (let (field-expr (list-get items idx))
+      (let (parsed-field (parse-record-field field-expr offset))
+        (parse-record-fields items (i32.add idx (i32.const 1)) len (i32.add offset (i32.const 4))
+          (list-push fields parsed-field))))))
+
+; Parse a record declaration: (record name (field1 type1) (field2 type2) ...)
+(fn parse-record-def ((items (list sexpr))) record-def
+  (if (i32.lt_s (list-len items) (i32.const 2))
+    (record-def "error" (list-new record-field))
+    (let (name-expr (list-get items (i32.const 1)))
+      (if (is-sym name-expr)
+        (let (rec-name (get-sym name-expr))
+          (let (fields (parse-record-fields items (i32.const 2) (list-len items) (i32.const 0) (list-new record-field)))
+            (record-def rec-name fields)))
+        (record-def "error" (list-new record-field))))))
+
+; Collect all variant definitions from forms
+(fn collect-variants-acc ((forms (list sexpr)) (idx s32) (len s32) (variants (list variant-def))) (list variant-def)
+  (if (i32.ge_s idx len)
+    variants
+    (let (form (list-get forms idx))
+      (if (is-lst form)
+        (let (items (get-lst form))
+          (if (i32.gt_s (list-len items) (i32.const 0))
+            (let (head (list-get items (i32.const 0)))
+              (if (is-sym head)
+                (if (string=? (get-sym head) "variant")
+                  (collect-variants-acc forms (i32.add idx (i32.const 1)) len
+                    (list-push variants (parse-variant-def items)))
+                  (collect-variants-acc forms (i32.add idx (i32.const 1)) len variants))
+                (collect-variants-acc forms (i32.add idx (i32.const 1)) len variants)))
+            (collect-variants-acc forms (i32.add idx (i32.const 1)) len variants)))
+        (collect-variants-acc forms (i32.add idx (i32.const 1)) len variants)))))
+
+(fn collect-variants ((forms (list sexpr))) (list variant-def)
+  (collect-variants-acc forms (i32.const 0) (list-len forms) (list-new variant-def)))
+
+; Collect all record definitions from forms
+(fn collect-records-acc ((forms (list sexpr)) (idx s32) (len s32) (records (list record-def))) (list record-def)
+  (if (i32.ge_s idx len)
+    records
+    (let (form (list-get forms idx))
+      (if (is-lst form)
+        (let (items (get-lst form))
+          (if (i32.gt_s (list-len items) (i32.const 0))
+            (let (head (list-get items (i32.const 0)))
+              (if (is-sym head)
+                (if (string=? (get-sym head) "record")
+                  (collect-records-acc forms (i32.add idx (i32.const 1)) len
+                    (list-push records (parse-record-def items)))
+                  (collect-records-acc forms (i32.add idx (i32.const 1)) len records))
+                (collect-records-acc forms (i32.add idx (i32.const 1)) len records)))
+            (collect-records-acc forms (i32.add idx (i32.const 1)) len records)))
+        (collect-records-acc forms (i32.add idx (i32.const 1)) len records)))))
+
+(fn collect-records ((forms (list sexpr))) (list record-def)
+  (collect-records-acc forms (i32.const 0) (list-len forms) (list-new record-def)))
+
+; ============================================================
+; Type Lookup Functions
+; ============================================================
+
+; Find a variant case by name in a list of cases
+(fn find-case-in-list ((cases (list variant-case)) (idx s32) (len s32) (name string)) variant-case
+  (if (i32.ge_s idx len)
+    (variant-case "" (i32.const -1) (i32.const 0))  ; not found
+    (let (c (list-get cases idx))
+      (if (string=? (variant-case.case-name c) name)
+        c
+        (find-case-in-list cases (i32.add idx (i32.const 1)) len name)))))
+
+; Find a variant case across all variants
+(fn find-case-in-variants ((variants (list variant-def)) (idx s32) (len s32) (name string)) variant-case
+  (if (i32.ge_s idx len)
+    (variant-case "" (i32.const -1) (i32.const 0))  ; not found
+    (let (v (list-get variants idx))
+      (let (cases (variant-def.var-cases v))
+        (let (found (find-case-in-list cases (i32.const 0) (list-len cases) name))
+          (if (i32.ge_s (variant-case.case-tag found) (i32.const 0))
+            found
+            (find-case-in-variants variants (i32.add idx (i32.const 1)) len name)))))))
+
+; Find a record by name
+(fn find-record ((records (list record-def)) (idx s32) (len s32) (name string)) record-def
+  (if (i32.ge_s idx len)
+    (record-def "" (list-new record-field))  ; not found
+    (let (r (list-get records idx))
+      (if (string=? (record-def.rec-name r) name)
+        r
+        (find-record records (i32.add idx (i32.const 1)) len name)))))
+
+; Find a field in a record
+(fn find-field ((fields (list record-field)) (idx s32) (len s32) (name string)) record-field
+  (if (i32.ge_s idx len)
+    (record-field "" (i32.const -1))  ; not found
+    (let (f (list-get fields idx))
+      (if (string=? (record-field.field-name f) name)
+        f
+        (find-field fields (i32.add idx (i32.const 1)) len name)))))
+
+; Check if a name contains a dot (for field accessor like "record.field")
+(fn contains-dot ((s string) (idx s32) (len s32)) s32
+  (if (i32.ge_s idx len)
+    (i32.const 0)
+    (if (i32.eq (string-ref s idx) (i32.const 46))  ; 46 = '.'
+      (i32.const 1)
+      (contains-dot s (i32.add idx (i32.const 1)) len))))
+
+(fn has-dot ((s string)) s32
+  (contains-dot s (i32.const 0) (string-len s)))
+
+; Find the position of the dot
+(fn find-dot-pos ((s string) (idx s32) (len s32)) s32
+  (if (i32.ge_s idx len)
+    (i32.const -1)
+    (if (i32.eq (string-ref s idx) (i32.const 46))
+      idx
+      (find-dot-pos s (i32.add idx (i32.const 1)) len))))
+
+; Get the part before the dot
+(fn get-before-dot ((s string)) string
+  (let (pos (find-dot-pos s (i32.const 0) (string-len s)))
+    (if (i32.lt_s pos (i32.const 0))
+      s
+      (substring s (i32.const 0) pos))))
+
+; Get the part after the dot
+(fn get-after-dot ((s string)) string
+  (let (pos (find-dot-pos s (i32.const 0) (string-len s)))
+    (if (i32.lt_s pos (i32.const 0))
+      ""
+      (substring s (i32.add pos (i32.const 1)) (string-len s)))))
+
+; ============================================================
 ; Number to String
 ; ============================================================
 
@@ -297,9 +514,63 @@
             (if (string=? prefix "f64.") (i32.const 1)
               (i32.const 0))))))))
 
-; Get variant constructor tag number
-; token: lparen=0, rparen=1, number=2, symbol=3, str-lit=4
-; sexpr: sym=0, num=1, str=2, lst=3
+; Get variant constructor tag number using context
+(fn constructor-tag-ctx ((ctx compile-ctx) (name string)) s32
+  (let (variants (compile-ctx.ctx-variants ctx))
+    (let (found (find-case-in-variants variants (i32.const 0) (list-len variants) name))
+      (variant-case.case-tag found))))
+
+; Check if a name is a variant constructor
+(fn is-variant-constructor ((ctx compile-ctx) (name string)) s32
+  (let (tag (constructor-tag-ctx ctx name))
+    (if (i32.ge_s tag (i32.const 0)) (i32.const 1) (i32.const 0))))
+
+; Get whether a variant constructor has a payload
+(fn constructor-has-payload ((ctx compile-ctx) (name string)) s32
+  (let (variants (compile-ctx.ctx-variants ctx))
+    (let (found (find-case-in-variants variants (i32.const 0) (list-len variants) name))
+      (variant-case.case-has-payload found))))
+
+; Check if a name is a record constructor
+(fn is-record-constructor ((ctx compile-ctx) (name string)) s32
+  (let (records (compile-ctx.ctx-records ctx))
+    (let (found (find-record records (i32.const 0) (list-len records) name))
+      (if (i32.gt_s (string-len (record-def.rec-name found)) (i32.const 0))
+        (i32.const 1)
+        (i32.const 0)))))
+
+; Get record definition by name
+(fn get-record-def ((ctx compile-ctx) (name string)) record-def
+  (let (records (compile-ctx.ctx-records ctx))
+    (find-record records (i32.const 0) (list-len records) name)))
+
+; Check if a name is a field accessor (record-name.field-name)
+(fn is-field-accessor ((ctx compile-ctx) (name string)) s32
+  (if (has-dot name)
+    (let (rec-name (get-before-dot name))
+      (let (field-name (get-after-dot name))
+        (let (records (compile-ctx.ctx-records ctx))
+          (let (rec (find-record records (i32.const 0) (list-len records) rec-name))
+            (if (i32.gt_s (string-len (record-def.rec-name rec)) (i32.const 0))
+              (let (fields (record-def.rec-fields rec))
+                (let (f (find-field fields (i32.const 0) (list-len fields) field-name))
+                  (if (i32.ge_s (record-field.field-offset f) (i32.const 0))
+                    (i32.const 1)
+                    (i32.const 0))))
+              (i32.const 0))))))
+    (i32.const 0)))
+
+; Get field offset for a field accessor
+(fn get-field-offset ((ctx compile-ctx) (name string)) s32
+  (let (rec-name (get-before-dot name))
+    (let (field-name (get-after-dot name))
+      (let (records (compile-ctx.ctx-records ctx))
+        (let (rec (find-record records (i32.const 0) (list-len records) rec-name))
+          (let (fields (record-def.rec-fields rec))
+            (let (f (find-field fields (i32.const 0) (list-len fields) field-name))
+              (record-field.field-offset f))))))))
+
+; Legacy fallback for hardcoded tags (kept for compatibility)
 (fn constructor-tag ((name string)) s32
   (if (string=? name "lparen") (i32.const 0)
     (if (string=? name "rparen") (i32.const 1)
@@ -320,9 +591,10 @@
 
 ; Generate code to store bytes of a string starting at offset
 ; Returns WAT code that stores bytes at (heap_ptr + offset)
-(fn compile-string-bytes ((s string) (idx s32) (len s32) (offset s32)) string
+; Uses tail recursion with accumulator to avoid stack overflow on long strings
+(fn compile-string-bytes-acc ((s string) (idx s32) (len s32) (offset s32) (acc string)) string
   (if (i32.ge_s idx len)
-    ""
+    acc
     (let (byte (string-ref s idx))
       (let (byte-code (string-append
               "global.get $__heap_ptr i32.const " (string-append
@@ -330,8 +602,11 @@
               " i32.add i32.const " (string-append
               (i32-to-string byte)
               " i32.store8 ")))))
-        (string-append byte-code
-          (compile-string-bytes s (i32.add idx (i32.const 1)) len (i32.add offset (i32.const 1))))))))
+        (compile-string-bytes-acc s (i32.add idx (i32.const 1)) len (i32.add offset (i32.const 1))
+          (string-append acc byte-code))))))
+
+(fn compile-string-bytes ((s string) (idx s32) (len s32) (offset s32)) string
+  (compile-string-bytes-acc s idx len offset ""))
 
 ; Compile a string literal to WAT
 ; String layout: 4 bytes length + bytes
@@ -663,13 +938,83 @@
                                                           (if (string=? name "parse-result.new-pos")
                                                             (let (rec-wat (compile-expr (list-get items (i32.const 1))))
                                                               (string-append "(i32.load (i32.add " (string-append rec-wat " (i32.const 4)))")))
-                                                            ; Regular function call or WASM instruction
-                                                            (let (rest-start (i32.const 1))
-                                                              (let (rest-len (i32.sub (list-len items) (i32.const 1)))
-                                                                (let (args (build-args-list items rest-start rest-len (list-new sexpr)))
-                                                                  (if (is-wasm-instr name)
-                                                                    (compile-wasm-call name args)
-                                                                    (compile-fn-call name args)))))))))))))))))))))))))))))))))
+                                                            ; Record constructor: variant-case (3 fields)
+                                                            (if (string=? name "variant-case")
+                                                              (let (f0 (compile-expr (list-get items (i32.const 1))))
+                                                                (let (f1 (compile-expr (list-get items (i32.const 2))))
+                                                                  (let (f2 (compile-expr (list-get items (i32.const 3))))
+                                                                    (string-append "(call $__make_record_3 " (string-append f0 (string-append " " (string-append f1 (string-append " " (string-append f2 ")")))))))))
+                                                              ; Record constructor: variant-def (2 fields)
+                                                              (if (string=? name "variant-def")
+                                                                (let (f0 (compile-expr (list-get items (i32.const 1))))
+                                                                  (let (f1 (compile-expr (list-get items (i32.const 2))))
+                                                                    (string-append "(call $__make_record_2 " (string-append f0 (string-append " " (string-append f1 ")"))))))
+                                                                ; Record constructor: record-field (2 fields)
+                                                                (if (string=? name "record-field")
+                                                                  (let (f0 (compile-expr (list-get items (i32.const 1))))
+                                                                    (let (f1 (compile-expr (list-get items (i32.const 2))))
+                                                                      (string-append "(call $__make_record_2 " (string-append f0 (string-append " " (string-append f1 ")"))))))
+                                                                  ; Record constructor: record-def (2 fields)
+                                                                  (if (string=? name "record-def")
+                                                                    (let (f0 (compile-expr (list-get items (i32.const 1))))
+                                                                      (let (f1 (compile-expr (list-get items (i32.const 2))))
+                                                                        (string-append "(call $__make_record_2 " (string-append f0 (string-append " " (string-append f1 ")"))))))
+                                                                    ; Record constructor: compile-ctx (2 fields)
+                                                                    (if (string=? name "compile-ctx")
+                                                                      (let (f0 (compile-expr (list-get items (i32.const 1))))
+                                                                        (let (f1 (compile-expr (list-get items (i32.const 2))))
+                                                                          (string-append "(call $__make_record_2 " (string-append f0 (string-append " " (string-append f1 ")"))))))
+                                                                      ; Field: variant-case.case-name (offset 0)
+                                                                      (if (string=? name "variant-case.case-name")
+                                                                        (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                          (string-append "(i32.load " (string-append rec-wat ")")))
+                                                                        ; Field: variant-case.case-tag (offset 4)
+                                                                        (if (string=? name "variant-case.case-tag")
+                                                                          (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                            (string-append "(i32.load (i32.add " (string-append rec-wat " (i32.const 4)))")))
+                                                                          ; Field: variant-case.case-has-payload (offset 8)
+                                                                          (if (string=? name "variant-case.case-has-payload")
+                                                                            (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                              (string-append "(i32.load (i32.add " (string-append rec-wat " (i32.const 8)))")))
+                                                                            ; Field: variant-def.var-name (offset 0)
+                                                                            (if (string=? name "variant-def.var-name")
+                                                                              (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                (string-append "(i32.load " (string-append rec-wat ")")))
+                                                                              ; Field: variant-def.var-cases (offset 4)
+                                                                              (if (string=? name "variant-def.var-cases")
+                                                                                (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                  (string-append "(i32.load (i32.add " (string-append rec-wat " (i32.const 4)))")))
+                                                                                ; Field: record-field.field-name (offset 0)
+                                                                                (if (string=? name "record-field.field-name")
+                                                                                  (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                    (string-append "(i32.load " (string-append rec-wat ")")))
+                                                                                  ; Field: record-field.field-offset (offset 4)
+                                                                                  (if (string=? name "record-field.field-offset")
+                                                                                    (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                      (string-append "(i32.load (i32.add " (string-append rec-wat " (i32.const 4)))")))
+                                                                                    ; Field: record-def.rec-name (offset 0)
+                                                                                    (if (string=? name "record-def.rec-name")
+                                                                                      (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                        (string-append "(i32.load " (string-append rec-wat ")")))
+                                                                                      ; Field: record-def.rec-fields (offset 4)
+                                                                                      (if (string=? name "record-def.rec-fields")
+                                                                                        (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                          (string-append "(i32.load (i32.add " (string-append rec-wat " (i32.const 4)))")))
+                                                                                        ; Field: compile-ctx.ctx-variants (offset 0)
+                                                                                        (if (string=? name "compile-ctx.ctx-variants")
+                                                                                          (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                            (string-append "(i32.load " (string-append rec-wat ")")))
+                                                                                          ; Field: compile-ctx.ctx-records (offset 4)
+                                                                                          (if (string=? name "compile-ctx.ctx-records")
+                                                                                            (let (rec-wat (compile-expr (list-get items (i32.const 1))))
+                                                                                              (string-append "(i32.load (i32.add " (string-append rec-wat " (i32.const 4)))")))
+                                                                                            ; Regular function call or WASM instruction
+                                                                                            (let (rest-start (i32.const 1))
+                                                                                              (let (rest-len (i32.sub (list-len items) (i32.const 1)))
+                                                                                                (let (args (build-args-list items rest-start rest-len (list-new sexpr)))
+                                                                                                  (if (is-wasm-instr name)
+                                                                                                    (compile-wasm-call name args)
+                                                                                                    (compile-fn-call name args)))))))))))))))))))))))))))))))))))))))))))))))))
         "(error: list head not symbol)"))))
 
 ; ============================================================
@@ -899,7 +1244,7 @@
 
 ; Runtime helpers for string, list, and variant operations
 (fn get-runtime () string
-  "  (global $__heap_ptr (mut i32) (i32.const 49152))\n  (func $__string_append (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $tot i32) (local $ptr i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb local.get $la local.get $lb i32.add local.set $tot global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $tot i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $tot i32.store local.get $ptr i32.const 4 i32.add local.get $a i32.const 4 i32.add local.get $la memory.copy local.get $ptr i32.const 4 i32.add local.get $la i32.add local.get $b i32.const 4 i32.add local.get $lb memory.copy local.get $ptr)\n  (func $__string_eq (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $i i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb block (result i32) local.get $la local.get $lb i32.ne if (result i32) i32.const 0 else i32.const 0 local.set $i block (result i32) loop local.get $i local.get $la i32.ge_u if i32.const 1 br 2 end local.get $a i32.const 4 i32.add local.get $i i32.add i32.load8_u local.get $b i32.const 4 i32.add local.get $i i32.add i32.load8_u i32.ne if i32.const 0 br 3 end local.get $i i32.const 1 i32.add local.set $i br 0 end i32.const 1 end end end)\n  (func $__substring (param $s i32) (param $start i32) (param $end i32) (result i32) (local $new_len i32) (local $ptr i32) local.get $end local.get $start i32.sub local.set $new_len global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $new_len i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $new_len i32.store local.get $ptr i32.const 4 i32.add local.get $s i32.const 4 i32.add local.get $start i32.add local.get $new_len memory.copy local.get $ptr)\n  (func $__list_new (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr i32.const 0 i32.store local.get $ptr i32.const 4 i32.add i32.const 0 i32.store local.get $ptr i32.const 8 i32.add i32.const 0 i32.store local.get $ptr)\n  (func $__list_push (param $lst i32) (param $item i32) (result i32) (local $len i32) (local $new_data i32) (local $old_data i32) local.get $lst i32.load local.set $len global.get $__heap_ptr local.set $new_data global.get $__heap_ptr local.get $len i32.const 1 i32.add i32.const 4 i32.mul i32.add global.set $__heap_ptr local.get $lst i32.const 8 i32.add i32.load local.set $old_data local.get $new_data local.get $old_data local.get $len i32.const 4 i32.mul memory.copy local.get $new_data local.get $len i32.const 4 i32.mul i32.add local.get $item i32.store local.get $lst local.get $len i32.const 1 i32.add i32.store local.get $lst i32.const 8 i32.add local.get $new_data i32.store local.get $lst)\n  (func $__make_variant_0 (param $tag i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr)\n  (func $__make_variant_1 (param $tag i32) (param $payload i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr i32.const 4 i32.add local.get $payload i32.store local.get $ptr)\n  (func $__make_record_2 (param $f0 i32) (param $f1 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr)\n")
+  "  (global $__heap_ptr (mut i32) (i32.const 49152))\n  (func $__string_append (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $tot i32) (local $ptr i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb local.get $la local.get $lb i32.add local.set $tot global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $tot i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $tot i32.store local.get $ptr i32.const 4 i32.add local.get $a i32.const 4 i32.add local.get $la memory.copy local.get $ptr i32.const 4 i32.add local.get $la i32.add local.get $b i32.const 4 i32.add local.get $lb memory.copy local.get $ptr)\n  (func $__string_eq (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $i i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb block (result i32) local.get $la local.get $lb i32.ne if (result i32) i32.const 0 else i32.const 0 local.set $i block (result i32) loop local.get $i local.get $la i32.ge_u if i32.const 1 br 2 end local.get $a i32.const 4 i32.add local.get $i i32.add i32.load8_u local.get $b i32.const 4 i32.add local.get $i i32.add i32.load8_u i32.ne if i32.const 0 br 3 end local.get $i i32.const 1 i32.add local.set $i br 0 end i32.const 1 end end end)\n  (func $__substring (param $s i32) (param $start i32) (param $end i32) (result i32) (local $new_len i32) (local $ptr i32) local.get $end local.get $start i32.sub local.set $new_len global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $new_len i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $new_len i32.store local.get $ptr i32.const 4 i32.add local.get $s i32.const 4 i32.add local.get $start i32.add local.get $new_len memory.copy local.get $ptr)\n  (func $__list_new (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr i32.const 0 i32.store local.get $ptr i32.const 4 i32.add i32.const 0 i32.store local.get $ptr i32.const 8 i32.add i32.const 0 i32.store local.get $ptr)\n  (func $__list_push (param $lst i32) (param $item i32) (result i32) (local $len i32) (local $new_data i32) (local $old_data i32) local.get $lst i32.load local.set $len global.get $__heap_ptr local.set $new_data global.get $__heap_ptr local.get $len i32.const 1 i32.add i32.const 4 i32.mul i32.add global.set $__heap_ptr local.get $lst i32.const 8 i32.add i32.load local.set $old_data local.get $new_data local.get $old_data local.get $len i32.const 4 i32.mul memory.copy local.get $new_data local.get $len i32.const 4 i32.mul i32.add local.get $item i32.store local.get $lst local.get $len i32.const 1 i32.add i32.store local.get $lst i32.const 8 i32.add local.get $new_data i32.store local.get $lst)\n  (func $__make_variant_0 (param $tag i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr)\n  (func $__make_variant_1 (param $tag i32) (param $payload i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr i32.const 4 i32.add local.get $payload i32.store local.get $ptr)\n  (func $__make_record_2 (param $f0 i32) (param $f1 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr)\n  (func $__make_record_3 (param $f0 i32) (param $f1 i32) (param $f2 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr i32.const 8 i32.add local.get $f2 i32.store local.get $ptr)\n")
 
 ; Compile source to WAT module
 (fn compile ((src string)) string
