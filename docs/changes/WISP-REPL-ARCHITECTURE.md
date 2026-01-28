@@ -11,9 +11,11 @@ A Theater-native REPL for Wisp that compiles S-expressions to WebAssembly compon
 - [x] Theater wrapper component implemented
 - [x] REPL Actor implemented with compile-and-run loop
 - [x] Component composition (wrapper + compiled wisp)
+- [x] End-to-end testing
+- [x] **Component loading with wit+ imports**
 - [ ] Theater spawn/await integration (future)
 - [ ] State persistence via Theater event chain (future)
-- [x] End-to-end testing
+- [ ] Remote Theater connections (future)
 
 ## Quick Start
 
@@ -41,6 +43,78 @@ defined function factorial
 wisp> (factorial (i32.const 5))
 120
 ```
+
+## Component Loading
+
+Load WASM components and call their exported functions from REPL expressions.
+
+**Syntax:**
+```lisp
+; Import an interface from a WASM component
+(import <interface> from "<path.wasm>")
+
+; Import from host runtime
+(import <interface> from host)
+```
+
+**Example session:**
+```
+wisp> (import colin:math/ops from "examples/math-lib-raw.wasm")
+loaded interface colin:math/ops from examples/math-lib-raw.wasm
+  exports: add, multiply, square
+
+wisp> (list)
+imports: 1 loaded
+  colin:math/ops from examples/math-lib-raw.wasm (3 exports)
+    add(s32, s32) -> s32
+    multiply(s32, s32) -> s32
+    square(s32) -> s32
+
+wisp> (add (i32.const 3) (i32.const 4))
+7
+
+wisp> (multiply (i32.const 6) (i32.const 7))
+42
+
+wisp> (square (i32.const 5))
+25
+
+wisp> (define x 8)
+wisp> (add (square x) (i32.const 1))
+65
+```
+
+**How it works:**
+1. Parse the import syntax and load the WASM component
+2. Extract function signatures using Wasmtime's type introspection
+3. When an expression uses an imported function, generate a stub for the compiler
+4. Post-process the generated WAT to inject proper import declarations
+5. Link the compiled expression to the imported component at instantiation
+
+### Host Imports
+
+Built-in host functions for debugging and development:
+
+```
+wisp> (import wisp:repl/debug from host)
+loaded interface wisp:repl/debug from host
+  exports: print-i32, print-i64, print-f32, print-f64
+
+wisp> (print-i32 (i32.const 42))
+[debug] 42
+42
+
+wisp> (import colin:math/ops from "examples/math-lib-raw.wasm")
+wisp> (print-i32 (add (i32.const 3) (i32.const 4)))
+[debug] 7
+7
+```
+
+The debug functions return the value they print, enabling easy chaining.
+
+**Current limitations:**
+- Only basic WASM types (i32, i64, f32, f64) are supported
+- Complex types (strings, lists, records) need CGRF encoding (not yet integrated)
 
 ## Key Insight
 
@@ -387,17 +461,32 @@ compiled: math.wasm (exports: double, quadruple)
 - [x] Implement component composition (wrapper + compiled)
 - [x] Implement eval flow (compile → assemble → execute)
 
-### Phase 4: Theater Integration (Future)
+### Phase 4: Component Loading ✓
+- [x] Parse wit+ style import syntax: `(import <interface> from <source>)`
+- [x] Handle `host` source - register as host-provided import
+- [x] Handle `"file.wasm"` source - load component, extract exports
+- [x] Extract function signatures via Wasmtime type introspection
+- [x] Track loaded interfaces in REPL state
+- [x] Link compiled expressions to loaded dependencies
+- [ ] Integrate with Composite's Graph ABI for complex types
+
+### Phase 5: Theater Integration (Future)
 - [ ] Add spawn capability to REPL actor
 - [ ] Implement await for eval result
 - [ ] Wire up message protocol
+- [ ] Actor listing and inspection
 
-### Phase 5: Build Mode (Future)
+### Phase 6: Build Mode (Future)
 - [ ] Implement `compile` command (unwrapped export)
 - [ ] Support selecting which functions to export
 - [ ] Test produced components work standalone
 
-### Phase 6: Persistence & Polish ✓ (Partial)
+### Phase 7: Distributed Theater (Future)
+- [ ] Connect to remote Theater runtimes
+- [ ] Cross-runtime actor references
+- [ ] Remote actor messaging
+
+### Phase 8: Persistence & Polish ✓ (Partial)
 - [ ] Implement state serialization
 - [ ] Integrate with Theater event chain
 - [ ] Test restart recovery
@@ -416,12 +505,14 @@ compiled: math.wasm (exports: double, quadruple)
 3. **Function redefinition**: Same question for functions
    - Leaning toward: allow redefinition
 
-4. **Imports**: How do we handle components that import from other components?
-   - Future work: `(import "math" double)` could load from compiled component
-
-5. **Memory/tables**: If we need memory operations, how does that work across evals?
+4. **Memory/tables**: If we need memory operations, how does that work across evals?
    - Each eval is fresh, no persistent memory
    - Could add `(define-memory ...)` that gets included in compilation
+
+5. **Package resolution**: How do we locate packages for imports?
+   - Direct file paths: `(import foo:bar/baz from "path/to/component.wasm")`
+   - Convention-based: `foo/bar.wasm` for `foo:bar/interface`
+   - Registry: Future package registry support
 
 ## Test Runtime
 
@@ -452,8 +543,9 @@ cargo run -p test-runtime -- --repl
 |---------|-------------|
 | `(define x 42)` | Define a variable (inlined into expressions) |
 | `(fn name ...)` | Define a function (included in compilation) |
-| `(list)` | Show current bindings and function count |
-| `(clear)` | Clear all bindings and functions |
+| `(import iface from src)` | Load a component and import its functions |
+| `(list)` | Show bindings, functions, and imports with signatures |
+| `(clear)` | Clear all bindings, functions, and imports |
 | `quit` / `exit` | Exit the REPL |
 | *expression* | Compile and evaluate, print result |
 
@@ -484,8 +576,107 @@ cargo run -p test-runtime -- --repl
 └─────────────────────────────────────────────────────────┘
 ```
 
+---
+
+## Future Vision: Theater Shell
+
+The REPL is designed to evolve into a **Theater Shell** - a full interactive environment for actor development and system management.
+
+### The Big Picture
+
+More than just a language REPL, the Theater Shell becomes the command center for:
+- **Developing** actors (write Wisp code, compile to WASM)
+- **Deploying** actors (spawn them into Theater)
+- **Monitoring** actors (see what's running, inspect state)
+- **Interacting** with actors (send messages, get responses)
+- **Managing** distributed systems (connect to remote Theaters)
+
+### Distributed Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              REPL Process                        │
+│  ┌───────────────────────────────────────────┐  │
+│  │         Local Theater Runtime              │  │
+│  │  ┌──────┐  ┌────────┐  ┌────────┐        │  │
+│  │  │ Shell│  │ Dev    │  │ Test   │        │  │
+│  │  │ Actor│  │ Actor  │  │ Actor  │        │  │
+│  │  └──┬───┘  └────────┘  └────────┘        │  │
+│  └─────┼─────────────────────────────────────┘  │
+└────────┼────────────────────────────────────────┘
+         │ (Theater protocol)
+         ▼
+┌─────────────────────────────────────────────────┐
+│           Remote Theater Runtime                 │
+│  ┌────────┐  ┌────────┐  ┌────────┐            │
+│  │Service │  │Database│  │ Worker │            │
+│  └────────┘  └────────┘  └────────┘            │
+└─────────────────────────────────────────────────┘
+```
+
+**Key insight**: The REPL runs its **own Theater runtime** (lightweight, in-process). Through actor interfaces, it can connect to and interact with actors on remote Theaters. This embraces a fully distributed model where the REPL is a first-class Theater citizen.
+
+### Component Loading (Next Step)
+
+Before full actor management, we need the ability to load and use components:
+
+```lisp
+; Import interface from host runtime
+(import theater:simple/runtime from host)
+
+; Import interface from a WASM component
+(import colin:math/division from "math.wasm")
+
+; Import specific function from interface
+(import colin:math/division.fraction from "math.wasm")
+
+; Use imported functions
+(log "Hello Theater!")
+(fraction (i32.const 1) (i32.const 3))
+```
+
+This syntax aligns with **Composite's wit+** - separating *what* interface to import from *where* to import it.
+
+### Future Commands
+
+```lisp
+; Actor lifecycle
+(spawn "path/to/actor.wisp")           ; Compile and spawn
+(spawn "path/to/actor.wasm")           ; Spawn pre-compiled
+(kill actor-id)                         ; Stop actor
+(actors)                                ; List running actors
+
+; Messaging
+(send actor-id '(message data))        ; Send message
+(ask actor-id '(request data))         ; Request/response
+
+; Inspection
+(actor-info actor-id)                  ; State and metadata
+(actor-events actor-id)                ; Event chain history
+(actor-state actor-id)                 ; Current state
+
+; Remote Theater connections
+(connect "theater://remote:8080")      ; Connect to remote Theater
+(disconnect remote-id)                  ; Disconnect
+(remotes)                               ; List connections
+```
+
+### Roadmap
+
+| Phase | Focus | Status |
+|-------|-------|--------|
+| 1 | Self-hosted compiler | ✅ Complete |
+| 2 | Basic REPL (eval, define, fn) | ✅ Complete |
+| 3 | Component loading (import from) | 🔜 Next |
+| 4 | Actor spawning & messaging | Future |
+| 5 | State inspection | Future |
+| 6 | Remote Theater connections | Future |
+
+---
+
 ## Related Documents
 
 - `docs/proposals/METAPROGRAMMING.md` - Macro system vision
 - `docs/changes/PHASE-1-MACROS.md` - Macro implementation (completed)
 - `docs/changes/SELF-HOSTED-COMPILER.md` - Self-hosted compiler (M1-M7)
+- Composite project - wit+ and Graph ABI for recursive types

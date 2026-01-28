@@ -4,7 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`wisp` is an educational Lisp-like compiler that compiles S-expressions to WebAssembly components. It generates WAT (WebAssembly text), WASM (binary), and WIT (WebAssembly Interface Types) files. The compiler exposes WebAssembly instructions directly - nearly 1:1 mapping to WASM. Supports scalar types (s32, s64, f32, f64), explicit WASM instructions, conditionals, let bindings, function calls, and component imports/exports.
+`wisp` is a Lisp-like compiler that compiles S-expressions to WebAssembly components. It generates WAT (WebAssembly text), WASM (binary), and WIT (WebAssembly Interface Types) files. The compiler exposes WebAssembly instructions directly - nearly 1:1 mapping to WASM. Supports scalar types (s32, s64, f32, f64), explicit WASM instructions, conditionals, let bindings, function calls, and component imports/exports.
+
+**The compiler is self-hosted** - a Wisp compiler written in Wisp, compiled to WASM, powers the interactive REPL.
+
+### Vision: Theater Shell
+
+The REPL is evolving into a **Theater Shell** - an interactive environment for developing and managing actors in the Theater runtime:
+
+- **Develop** actors (write Wisp code, compile to WASM)
+- **Deploy** actors (spawn them into Theater)
+- **Monitor** actors (inspect state, view event chains)
+- **Interact** with actors (send messages, receive responses)
+- **Connect** to remote Theaters (distributed actor management)
+
+The REPL runs its own lightweight Theater runtime and can communicate with actors on remote Theaters through standard actor interfaces. See [WISP-REPL-ARCHITECTURE.md](docs/changes/WISP-REPL-ARCHITECTURE.md) for details.
 
 ## Documentation Structure
 
@@ -27,6 +41,8 @@ The project uses a two-tier documentation system:
 - [WISP-REPL-ARCHITECTURE.md](docs/changes/WISP-REPL-ARCHITECTURE.md) - Interactive REPL powered by self-hosted compiler
 - [PHASE-1-MACROS.md](docs/changes/PHASE-1-MACROS.md) - Unhygienic macros with quasiquotation (complete)
 - [PHASE-0-WASM-INSTRUCTIONS.md](docs/changes/PHASE-0-WASM-INSTRUCTIONS.md) - Exposing core WASM instructions (complete)
+
+**Current focus**: Theater integration - actor spawning and messaging (see Theater Shell vision above)
 
 ## Common Commands
 
@@ -63,13 +79,26 @@ wisp> (fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (
 defined function factorial
 wisp> (factorial (i32.const 5))
 120
+wisp> (import colin:math/ops from "examples/math-lib-raw.wasm")
+loaded interface colin:math/ops from examples/math-lib-raw.wasm
+  exports: add, multiply, square
+wisp> (square (i32.const 7))
+49
+wisp> (import wisp:repl/debug from host)
+loaded interface wisp:repl/debug from host
+  exports: print-i32, print-i64, print-f32, print-f64
+wisp> (print-i32 (add (i32.const 3) (i32.const 4)))
+[debug] 7
+7
 ```
 
 **REPL commands:**
 - `(define x 42)` - define variable (inlined into expressions)
 - `(fn name ...)` - define function (included in compilation)
-- `(list)` - show current bindings and functions
-- `(clear)` - clear all definitions
+- `(import iface from "path.wasm")` - load component, import its functions
+- `(import iface from host)` - import host-provided interface
+- `(list)` - show bindings, functions, and imports with signatures
+- `(clear)` - clear all definitions and imports
 - `quit` - exit REPL
 
 ### Development
@@ -128,6 +157,24 @@ cargo run -- compile examples/prog.lisp
 - WIT world groups imports by module into interfaces
 - Component encoding uses wit-component crate with embedded metadata
 - Runtime dependency linking via `--dep module=path.wasm` creates namespace with exported functions
+
+### Composite Integration
+
+Wisp aligns with [Composite's](../composite) **wit+** - an extended WIT dialect that supports recursive types. This is essential for representing S-expressions and ASTs.
+
+**REPL import syntax** (planned):
+```lisp
+; Import interface from host
+(import theater:simple/runtime from host)
+
+; Import from WASM component
+(import colin:math/ops from "math.wasm")
+
+; Import specific function
+(import colin:math/ops.factorial from "math.wasm")
+```
+
+Key: Separate *what* to import (interface) from *where* (source).
 
 ## Language Features
 
