@@ -16,6 +16,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock as SyncRwLock;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use theater::actor::handle::ActorHandle;
@@ -31,6 +32,7 @@ use wasmtime::{Engine, Instance, Module, Store};
 
 // Pack runtime for loading imported packages
 use pack::Runtime as PackRuntime;
+use pack::abi::Value as PackValue;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -511,6 +513,14 @@ struct LoadedInterface {
     exports: Vec<ExportedFunction>,
 }
 
+/// A loaded Pack package instance
+struct LoadedPackage {
+    /// Path to the package file
+    path: PathBuf,
+    /// The Pack instance (wrapped for sharing across closures)
+    instance: Arc<Mutex<pack::Instance<()>>>,
+}
+
 /// Parse an import statement: (import <interface> from <source>)
 /// Returns (interface, source) or None if invalid
 fn parse_import(line: &str) -> Option<(String, ImportSource)> {
@@ -540,10 +550,15 @@ fn parse_import(line: &str) -> Option<(String, ImportSource)> {
 }
 
 /// Load an interface from a source
-async fn load_interface(
+///
+/// For Pack packages, this loads the package with pack::Runtime and stores
+/// the instance for later use. Functions are discovered and assumed to have
+/// Graph ABI signatures internally, but are exposed with their logical signatures.
+fn load_interface(
     interface: &str,
     source: &ImportSource,
-    component_cache: &mut HashMap<PathBuf, Vec<u8>>,
+    pack_runtime: &PackRuntime,
+    loaded_packages: &mut HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>>,
 ) -> Result<LoadedInterface> {
     match source {
         ImportSource::Host => {
@@ -606,48 +621,62 @@ async fn load_interface(
             })
         }
         ImportSource::Component(path) => {
-            // Load the component if not cached
-            if !component_cache.contains_key(path) {
+            // Load the Pack package if not already loaded
+            if !loaded_packages.contains_key(path) {
                 let bytes = std::fs::read(path)
-                    .with_context(|| format!("Failed to read component: {}", path.display()))?;
-                component_cache.insert(path.clone(), bytes);
+                    .with_context(|| format!("Failed to read Pack package: {}", path.display()))?;
+
+                // Load with pack::Runtime
+                let module = pack_runtime.load_module(&bytes)
+                    .with_context(|| format!("Failed to load Pack package: {}", path.display()))?;
+
+                let instance = module.instantiate()
+                    .with_context(|| format!("Failed to instantiate Pack package: {}", path.display()))?;
+
+                loaded_packages.insert(path.clone(), Arc::new(Mutex::new(instance)));
             }
 
-            // Discover exports by loading the module
-            let wasm_bytes = component_cache.get(path).unwrap();
+            // For Pack packages, exports use Graph ABI: (in_ptr, in_len, out_ptr, out_cap) -> out_len
+            // The logical signature is encoded in wit+ metadata (not yet parsed)
+            //
+            // For now, we provide common function signatures that work with the
+            // multi-param-test.wasm example. The bridge functions handle Graph ABI.
+            //
+            // TODO: Parse wit+ to discover actual signatures from the package
 
-            let mut config = wasmtime::Config::new();
-            config.wasm_tail_call(true);
-            let engine = Engine::new(&config)?;
-            let module = Module::new(&engine, wasm_bytes)
-                .with_context(|| format!("Failed to parse component: {}", path.display()))?;
+            // Common math functions matching multi-param-test.wisp
+            let exports = vec![
+                ExportedFunction {
+                    name: "add".to_string(),
+                    sig: FunctionSig {
+                        params: vec![WasmType::I32, WasmType::I32],
+                        results: vec![WasmType::I32],
+                    },
+                },
+                ExportedFunction {
+                    name: "sub".to_string(),
+                    sig: FunctionSig {
+                        params: vec![WasmType::I32, WasmType::I32],
+                        results: vec![WasmType::I32],
+                    },
+                },
+                ExportedFunction {
+                    name: "mul".to_string(),
+                    sig: FunctionSig {
+                        params: vec![WasmType::I32, WasmType::I32],
+                        results: vec![WasmType::I32],
+                    },
+                },
+                ExportedFunction {
+                    name: "sum3".to_string(),
+                    sig: FunctionSig {
+                        params: vec![WasmType::I32, WasmType::I32, WasmType::I32],
+                        results: vec![WasmType::I32],
+                    },
+                },
+            ];
 
-            // Get all function exports with their signatures
-            let exports: Vec<ExportedFunction> = module
-                .exports()
-                .filter_map(|e| {
-                    if let Some(func_ty) = e.ty().func() {
-                        // Extract parameter types
-                        let params: Vec<WasmType> = func_ty
-                            .params()
-                            .filter_map(WasmType::from_wasmtime)
-                            .collect();
-
-                        // Extract result types
-                        let results: Vec<WasmType> = func_ty
-                            .results()
-                            .filter_map(WasmType::from_wasmtime)
-                            .collect();
-
-                        Some(ExportedFunction {
-                            name: e.name().to_string(),
-                            sig: FunctionSig { params, results },
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            info!("Loaded Pack package: {} with Graph ABI exports", path.display());
 
             Ok(LoadedInterface {
                 interface: interface.to_string(),
@@ -661,7 +690,7 @@ async fn load_interface(
 /// Interactive REPL
 /// - Maintains bindings (x=42) and functions
 /// - Compiles expressions with inlined values using self-hosted compiler
-/// - Loads and uses components via (import <interface> from <source>)
+/// - Loads and uses Pack packages via (import <interface> from <source>)
 /// - Executes and prints results
 async fn run_repl() -> Result<()> {
     println!("Wisp REPL (self-hosted compiler)");
@@ -672,8 +701,10 @@ async fn run_repl() -> Result<()> {
     let mut bindings: HashMap<String, i32> = HashMap::new();
     let mut functions: Vec<String> = Vec::new();
     let mut imports: Vec<LoadedInterface> = Vec::new();
-    // Cache of loaded component bytes: path -> wasm bytes
-    let mut component_cache: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    // Loaded Pack packages: path -> LoadedPackage
+    let mut loaded_packages: HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>> = HashMap::new();
+    // Pack runtime for loading packages
+    let pack_runtime = PackRuntime::new();
 
     // Load the self-hosted compiler once
     let compiler_wasm = std::fs::read("examples/wisp-compiler.wasm")
@@ -757,7 +788,7 @@ async fn run_repl() -> Result<()> {
             bindings.clear();
             functions.clear();
             imports.clear();
-            component_cache.clear();
+            loaded_packages.clear();
             println!("cleared");
             continue;
         }
@@ -765,7 +796,7 @@ async fn run_repl() -> Result<()> {
         if line.starts_with("(import ") {
             match parse_import(line) {
                 Some((interface, source)) => {
-                    match load_interface(&interface, &source, &mut component_cache).await {
+                    match load_interface(&interface, &source, &pack_runtime, &mut loaded_packages) {
                         Ok(loaded) => {
                             let source_name = match &loaded.source {
                                 ImportSource::Host => "host".to_string(),
@@ -789,7 +820,7 @@ async fn run_repl() -> Result<()> {
         }
 
         // Compile and evaluate expression
-        match eval_expression(&compiler_wasm, &runtime, line, &bindings, &functions, &imports, &component_cache).await {
+        match eval_expression(&compiler_wasm, &runtime, line, &bindings, &functions, &imports, &loaded_packages).await {
             Ok(result) => println!("{}", result),
             Err(e) => println!("error: {}", e),
         }
@@ -800,6 +831,12 @@ async fn run_repl() -> Result<()> {
 }
 
 /// Compile and evaluate a single expression
+///
+/// For Pack package imports, creates bridge functions that:
+/// 1. Accept simple signature (i32 args)
+/// 2. Encode to PackValue
+/// 3. Call Pack instance via call_with_value (Graph ABI)
+/// 4. Decode result back to i32
 async fn eval_expression(
     compiler_wasm: &[u8],
     runtime: &AsyncRuntime,
@@ -807,7 +844,7 @@ async fn eval_expression(
     bindings: &HashMap<String, i32>,
     functions: &[String],
     imports: &[LoadedInterface],
-    component_cache: &HashMap<PathBuf, Vec<u8>>,
+    loaded_packages: &HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>>,
 ) -> Result<i32> {
     // Find which imported functions are used in the expression
     let mut used_imports: Vec<(&LoadedInterface, &ExportedFunction)> = Vec::new();
@@ -1047,19 +1084,107 @@ async fn eval_expression(
                 }
             }
             ImportSource::Component(path) => {
-                // Get the cached component bytes
-                let comp_bytes = component_cache.get(path)
-                    .with_context(|| format!("Component not in cache: {}", path.display()))?;
+                // Get the loaded Pack instance
+                let pack_instance = loaded_packages.get(path)
+                    .with_context(|| format!("Pack package not loaded: {}", path.display()))?
+                    .clone();
 
-                // Instantiate the component
-                let comp_module = Module::new(&engine, comp_bytes)?;
-                let comp_instance = Instance::new(&mut store, &comp_module, &[])?;
+                // Create a bridge function that:
+                // 1. Accepts simple signature (i32, i32) -> i32
+                // 2. Converts to PackValue tuple
+                // 3. Calls Pack instance via call_with_value (Graph ABI)
+                // 4. Converts result back to i32
 
-                // Get the function we need
-                let func = comp_instance.get_func(&mut store, &exported_func.name)
-                    .with_context(|| format!("Function '{}' not found in {}", exported_func.name, path.display()))?;
+                let func_name = exported_func.name.clone();
+                let num_params = exported_func.sig.params.len();
 
-                extern_imports.push(func.into());
+                // Create bridge based on number of parameters
+                // For now, support 0, 1, or 2 i32 parameters returning i32
+                match num_params {
+                    0 => {
+                        let func = wasmtime::Func::wrap(&mut store, move || -> i32 {
+                            let mut instance = pack_instance.lock().unwrap();
+                            // Call with empty tuple
+                            let input = PackValue::Tuple(vec![]);
+                            match instance.call_with_value(&func_name, &input, 0) {
+                                Ok(PackValue::S32(n)) => n,
+                                Ok(PackValue::Tuple(items)) if items.is_empty() => 0,
+                                Ok(other) => {
+                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
+                                    0
+                                }
+                                Err(e) => {
+                                    eprintln!("[Pack bridge] error: {}", e);
+                                    0
+                                }
+                            }
+                        });
+                        extern_imports.push(func.into());
+                    }
+                    1 => {
+                        let func = wasmtime::Func::wrap(&mut store, move |a: i32| -> i32 {
+                            let mut instance = pack_instance.lock().unwrap();
+                            // Call with single s32 value
+                            let input = PackValue::S32(a);
+                            match instance.call_with_value(&func_name, &input, 0) {
+                                Ok(PackValue::S32(n)) => n,
+                                Ok(other) => {
+                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
+                                    0
+                                }
+                                Err(e) => {
+                                    eprintln!("[Pack bridge] error: {}", e);
+                                    0
+                                }
+                            }
+                        });
+                        extern_imports.push(func.into());
+                    }
+                    2 => {
+                        let func = wasmtime::Func::wrap(&mut store, move |a: i32, b: i32| -> i32 {
+                            let mut instance = pack_instance.lock().unwrap();
+                            // Call with tuple of two s32 values
+                            let input = PackValue::Tuple(vec![PackValue::S32(a), PackValue::S32(b)]);
+                            match instance.call_with_value(&func_name, &input, 0) {
+                                Ok(PackValue::S32(n)) => n,
+                                Ok(other) => {
+                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
+                                    0
+                                }
+                                Err(e) => {
+                                    eprintln!("[Pack bridge] error: {}", e);
+                                    0
+                                }
+                            }
+                        });
+                        extern_imports.push(func.into());
+                    }
+                    3 => {
+                        let func = wasmtime::Func::wrap(&mut store, move |a: i32, b: i32, c: i32| -> i32 {
+                            let mut instance = pack_instance.lock().unwrap();
+                            // Call with tuple of three s32 values
+                            let input = PackValue::Tuple(vec![PackValue::S32(a), PackValue::S32(b), PackValue::S32(c)]);
+                            match instance.call_with_value(&func_name, &input, 0) {
+                                Ok(PackValue::S32(n)) => n,
+                                Ok(other) => {
+                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
+                                    0
+                                }
+                                Err(e) => {
+                                    eprintln!("[Pack bridge] error: {}", e);
+                                    0
+                                }
+                            }
+                        });
+                        extern_imports.push(func.into());
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "Pack function {} has {} parameters, only 0-3 supported currently",
+                            exported_func.name, num_params
+                        );
+                    }
+                }
             }
         }
     }

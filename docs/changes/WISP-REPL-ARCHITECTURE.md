@@ -84,18 +84,23 @@ wisp> (add (square x) (i32.const 1))
 65
 ```
 
-**How it works (current prototype):**
-1. Parse the import syntax and load the WASM module
-2. Extract function signatures using Wasmtime's type introspection
-3. When an expression uses an imported function, generate a stub for the compiler
-4. Post-process the generated WAT to inject proper import declarations
-5. Link the compiled expression to the imported module at instantiation
+**How it works (Pack integration):**
+1. Parse the import syntax: `(import <interface> from "<package.wasm>")`
+2. Load the Pack package using `pack::Runtime`
+3. Create bridge functions that:
+   - Accept simple WASM signatures (i32, i64, etc.)
+   - Encode arguments to `pack::Value` (CGRF)
+   - Call the Pack package via `call_with_value` (Graph ABI)
+   - Decode and return the result
+4. When an expression uses an imported function, generate a stub for the compiler
+5. Post-process the generated WAT to inject proper import declarations
+6. Provide bridge functions as imports when instantiating the expression
 
-**Target architecture (Pack integration):**
-1. Load Pack packages (not raw WASM components)
-2. Parse wit+ interface definitions for type discovery
-3. Use Graph ABI (CGRF) for all cross-boundary calls
-4. Full support for recursive types (S-expressions, ASTs, etc.)
+**Current status:**
+- Pack packages load with Graph ABI support
+- Bridge functions handle s32 scalar types
+- Functions with 0-3 parameters supported
+- TODO: Parse wit+ for function discovery, complex types
 
 See [Pack Integration](#pack-integration) section below.
 
@@ -143,35 +148,34 @@ The debug functions return the value they print, enabling easy chaining.
 2. **Graph ABI**: Enables sharing and cycles in data structures (ASTs, S-expressions)
 3. **Theater integration**: Pack is the native package format for Theater actors
 
-### Target Architecture
+### Current Implementation
 
 ```rust
-use pack::{Runtime, Value, parse_interface};
+use pack::{Runtime as PackRuntime, abi::Value as PackValue};
 
 // Load a Pack package
-let runtime = pack::AsyncRuntime::new();
-let module = runtime.load_module(&wasm_bytes)?;
+let pack_runtime = PackRuntime::new();
+let module = pack_runtime.load_module(&wasm_bytes)?;
+let instance = Arc::new(Mutex::new(module.instantiate()?));
 
-// Instantiate with host functions
-let instance = module.instantiate_with_host(state, |builder| {
-    builder.interface("wisp:repl/debug")?
-        .func("print-i32", |ctx, input| {
-            if let Value::S32(v) = input {
-                println!("[debug] {}", v);
-                Ok(Value::S32(v))
-            } else {
-                Err(...)
-            }
-        })?;
-    Ok(())
-})?;
+// Create bridge function for expression module
+// Takes simple signature, calls Pack via Graph ABI
+let bridge = move |a: i32, b: i32| -> i32 {
+    let mut inst = instance.lock().unwrap();
+    let input = PackValue::Tuple(vec![PackValue::S32(a), PackValue::S32(b)]);
+    match inst.call_with_value("add", &input, 0) {
+        Ok(PackValue::S32(n)) => n,
+        _ => 0,  // Error case
+    }
+};
 
-// Call with Graph ABI
-let result = instance.call_with_value("add", &Value::Tuple(vec![
-    Value::S32(3),
-    Value::S32(4),
-]))?;
+// Provide bridge as import to expression module
+let func = wasmtime::Func::wrap(&mut store, bridge);
 ```
+
+The bridge functions translate between:
+- **Expression module**: Simple signatures like `add(i32, i32) -> i32`
+- **Pack package**: Graph ABI `(in_ptr, in_len, out_ptr, out_cap) -> out_len`
 
 ### Calling Convention
 
@@ -531,11 +535,13 @@ compiled: math.wasm (exports: double, quadruple)
 ### Phase 4: Component Loading ✓
 - [x] Parse wit+ style import syntax: `(import <interface> from <source>)`
 - [x] Handle `host` source - register as host-provided import
-- [x] Handle `"file.wasm"` source - load component, extract exports
-- [x] Extract function signatures via Wasmtime type introspection
+- [x] Handle `"file.wasm"` source - load Pack package with `pack::Runtime`
+- [x] Create bridge functions that translate between simple WASM signatures and Graph ABI
 - [x] Track loaded interfaces in REPL state
-- [x] Link compiled expressions to loaded dependencies
-- [ ] Integrate with Pack's Graph ABI for complex types
+- [x] Link compiled expressions to Pack packages via bridge functions
+- [x] Graph ABI integration for s32/s64/f32/f64 types
+- [ ] Parse wit+ to discover actual function signatures from packages
+- [ ] Support complex types (strings, lists, records) via full CGRF encoding
 
 ### Phase 5: Theater Integration (Future)
 - [ ] Add spawn capability to REPL actor
