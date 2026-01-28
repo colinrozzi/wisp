@@ -32,7 +32,6 @@ use wasmtime::{Engine, Instance, Module, Store};
 
 // Pack runtime for loading imported packages
 use pack::Runtime as PackRuntime;
-use pack::abi::Value as PackValue;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -521,6 +520,169 @@ struct LoadedPackage {
     instance: Arc<Mutex<pack::Instance<()>>>,
 }
 
+// CGRF v2 constants
+const CGRF_MAGIC: u32 = 0x46524743; // "CGRF" in little-endian
+const CGRF_VERSION: u16 = 2;
+
+/// Generate a CGRF wrapper function for a Pack import.
+///
+/// The wrapper has the "simple" signature (i32 params, i32 result) but internally:
+/// 1. Encodes arguments to CGRF in a buffer
+/// 2. Calls the raw import (which has Graph ABI signature)
+/// 3. Decodes the result from CGRF
+fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
+    let mut out = String::new();
+    let wrapper_name = &func.name;
+    let raw_name = format!("$__raw_{}", func.name);
+
+    // Buffer locations (fixed offsets in linear memory)
+    let in_buf: i32 = 0x10000;  // Input buffer at 64KB
+    let out_buf: i32 = 0x11000; // Output buffer at 68KB
+    let buf_cap: i32 = 0x1000;  // 4KB capacity
+
+    // Start function with original signature
+    out.push_str(&format!("  (func ${} ", wrapper_name));
+    for (i, ty) in func.sig.params.iter().enumerate() {
+        out.push_str(&format!("(param $p{} {}) ", i, ty.to_wat()));
+    }
+
+    let result_type = func.sig.results.first().map(|t| t.to_wat()).unwrap_or("i32");
+    out.push_str(&format!("(result {})\n", result_type));
+
+    // Local variables
+    out.push_str("    (local $in_len i32)\n");
+    out.push_str("    (local $out_len i32)\n");
+
+    // Encode arguments to CGRF
+    let num_params = func.sig.params.len();
+    if num_params == 0 {
+        // Empty tuple
+        out.push_str(&format!("    ;; Encode empty tuple\n"));
+        out.push_str(&format!("    i32.const {}\n", in_buf));
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 4));
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 6));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 8));
+        out.push_str("    i32.const 1\n"); // 1 node
+        out.push_str("    i32.store\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 12));
+        out.push_str("    i32.const 0\n"); // root index
+        out.push_str("    i32.store\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 16));
+        out.push_str("    i32.const 8\n"); // Tuple type tag
+        out.push_str("    i32.store8\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 17));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 18));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 20));
+        out.push_str("    i32.const 0\n"); // payload len
+        out.push_str("    i32.store\n");
+        out.push_str("    i32.const 24\n");
+        out.push_str("    local.set $in_len\n");
+    } else {
+        // Tuple of s32 values
+        // Header: 16 bytes, each node: 8 bytes header + payload
+        // For tuple of N s32s: header(16) + tuple_node(8 + 4*N) + N*s32_nodes(8+4 each)
+        let tuple_payload = 4 * num_params; // 4 bytes per child index
+        let s32_node_size = 12; // 8 byte header + 4 byte payload
+        let total_nodes = 1 + num_params; // tuple + N s32 nodes
+        let total_size = 16 + 8 + tuple_payload + num_params * s32_node_size;
+
+        out.push_str(&format!("    ;; Encode tuple of {} s32 values\n", num_params));
+
+        // CGRF header
+        out.push_str(&format!("    i32.const {}\n", in_buf));
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 4));
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 6));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 8));
+        out.push_str(&format!("    i32.const {}\n", total_nodes));
+        out.push_str("    i32.store\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 12));
+        out.push_str("    i32.const 0\n"); // root = tuple node at index 0
+        out.push_str("    i32.store\n");
+
+        // Tuple node at offset 16
+        out.push_str(&format!("    i32.const {}\n", in_buf + 16));
+        out.push_str("    i32.const 8\n"); // Tuple type tag
+        out.push_str("    i32.store8\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 17));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 18));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 20));
+        out.push_str(&format!("    i32.const {}\n", tuple_payload));
+        out.push_str("    i32.store\n");
+
+        // Tuple child indices (at offset 24)
+        for i in 0..num_params {
+            out.push_str(&format!("    i32.const {}\n", in_buf + 24 + (i as i32 * 4)));
+            out.push_str(&format!("    i32.const {}\n", i + 1)); // child node indices start at 1
+            out.push_str("    i32.store\n");
+        }
+
+        // S32 nodes (after tuple node)
+        let s32_nodes_start = in_buf + 24 + (num_params as i32 * 4);
+        for i in 0..num_params {
+            let node_offset = s32_nodes_start + (i as i32 * s32_node_size as i32);
+            // Node header
+            out.push_str(&format!("    i32.const {}\n", node_offset));
+            out.push_str("    i32.const 2\n"); // S32 type tag
+            out.push_str("    i32.store8\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset + 1));
+            out.push_str("    i32.const 0\n");
+            out.push_str("    i32.store8\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset + 2));
+            out.push_str("    i32.const 0\n");
+            out.push_str("    i32.store16\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset + 4));
+            out.push_str("    i32.const 4\n"); // payload len = 4 bytes
+            out.push_str("    i32.store\n");
+            // Value
+            out.push_str(&format!("    i32.const {}\n", node_offset + 8));
+            out.push_str(&format!("    local.get $p{}\n", i));
+            out.push_str("    i32.store\n");
+        }
+
+        out.push_str(&format!("    i32.const {}\n", total_size));
+        out.push_str("    local.set $in_len\n");
+    }
+
+    // Call raw import with Graph ABI
+    out.push_str("    ;; Call raw import\n");
+    out.push_str(&format!("    i32.const {}\n", in_buf));
+    out.push_str("    local.get $in_len\n");
+    out.push_str(&format!("    i32.const {}\n", out_buf));
+    out.push_str(&format!("    i32.const {}\n", buf_cap));
+    out.push_str(&format!("    call {}\n", raw_name));
+    out.push_str("    local.set $out_len\n");
+
+    // Decode result - read s32 from CGRF output
+    // CGRF format: header(16) + node header(8) + payload
+    // For s32: value is at out_buf + 24
+    out.push_str("    ;; Decode s32 result\n");
+    out.push_str(&format!("    i32.const {}\n", out_buf + 24));
+    out.push_str("    i32.load\n");
+
+    out.push_str("  )\n");
+    out
+}
+
 /// Parse an import statement: (import <interface> from <source>)
 /// Returns (interface, source) or None if invalid
 fn parse_import(line: &str) -> Option<(String, ImportSource)> {
@@ -985,33 +1147,52 @@ async fn eval_expression(
             })
             .collect();
 
-        // Generate import declarations with correct signatures
+        // Generate Graph ABI imports and CGRF wrapper functions
         let mut import_wat = String::new();
+        let mut wrapper_wat = String::new();
+
         for (imp, func) in &used_imports {
-            // Generate param types
-            let params: Vec<&str> = func.sig.params.iter()
-                .map(|t| t.to_wat())
-                .collect();
-            let params_str = params.iter()
-                .map(|t| format!("(param {})", t))
-                .collect::<Vec<_>>()
-                .join(" ");
+            match &imp.source {
+                ImportSource::Host => {
+                    // Host functions use simple signatures (handled in instantiation)
+                    let params: Vec<&str> = func.sig.params.iter()
+                        .map(|t| t.to_wat())
+                        .collect();
+                    let params_str = params.iter()
+                        .map(|t| format!("(param {})", t))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let results_str = func.sig.results.iter()
+                        .map(|t| format!("(result {})", t.to_wat()))
+                        .collect::<Vec<_>>()
+                        .join(" ");
 
-            // Generate result type
-            let results_str = func.sig.results.iter()
-                .map(|t| format!("(result {})", t.to_wat()))
-                .collect::<Vec<_>>()
-                .join(" ");
+                    import_wat.push_str(&format!(
+                        "  (import \"{}\" \"{}\" (func ${} {} {}))\n",
+                        imp.interface, func.name, func.name, params_str, results_str
+                    ));
+                }
+                ImportSource::Component(_) => {
+                    // Pack packages use Graph ABI: generate raw import + wrapper
+                    // Raw import with Graph ABI signature
+                    import_wat.push_str(&format!(
+                        "  (import \"{}\" \"{}\" (func $__raw_{} (param i32 i32 i32 i32) (result i32)))\n",
+                        imp.interface, func.name, func.name
+                    ));
 
-            import_wat.push_str(&format!(
-                "  (import \"{}\" \"{}\" (func ${} {} {}))\n",
-                imp.interface, func.name, func.name, params_str, results_str
-            ));
+                    // Generate wrapper function that encodes args and decodes result
+                    wrapper_wat.push_str(&generate_cgrf_wrapper(func));
+                }
+            }
         }
 
-        // Build result, inserting imports after (module
+        // Build result, inserting imports after (module and wrappers before closing )
         let mut result = String::new();
         for line in lines {
+            if line.trim() == ")" && !wrapper_wat.is_empty() {
+                // Insert wrappers before final closing paren
+                result.push_str(&wrapper_wat);
+            }
             result.push_str(line);
             result.push('\n');
             if line.trim().starts_with("(module") {
@@ -1089,102 +1270,63 @@ async fn eval_expression(
                     .with_context(|| format!("Pack package not loaded: {}", path.display()))?
                     .clone();
 
-                // Create a bridge function that:
-                // 1. Accepts simple signature (i32, i32) -> i32
-                // 2. Converts to PackValue tuple
-                // 3. Calls Pack instance via call_with_value (Graph ABI)
-                // 4. Converts result back to i32
+                // Create a Graph ABI bridge function that:
+                // 1. Accepts Graph ABI signature (in_ptr, in_len, out_ptr, out_cap) -> out_len
+                // 2. Reads CGRF from expression's memory
+                // 3. Decodes to pack::Value
+                // 4. Calls Pack instance via call_with_value
+                // 5. Encodes result back to CGRF
+                // 6. Writes to expression's output buffer
+                // 7. Returns bytes written
 
                 let func_name = exported_func.name.clone();
-                let num_params = exported_func.sig.params.len();
 
-                // Create bridge based on number of parameters
-                // For now, support 0, 1, or 2 i32 parameters returning i32
-                match num_params {
-                    0 => {
-                        let func = wasmtime::Func::wrap(&mut store, move || -> i32 {
-                            let mut instance = pack_instance.lock().unwrap();
-                            // Call with empty tuple
-                            let input = PackValue::Tuple(vec![]);
-                            match instance.call_with_value(&func_name, &input, 0) {
-                                Ok(PackValue::S32(n)) => n,
-                                Ok(PackValue::Tuple(items)) if items.is_empty() => 0,
-                                Ok(other) => {
-                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
-                                    0
-                                }
-                                Err(e) => {
-                                    eprintln!("[Pack bridge] error: {}", e);
-                                    0
-                                }
-                            }
-                        });
-                        extern_imports.push(func.into());
-                    }
-                    1 => {
-                        let func = wasmtime::Func::wrap(&mut store, move |a: i32| -> i32 {
-                            let mut instance = pack_instance.lock().unwrap();
-                            // Call with single s32 value
-                            let input = PackValue::S32(a);
-                            match instance.call_with_value(&func_name, &input, 0) {
-                                Ok(PackValue::S32(n)) => n,
-                                Ok(other) => {
-                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
-                                    0
-                                }
-                                Err(e) => {
-                                    eprintln!("[Pack bridge] error: {}", e);
-                                    0
-                                }
-                            }
-                        });
-                        extern_imports.push(func.into());
-                    }
-                    2 => {
-                        let func = wasmtime::Func::wrap(&mut store, move |a: i32, b: i32| -> i32 {
-                            let mut instance = pack_instance.lock().unwrap();
-                            // Call with tuple of two s32 values
-                            let input = PackValue::Tuple(vec![PackValue::S32(a), PackValue::S32(b)]);
-                            match instance.call_with_value(&func_name, &input, 0) {
-                                Ok(PackValue::S32(n)) => n,
-                                Ok(other) => {
-                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
-                                    0
-                                }
-                                Err(e) => {
-                                    eprintln!("[Pack bridge] error: {}", e);
-                                    0
-                                }
-                            }
-                        });
-                        extern_imports.push(func.into());
-                    }
-                    3 => {
-                        let func = wasmtime::Func::wrap(&mut store, move |a: i32, b: i32, c: i32| -> i32 {
-                            let mut instance = pack_instance.lock().unwrap();
-                            // Call with tuple of three s32 values
-                            let input = PackValue::Tuple(vec![PackValue::S32(a), PackValue::S32(b), PackValue::S32(c)]);
-                            match instance.call_with_value(&func_name, &input, 0) {
-                                Ok(PackValue::S32(n)) => n,
-                                Ok(other) => {
-                                    eprintln!("[Pack bridge] unexpected result: {:?}", other);
-                                    0
-                                }
-                                Err(e) => {
-                                    eprintln!("[Pack bridge] error: {}", e);
-                                    0
-                                }
-                            }
-                        });
-                        extern_imports.push(func.into());
-                    }
-                    _ => {
-                        anyhow::bail!(
-                            "Pack function {} has {} parameters, only 0-3 supported currently",
-                            exported_func.name, num_params
-                        );
-                    }
-                }
+                let func = wasmtime::Func::new(
+                    &mut store,
+                    wasmtime::FuncType::new(
+                        &engine,
+                        [wasmtime::ValType::I32, wasmtime::ValType::I32, wasmtime::ValType::I32, wasmtime::ValType::I32],
+                        [wasmtime::ValType::I32],
+                    ),
+                    move |mut caller: wasmtime::Caller<'_, ()>, params: &[wasmtime::Val], results: &mut [wasmtime::Val]| {
+                        let in_ptr = params[0].unwrap_i32() as usize;
+                        let in_len = params[1].unwrap_i32() as usize;
+                        let out_ptr = params[2].unwrap_i32() as usize;
+                        let _out_cap = params[3].unwrap_i32() as usize;
+
+                        // Get memory from the expression module
+                        let memory = caller.get_export("memory")
+                            .and_then(|e| e.into_memory())
+                            .ok_or_else(|| wasmtime::Error::msg("no memory export"))?;
+
+                        // Read CGRF input from expression's memory
+                        let mut in_buf = vec![0u8; in_len];
+                        memory.read(&caller, in_ptr, &mut in_buf)
+                            .map_err(|e| wasmtime::Error::msg(format!("failed to read input: {}", e)))?;
+
+                        // Decode CGRF to pack::Value
+                        let input = pack::decode(&in_buf)
+                            .map_err(|e| wasmtime::Error::msg(format!("failed to decode CGRF: {}", e)))?;
+
+                        // Call Pack instance via call_with_value
+                        let mut instance = pack_instance.lock().unwrap();
+                        let output = instance.call_with_value(&func_name, &input, 0)
+                            .map_err(|e| wasmtime::Error::msg(format!("Pack call failed: {}", e)))?;
+
+                        // Encode result back to CGRF
+                        let out_buf = pack::encode(&output)
+                            .map_err(|e| wasmtime::Error::msg(format!("failed to encode result: {}", e)))?;
+
+                        // Write to expression's output buffer
+                        memory.write(&mut caller, out_ptr, &out_buf)
+                            .map_err(|e| wasmtime::Error::msg(format!("failed to write output: {}", e)))?;
+
+                        results[0] = wasmtime::Val::I32(out_buf.len() as i32);
+                        Ok(())
+                    },
+                );
+
+                extern_imports.push(func.into());
             }
         }
     }

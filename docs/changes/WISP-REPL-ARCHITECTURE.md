@@ -97,10 +97,11 @@ wisp> (add (square x) (i32.const 1))
 6. Provide bridge functions as imports when instantiating the expression
 
 **Current status:**
-- Pack packages load with Graph ABI support
-- Bridge functions handle s32 scalar types
-- Functions with 0-3 parameters supported
-- TODO: Parse wit+ for function discovery, complex types
+- Pack packages load with full Graph ABI support
+- CGRF encoding/decoding in WAT wrappers
+- Runtime bridge handles memory transfer between modules
+- All types supported via pack::encode/decode
+- TODO: Parse wit+ for automatic function signature discovery
 
 See [Pack Integration](#pack-integration) section below.
 
@@ -125,9 +126,10 @@ wisp> (print-i32 (add (i32.const 3) (i32.const 4)))
 
 The debug functions return the value they print, enabling easy chaining.
 
-**Current limitations:**
-- Only basic WASM types (i32, i64, f32, f64) are supported
-- Complex types (strings, lists, records) need Pack/Graph ABI integration
+**Current capabilities:**
+- Full CGRF encoding for Pack package imports
+- All types supported via pack::encode/decode (including strings, lists, records)
+- Host debug functions (print-i32, etc.) use simple signatures
 
 ## Pack Integration
 
@@ -150,32 +152,65 @@ The debug functions return the value they print, enabling easy chaining.
 
 ### Current Implementation
 
-```rust
-use pack::{Runtime as PackRuntime, abi::Value as PackValue};
+The REPL uses full CGRF encoding for all Pack package calls:
 
-// Load a Pack package
-let pack_runtime = PackRuntime::new();
-let module = pack_runtime.load_module(&wasm_bytes)?;
-let instance = Arc::new(Mutex::new(module.instantiate()?));
+**1. WAT Generation (Expression Module):**
+```wat
+;; Raw import with Graph ABI signature
+(import "interface" "add" (func $__raw_add (param i32 i32 i32 i32) (result i32)))
 
-// Create bridge function for expression module
-// Takes simple signature, calls Pack via Graph ABI
-let bridge = move |a: i32, b: i32| -> i32 {
-    let mut inst = instance.lock().unwrap();
-    let input = PackValue::Tuple(vec![PackValue::S32(a), PackValue::S32(b)]);
-    match inst.call_with_value("add", &input, 0) {
-        Ok(PackValue::S32(n)) => n,
-        _ => 0,  // Error case
-    }
-};
+;; Wrapper function with original signature
+(func $add (param $p0 i32) (param $p1 i32) (result i32)
+  ;; Encode args to CGRF tuple at in_buf
+  ;; ... CGRF header + tuple node + s32 nodes ...
 
-// Provide bridge as import to expression module
-let func = wasmtime::Func::wrap(&mut store, bridge);
+  ;; Call raw import with Graph ABI
+  i32.const 0x10000  ;; in_buf
+  local.get $in_len
+  i32.const 0x11000  ;; out_buf
+  i32.const 0x1000   ;; out_cap
+  call $__raw_add
+
+  ;; Decode s32 result from CGRF output
+  i32.const 0x11018  ;; out_buf + 24 (value offset)
+  i32.load
+)
 ```
 
-The bridge functions translate between:
-- **Expression module**: Simple signatures like `add(i32, i32) -> i32`
-- **Pack package**: Graph ABI `(in_ptr, in_len, out_ptr, out_cap) -> out_len`
+**2. Runtime Bridge (Rust):**
+```rust
+// Graph ABI bridge: reads/writes CGRF between expression and Pack memories
+wasmtime::Func::new(&mut store, graph_abi_type, |caller, params, results| {
+    // Read CGRF from expression's memory
+    let in_buf = read_memory(caller, in_ptr, in_len);
+    let input = pack::decode(&in_buf)?;
+
+    // Call Pack instance
+    let output = pack_instance.call_with_value(&func_name, &input, 0)?;
+
+    // Encode and write back
+    let out_buf = pack::encode(&output)?;
+    write_memory(caller, out_ptr, &out_buf);
+    results[0] = out_buf.len();
+});
+```
+
+**Data flow:**
+```
+Expression Module        Runtime Bridge        Pack Package
+      │                       │                      │
+      │ encode args to CGRF   │                      │
+      │──────────────────────>│                      │
+      │                       │ decode CGRF          │
+      │                       │ call_with_value      │
+      │                       │─────────────────────>│
+      │                       │                      │ Graph ABI
+      │                       │<─────────────────────│
+      │                       │ encode result        │
+      │<──────────────────────│                      │
+      │ decode CGRF result    │                      │
+      ▼                       │                      │
+```
 
 ### Calling Convention
 
