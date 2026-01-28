@@ -458,6 +458,7 @@ enum WasmType {
 }
 
 impl WasmType {
+    #[allow(dead_code)]
     fn from_wasmtime(ty: wasmtime::ValType) -> Option<Self> {
         match ty {
             wasmtime::ValType::I32 => Some(WasmType::I32),
@@ -512,13 +513,6 @@ struct LoadedInterface {
     exports: Vec<ExportedFunction>,
 }
 
-/// A loaded Pack package instance
-struct LoadedPackage {
-    /// Path to the package file
-    path: PathBuf,
-    /// The Pack instance (wrapped for sharing across closures)
-    instance: Arc<Mutex<pack::Instance<()>>>,
-}
 
 // CGRF v2 constants
 const CGRF_MAGIC: u32 = 0x46524743; // "CGRF" in little-endian
@@ -536,8 +530,9 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
     let raw_name = format!("$__raw_{}", func.name);
 
     // Buffer locations (fixed offsets in linear memory)
-    let in_buf: i32 = 0x10000;  // Input buffer at 64KB
-    let out_buf: i32 = 0x11000; // Output buffer at 68KB
+    // Use low offsets that fit within a single 64KB memory page
+    let in_buf: i32 = 0x2000;   // Input buffer at 8KB
+    let out_buf: i32 = 0x3000;  // Output buffer at 12KB
     let buf_cap: i32 = 0x1000;  // 4KB capacity
 
     // Start function with original signature
@@ -557,6 +552,7 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
     let num_params = func.sig.params.len();
     if num_params == 0 {
         // Empty tuple
+        // Tuple payload format: [count:u32] = 4 bytes
         out.push_str(&format!("    ;; Encode empty tuple\n"));
         out.push_str(&format!("    i32.const {}\n", in_buf));
         out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
@@ -574,7 +570,7 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         out.push_str("    i32.const 0\n"); // root index
         out.push_str("    i32.store\n");
         out.push_str(&format!("    i32.const {}\n", in_buf + 16));
-        out.push_str("    i32.const 8\n"); // Tuple type tag
+        out.push_str("    i32.const 11\n"); // Tuple type tag (0x0B)
         out.push_str("    i32.store8\n");
         out.push_str(&format!("    i32.const {}\n", in_buf + 17));
         out.push_str("    i32.const 0\n");
@@ -583,15 +579,64 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store16\n");
         out.push_str(&format!("    i32.const {}\n", in_buf + 20));
-        out.push_str("    i32.const 0\n"); // payload len
+        out.push_str("    i32.const 4\n"); // payload len = 4 bytes (just the count)
         out.push_str("    i32.store\n");
-        out.push_str("    i32.const 24\n");
+        // Tuple count = 0
+        out.push_str(&format!("    i32.const {}\n", in_buf + 24));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store\n");
+        // Total: 16 (header) + 8 (node header) + 4 (count) = 28 bytes
+        out.push_str("    i32.const 28\n");
+        out.push_str("    local.set $in_len\n");
+    } else if num_params == 1 {
+        // Single s32 value (not wrapped in tuple)
+        // CGRF format: header(16) + s32_node(8 header + 4 payload) = 28 bytes
+        out.push_str(&format!("    ;; Encode single s32 value\n"));
+
+        // CGRF header
+        out.push_str(&format!("    i32.const {}\n", in_buf));
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 4));
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 6));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 8));
+        out.push_str("    i32.const 1\n"); // 1 node
+        out.push_str("    i32.store\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 12));
+        out.push_str("    i32.const 0\n"); // root index
+        out.push_str("    i32.store\n");
+
+        // S32 node at offset 16
+        out.push_str(&format!("    i32.const {}\n", in_buf + 16));
+        out.push_str("    i32.const 2\n"); // S32 type tag
+        out.push_str("    i32.store8\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 17));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 18));
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf + 20));
+        out.push_str("    i32.const 4\n"); // payload len = 4 bytes
+        out.push_str("    i32.store\n");
+        // Value
+        out.push_str(&format!("    i32.const {}\n", in_buf + 24));
+        out.push_str("    local.get $p0\n");
+        out.push_str("    i32.store\n");
+
+        // Total: 16 (header) + 8 (node header) + 4 (payload) = 28 bytes
+        out.push_str("    i32.const 28\n");
         out.push_str("    local.set $in_len\n");
     } else {
-        // Tuple of s32 values
+        // Tuple of s32 values (2 or more)
         // Header: 16 bytes, each node: 8 bytes header + payload
-        // For tuple of N s32s: header(16) + tuple_node(8 + 4*N) + N*s32_nodes(8+4 each)
-        let tuple_payload = 4 * num_params; // 4 bytes per child index
+        // Tuple payload format: [count:u32, child_indices:u32*]
+        // For tuple of N s32s: header(16) + tuple_node(8 + 4 + 4*N) + N*s32_nodes(8+4 each)
+        let tuple_payload = 4 + 4 * num_params; // 4 bytes count + 4 bytes per child index
         let s32_node_size = 12; // 8 byte header + 4 byte payload
         let total_nodes = 1 + num_params; // tuple + N s32 nodes
         let total_size = 16 + 8 + tuple_payload + num_params * s32_node_size;
@@ -617,7 +662,7 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
 
         // Tuple node at offset 16
         out.push_str(&format!("    i32.const {}\n", in_buf + 16));
-        out.push_str("    i32.const 8\n"); // Tuple type tag
+        out.push_str("    i32.const 11\n"); // Tuple type tag (0x0B)
         out.push_str("    i32.store8\n");
         out.push_str(&format!("    i32.const {}\n", in_buf + 17));
         out.push_str("    i32.const 0\n");
@@ -629,15 +674,20 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         out.push_str(&format!("    i32.const {}\n", tuple_payload));
         out.push_str("    i32.store\n");
 
-        // Tuple child indices (at offset 24)
+        // Tuple count (at offset 24)
+        out.push_str(&format!("    i32.const {}\n", in_buf + 24));
+        out.push_str(&format!("    i32.const {}\n", num_params));
+        out.push_str("    i32.store\n");
+
+        // Tuple child indices (at offset 28)
         for i in 0..num_params {
-            out.push_str(&format!("    i32.const {}\n", in_buf + 24 + (i as i32 * 4)));
+            out.push_str(&format!("    i32.const {}\n", in_buf + 28 + (i as i32 * 4)));
             out.push_str(&format!("    i32.const {}\n", i + 1)); // child node indices start at 1
             out.push_str("    i32.store\n");
         }
 
         // S32 nodes (after tuple node)
-        let s32_nodes_start = in_buf + 24 + (num_params as i32 * 4);
+        let s32_nodes_start = in_buf + 28 + (num_params as i32 * 4);
         for i in 0..num_params {
             let node_offset = s32_nodes_start + (i as i32 * s32_node_size as i32);
             // Node header
@@ -783,11 +833,12 @@ fn load_interface(
             })
         }
         ImportSource::Component(path) => {
+            // Read the WASM bytes
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read Pack package: {}", path.display()))?;
+
             // Load the Pack package if not already loaded
             if !loaded_packages.contains_key(path) {
-                let bytes = std::fs::read(path)
-                    .with_context(|| format!("Failed to read Pack package: {}", path.display()))?;
-
                 // Load with pack::Runtime
                 let module = pack_runtime.load_module(&bytes)
                     .with_context(|| format!("Failed to load Pack package: {}", path.display()))?;
@@ -798,45 +849,47 @@ fn load_interface(
                 loaded_packages.insert(path.clone(), Arc::new(Mutex::new(instance)));
             }
 
-            // For Pack packages, exports use Graph ABI: (in_ptr, in_len, out_ptr, out_cap) -> out_len
-            // The logical signature is encoded in wit+ metadata (not yet parsed)
-            //
-            // For now, we provide common function signatures that work with the
-            // multi-param-test.wasm example. The bridge functions handle Graph ABI.
-            //
-            // TODO: Parse wit+ to discover actual signatures from the package
+            // Discover exports from the WASM module using wasmtime
+            // Pack functions use Graph ABI: (in_ptr, in_len, out_ptr, out_cap) -> out_len
+            let engine = wasmtime::Engine::default();
+            let wasm_module = wasmtime::Module::new(&engine, &bytes)
+                .with_context(|| format!("Failed to parse Pack package: {}", path.display()))?;
 
-            // Common math functions matching multi-param-test.wisp
-            let exports = vec![
-                ExportedFunction {
-                    name: "add".to_string(),
-                    sig: FunctionSig {
-                        params: vec![WasmType::I32, WasmType::I32],
-                        results: vec![WasmType::I32],
-                    },
-                },
-                ExportedFunction {
-                    name: "sub".to_string(),
-                    sig: FunctionSig {
-                        params: vec![WasmType::I32, WasmType::I32],
-                        results: vec![WasmType::I32],
-                    },
-                },
-                ExportedFunction {
-                    name: "mul".to_string(),
-                    sig: FunctionSig {
-                        params: vec![WasmType::I32, WasmType::I32],
-                        results: vec![WasmType::I32],
-                    },
-                },
-                ExportedFunction {
-                    name: "sum3".to_string(),
-                    sig: FunctionSig {
-                        params: vec![WasmType::I32, WasmType::I32, WasmType::I32],
-                        results: vec![WasmType::I32],
-                    },
-                },
-            ];
+            let mut exports = Vec::new();
+            for export in wasm_module.exports() {
+                // Only consider function exports with Graph ABI signature
+                if let wasmtime::ExternType::Func(func_ty) = export.ty() {
+                    // Graph ABI: 4 i32 params, 1 i32 result
+                    let params: Vec<_> = func_ty.params().collect();
+                    let results: Vec<_> = func_ty.results().collect();
+
+                    let is_graph_abi = params.len() == 4
+                        && params.iter().all(|p| matches!(p, wasmtime::ValType::I32))
+                        && results.len() == 1
+                        && matches!(results[0], wasmtime::ValType::I32);
+
+                    if is_graph_abi {
+                        // This is a Graph ABI export - the logical signature is encoded in CGRF
+                        // Heuristic: detect common unary function patterns
+                        // TODO: Parse wit+ to discover actual signatures
+                        let name = export.name();
+                        let param_count = match name {
+                            // Known unary math functions
+                            "square" | "sqrt" | "abs" | "negate" | "factorial" | "double" | "inc" | "dec" => 1,
+                            // Default to binary for operators
+                            _ => 2,
+                        };
+
+                        exports.push(ExportedFunction {
+                            name: name.to_string(),
+                            sig: FunctionSig {
+                                params: vec![WasmType::I32; param_count],
+                                results: vec![WasmType::I32],
+                            },
+                        });
+                    }
+                }
+            }
 
             info!("Loaded Pack package: {} with Graph ABI exports", path.display());
 
@@ -1008,13 +1061,27 @@ async fn eval_expression(
     imports: &[LoadedInterface],
     loaded_packages: &HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>>,
 ) -> Result<i32> {
-    // Find which imported functions are used in the expression
+    // Find which imported functions are used in the expression or user-defined functions
     let mut used_imports: Vec<(&LoadedInterface, &ExportedFunction)> = Vec::new();
     for imp in imports {
         for export in &imp.exports {
             // Check if this function name appears in the expression
             // Simple heuristic: look for (funcname or funcname)
-            if expr.contains(&format!("({}", export.name)) || expr.contains(&format!(" {}", export.name)) {
+            let mut is_used = expr.contains(&format!("({}", export.name))
+                           || expr.contains(&format!(" {}", export.name));
+
+            // Also check if any user-defined function uses this import
+            if !is_used {
+                for func_def in functions {
+                    if func_def.contains(&format!("({}", export.name))
+                    || func_def.contains(&format!(" {}", export.name)) {
+                        is_used = true;
+                        break;
+                    }
+                }
+            }
+
+            if is_used {
                 used_imports.push((imp, export));
             }
         }
@@ -1188,15 +1255,34 @@ async fn eval_expression(
 
         // Build result, inserting imports after (module and wrappers before closing )
         let mut result = String::new();
-        for line in lines {
+        let mut _memory_exported = false;
+
+        for line in &lines {
             if line.trim() == ")" && !wrapper_wat.is_empty() {
                 // Insert wrappers before final closing paren
                 result.push_str(&wrapper_wat);
             }
+
+            // For Pack imports, ensure memory is exported (bridge needs to access it)
+            if !wrapper_wat.is_empty() && line.contains("(memory") && !line.contains("export") {
+                // Replace non-exported memory with exported memory
+                let exported_line = line.replace("(memory", "(memory (export \"memory\")");
+                result.push_str(&exported_line);
+                result.push('\n');
+                _memory_exported = true;
+                continue;
+            }
+
             result.push_str(line);
             result.push('\n');
+
             if line.trim().starts_with("(module") {
                 result.push_str(&import_wat);
+                // Add memory if not present and we have Pack imports (CGRF wrappers need it)
+                if !wrapper_wat.is_empty() && !lines.iter().any(|l| l.contains("(memory")) {
+                    result.push_str("  (memory (export \"memory\") 1)\n");
+                    _memory_exported = true;
+                }
             }
         }
         result
