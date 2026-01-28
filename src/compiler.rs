@@ -7518,6 +7518,20 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
 "#,
     );
 
+    // Pack ABI: __pack_alloc and __pack_free exports for the host
+    out.push_str(
+        r#"  (func (export "__pack_alloc") (param $size i32) (result i32)
+    local.get $size
+    call $__alloc
+  )
+  (func (export "__pack_free") (param $ptr i32) (param $len i32)
+    ;; Simple bump allocator doesn't actually free, but we need the export
+    ;; for Pack's ABI. A future optimization could track free lists.
+    nop
+  )
+"#,
+    );
+
     // Generate import wrapper functions
     // These have the original wisp signature but internally encode args and call the raw import
     for import in &prog.imports {
@@ -7565,8 +7579,9 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
 
 /// Generate a Pack-compatible export wrapper for a function.
 ///
-/// The wrapper has signature: (in_ptr, in_len, out_ptr, out_cap) -> bytes_written
-/// It decodes input (if any), calls the internal function, encodes the result.
+/// The wrapper has signature: (in_ptr, in_len, out_ptr_ptr, out_len_ptr) -> status
+/// Guest-allocates ABI: guest allocates output buffer, writes ptr/len to provided slots.
+/// Returns 0 on success, -1 on error.
 fn generate_pack_wrapper(
     out: &mut String,
     func: &Function,
@@ -7578,9 +7593,13 @@ fn generate_pack_wrapper(
     let internal_name = format!("${}", func.name);
 
     out.push_str(&format!(
-        "  (func ${} (export \"{}\") (param $in_ptr i32) (param $in_len i32) (param $out_ptr i32) (param $out_cap i32) (result i32)\n",
+        "  (func ${} (export \"{}\") (param $in_ptr i32) (param $in_len i32) (param $out_ptr_ptr i32) (param $out_len_ptr i32) (result i32)\n",
         wrapper_name, export_name
     ));
+
+    // $out_ptr is now a local - we allocate the buffer ourselves
+    out.push_str("    (local $out_ptr i32)\n");
+    out.push_str("    (local $bytes_written i32)\n");
 
     // Declare local for the result value (locals must be at the top)
     // All compound types (strings, records, etc.) are i32 pointers
@@ -7730,6 +7749,20 @@ fn generate_pack_wrapper(
     out.push_str(&format!("    call {}\n", internal_name));
     out.push_str("    local.set $value\n");
 
+    // Allocate output buffer (guest-allocates ABI)
+    // Use a conservative size based on return type
+    let alloc_size = match &func.return_type {
+        Type::S32 | Type::F32 => 32,      // 28 bytes needed
+        Type::S64 | Type::F64 => 40,      // 32 bytes needed
+        Type::Str => 4096,                 // Variable, allocate generously
+        Type::List(_) => 16384,            // Lists can be large
+        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) => 4096,
+        _ => 4096,
+    };
+    out.push_str(&format!("    i32.const {}\n", alloc_size));
+    out.push_str("    call $__alloc\n");
+    out.push_str("    local.set $out_ptr\n");
+
     // Encode result based on return type
     match &func.return_type {
         Type::S32 => {
@@ -7764,9 +7797,22 @@ fn generate_pack_wrapper(
         }
         _ => {
             out.push_str("    ;; TODO: encode non-scalar return types\n");
-            out.push_str("    i32.const -1\n");
+            out.push_str("    i32.const 28\n"); // Minimum size for error
         }
     }
+
+    // Guest-allocates ABI: save bytes_written, write ptr/len to slots, return 0
+    out.push_str("    local.set $bytes_written\n");
+    out.push_str("    ;; Write output pointer to out_ptr_ptr slot\n");
+    out.push_str("    local.get $out_ptr_ptr\n");
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.store\n");
+    out.push_str("    ;; Write output length to out_len_ptr slot\n");
+    out.push_str("    local.get $out_len_ptr\n");
+    out.push_str("    local.get $bytes_written\n");
+    out.push_str("    i32.store\n");
+    out.push_str("    ;; Return 0 for success\n");
+    out.push_str("    i32.const 0\n");
 
     out.push_str("  )\n");
 }
@@ -7792,22 +7838,22 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
     let result_type = wat_type(&import.return_type);
     out.push_str(&format!("(result {})\n", result_type));
 
-    // Local variables for encoding
+    // Local variables for encoding (guest-allocates ABI)
     out.push_str("    (local $in_buf i32)\n");
     out.push_str("    (local $in_len i32)\n");
-    out.push_str("    (local $out_buf i32)\n");
-    out.push_str("    (local $result i32)\n");
+    out.push_str("    (local $out_ptr i32)\n");
+    out.push_str("    (local $out_len i32)\n");
+    out.push_str("    (local $status i32)\n");
 
     // Use fixed buffer locations for import calls
-    // Import input buffer at 0x8000, output at 0x9000
+    // Import input buffer at 0x8000
+    // Result ptr/len slots at 0x9000 and 0x9004 (callee writes here)
     let import_in_buf = 0x8000;
-    let import_out_buf = 0x9000;
-    let buf_cap = 0x1000; // 4KB
+    let result_ptr_slot = 0x9000;
+    let result_len_slot = 0x9004;
 
     out.push_str(&format!("    i32.const {}\n", import_in_buf));
     out.push_str("    local.set $in_buf\n");
-    out.push_str(&format!("    i32.const {}\n", import_out_buf));
-    out.push_str("    local.set $out_buf\n");
 
     // Encode arguments to CGRF
     // For single string argument (like log), encode as a string node
@@ -7961,17 +8007,25 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
         out.push_str("    local.set $in_len\n");
     }
 
-    // Call the raw import
-    out.push_str("    ;; Call raw import\n");
+    // Call the raw import (guest-allocates ABI)
+    out.push_str("    ;; Call raw import with ptr/len slots\n");
     out.push_str("    local.get $in_buf\n");
     out.push_str("    local.get $in_len\n");
-    out.push_str("    local.get $out_buf\n");
-    out.push_str(&format!("    i32.const {}\n", buf_cap));
+    out.push_str(&format!("    i32.const {}\n", result_ptr_slot));
+    out.push_str(&format!("    i32.const {}\n", result_len_slot));
     out.push_str(&format!("    call {}\n", raw_name));
-    out.push_str("    local.set $result\n");
+    out.push_str("    local.set $status\n");
+
+    // Read the result ptr and len from the slots
+    out.push_str(&format!("    i32.const {}\n", result_ptr_slot));
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", result_len_slot));
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $out_len\n");
 
     // For now, just return 0 (success) for void-returning imports
-    // TODO: decode result for non-void imports
+    // TODO: decode result from $out_ptr for non-void imports
     out.push_str("    ;; Return result\n");
     match &import.return_type {
         Type::S32 => out.push_str("    i32.const 0\n"),

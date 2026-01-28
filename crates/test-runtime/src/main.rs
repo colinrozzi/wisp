@@ -522,8 +522,8 @@ const CGRF_VERSION: u16 = 2;
 ///
 /// The wrapper has the "simple" signature (i32 params, i32 result) but internally:
 /// 1. Encodes arguments to CGRF in a buffer
-/// 2. Calls the raw import (which has Graph ABI signature)
-/// 3. Decodes the result from CGRF
+/// 2. Calls the raw import (guest-allocates ABI: in_ptr, in_len, out_ptr_ptr, out_len_ptr -> status)
+/// 3. Reads ptr/len from the slots, decodes the result from CGRF
 fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
     let mut out = String::new();
     let wrapper_name = &func.name;
@@ -531,9 +531,9 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
 
     // Buffer locations (fixed offsets in linear memory)
     // Use low offsets that fit within a single 64KB memory page
-    let in_buf: i32 = 0x2000;   // Input buffer at 8KB
-    let out_buf: i32 = 0x3000;  // Output buffer at 12KB
-    let buf_cap: i32 = 0x1000;  // 4KB capacity
+    let in_buf: i32 = 0x2000;     // Input buffer at 8KB
+    let out_ptr_slot: i32 = 0x3000;  // Slot for callee to write output ptr
+    let out_len_slot: i32 = 0x3004;  // Slot for callee to write output len
 
     // Start function with original signature
     out.push_str(&format!("  (func ${} ", wrapper_name));
@@ -546,7 +546,9 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
 
     // Local variables
     out.push_str("    (local $in_len i32)\n");
+    out.push_str("    (local $out_ptr i32)\n");
     out.push_str("    (local $out_len i32)\n");
+    out.push_str("    (local $status i32)\n");
 
     // Encode arguments to CGRF
     let num_params = func.sig.params.len();
@@ -713,20 +715,31 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         out.push_str("    local.set $in_len\n");
     }
 
-    // Call raw import with Graph ABI
-    out.push_str("    ;; Call raw import\n");
+    // Call raw import with guest-allocates ABI
+    out.push_str("    ;; Call raw import (guest-allocates ABI)\n");
     out.push_str(&format!("    i32.const {}\n", in_buf));
     out.push_str("    local.get $in_len\n");
-    out.push_str(&format!("    i32.const {}\n", out_buf));
-    out.push_str(&format!("    i32.const {}\n", buf_cap));
+    out.push_str(&format!("    i32.const {}\n", out_ptr_slot));
+    out.push_str(&format!("    i32.const {}\n", out_len_slot));
     out.push_str(&format!("    call {}\n", raw_name));
+    out.push_str("    local.set $status\n");
+
+    // Read output ptr/len from slots
+    out.push_str("    ;; Read output ptr/len from slots\n");
+    out.push_str(&format!("    i32.const {}\n", out_ptr_slot));
+    out.push_str("    i32.load\n");
+    out.push_str("    local.set $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", out_len_slot));
+    out.push_str("    i32.load\n");
     out.push_str("    local.set $out_len\n");
 
     // Decode result - read s32 from CGRF output
     // CGRF format: header(16) + node header(8) + payload
-    // For s32: value is at out_buf + 24
+    // For s32: value is at out_ptr + 24
     out.push_str("    ;; Decode s32 result\n");
-    out.push_str(&format!("    i32.const {}\n", out_buf + 24));
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 24\n");
+    out.push_str("    i32.add\n");
     out.push_str("    i32.load\n");
 
     out.push_str("  )\n");
@@ -870,14 +883,17 @@ fn load_interface(
 
                     if is_graph_abi {
                         // This is a Graph ABI export - the logical signature is encoded in CGRF
-                        // Heuristic: detect common unary function patterns
+                        // Heuristic: detect common function patterns
                         // TODO: Parse wit+ to discover actual signatures
                         let name = export.name();
                         let param_count = match name {
+                            // Known nullary functions (no params, just return value)
+                            n if n.starts_with("test-") || n.ends_with("-test") || n.contains("internal") => 0,
+                            "init" | "run" | "main" | "start" => 0,
                             // Known unary math functions
                             "square" | "sqrt" | "abs" | "negate" | "factorial" | "double" | "inc" | "dec" => 1,
-                            // Default to binary for operators
-                            _ => 2,
+                            // Default to unary for most other cases
+                            _ => 1,
                         };
 
                         exports.push(ExportedFunction {
@@ -1259,6 +1275,17 @@ async fn eval_expression(
 
         for line in &lines {
             if line.trim() == ")" && !wrapper_wat.is_empty() {
+                // Insert __pack_alloc for guest-allocates ABI
+                result.push_str("  (func (export \"__pack_alloc\") (param $size i32) (result i32)\n");
+                result.push_str("    (local $ptr i32)\n");
+                result.push_str("    global.get $__heap_ptr\n");
+                result.push_str("    local.set $ptr\n");
+                result.push_str("    global.get $__heap_ptr\n");
+                result.push_str("    local.get $size\n");
+                result.push_str("    i32.add\n");
+                result.push_str("    global.set $__heap_ptr\n");
+                result.push_str("    local.get $ptr\n");
+                result.push_str("  )\n");
                 // Insert wrappers before final closing paren
                 result.push_str(&wrapper_wat);
             }
@@ -1297,13 +1324,14 @@ async fn eval_expression(
 
     // Assemble WAT to WASM
     let wasm_bytes = wat::parse_str(&wat)
-        .context("Failed to assemble WAT")?;
+        .with_context(|| format!("Failed to assemble WAT:\n{}", wat))?;
 
     // Load and run
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     let engine = Engine::new(&config)?;
-    let module = Module::new(&engine, &wasm_bytes)?;
+    let module = Module::new(&engine, &wasm_bytes)
+        .with_context(|| format!("Failed to compile WASM from WAT:\n{}", wat))?;
     let mut store = Store::new(&engine, ());
 
     // Build imports list by instantiating imported components
@@ -1356,14 +1384,15 @@ async fn eval_expression(
                     .with_context(|| format!("Pack package not loaded: {}", path.display()))?
                     .clone();
 
-                // Create a Graph ABI bridge function that:
-                // 1. Accepts Graph ABI signature (in_ptr, in_len, out_ptr, out_cap) -> out_len
+                // Create a Graph ABI bridge function (guest-allocates ABI):
+                // 1. Accepts signature (in_ptr, in_len, out_ptr_ptr, out_len_ptr) -> status
                 // 2. Reads CGRF from expression's memory
                 // 3. Decodes to pack::Value
                 // 4. Calls Pack instance via call_with_value
                 // 5. Encodes result back to CGRF
-                // 6. Writes to expression's output buffer
-                // 7. Returns bytes written
+                // 6. Allocates output buffer in expression's memory via __pack_alloc
+                // 7. Writes result to allocated buffer, ptr/len to slots
+                // 8. Returns 0 on success
 
                 let func_name = exported_func.name.clone();
 
@@ -1377,8 +1406,8 @@ async fn eval_expression(
                     move |mut caller: wasmtime::Caller<'_, ()>, params: &[wasmtime::Val], results: &mut [wasmtime::Val]| {
                         let in_ptr = params[0].unwrap_i32() as usize;
                         let in_len = params[1].unwrap_i32() as usize;
-                        let out_ptr = params[2].unwrap_i32() as usize;
-                        let _out_cap = params[3].unwrap_i32() as usize;
+                        let out_ptr_ptr = params[2].unwrap_i32() as usize;
+                        let out_len_ptr = params[3].unwrap_i32() as usize;
 
                         // Get memory from the expression module
                         let memory = caller.get_export("memory")
@@ -1396,18 +1425,35 @@ async fn eval_expression(
 
                         // Call Pack instance via call_with_value
                         let mut instance = pack_instance.lock().unwrap();
-                        let output = instance.call_with_value(&func_name, &input, 0)
+                        let output = instance.call_with_value(&func_name, &input)
                             .map_err(|e| wasmtime::Error::msg(format!("Pack call failed: {}", e)))?;
 
                         // Encode result back to CGRF
                         let out_buf = pack::encode(&output)
                             .map_err(|e| wasmtime::Error::msg(format!("failed to encode result: {}", e)))?;
 
-                        // Write to expression's output buffer
+                        // Guest-allocates ABI: allocate output buffer in expression's memory
+                        let pack_alloc = caller.get_export("__pack_alloc")
+                            .and_then(|e| e.into_func())
+                            .ok_or_else(|| wasmtime::Error::msg("no __pack_alloc export"))?;
+
+                        let mut alloc_result = [wasmtime::Val::I32(0)];
+                        pack_alloc.call(&mut caller, &[wasmtime::Val::I32(out_buf.len() as i32)], &mut alloc_result)
+                            .map_err(|e| wasmtime::Error::msg(format!("__pack_alloc failed: {}", e)))?;
+                        let out_ptr = alloc_result[0].unwrap_i32() as usize;
+
+                        // Write result to allocated buffer
                         memory.write(&mut caller, out_ptr, &out_buf)
                             .map_err(|e| wasmtime::Error::msg(format!("failed to write output: {}", e)))?;
 
-                        results[0] = wasmtime::Val::I32(out_buf.len() as i32);
+                        // Write ptr and len to the slots
+                        memory.write(&mut caller, out_ptr_ptr, &(out_ptr as i32).to_le_bytes())
+                            .map_err(|e| wasmtime::Error::msg(format!("failed to write out_ptr: {}", e)))?;
+                        memory.write(&mut caller, out_len_ptr, &(out_buf.len() as i32).to_le_bytes())
+                            .map_err(|e| wasmtime::Error::msg(format!("failed to write out_len: {}", e)))?;
+
+                        // Return 0 for success
+                        results[0] = wasmtime::Val::I32(0);
                         Ok(())
                     },
                 );
