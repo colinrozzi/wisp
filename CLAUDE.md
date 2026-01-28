@@ -4,9 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`wisp` is a Lisp-like compiler that compiles S-expressions to WebAssembly components. It generates WAT (WebAssembly text), WASM (binary), and WIT (WebAssembly Interface Types) files. The compiler exposes WebAssembly instructions directly - nearly 1:1 mapping to WASM. Supports scalar types (s32, s64, f32, f64), explicit WASM instructions, conditionals, let bindings, function calls, and component imports/exports.
+`wisp` is a Lisp-like compiler that compiles S-expressions to WebAssembly. It generates WAT (WebAssembly text) and WASM (binary) files. The compiler exposes WebAssembly instructions directly - nearly 1:1 mapping to WASM. Supports scalar types (s32, s64, f32, f64), explicit WASM instructions, conditionals, let bindings, function calls, and imports/exports.
 
 **The compiler is self-hosted** - a Wisp compiler written in Wisp, compiled to WASM, powers the interactive REPL.
+
+### Pack Packages (Not WASM Components)
+
+Wisp targets **Pack packages**, not standard WebAssembly Components:
+
+| Aspect | Standard WASM Components | Pack Packages |
+|--------|-------------------------|---------------|
+| **ABI** | Canonical ABI | Graph ABI (CGRF) |
+| **Types** | WIT | wit+ (recursive types) |
+| **Runtime** | wasmtime component model | Pack/Theater |
+
+**Why Pack?** Recursive types like `variant sexpr { sym(string), lst(list<sexpr>) }` are essential for a Lisp. Pack's wit+ and Graph ABI support this natively.
+
+See the [Pack crate](../pack) for the runtime.
 
 ### Vision: Theater Shell
 
@@ -158,9 +172,9 @@ cargo run -- compile examples/prog.lisp
 - Component encoding uses wit-component crate with embedded metadata
 - Runtime dependency linking via `--dep module=path.wasm` creates namespace with exported functions
 
-### Composite Integration
+### Pack Integration
 
-Wisp aligns with [Composite's](../composite) **wit+** - an extended WIT dialect that supports recursive types. This is essential for representing S-expressions and ASTs.
+Wisp aligns with [Pack's](../pack) **wit+** - an extended WIT dialect that supports recursive types. This is essential for representing S-expressions and ASTs.
 
 **REPL import syntax** (planned):
 ```lisp

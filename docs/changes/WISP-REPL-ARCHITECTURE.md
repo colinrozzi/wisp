@@ -84,12 +84,20 @@ wisp> (add (square x) (i32.const 1))
 65
 ```
 
-**How it works:**
-1. Parse the import syntax and load the WASM component
+**How it works (current prototype):**
+1. Parse the import syntax and load the WASM module
 2. Extract function signatures using Wasmtime's type introspection
 3. When an expression uses an imported function, generate a stub for the compiler
 4. Post-process the generated WAT to inject proper import declarations
-5. Link the compiled expression to the imported component at instantiation
+5. Link the compiled expression to the imported module at instantiation
+
+**Target architecture (Pack integration):**
+1. Load Pack packages (not raw WASM components)
+2. Parse wit+ interface definitions for type discovery
+3. Use Graph ABI (CGRF) for all cross-boundary calls
+4. Full support for recursive types (S-expressions, ASTs, etc.)
+
+See [Pack Integration](#pack-integration) section below.
 
 ### Host Imports
 
@@ -114,7 +122,66 @@ The debug functions return the value they print, enabling easy chaining.
 
 **Current limitations:**
 - Only basic WASM types (i32, i64, f32, f64) are supported
-- Complex types (strings, lists, records) need CGRF encoding (not yet integrated)
+- Complex types (strings, lists, records) need Pack/Graph ABI integration
+
+## Pack Integration
+
+**Important:** Wisp uses **Pack packages**, not standard WebAssembly Components.
+
+### Pack vs WASM Components
+
+| Aspect | Standard WASM Components | Pack Packages |
+|--------|-------------------------|---------------|
+| **ABI** | Canonical ABI | Graph ABI (CGRF v2) |
+| **Types** | WIT (no recursion) | wit+ (recursive by default) |
+| **Discovery** | Component Model introspection | wit+ parsing |
+| **Encoding** | Linear memory layout | Graph-encoded nodes |
+
+### Why Pack?
+
+1. **Recursive types**: wit+ allows types like `variant sexpr { sym(string), lst(list<sexpr>) }` without special syntax
+2. **Graph ABI**: Enables sharing and cycles in data structures (ASTs, S-expressions)
+3. **Theater integration**: Pack is the native package format for Theater actors
+
+### Target Architecture
+
+```rust
+use pack::{Runtime, Value, parse_interface};
+
+// Load a Pack package
+let runtime = pack::AsyncRuntime::new();
+let module = runtime.load_module(&wasm_bytes)?;
+
+// Instantiate with host functions
+let instance = module.instantiate_with_host(state, |builder| {
+    builder.interface("wisp:repl/debug")?
+        .func("print-i32", |ctx, input| {
+            if let Value::S32(v) = input {
+                println!("[debug] {}", v);
+                Ok(Value::S32(v))
+            } else {
+                Err(...)
+            }
+        })?;
+    Ok(())
+})?;
+
+// Call with Graph ABI
+let result = instance.call_with_value("add", &Value::Tuple(vec![
+    Value::S32(3),
+    Value::S32(4),
+]))?;
+```
+
+### Calling Convention
+
+Pack uses the Graph ABI calling convention:
+- **Signature**: `(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32) -> i32`
+- **Input**: CGRF-encoded value at `in_ptr:in_len`
+- **Output**: Function writes CGRF result to `out_ptr`
+- **Return**: Number of bytes written (or error)
+
+This enables passing complex recursive structures (like Wisp S-expressions) across package boundaries.
 
 ## Key Insight
 
@@ -468,7 +535,7 @@ compiled: math.wasm (exports: double, quadruple)
 - [x] Extract function signatures via Wasmtime type introspection
 - [x] Track loaded interfaces in REPL state
 - [x] Link compiled expressions to loaded dependencies
-- [ ] Integrate with Composite's Graph ABI for complex types
+- [ ] Integrate with Pack's Graph ABI for complex types
 
 ### Phase 5: Theater Integration (Future)
 - [ ] Add spawn capability to REPL actor
@@ -635,7 +702,7 @@ Before full actor management, we need the ability to load and use components:
 (fraction (i32.const 1) (i32.const 3))
 ```
 
-This syntax aligns with **Composite's wit+** - separating *what* interface to import from *where* to import it.
+This syntax aligns with **Pack's wit+** - separating *what* interface to import from *where* to import it.
 
 ### Future Commands
 
@@ -679,4 +746,4 @@ This syntax aligns with **Composite's wit+** - separating *what* interface to im
 - `docs/proposals/METAPROGRAMMING.md` - Macro system vision
 - `docs/changes/PHASE-1-MACROS.md` - Macro implementation (completed)
 - `docs/changes/SELF-HOSTED-COMPILER.md` - Self-hosted compiler (M1-M7)
-- Composite project - wit+ and Graph ABI for recursive types
+- Pack project - wit+ and Graph ABI for recursive types
