@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 theater = { path = "../../../theater/crates/theater" }
-assembler-handler = { path = "../assembler-handler" }
+pack = { path = "../../../pack" }
 wat = "1.242.0"
 wasmtime = { version = "31.0", features = ["async"] }
 tokio = { version = "1", features = ["full"] }

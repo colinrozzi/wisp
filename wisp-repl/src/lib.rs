@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use wisp::compiler::{
-    Function, InlineValue, Type, compile_repl_expr, compile_repl_expr_composite,
-    compile_repl_expr_composite_wat,
+    Function, InlineValue, Type, compile_repl_expr, compile_repl_expr_pack,
+    compile_repl_expr_pack_wat,
 };
 
 /// A runtime value that can be inlined during REPL compilation
@@ -135,9 +135,9 @@ pub fn compile_repl(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
     compile_repl_expr(expr, &bindings, &functions)
 }
 
-/// Compile an expression with REPL context for composite runtime
-/// Returns raw WASM bytes (composite package with CGRF encoding)
-pub fn compile_repl_composite(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
+/// Compile an expression with REPL context for Pack runtime
+/// Returns raw WASM bytes (Pack package with Graph ABI encoding)
+pub fn compile_repl_pack(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
     // Convert bindings to InlineValue
     let bindings: HashMap<String, InlineValue> = state
         .bindings
@@ -148,8 +148,8 @@ pub fn compile_repl_composite(expr: &str, state: &ReplState) -> anyhow::Result<V
     // Collect functions as a Vec
     let functions: Vec<Function> = state.functions.values().cloned().collect();
 
-    // Compile the expression using composite calling convention
-    compile_repl_expr_composite(expr, &bindings, &functions)
+    // Compile the expression using Pack calling convention
+    compile_repl_expr_pack(expr, &bindings, &functions)
 }
 
 #[cfg(test)]
@@ -263,44 +263,44 @@ mod tests {
         assert_eq!(result, 20);
     }
 
-    // Tests for composite package output
+    // Tests for Pack package output
     #[test]
-    fn test_compile_composite_literal() {
-        use super::compile_repl_composite;
+    fn test_compile_pack_literal() {
+        use super::compile_repl_pack;
         let state = ReplState::new();
-        let result = compile_repl_composite("42", &state);
+        let result = compile_repl_pack("42", &state);
         assert!(
             result.is_ok(),
-            "Failed to compile composite literal: {:?}",
+            "Failed to compile pack literal: {:?}",
             result.err()
         );
         let bytes = result.unwrap();
-        assert!(!bytes.is_empty(), "Composite bytes should not be empty");
+        assert!(!bytes.is_empty(), "Pack bytes should not be empty");
         // Verify it's a WASM module (magic number \0asm)
         assert_eq!(&bytes[0..4], b"\0asm", "Should be valid WASM binary");
     }
 
     #[test]
-    fn test_compile_composite_with_binding() {
-        use super::compile_repl_composite;
+    fn test_compile_pack_with_binding() {
+        use super::compile_repl_pack;
         let mut state = ReplState::new();
         state.bindings.insert("x".to_string(), Value::S32(100));
 
-        let result = compile_repl_composite("x", &state);
+        let result = compile_repl_pack("x", &state);
         assert!(
             result.is_ok(),
-            "Failed to compile composite with binding: {:?}",
+            "Failed to compile pack with binding: {:?}",
             result.err()
         );
     }
 
     #[test]
-    fn test_composite_wat_output() {
-        use super::compile_repl_expr_composite_wat;
+    fn test_pack_wat_output() {
+        use super::compile_repl_expr_pack_wat;
         let bindings: HashMap<String, InlineValue> = HashMap::new();
         let functions = vec![];
 
-        let wat = compile_repl_expr_composite_wat("42", &bindings, &functions)
+        let wat = compile_repl_expr_pack_wat("42", &bindings, &functions)
             .expect("WAT generation failed");
 
         // Print the WAT for inspection
@@ -315,7 +315,7 @@ mod tests {
         );
         assert!(
             wat.contains("(param $in_ptr i32)"),
-            "Should have composite calling convention params"
+            "Should have pack calling convention params"
         );
         assert!(
             wat.contains("(param $out_ptr i32)"),

@@ -1,5 +1,6 @@
 [workspace]
-members = ["wisp-repl", "crates/assembler-handler", "crates/test-runtime"]
+members = ["wisp-repl", "crates/test-runtime"]
+# Note: assembler-handler temporarily excluded - needs update for new theater API
 
 [package]
 name = "wisp"

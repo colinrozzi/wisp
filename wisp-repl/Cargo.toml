@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 wisp = { path = ".." }
 anyhow = "1.0"
-composite = { path = "../../composite" }
+pack = { path = "../../pack" }
 rustyline = "15"
 
 [dev-dependencies]

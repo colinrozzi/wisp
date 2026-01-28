@@ -1,11 +1,11 @@
-use composite::abi::Value as CompositeValue;
-use composite::Runtime;
+use pack::abi::Value as PackValue;
+use pack::Runtime;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use wisp_repl::{compile_repl_composite, ReplState, Value};
+use wisp_repl::{compile_repl_pack, ReplState, Value};
 
 fn main() -> anyhow::Result<()> {
-    println!("Wisp REPL v0.1.0 (composite runtime)");
+    println!("Wisp REPL v0.1.0 (pack runtime)");
     println!("Type expressions to evaluate. Use 'let name = expr' to bind values.");
     println!("Type :quit to exit.\n");
 
@@ -122,37 +122,37 @@ fn handle_let_binding(
 }
 
 fn eval_expr(expr: &str, state: &ReplState, runtime: &Runtime) -> anyhow::Result<Value> {
-    // Compile the expression to composite WASM
-    let wasm_bytes = compile_repl_composite(expr, state)?;
+    // Compile the expression to Pack package
+    let wasm_bytes = compile_repl_pack(expr, state)?;
 
-    // Load and instantiate with composite runtime
+    // Load and instantiate with Pack runtime
     let module = runtime.load_module(&wasm_bytes)?;
     let mut instance = module.instantiate()?;
 
     // Call eval with no arguments (empty tuple)
-    let input = CompositeValue::Tuple(vec![]);
+    let input = PackValue::Tuple(vec![]);
     let output = instance.call_with_value("eval", &input, 0)?;
 
-    // Convert composite Value to our Value
-    composite_to_repl_value(&output)
+    // Convert Pack Value to our Value
+    pack_to_repl_value(&output)
 }
 
 use wisp::compiler::Type;
 
-/// Convert a composite ValueType to a wisp Type
-fn composite_type_to_wisp_type(cvt: &composite::abi::ValueType) -> Type {
-    use composite::abi::ValueType;
+/// Convert a Pack ValueType to a wisp Type
+fn pack_type_to_wisp_type(cvt: &pack::abi::ValueType) -> Type {
+    use pack::abi::ValueType;
     match cvt {
         ValueType::Bool | ValueType::S8 | ValueType::S16 | ValueType::S32 | ValueType::U8 | ValueType::U16 | ValueType::U32 => Type::S32,
         ValueType::S64 | ValueType::U64 => Type::S64,
         ValueType::F32 => Type::F32,
         ValueType::F64 => Type::F64,
         ValueType::Char | ValueType::String => Type::Str,
-        ValueType::List(elem) => Type::List(Box::new(composite_type_to_wisp_type(elem))),
-        ValueType::Option(inner) => Type::Option(Box::new(composite_type_to_wisp_type(inner))),
+        ValueType::List(elem) => Type::List(Box::new(pack_type_to_wisp_type(elem))),
+        ValueType::Option(inner) => Type::Option(Box::new(pack_type_to_wisp_type(inner))),
         ValueType::Result { ok, err } => Type::Result(
-            Box::new(composite_type_to_wisp_type(ok)),
-            Box::new(composite_type_to_wisp_type(err)),
+            Box::new(pack_type_to_wisp_type(ok)),
+            Box::new(pack_type_to_wisp_type(err)),
         ),
         ValueType::Record(name) => Type::Record(name.clone()),
         ValueType::Variant(name) => Type::Variant(name.clone()),
@@ -161,40 +161,40 @@ fn composite_type_to_wisp_type(cvt: &composite::abi::ValueType) -> Type {
     }
 }
 
-fn composite_to_repl_value(cv: &CompositeValue) -> anyhow::Result<Value> {
+fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
     match cv {
-        CompositeValue::S32(n) => Ok(Value::S32(*n)),
-        CompositeValue::S64(n) => Ok(Value::S64(*n)),
-        CompositeValue::F32(n) => Ok(Value::F32(*n)),
-        CompositeValue::F64(n) => Ok(Value::F64(*n)),
-        CompositeValue::String(s) => Ok(Value::Str(s.clone())),
-        CompositeValue::Option { inner_type, value } => Ok(Value::Option {
-            inner_type: composite_type_to_wisp_type(inner_type),
+        PackValue::S32(n) => Ok(Value::S32(*n)),
+        PackValue::S64(n) => Ok(Value::S64(*n)),
+        PackValue::F32(n) => Ok(Value::F32(*n)),
+        PackValue::F64(n) => Ok(Value::F64(*n)),
+        PackValue::String(s) => Ok(Value::Str(s.clone())),
+        PackValue::Option { inner_type, value } => Ok(Value::Option {
+            inner_type: pack_type_to_wisp_type(inner_type),
             value: value
                 .as_ref()
-                .map(|v| composite_to_repl_value(v).map(Box::new))
+                .map(|v| pack_to_repl_value(v).map(Box::new))
                 .transpose()?,
         }),
-        CompositeValue::List { elem_type, items } => Ok(Value::List {
-            elem_type: composite_type_to_wisp_type(elem_type),
+        PackValue::List { elem_type, items } => Ok(Value::List {
+            elem_type: pack_type_to_wisp_type(elem_type),
             items: items
                 .iter()
-                .map(composite_to_repl_value)
+                .map(pack_to_repl_value)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         }),
-        CompositeValue::Result { ok_type, err_type, value } => Ok(Value::Result {
-            ok_type: composite_type_to_wisp_type(ok_type),
-            err_type: composite_type_to_wisp_type(err_type),
+        PackValue::Result { ok_type, err_type, value } => Ok(Value::Result {
+            ok_type: pack_type_to_wisp_type(ok_type),
+            err_type: pack_type_to_wisp_type(err_type),
             value: match value {
-                Ok(v) => Ok(Box::new(composite_to_repl_value(v)?)),
-                Err(v) => Err(Box::new(composite_to_repl_value(v)?)),
+                Ok(v) => Ok(Box::new(pack_to_repl_value(v)?)),
+                Err(v) => Err(Box::new(pack_to_repl_value(v)?)),
             },
         }),
-        CompositeValue::Record { type_name, fields } => {
+        PackValue::Record { type_name, fields } => {
             let converted_fields = fields
                 .iter()
                 .map(|(name, value)| {
-                    Ok((name.clone(), composite_to_repl_value(value)?))
+                    Ok((name.clone(), pack_to_repl_value(value)?))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             Ok(Value::Record {
@@ -202,14 +202,14 @@ fn composite_to_repl_value(cv: &CompositeValue) -> anyhow::Result<Value> {
                 fields: converted_fields,
             })
         }
-        CompositeValue::Variant { type_name, case_name, tag: _, payload } => Ok(Value::Variant {
+        PackValue::Variant { type_name, case_name, tag: _, payload } => Ok(Value::Variant {
             type_name: type_name.clone(),
             case: case_name.clone(),
             payload: payload
                 .iter()
-                .map(composite_to_repl_value)
+                .map(pack_to_repl_value)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         }),
-        other => Err(anyhow::anyhow!("Unsupported composite value: {:?}", other)),
+        other => Err(anyhow::anyhow!("Unsupported pack value: {:?}", other)),
     }
 }

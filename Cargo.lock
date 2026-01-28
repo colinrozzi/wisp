@@ -137,19 +137,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "assembler-handler"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "theater",
- "tokio",
- "tracing",
- "val-serde",
- "wasmtime 31.0.0",
- "wat",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -435,24 +422,6 @@ name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
-
-[[package]]
-name = "composite"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "wasmtime 27.0.0",
-]
-
-[[package]]
-name = "composite-abi"
-version = "0.1.0"
-dependencies = [
- "hashbrown 0.14.5",
-]
 
 [[package]]
 name = "console"
@@ -2106,6 +2075,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "wasmtime 27.0.0",
+]
+
+[[package]]
+name = "pack-abi"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.14.5",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2987,7 +2974,7 @@ name = "test-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "assembler-handler",
+ "pack",
  "theater",
  "tokio",
  "tracing",
@@ -3006,8 +2993,6 @@ dependencies = [
  "base64 0.21.7",
  "bytes",
  "chrono",
- "composite",
- "composite-abi",
  "console",
  "dunce",
  "futures",
@@ -3016,6 +3001,8 @@ dependencies = [
  "lazy_static",
  "libc",
  "md5",
+ "pack",
+ "pack-abi",
  "pin-utils",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
@@ -4904,7 +4891,7 @@ name = "wisp-repl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "composite",
+ "pack",
  "rustyline",
  "wasmtime 21.0.2",
  "wisp",

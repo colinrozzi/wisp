@@ -312,8 +312,8 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     let signatures = collect_signatures(&prog)?;
     type_check(&prog, &signatures, &ctx)?;
 
-    // Generate Composite-compatible WAT (raw module with Composite ABI)
-    let wat = generate_wat_composite(&prog, &signatures);
+    // Generate Pack-compatible WAT (raw module with Pack/Graph ABI)
+    let wat = generate_wat_pack(&prog, &signatures);
 
     let mut wat_path = out_base.to_path_buf();
     wat_path.set_extension("wat");
@@ -7285,7 +7285,7 @@ fn value_to_sexpr(value: &InlineValue, span: &Span) -> SExpr {
 }
 
 // ============================================================================
-// Composite Component Generation
+// Pack Package Generation
 // ============================================================================
 
 /// CGRF format constants
@@ -7314,7 +7314,7 @@ const CGRF_CHAR: u8 = 0x12;
 const CGRF_FLAGS: u8 = 0x13;
 const CGRF_RESULT: u8 = 0x14;
 
-/// Memory layout for composite packages
+/// Memory layout for Pack packages
 const INPUT_BUFFER_OFFSET: i32 = 0x0000;
 const OUTPUT_BUFFER_OFFSET: i32 = 0x4000;
 const HEAP_START_OFFSET: i32 = 0xC000;
@@ -7396,20 +7396,20 @@ fn generate_write_type_tag(out: &mut String, ty: &Type, base_local: &str, offset
     }
 }
 
-/// Generate WAT for a composite-compatible package.
+/// Generate WAT for a Pack-compatible package.
 ///
 /// This produces WASM with:
-/// - Export functions using composite calling convention: (i32, i32, i32, i32) -> i32
+/// - Export functions using Pack/Graph ABI calling convention: (i32, i32, i32, i32) -> i32
 /// - CGRF encoding for input/output values
 /// - Memory layout with input buffer at 0x0, output at 0x4000
-fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature>) -> String {
+fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) -> String {
     let mut out = String::new();
     out.push_str("(module\n");
 
-    // Generate import declarations with Composite ABI signature
+    // Generate import declarations with Pack/Graph ABI signature
     // Each import is declared as (i32, i32, i32, i32) -> i32
     for import in &prog.imports {
-        // Raw import with Composite calling convention
+        // Raw import with Pack/Graph ABI calling convention
         out.push_str(&format!(
             "  (import \"{}\" \"{}\" (func $__raw_{} (param i32 i32 i32 i32) (result i32)))\n",
             import.module, import.name, import.name
@@ -7553,21 +7553,21 @@ fn generate_wat_composite(prog: &Program, signatures: &HashMap<String, Signature
         out.push_str("  )\n");
     }
 
-    // Generate composite wrappers for exported functions
+    // Generate Pack wrappers for exported functions
     for export in &prog.exports {
         let func = find_function(prog, export);
-        generate_composite_wrapper(&mut out, func, &records_map, &variants_map);
+        generate_pack_wrapper(&mut out, func, &records_map, &variants_map);
     }
 
     out.push_str(")\n");
     out
 }
 
-/// Generate a composite-compatible export wrapper for a function.
+/// Generate a Pack-compatible export wrapper for a function.
 ///
 /// The wrapper has signature: (in_ptr, in_len, out_ptr, out_cap) -> bytes_written
 /// It decodes input (if any), calls the internal function, encodes the result.
-fn generate_composite_wrapper(
+fn generate_pack_wrapper(
     out: &mut String,
     func: &Function,
     records: &HashMap<String, RecordDef>,
@@ -7775,7 +7775,7 @@ fn generate_composite_wrapper(
 ///
 /// The wrapper has the original wisp signature but internally:
 /// 1. Encodes arguments to CGRF in a buffer
-/// 2. Calls the raw import (which has Composite ABI signature)
+/// 2. Calls the raw import (which has Pack/Graph ABI signature)
 /// 3. Decodes the result (if any)
 fn generate_import_wrapper(out: &mut String, import: &Import) {
     let wrapper_name = &import.name;
@@ -11240,11 +11240,11 @@ fn generate_cgrf_decode_tuple_param(
     }
 }
 
-/// Compile an expression for REPL evaluation, producing a composite package.
+/// Compile an expression for REPL evaluation, producing a Pack package.
 ///
-/// This generates a WASM module (not a full package) with composite calling convention.
+/// This generates a WASM module (not a full package) with Pack/Graph ABI calling convention.
 /// The module exports an `eval` function with signature (i32, i32, i32, i32) -> i32.
-pub fn compile_repl_expr_composite(
+pub fn compile_repl_expr_pack(
     expr_source: &str,
     bindings: &HashMap<String, InlineValue>,
     functions: &[Function],
@@ -11321,8 +11321,8 @@ pub fn compile_repl_expr_composite(
     let full_signatures = collect_signatures(&prog)?;
     type_check(&prog, &full_signatures, &ctx)?;
 
-    // Generate composite WAT
-    let wat = generate_wat_composite(&prog, &full_signatures);
+    // Generate Pack/Graph ABI WAT
+    let wat = generate_wat_pack(&prog, &full_signatures);
 
     // Convert WAT to WASM bytes (raw module, not component)
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
@@ -11330,9 +11330,9 @@ pub fn compile_repl_expr_composite(
     Ok(wasm_bytes)
 }
 
-/// Like compile_repl_expr_composite but returns WAT string instead of WASM bytes.
+/// Like compile_repl_expr_pack but returns WAT string instead of WASM bytes.
 /// Useful for debugging and testing.
-pub fn compile_repl_expr_composite_wat(
+pub fn compile_repl_expr_pack_wat(
     expr_source: &str,
     bindings: &HashMap<String, InlineValue>,
     functions: &[Function],
@@ -11400,5 +11400,5 @@ pub fn compile_repl_expr_composite_wat(
     let full_signatures = collect_signatures(&prog)?;
     type_check(&prog, &full_signatures, &ctx)?;
 
-    Ok(generate_wat_composite(&prog, &full_signatures))
+    Ok(generate_wat_pack(&prog, &full_signatures))
 }

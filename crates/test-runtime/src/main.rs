@@ -21,13 +21,16 @@ use anyhow::{Context, Result};
 use theater::actor::handle::ActorHandle;
 use theater::actor::store::ActorStore;
 use theater::chain::StateChain;
-use theater::composite_bridge::{AsyncRuntime, CompositeInstance, Ctx, Value};
+use theater::pack_bridge::{AsyncRuntime, PackInstance, Ctx, Value};
 use theater::id::TheaterId;
 use theater::messages::TheaterCommand;
 use theater::ValueType;
 use tokio::sync::mpsc;
 use tracing::info;
 use wasmtime::{Engine, Instance, Module, Store};
+
+// Pack runtime for loading imported packages
+use pack::Runtime as PackRuntime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -94,7 +97,7 @@ async fn main() -> Result<()> {
         chain,
     );
 
-    let mut instance = CompositeInstance::new(
+    let mut instance = PackInstance::new(
         "wisp-test",
         &wasm_bytes,
         &runtime,
@@ -160,7 +163,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    info!("CompositeInstance created successfully");
+    info!("PackInstance created successfully");
     info!("Calling function: {}", func_name);
 
     // Build the input value
@@ -209,7 +212,7 @@ async fn run_compile_pipeline(source: &str) -> Result<()> {
     let runtime = AsyncRuntime::new();
     let actor_store = create_actor_store();
 
-    let mut instance = CompositeInstance::new(
+    let mut instance = PackInstance::new(
         "compiler",
         &compiler_wasm,
         &runtime,
@@ -266,7 +269,7 @@ async fn run_compile_and_execute(source: &str, func_name: &str, func_args: &[i32
     let runtime = AsyncRuntime::new();
     let actor_store = create_actor_store();
 
-    let mut instance = CompositeInstance::new(
+    let mut instance = PackInstance::new(
         "compiler",
         &compiler_wasm,
         &runtime,
@@ -879,7 +882,7 @@ async fn eval_expression(
 
     // Compile using self-hosted compiler
     let actor_store = create_actor_store();
-    let mut compiler = CompositeInstance::new(
+    let mut compiler = PackInstance::new(
         "compiler",
         compiler_wasm,
         runtime,
