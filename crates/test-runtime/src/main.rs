@@ -27,7 +27,7 @@ use theater::id::TheaterId;
 use theater::messages::TheaterCommand;
 use theater::ValueType;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 use wasmtime::{Engine, Instance, Module, Store};
 
 // Pack runtime for loading imported packages
@@ -495,11 +495,20 @@ struct FunctionSig {
     results: Vec<WasmType>,
 }
 
+/// Rich type information from Pack metadata
+#[derive(Debug, Clone)]
+struct RichSignature {
+    params: Vec<pack::ParamSignature>,
+    results: Vec<pack::TypeDesc>,
+}
+
 /// An exported function with its signature
 #[derive(Debug, Clone)]
 struct ExportedFunction {
     name: String,
     sig: FunctionSig,
+    /// Rich type info from Pack metadata (None for host functions)
+    rich_sig: Option<RichSignature>,
 }
 
 /// Tracks a loaded interface and its exports
@@ -514,16 +523,347 @@ struct LoadedInterface {
 }
 
 
+/// A field in a user-defined record type
+#[derive(Debug, Clone)]
+struct ReplRecordField {
+    name: String,
+    #[allow(dead_code)]
+    ty: String,
+}
+
+/// A user-defined record type
+#[derive(Debug, Clone)]
+struct ReplRecordDef {
+    name: String,
+    fields: Vec<ReplRecordField>,
+    /// Original source text for inclusion in compilation
+    original_source: String,
+}
+
+/// A case in a user-defined variant type
+#[derive(Debug, Clone)]
+struct ReplVariantCase {
+    name: String,
+    has_payload: bool,
+}
+
+/// A user-defined variant type
+#[derive(Debug, Clone)]
+struct ReplVariantDef {
+    name: String,
+    cases: Vec<ReplVariantCase>,
+    /// Original source text for inclusion in compilation
+    original_source: String,
+}
+
+/// What kind of return type an expression has
+enum ReplReturnType {
+    Scalar,
+    NativeString,
+    NativeRecord(String),
+    NativeVariant(String),
+    PackCompound,
+}
+
+/// Result of evaluating an expression in the REPL
+enum EvalResult {
+    /// Simple scalar result (i32)
+    Scalar(i32),
+    /// Compound result decoded from CGRF (string, list, record, etc.)
+    Compound(pack::abi::Value),
+    /// Native string from WASM linear memory
+    NativeString(String),
+    /// Native record from WASM linear memory
+    NativeRecord { type_name: String, fields: Vec<(String, i32)> },
+    /// Native variant from WASM linear memory
+    NativeVariant { type_name: String, case_name: String, payload: Option<i32> },
+}
+
+/// Check if a Pack TypeDesc is a compound type (not a scalar)
+fn is_compound_type(td: &pack::TypeDesc) -> bool {
+    matches!(
+        td,
+        pack::TypeDesc::String
+            | pack::TypeDesc::List(_)
+            | pack::TypeDesc::Option(_)
+            | pack::TypeDesc::Result { .. }
+            | pack::TypeDesc::Record { .. }
+            | pack::TypeDesc::Variant { .. }
+            | pack::TypeDesc::Tuple(_)
+            | pack::TypeDesc::Value
+    )
+}
+
+/// Pretty-print a pack::Value for REPL display
+fn format_value(value: &pack::abi::Value) -> String {
+    match value {
+        pack::abi::Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        pack::abi::Value::U8(n) => n.to_string(),
+        pack::abi::Value::U16(n) => n.to_string(),
+        pack::abi::Value::U32(n) => n.to_string(),
+        pack::abi::Value::U64(n) => n.to_string(),
+        pack::abi::Value::S8(n) => n.to_string(),
+        pack::abi::Value::S16(n) => n.to_string(),
+        pack::abi::Value::S32(n) => n.to_string(),
+        pack::abi::Value::S64(n) => n.to_string(),
+        pack::abi::Value::F32(n) => n.to_string(),
+        pack::abi::Value::F64(n) => n.to_string(),
+        pack::abi::Value::Char(c) => format!("'{}'", c),
+        pack::abi::Value::String(s) => format!("\"{}\"", s),
+        pack::abi::Value::List { items, .. } => {
+            let inner: Vec<String> = items.iter().map(format_value).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        pack::abi::Value::Option {
+            value: Some(v), ..
+        } => format!("some({})", format_value(v)),
+        pack::abi::Value::Option { value: None, .. } => "none".to_string(),
+        pack::abi::Value::Result {
+            value: Ok(v), ..
+        } => format!("ok({})", format_value(v)),
+        pack::abi::Value::Result {
+            value: Err(v), ..
+        } => format!("err({})", format_value(v)),
+        pack::abi::Value::Record {
+            type_name, fields, ..
+        } => {
+            let field_strs: Vec<String> = fields
+                .iter()
+                .map(|(name, val)| format!("{}: {}", name, format_value(val)))
+                .collect();
+            format!("{}{{ {} }}", type_name, field_strs.join(", "))
+        }
+        pack::abi::Value::Variant {
+            case_name, payload, ..
+        } => {
+            if payload.is_empty() {
+                case_name.clone()
+            } else {
+                let inner: Vec<String> = payload.iter().map(format_value).collect();
+                format!("{}({})", case_name, inner.join(", "))
+            }
+        }
+        pack::abi::Value::Tuple(items) => {
+            let inner: Vec<String> = items.iter().map(format_value).collect();
+            format!("({})", inner.join(", "))
+        }
+        pack::abi::Value::Flags(n) => format!("flags(0x{:x})", n),
+    }
+}
+
+/// Preprocess string literals in an expression.
+/// Replaces `(str.const "...")` with `(i32.const <addr>)` and collects string data.
+/// Strings are stored in memory at addresses starting from 0x100 in format [len:u32][utf8_bytes...].
+fn preprocess_string_literals(source: &str) -> (String, Vec<(i32, String)>) {
+    let mut result = source.to_string();
+    let mut strings = Vec::new();
+    let mut addr: i32 = 0x100; // Start at offset 256
+
+    while let Some(start) = result.find("(str.const \"") {
+        let content_start = start + "(str.const \"".len();
+        if let Some(quote_end) = result[content_start..].find('"') {
+            let content_end = content_start + quote_end;
+            let paren_end = content_end + 1; // ')' after closing quote
+            if paren_end < result.len() && result.as_bytes()[paren_end] == b')' {
+                let string_value = result[content_start..content_end].to_string();
+                let replacement = format!("(i32.const {})", addr);
+                result.replace_range(start..=paren_end, &replacement);
+
+                // Allocate: 4 bytes length + string bytes, aligned to 4
+                let total = 4 + string_value.len() as i32;
+                strings.push((addr, string_value));
+                addr += (total + 3) & !3;
+            } else {
+                break; // Malformed, stop
+            }
+        } else {
+            break;
+        }
+    }
+
+    (result, strings)
+}
+
+/// Encode a string into WAT data segment format: length prefix + UTF-8 bytes
+fn encode_string_data_segment(s: &str) -> String {
+    let len = s.len() as u32;
+    let len_bytes = len.to_le_bytes();
+    let mut result = String::new();
+    // Encode length prefix as hex escapes
+    for b in &len_bytes {
+        result.push_str(&format!("\\{:02x}", b));
+    }
+    // Encode string bytes
+    for b in s.as_bytes() {
+        if *b >= 0x20 && *b < 0x7f && *b != b'\\' && *b != b'"' {
+            result.push(*b as char);
+        } else {
+            result.push_str(&format!("\\{:02x}", b));
+        }
+    }
+    result
+}
+
+/// Display a Pack TypeDesc as a human-readable string
+fn type_desc_display(td: &pack::TypeDesc) -> String {
+    match td {
+        pack::TypeDesc::Bool => "bool".to_string(),
+        pack::TypeDesc::U8 => "u8".to_string(),
+        pack::TypeDesc::U16 => "u16".to_string(),
+        pack::TypeDesc::U32 => "u32".to_string(),
+        pack::TypeDesc::U64 => "u64".to_string(),
+        pack::TypeDesc::S8 => "s8".to_string(),
+        pack::TypeDesc::S16 => "s16".to_string(),
+        pack::TypeDesc::S32 => "s32".to_string(),
+        pack::TypeDesc::S64 => "s64".to_string(),
+        pack::TypeDesc::F32 => "f32".to_string(),
+        pack::TypeDesc::F64 => "f64".to_string(),
+        pack::TypeDesc::Char => "char".to_string(),
+        pack::TypeDesc::String => "string".to_string(),
+        pack::TypeDesc::Flags => "flags".to_string(),
+        pack::TypeDesc::List(inner) => format!("list<{}>", type_desc_display(inner)),
+        pack::TypeDesc::Option(inner) => format!("option<{}>", type_desc_display(inner)),
+        pack::TypeDesc::Result { ok, err } => format!("result<{}, {}>", type_desc_display(ok), type_desc_display(err)),
+        pack::TypeDesc::Record { name, .. } => name.clone(),
+        pack::TypeDesc::Variant { name, .. } => name.clone(),
+        pack::TypeDesc::Tuple(elems) => {
+            let inner: Vec<String> = elems.iter().map(|e| type_desc_display(e)).collect();
+            format!("tuple<{}>", inner.join(", "))
+        }
+        pack::TypeDesc::Value => "value".to_string(),
+    }
+}
+
+/// Convert a Pack TypeDesc to a WASM-level type
+fn type_desc_to_wasm(td: &pack::TypeDesc) -> WasmType {
+    match td {
+        pack::TypeDesc::S32 | pack::TypeDesc::U32 | pack::TypeDesc::Bool
+        | pack::TypeDesc::U8 | pack::TypeDesc::U16 | pack::TypeDesc::S8
+        | pack::TypeDesc::S16 | pack::TypeDesc::Char | pack::TypeDesc::Flags => WasmType::I32,
+        pack::TypeDesc::S64 | pack::TypeDesc::U64 => WasmType::I64,
+        pack::TypeDesc::F32 => WasmType::F32,
+        pack::TypeDesc::F64 => WasmType::F64,
+        // Compound types are all i32 pointers/handles at the WASM level
+        pack::TypeDesc::String | pack::TypeDesc::List(_) | pack::TypeDesc::Option(_)
+        | pack::TypeDesc::Result { .. } | pack::TypeDesc::Record { .. }
+        | pack::TypeDesc::Variant { .. } | pack::TypeDesc::Tuple(_)
+        | pack::TypeDesc::Value => WasmType::I32,
+    }
+}
+
 // CGRF v2 constants
 const CGRF_MAGIC: u32 = 0x46524743; // "CGRF" in little-endian
 const CGRF_VERSION: u16 = 2;
 
+/// Type information for CGRF encoding/decoding of a single value
+struct CgrfTypeInfo {
+    /// CGRF node type tag
+    tag: u8,
+    /// Payload size in bytes (0 for dynamic types like String)
+    payload_size: usize,
+    /// WAT instruction to store the value (e.g., "i32.store", "i64.store")
+    store_instr: &'static str,
+    /// WAT instruction to load the value (e.g., "i32.load", "i64.load")
+    load_instr: &'static str,
+    /// Whether this type has dynamic size (e.g., String, List)
+    is_dynamic: bool,
+}
+
+/// Get CGRF encoding info for a Pack TypeDesc
+fn cgrf_type_info(td: &pack::TypeDesc) -> CgrfTypeInfo {
+    match td {
+        pack::TypeDesc::Bool => CgrfTypeInfo {
+            tag: 0x01, payload_size: 1,
+            store_instr: "i32.store8", load_instr: "i32.load8_u",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::S32 => CgrfTypeInfo {
+            tag: 0x02, payload_size: 4,
+            store_instr: "i32.store", load_instr: "i32.load",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::S64 => CgrfTypeInfo {
+            tag: 0x03, payload_size: 8,
+            store_instr: "i64.store", load_instr: "i64.load",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::F32 => CgrfTypeInfo {
+            tag: 0x04, payload_size: 4,
+            store_instr: "f32.store", load_instr: "f32.load",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::F64 => CgrfTypeInfo {
+            tag: 0x05, payload_size: 8,
+            store_instr: "f64.store", load_instr: "f64.load",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::String => CgrfTypeInfo {
+            tag: 0x06, payload_size: 0, // dynamic: 4 + string length
+            store_instr: "", load_instr: "",
+            is_dynamic: true,
+        },
+        pack::TypeDesc::U8 => CgrfTypeInfo {
+            tag: 0x0C, payload_size: 1,
+            store_instr: "i32.store8", load_instr: "i32.load8_u",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::S8 => CgrfTypeInfo {
+            tag: 0x10, payload_size: 1,
+            store_instr: "i32.store8", load_instr: "i32.load8_s",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::U16 => CgrfTypeInfo {
+            tag: 0x0D, payload_size: 2,
+            store_instr: "i32.store16", load_instr: "i32.load16_u",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::S16 => CgrfTypeInfo {
+            tag: 0x11, payload_size: 2,
+            store_instr: "i32.store16", load_instr: "i32.load16_s",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::U32 => CgrfTypeInfo {
+            tag: 0x0E, payload_size: 4,
+            store_instr: "i32.store", load_instr: "i32.load",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::U64 => CgrfTypeInfo {
+            tag: 0x0F, payload_size: 8,
+            store_instr: "i64.store", load_instr: "i64.load",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::Char => CgrfTypeInfo {
+            tag: 0x12, payload_size: 4,
+            store_instr: "i32.store", load_instr: "i32.load",
+            is_dynamic: false,
+        },
+        pack::TypeDesc::Flags => CgrfTypeInfo {
+            tag: 0x13, payload_size: 4,
+            store_instr: "i32.store", load_instr: "i32.load",
+            is_dynamic: false,
+        },
+        // For other compound types, fall back to S32 (pointer/handle)
+        _ => CgrfTypeInfo {
+            tag: 0x02, payload_size: 4,
+            store_instr: "i32.store", load_instr: "i32.load",
+            is_dynamic: false,
+        },
+    }
+}
+
 /// Generate a CGRF wrapper function for a Pack import.
 ///
-/// The wrapper has the "simple" signature (i32 params, i32 result) but internally:
-/// 1. Encodes arguments to CGRF in a buffer
+/// The wrapper has the logical signature matching the Pack function but internally:
+/// 1. Encodes arguments to CGRF in a buffer (type-aware using RichSignature)
 /// 2. Calls the raw import (guest-allocates ABI: in_ptr, in_len, out_ptr_ptr, out_len_ptr -> status)
-/// 3. Reads ptr/len from the slots, decodes the result from CGRF
+/// 3. Reads ptr/len from the slots, stores in globals for host compound result reading
+/// 4. Decodes the result from CGRF (scalar) or returns placeholder (compound)
 fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
     let mut out = String::new();
     let wrapper_name = &func.name;
@@ -531,9 +871,31 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
 
     // Buffer locations (fixed offsets in linear memory)
     // Use low offsets that fit within a single 64KB memory page
-    let in_buf: i32 = 0x2000;     // Input buffer at 8KB
-    let out_ptr_slot: i32 = 0x3000;  // Slot for callee to write output ptr
-    let out_len_slot: i32 = 0x3004;  // Slot for callee to write output len
+    let in_buf: i32 = 0x2000;        // Input buffer at 8KB (up to 8KB for input CGRF)
+    let out_ptr_slot: i32 = 0x4000;  // Slot for callee to write output ptr
+    let out_len_slot: i32 = 0x4004;  // Slot for callee to write output len
+
+    // Get rich type info for params and result
+    let param_infos: Vec<CgrfTypeInfo> = if let Some(ref rich) = func.rich_sig {
+        rich.params.iter().map(|p| cgrf_type_info(&p.ty)).collect()
+    } else {
+        func.sig.params.iter().map(|_| cgrf_type_info(&pack::TypeDesc::S32)).collect()
+    };
+
+    let has_dynamic_params = param_infos.iter().any(|ti| ti.is_dynamic);
+
+    let result_info = if let Some(ref rich) = func.rich_sig {
+        rich.results.first()
+            .map(|td| cgrf_type_info(td))
+            .unwrap_or_else(|| cgrf_type_info(&pack::TypeDesc::S32))
+    } else {
+        cgrf_type_info(&pack::TypeDesc::S32)
+    };
+
+    let result_is_compound = func.rich_sig.as_ref()
+        .and_then(|r| r.results.first())
+        .map(|td| is_compound_type(td))
+        .unwrap_or(false);
 
     // Start function with original signature
     out.push_str(&format!("  (func ${} ", wrapper_name));
@@ -549,40 +911,22 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
     out.push_str("    (local $out_ptr i32)\n");
     out.push_str("    (local $out_len i32)\n");
     out.push_str("    (local $status i32)\n");
+    if has_dynamic_params {
+        out.push_str("    (local $write_pos i32)\n");
+        // Add string length locals for each dynamic param
+        for (i, ti) in param_infos.iter().enumerate() {
+            if ti.is_dynamic {
+                out.push_str(&format!("    (local $str_len_{} i32)\n", i));
+            }
+        }
+    }
 
     // Encode arguments to CGRF
     let num_params = func.sig.params.len();
     if num_params == 0 {
         // Empty tuple
-        // Tuple payload format: [count:u32] = 4 bytes
-        out.push_str(&format!("    ;; Encode empty tuple\n"));
-        out.push_str(&format!("    i32.const {}\n", in_buf));
-        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-        out.push_str("    i32.store\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 4));
-        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 6));
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 8));
-        out.push_str("    i32.const 1\n"); // 1 node
-        out.push_str("    i32.store\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 12));
-        out.push_str("    i32.const 0\n"); // root index
-        out.push_str("    i32.store\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 16));
-        out.push_str("    i32.const 11\n"); // Tuple type tag (0x0B)
-        out.push_str("    i32.store8\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 17));
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store8\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 18));
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 20));
-        out.push_str("    i32.const 4\n"); // payload len = 4 bytes (just the count)
-        out.push_str("    i32.store\n");
+        emit_cgrf_header(&mut out, in_buf, 1, 0);
+        emit_node_header(&mut out, in_buf + 16, 0x0B, 4); // Tuple tag, count-only payload
         // Tuple count = 0
         out.push_str(&format!("    i32.const {}\n", in_buf + 24));
         out.push_str("    i32.const 0\n");
@@ -590,91 +934,89 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         // Total: 16 (header) + 8 (node header) + 4 (count) = 28 bytes
         out.push_str("    i32.const 28\n");
         out.push_str("    local.set $in_len\n");
-    } else if num_params == 1 {
-        // Single s32 value (not wrapped in tuple)
-        // CGRF format: header(16) + s32_node(8 header + 4 payload) = 28 bytes
-        out.push_str(&format!("    ;; Encode single s32 value\n"));
+    } else if num_params == 1 && !param_infos[0].is_dynamic {
+        // Single scalar value (not wrapped in tuple)
+        let ti = &param_infos[0];
+        let node_size = 8 + ti.payload_size;
+        let total_size = 16 + node_size;
 
-        // CGRF header
-        out.push_str(&format!("    i32.const {}\n", in_buf));
-        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-        out.push_str("    i32.store\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 4));
-        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 6));
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 8));
-        out.push_str("    i32.const 1\n"); // 1 node
-        out.push_str("    i32.store\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 12));
-        out.push_str("    i32.const 0\n"); // root index
-        out.push_str("    i32.store\n");
+        out.push_str(&format!("    ;; Encode single {} value\n", ti.store_instr));
+        emit_cgrf_header(&mut out, in_buf, 1, 0);
+        emit_node_header(&mut out, in_buf + 16, ti.tag, ti.payload_size as u32);
 
-        // S32 node at offset 16
-        out.push_str(&format!("    i32.const {}\n", in_buf + 16));
-        out.push_str("    i32.const 2\n"); // S32 type tag
-        out.push_str("    i32.store8\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 17));
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store8\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 18));
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 20));
-        out.push_str("    i32.const 4\n"); // payload len = 4 bytes
-        out.push_str("    i32.store\n");
-        // Value
+        // Write value with type-appropriate store instruction
         out.push_str(&format!("    i32.const {}\n", in_buf + 24));
         out.push_str("    local.get $p0\n");
-        out.push_str("    i32.store\n");
+        out.push_str(&format!("    {}\n", ti.store_instr));
 
-        // Total: 16 (header) + 8 (node header) + 4 (payload) = 28 bytes
-        out.push_str("    i32.const 28\n");
+        out.push_str(&format!("    i32.const {}\n", total_size));
         out.push_str("    local.set $in_len\n");
-    } else {
-        // Tuple of s32 values (2 or more)
-        // Header: 16 bytes, each node: 8 bytes header + payload
-        // Tuple payload format: [count:u32, child_indices:u32*]
-        // For tuple of N s32s: header(16) + tuple_node(8 + 4 + 4*N) + N*s32_nodes(8+4 each)
-        let tuple_payload = 4 + 4 * num_params; // 4 bytes count + 4 bytes per child index
-        let s32_node_size = 12; // 8 byte header + 4 byte payload
-        let total_nodes = 1 + num_params; // tuple + N s32 nodes
-        let total_size = 16 + 8 + tuple_payload + num_params * s32_node_size;
+    } else if num_params == 1 && param_infos[0].is_dynamic {
+        // Single dynamic value (string) - not wrapped in tuple
+        let ti = &param_infos[0];
+        out.push_str("    ;; Encode single string value\n");
 
-        out.push_str(&format!("    ;; Encode tuple of {} s32 values\n", num_params));
+        // Read string length from Wisp memory format [len:u32][utf8_bytes...]
+        out.push_str("    local.get $p0\n");
+        out.push_str("    i32.load\n");
+        out.push_str("    local.set $str_len_0\n");
 
-        // CGRF header
-        out.push_str(&format!("    i32.const {}\n", in_buf));
-        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-        out.push_str("    i32.store\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 4));
-        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 6));
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 8));
-        out.push_str(&format!("    i32.const {}\n", total_nodes));
-        out.push_str("    i32.store\n");
-        out.push_str(&format!("    i32.const {}\n", in_buf + 12));
-        out.push_str("    i32.const 0\n"); // root = tuple node at index 0
-        out.push_str("    i32.store\n");
+        // CGRF header (16 bytes) - num_nodes=1
+        emit_cgrf_header(&mut out, in_buf, 1, 0);
 
-        // Tuple node at offset 16
+        // String node header - payload_len is dynamic: 4 + str_len
+        // Type tag (1 byte)
         out.push_str(&format!("    i32.const {}\n", in_buf + 16));
-        out.push_str("    i32.const 11\n"); // Tuple type tag (0x0B)
+        out.push_str(&format!("    i32.const {}\n", ti.tag));
         out.push_str("    i32.store8\n");
+        // Padding (1 byte)
         out.push_str(&format!("    i32.const {}\n", in_buf + 17));
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store8\n");
+        // Padding (2 bytes)
         out.push_str(&format!("    i32.const {}\n", in_buf + 18));
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store16\n");
+        // Payload length = 4 + str_len
         out.push_str(&format!("    i32.const {}\n", in_buf + 20));
-        out.push_str(&format!("    i32.const {}\n", tuple_payload));
+        out.push_str("    i32.const 4\n");
+        out.push_str("    local.get $str_len_0\n");
+        out.push_str("    i32.add\n");
         out.push_str("    i32.store\n");
+
+        // String payload: length prefix
+        out.push_str(&format!("    i32.const {}\n", in_buf + 24));
+        out.push_str("    local.get $str_len_0\n");
+        out.push_str("    i32.store\n");
+
+        // Copy string bytes from [p0+4] to [in_buf+28]
+        out.push_str(&format!("    i32.const {}\n", in_buf + 28)); // dest
+        out.push_str("    local.get $p0\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n"); // src = p0 + 4
+        out.push_str("    local.get $str_len_0\n"); // len
+        out.push_str("    memory.copy\n");
+
+        // in_len = 28 + str_len
+        out.push_str("    i32.const 28\n");
+        out.push_str("    local.get $str_len_0\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.set $in_len\n");
+    } else if !has_dynamic_params {
+        // Tuple of scalar values (2 or more) - original fixed-offset code
+        let tuple_payload = 4 + 4 * num_params; // 4 bytes count + 4 bytes per child index
+        let total_nodes = 1 + num_params;
+
+        // Calculate child node sizes (each has 8-byte header + variable payload)
+        let child_node_sizes: Vec<usize> = param_infos.iter()
+            .map(|ti| 8 + ti.payload_size)
+            .collect();
+        let total_child_bytes: usize = child_node_sizes.iter().sum();
+        let total_size = 16 + 8 + tuple_payload + total_child_bytes;
+
+        out.push_str(&format!("    ;; Encode tuple of {} scalar values\n", num_params));
+        emit_cgrf_header(&mut out, in_buf, total_nodes as u32, 0);
+        emit_node_header(&mut out, in_buf + 16, 0x0B, tuple_payload as u32);
 
         // Tuple count (at offset 24)
         out.push_str(&format!("    i32.const {}\n", in_buf + 24));
@@ -688,30 +1030,156 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
             out.push_str("    i32.store\n");
         }
 
-        // S32 nodes (after tuple node)
-        let s32_nodes_start = in_buf + 28 + (num_params as i32 * 4);
+        // Child nodes (after tuple node) - each with its correct type
+        let mut node_offset = in_buf + 24 + tuple_payload as i32; // after tuple header + payload
         for i in 0..num_params {
-            let node_offset = s32_nodes_start + (i as i32 * s32_node_size as i32);
-            // Node header
-            out.push_str(&format!("    i32.const {}\n", node_offset));
-            out.push_str("    i32.const 2\n"); // S32 type tag
-            out.push_str("    i32.store8\n");
-            out.push_str(&format!("    i32.const {}\n", node_offset + 1));
-            out.push_str("    i32.const 0\n");
-            out.push_str("    i32.store8\n");
-            out.push_str(&format!("    i32.const {}\n", node_offset + 2));
-            out.push_str("    i32.const 0\n");
-            out.push_str("    i32.store16\n");
-            out.push_str(&format!("    i32.const {}\n", node_offset + 4));
-            out.push_str("    i32.const 4\n"); // payload len = 4 bytes
-            out.push_str("    i32.store\n");
-            // Value
+            let ti = &param_infos[i];
+            emit_node_header(&mut out, node_offset, ti.tag, ti.payload_size as u32);
+            // Write value
             out.push_str(&format!("    i32.const {}\n", node_offset + 8));
             out.push_str(&format!("    local.get $p{}\n", i));
-            out.push_str("    i32.store\n");
+            out.push_str(&format!("    {}\n", ti.store_instr));
+
+            node_offset += 8 + ti.payload_size as i32;
         }
 
         out.push_str(&format!("    i32.const {}\n", total_size));
+        out.push_str("    local.set $in_len\n");
+    } else {
+        // Tuple with mixed types (some dynamic) - use $write_pos tracking
+        let tuple_payload = 4 + 4 * num_params;
+        let total_nodes = 1 + num_params;
+
+        out.push_str(&format!("    ;; Encode tuple of {} mixed values (has dynamic types)\n", num_params));
+
+        // Read string lengths first
+        for (i, ti) in param_infos.iter().enumerate() {
+            if ti.is_dynamic {
+                out.push_str(&format!("    ;; Read string length for param {}\n", i));
+                out.push_str(&format!("    local.get $p{}\n", i));
+                out.push_str("    i32.load\n");
+                out.push_str(&format!("    local.set $str_len_{}\n", i));
+            }
+        }
+
+        // CGRF header
+        emit_cgrf_header(&mut out, in_buf, total_nodes as u32, 0);
+
+        // Tuple node header - payload_len is fixed (count + indices)
+        emit_node_header(&mut out, in_buf + 16, 0x0B, tuple_payload as u32);
+
+        // Tuple count
+        out.push_str(&format!("    i32.const {}\n", in_buf + 24));
+        out.push_str(&format!("    i32.const {}\n", num_params));
+        out.push_str("    i32.store\n");
+
+        // Tuple child indices (stable: 1, 2, 3, ...)
+        for i in 0..num_params {
+            out.push_str(&format!("    i32.const {}\n", in_buf + 28 + (i as i32 * 4)));
+            out.push_str(&format!("    i32.const {}\n", i + 1));
+            out.push_str("    i32.store\n");
+        }
+
+        // Initialize write_pos after tuple node
+        let child_start = in_buf + 24 + tuple_payload as i32;
+        out.push_str(&format!("    i32.const {}\n", child_start));
+        out.push_str("    local.set $write_pos\n");
+
+        // Write child nodes using $write_pos
+        for (i, ti) in param_infos.iter().enumerate() {
+            if ti.is_dynamic {
+                // Dynamic child (string)
+                out.push_str(&format!("    ;; Child {} (string)\n", i));
+                // Node header - tag
+                out.push_str("    local.get $write_pos\n");
+                out.push_str(&format!("    i32.const {}\n", ti.tag));
+                out.push_str("    i32.store8\n");
+                // Padding byte
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 1\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 0\n");
+                out.push_str("    i32.store8\n");
+                // Padding 2 bytes
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 2\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 0\n");
+                out.push_str("    i32.store16\n");
+                // Payload length = 4 + str_len
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str(&format!("    local.get $str_len_{}\n", i));
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.store\n");
+                // String length in payload
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str(&format!("    local.get $str_len_{}\n", i));
+                out.push_str("    i32.store\n");
+                // Copy string bytes
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n"); // dest = write_pos + 12
+                out.push_str(&format!("    local.get $p{}\n", i));
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n"); // src = p_i + 4
+                out.push_str(&format!("    local.get $str_len_{}\n", i));
+                out.push_str("    memory.copy\n");
+                // Advance: write_pos += 12 + str_len
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n");
+                out.push_str(&format!("    local.get $str_len_{}\n", i));
+                out.push_str("    i32.add\n");
+                out.push_str("    local.set $write_pos\n");
+            } else {
+                // Scalar child - fixed size
+                let node_size = 8 + ti.payload_size;
+                out.push_str(&format!("    ;; Child {} (scalar, {} bytes)\n", i, node_size));
+                // Node header - tag
+                out.push_str("    local.get $write_pos\n");
+                out.push_str(&format!("    i32.const {}\n", ti.tag));
+                out.push_str("    i32.store8\n");
+                // Padding byte
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 1\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 0\n");
+                out.push_str("    i32.store8\n");
+                // Padding 2 bytes
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 2\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.const 0\n");
+                out.push_str("    i32.store16\n");
+                // Payload length
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str(&format!("    i32.const {}\n", ti.payload_size));
+                out.push_str("    i32.store\n");
+                // Write value
+                out.push_str("    local.get $write_pos\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.add\n");
+                out.push_str(&format!("    local.get $p{}\n", i));
+                out.push_str(&format!("    {}\n", ti.store_instr));
+                // Advance: write_pos += 8 + payload_size
+                out.push_str("    local.get $write_pos\n");
+                out.push_str(&format!("    i32.const {}\n", node_size));
+                out.push_str("    i32.add\n");
+                out.push_str("    local.set $write_pos\n");
+            }
+        }
+
+        // in_len = write_pos - in_buf
+        out.push_str("    local.get $write_pos\n");
+        out.push_str(&format!("    i32.const {}\n", in_buf));
+        out.push_str("    i32.sub\n");
         out.push_str("    local.set $in_len\n");
     }
 
@@ -733,17 +1201,75 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
     out.push_str("    i32.load\n");
     out.push_str("    local.set $out_len\n");
 
-    // Decode result - read s32 from CGRF output
-    // CGRF format: header(16) + node header(8) + payload
-    // For s32: value is at out_ptr + 24
-    out.push_str("    ;; Decode s32 result\n");
+    // Store output ptr/len in globals for host to read compound results
+    out.push_str("    ;; Store output ptr/len in globals for host\n");
     out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.load\n");
+    out.push_str("    global.set $__result_ptr\n");
+    out.push_str("    local.get $out_len\n");
+    out.push_str("    global.set $__result_len\n");
+
+    if result_is_compound {
+        // Compound result: host will read CGRF from memory via globals
+        // Return 0 as placeholder
+        out.push_str("    ;; Compound result - host reads CGRF via globals\n");
+        out.push_str("    i32.const 0\n");
+    } else {
+        // Scalar result: decode from CGRF output
+        // CGRF format: header(16) + node header(8) + payload
+        // Value is at out_ptr + 24
+        out.push_str(&format!("    ;; Decode {} result\n", result_info.load_instr));
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.const 24\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    {}\n", result_info.load_instr));
+    }
 
     out.push_str("  )\n");
     out
+}
+
+/// Emit a CGRF v2 header at the given offset
+fn emit_cgrf_header(out: &mut String, offset: i32, num_nodes: u32, root_index: u32) {
+    // Magic: "CGRF" (4 bytes)
+    out.push_str(&format!("    i32.const {}\n", offset));
+    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+    out.push_str("    i32.store\n");
+    // Version: 2 (2 bytes)
+    out.push_str(&format!("    i32.const {}\n", offset + 4));
+    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION));
+    out.push_str("    i32.store16\n");
+    // Padding (2 bytes)
+    out.push_str(&format!("    i32.const {}\n", offset + 6));
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+    // Num nodes (4 bytes)
+    out.push_str(&format!("    i32.const {}\n", offset + 8));
+    out.push_str(&format!("    i32.const {}\n", num_nodes));
+    out.push_str("    i32.store\n");
+    // Root index (4 bytes)
+    out.push_str(&format!("    i32.const {}\n", offset + 12));
+    out.push_str(&format!("    i32.const {}\n", root_index));
+    out.push_str("    i32.store\n");
+}
+
+/// Emit a CGRF node header at the given offset
+fn emit_node_header(out: &mut String, offset: i32, type_tag: u8, payload_len: u32) {
+    // Type tag (1 byte)
+    out.push_str(&format!("    i32.const {}\n", offset));
+    out.push_str(&format!("    i32.const {}\n", type_tag));
+    out.push_str("    i32.store8\n");
+    // Padding (1 byte)
+    out.push_str(&format!("    i32.const {}\n", offset + 1));
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store8\n");
+    // Padding (2 bytes)
+    out.push_str(&format!("    i32.const {}\n", offset + 2));
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+    // Payload length (4 bytes)
+    out.push_str(&format!("    i32.const {}\n", offset + 4));
+    out.push_str(&format!("    i32.const {}\n", payload_len));
+    out.push_str("    i32.store\n");
 }
 
 /// Parse an import statement: (import <interface> from <source>)
@@ -796,6 +1322,7 @@ fn load_interface(
                             params: vec![], // Takes a string via CGRF, not supported yet
                             results: vec![],
                         },
+                        rich_sig: None,
                     },
                 ],
                 "theater:simple/assembler" => vec![
@@ -805,6 +1332,7 @@ fn load_interface(
                             params: vec![], // Takes a string via CGRF
                             results: vec![], // Returns result<list<u8>, string>
                         },
+                        rich_sig: None,
                     },
                 ],
                 "wisp:repl/debug" => vec![
@@ -812,8 +1340,9 @@ fn load_interface(
                         name: "print-i32".to_string(),
                         sig: FunctionSig {
                             params: vec![WasmType::I32],
-                            results: vec![WasmType::I32], // Returns the value (useful for chaining)
+                            results: vec![WasmType::I32],
                         },
+                        rich_sig: None,
                     },
                     ExportedFunction {
                         name: "print-i64".to_string(),
@@ -821,6 +1350,7 @@ fn load_interface(
                             params: vec![WasmType::I64],
                             results: vec![WasmType::I64],
                         },
+                        rich_sig: None,
                     },
                     ExportedFunction {
                         name: "print-f32".to_string(),
@@ -828,6 +1358,7 @@ fn load_interface(
                             params: vec![WasmType::F32],
                             results: vec![WasmType::F32],
                         },
+                        rich_sig: None,
                     },
                     ExportedFunction {
                         name: "print-f64".to_string(),
@@ -835,6 +1366,7 @@ fn load_interface(
                             params: vec![WasmType::F64],
                             results: vec![WasmType::F64],
                         },
+                        rich_sig: None,
                     },
                 ],
                 _ => anyhow::bail!("Unknown host interface: {}", interface),
@@ -862,52 +1394,75 @@ fn load_interface(
                 loaded_packages.insert(path.clone(), Arc::new(Mutex::new(instance)));
             }
 
-            // Discover exports from the WASM module using wasmtime
-            // Pack functions use Graph ABI: (in_ptr, in_len, out_ptr, out_cap) -> out_len
-            let engine = wasmtime::Engine::default();
-            let wasm_module = wasmtime::Module::new(&engine, &bytes)
-                .with_context(|| format!("Failed to parse Pack package: {}", path.display()))?;
-
+            // Discover exports using Pack type metadata
             let mut exports = Vec::new();
-            for export in wasm_module.exports() {
-                // Only consider function exports with Graph ABI signature
-                if let wasmtime::ExternType::Func(func_ty) = export.ty() {
-                    // Graph ABI: 4 i32 params, 1 i32 result
-                    let params: Vec<_> = func_ty.params().collect();
-                    let results: Vec<_> = func_ty.results().collect();
+            {
+                let mut instance = loaded_packages.get(path).unwrap().lock().unwrap();
+                match instance.types() {
+                    Ok(metadata) => {
+                        for func_sig in &metadata.exports {
+                            let wasm_params: Vec<WasmType> = func_sig.params.iter()
+                                .map(|p| type_desc_to_wasm(&p.ty))
+                                .collect();
+                            let wasm_results: Vec<WasmType> = func_sig.results.iter()
+                                .map(|td| type_desc_to_wasm(td))
+                                .collect();
 
-                    let is_graph_abi = params.len() == 4
-                        && params.iter().all(|p| matches!(p, wasmtime::ValType::I32))
-                        && results.len() == 1
-                        && matches!(results[0], wasmtime::ValType::I32);
+                            exports.push(ExportedFunction {
+                                name: func_sig.name.clone(),
+                                sig: FunctionSig {
+                                    params: wasm_params,
+                                    results: wasm_results,
+                                },
+                                rich_sig: Some(RichSignature {
+                                    params: func_sig.params.clone(),
+                                    results: func_sig.results.clone(),
+                                }),
+                            });
+                        }
+                        info!("Loaded Pack package: {} with {} typed exports",
+                            path.display(), exports.len());
+                    }
+                    Err(pack::MetadataError::NotFound) => {
+                        // No __pack_types - fall back to discovering Graph ABI exports
+                        warn!("Pack package {} has no type metadata, falling back to heuristic",
+                            path.display());
+                        let engine = wasmtime::Engine::default();
+                        let wasm_module = wasmtime::Module::new(&engine, &bytes)
+                            .with_context(|| format!("Failed to parse Pack package: {}", path.display()))?;
 
-                    if is_graph_abi {
-                        // This is a Graph ABI export - the logical signature is encoded in CGRF
-                        // Heuristic: detect common function patterns
-                        // TODO: Parse wit+ to discover actual signatures
-                        let name = export.name();
-                        let param_count = match name {
-                            // Known nullary functions (no params, just return value)
-                            n if n.starts_with("test-") || n.ends_with("-test") || n.contains("internal") => 0,
-                            "init" | "run" | "main" | "start" => 0,
-                            // Known unary math functions
-                            "square" | "sqrt" | "abs" | "negate" | "factorial" | "double" | "inc" | "dec" => 1,
-                            // Default to unary for most other cases
-                            _ => 1,
-                        };
+                        for export in wasm_module.exports() {
+                            if let wasmtime::ExternType::Func(func_ty) = export.ty() {
+                                let params: Vec<_> = func_ty.params().collect();
+                                let results: Vec<_> = func_ty.results().collect();
 
-                        exports.push(ExportedFunction {
-                            name: name.to_string(),
-                            sig: FunctionSig {
-                                params: vec![WasmType::I32; param_count],
-                                results: vec![WasmType::I32],
-                            },
-                        });
+                                let is_graph_abi = params.len() == 4
+                                    && params.iter().all(|p| matches!(p, wasmtime::ValType::I32))
+                                    && results.len() == 1
+                                    && matches!(results[0], wasmtime::ValType::I32);
+
+                                if is_graph_abi {
+                                    let name = export.name();
+                                    // Without metadata, default to 1 param
+                                    exports.push(ExportedFunction {
+                                        name: name.to_string(),
+                                        sig: FunctionSig {
+                                            params: vec![WasmType::I32],
+                                            results: vec![WasmType::I32],
+                                        },
+                                        rich_sig: None,
+                                    });
+                                }
+                            }
+                        }
+                        info!("Loaded Pack package: {} with Graph ABI exports (no metadata)",
+                            path.display());
+                    }
+                    Err(e) => {
+                        warn!("Failed to read type metadata from {}: {}", path.display(), e);
                     }
                 }
             }
-
-            info!("Loaded Pack package: {} with Graph ABI exports", path.display());
 
             Ok(LoadedInterface {
                 interface: interface.to_string(),
@@ -916,6 +1471,212 @@ fn load_interface(
             })
         }
     }
+}
+
+/// Parse a variant type definition: (variant name (case1) (case2 payload-type) ...)
+fn parse_variant_def(line: &str) -> Option<ReplVariantDef> {
+    let inner = line.strip_prefix("(variant ")?.strip_suffix(')')?;
+    let name_end = inner.find(' ')?;
+    let name = inner[..name_end].to_string();
+    let rest = inner[name_end..].trim();
+
+    let mut cases = Vec::new();
+    let mut pos = 0;
+    let bytes = rest.as_bytes();
+    while pos < bytes.len() {
+        if bytes[pos] == b'(' {
+            let start = pos + 1;
+            // Find matching close paren
+            let end = rest[start..].find(')')? + start;
+            let case_str = rest[start..end].trim();
+            let parts: Vec<&str> = case_str.split_whitespace().collect();
+            if parts.is_empty() {
+                return None;
+            }
+            let case_name = parts[0].to_string();
+            let has_payload = parts.len() > 1;
+            cases.push(ReplVariantCase { name: case_name, has_payload });
+            pos = end + 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    if cases.is_empty() {
+        return None;
+    }
+
+    Some(ReplVariantDef {
+        name,
+        cases,
+        original_source: line.to_string(),
+    })
+}
+
+/// Parse a record type definition: (record name (field1 type1) (field2 type2) ...)
+fn parse_record_def(line: &str) -> Option<ReplRecordDef> {
+    let inner = line.strip_prefix("(record ")?.strip_suffix(')')?;
+    let name_end = inner.find(' ')?;
+    let name = inner[..name_end].to_string();
+    let rest = inner[name_end..].trim();
+
+    let mut fields = Vec::new();
+    let mut pos = 0;
+    let bytes = rest.as_bytes();
+    while pos < bytes.len() {
+        if bytes[pos] == b'(' {
+            let start = pos + 1;
+            let end = rest[start..].find(')')? + start;
+            let field_str = rest[start..end].trim();
+            let parts: Vec<&str> = field_str.split_whitespace().collect();
+            if parts.len() != 2 {
+                return None;
+            }
+            fields.push(ReplRecordField {
+                name: parts[0].to_string(),
+                ty: parts[1].to_string(),
+            });
+            pos = end + 1;
+        } else {
+            pos += 1;
+        }
+    }
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    Some(ReplRecordDef {
+        name,
+        fields,
+        original_source: line.to_string(),
+    })
+}
+
+/// Infer the return type of an expression based on known type definitions
+fn infer_return_type(
+    expr: &str,
+    record_defs: &HashMap<String, ReplRecordDef>,
+    variant_defs: &HashMap<String, ReplVariantDef>,
+    used_imports: &[(&LoadedInterface, &ExportedFunction)],
+) -> ReplReturnType {
+    let trimmed = expr.trim();
+
+    // Check for string-returning operations
+    if trimmed.starts_with("(string-append")
+        || trimmed.starts_with("(substring")
+        || trimmed.starts_with("(str.const")
+    {
+        return ReplReturnType::NativeString;
+    }
+
+    // Check for Pack compound import call
+    for (_, func) in used_imports {
+        if func.rich_sig.as_ref()
+            .and_then(|r| r.results.first())
+            .map(|td| is_compound_type(td))
+            .unwrap_or(false)
+            && trimmed.starts_with(&format!("({}", func.name))
+        {
+            return ReplReturnType::PackCompound;
+        }
+    }
+
+    // Extract the first symbol from the expression
+    let first_sym_raw = if trimmed.starts_with('(') {
+        trimmed[1..].split_whitespace().next().unwrap_or("")
+    } else {
+        trimmed
+    };
+    // Strip trailing parens (e.g., "red)" from "(red)")
+    let first_sym = first_sym_raw.trim_end_matches(')');
+
+    // Check if it's a record constructor
+    if record_defs.contains_key(first_sym) {
+        return ReplReturnType::NativeRecord(first_sym.to_string());
+    }
+
+    // Check if it's a variant case constructor
+    for (vname, vdef) in variant_defs {
+        for case in &vdef.cases {
+            if case.name == first_sym {
+                return ReplReturnType::NativeVariant(vname.clone());
+            }
+        }
+    }
+
+    // Check if it's a field accessor (e.g., point.x)
+    if first_sym.contains('.') {
+        // Field accessor returns scalar
+        return ReplReturnType::Scalar;
+    }
+
+    ReplReturnType::Scalar
+}
+
+/// Read a string from WASM linear memory at the given pointer.
+/// Format: [len:u32][utf8_bytes...]
+fn read_string_from_memory(memory: &wasmtime::Memory, store: &Store<()>, ptr: i32) -> Result<String> {
+    let mut len_buf = [0u8; 4];
+    memory.read(store, ptr as usize, &mut len_buf)
+        .context("failed to read string length")?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut str_buf = vec![0u8; len];
+    memory.read(store, (ptr as usize) + 4, &mut str_buf)
+        .context("failed to read string bytes")?;
+
+    String::from_utf8(str_buf).context("invalid UTF-8 in string")
+}
+
+/// Read a record from WASM linear memory at the given pointer.
+/// Records are stored as N consecutive i32 fields.
+fn read_record_from_memory(
+    memory: &wasmtime::Memory,
+    store: &Store<()>,
+    ptr: i32,
+    rec_def: &ReplRecordDef,
+) -> Result<Vec<(String, i32)>> {
+    let mut fields = Vec::new();
+    for (i, field) in rec_def.fields.iter().enumerate() {
+        let offset = (i * 4) as usize;
+        let mut buf = [0u8; 4];
+        memory.read(store, (ptr as usize) + offset, &mut buf)
+            .context("failed to read record field")?;
+        let value = i32::from_le_bytes(buf);
+        fields.push((field.name.clone(), value));
+    }
+    Ok(fields)
+}
+
+/// Read a variant from WASM linear memory at the given pointer.
+/// Variants are stored as [tag:i32][payload:i32 (optional)]
+fn read_variant_from_memory(
+    memory: &wasmtime::Memory,
+    store: &Store<()>,
+    ptr: i32,
+    var_def: &ReplVariantDef,
+) -> Result<(String, Option<i32>)> {
+    let mut tag_buf = [0u8; 4];
+    memory.read(store, ptr as usize, &mut tag_buf)
+        .context("failed to read variant tag")?;
+    let tag = i32::from_le_bytes(tag_buf) as usize;
+
+    if tag >= var_def.cases.len() {
+        anyhow::bail!("variant tag {} out of range (max {})", tag, var_def.cases.len() - 1);
+    }
+
+    let case = &var_def.cases[tag];
+    let payload = if case.has_payload {
+        let mut payload_buf = [0u8; 4];
+        memory.read(store, (ptr as usize) + 4, &mut payload_buf)
+            .context("failed to read variant payload")?;
+        Some(i32::from_le_bytes(payload_buf))
+    } else {
+        None
+    };
+
+    Ok((case.name.clone(), payload))
 }
 
 /// Interactive REPL
@@ -932,6 +1693,8 @@ async fn run_repl() -> Result<()> {
     let mut bindings: HashMap<String, i32> = HashMap::new();
     let mut functions: Vec<String> = Vec::new();
     let mut imports: Vec<LoadedInterface> = Vec::new();
+    let mut record_defs: HashMap<String, ReplRecordDef> = HashMap::new();
+    let mut variant_defs: HashMap<String, ReplVariantDef> = HashMap::new();
     // Loaded Pack packages: path -> LoadedPackage
     let mut loaded_packages: HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>> = HashMap::new();
     // Pack runtime for loading packages
@@ -995,9 +1758,47 @@ async fn run_repl() -> Result<()> {
             continue;
         }
 
+        if line.starts_with("(variant ") {
+            match parse_variant_def(line) {
+                Some(vdef) => {
+                    println!("defined variant {}", vdef.name);
+                    variant_defs.insert(vdef.name.clone(), vdef);
+                }
+                None => println!("error: invalid variant syntax. Use: (variant name (case1) (case2 payload-type) ...)"),
+            }
+            continue;
+        }
+
+        if line.starts_with("(record ") {
+            match parse_record_def(line) {
+                Some(rdef) => {
+                    println!("defined record {}", rdef.name);
+                    record_defs.insert(rdef.name.clone(), rdef);
+                }
+                None => println!("error: invalid record syntax. Use: (record name (field1 type1) (field2 type2) ...)"),
+            }
+            continue;
+        }
+
         if line == "(list)" {
             println!("bindings: {:?}", bindings);
             println!("functions: {} defined", functions.len());
+            if !variant_defs.is_empty() {
+                println!("variants:");
+                for (name, vdef) in &variant_defs {
+                    let cases: Vec<String> = vdef.cases.iter().map(|c| {
+                        if c.has_payload { format!("{}(_)", c.name) } else { c.name.clone() }
+                    }).collect();
+                    println!("  {} = {}", name, cases.join(" | "));
+                }
+            }
+            if !record_defs.is_empty() {
+                println!("records:");
+                for (name, rdef) in &record_defs {
+                    let fields: Vec<String> = rdef.fields.iter().map(|f| format!("{}: {}", f.name, f.ty)).collect();
+                    println!("  {} {{ {} }}", name, fields.join(", "));
+                }
+            }
             println!("imports: {} loaded", imports.len());
             for imp in &imports {
                 let source_name = match &imp.source {
@@ -1006,10 +1807,22 @@ async fn run_repl() -> Result<()> {
                 };
                 println!("  {} from {} ({} exports)", imp.interface, source_name, imp.exports.len());
                 for func in &imp.exports {
-                    let params: Vec<&str> = func.sig.params.iter().map(|t| t.to_wisp()).collect();
-                    let results: Vec<&str> = func.sig.results.iter().map(|t| t.to_wisp()).collect();
-                    let result_str = if results.is_empty() { "()".to_string() } else { results.join(", ") };
-                    println!("    {}({}) -> {}", func.name, params.join(", "), result_str);
+                    // Prefer rich type names when available
+                    if let Some(ref rich) = func.rich_sig {
+                        let params: Vec<String> = rich.params.iter()
+                            .map(|p| format!("{}: {}", p.name, type_desc_display(&p.ty)))
+                            .collect();
+                        let results: Vec<String> = rich.results.iter()
+                            .map(|td| type_desc_display(td))
+                            .collect();
+                        let result_str = if results.is_empty() { "()".to_string() } else { results.join(", ") };
+                        println!("    {}({}) -> {}", func.name, params.join(", "), result_str);
+                    } else {
+                        let params: Vec<&str> = func.sig.params.iter().map(|t| t.to_wisp()).collect();
+                        let results: Vec<&str> = func.sig.results.iter().map(|t| t.to_wisp()).collect();
+                        let result_str = if results.is_empty() { "()".to_string() } else { results.join(", ") };
+                        println!("    {}({}) -> {}", func.name, params.join(", "), result_str);
+                    }
                 }
             }
             continue;
@@ -1020,6 +1833,8 @@ async fn run_repl() -> Result<()> {
             functions.clear();
             imports.clear();
             loaded_packages.clear();
+            record_defs.clear();
+            variant_defs.clear();
             println!("cleared");
             continue;
         }
@@ -1051,8 +1866,22 @@ async fn run_repl() -> Result<()> {
         }
 
         // Compile and evaluate expression
-        match eval_expression(&compiler_wasm, &runtime, line, &bindings, &functions, &imports, &loaded_packages).await {
-            Ok(result) => println!("{}", result),
+        match eval_expression(&compiler_wasm, &runtime, line, &bindings, &functions, &imports, &loaded_packages, &record_defs, &variant_defs).await {
+            Ok(EvalResult::Scalar(n)) => println!("{}", n),
+            Ok(EvalResult::Compound(v)) => println!("{}", format_value(&v)),
+            Ok(EvalResult::NativeString(s)) => println!("\"{}\"", s),
+            Ok(EvalResult::NativeRecord { type_name, fields }) => {
+                let field_strs: Vec<String> = fields.iter()
+                    .map(|(name, val)| format!("{}: {}", name, val))
+                    .collect();
+                println!("{}{{ {} }}", type_name, field_strs.join(", "));
+            }
+            Ok(EvalResult::NativeVariant { case_name, payload, .. }) => {
+                match payload {
+                    Some(v) => println!("{}({})", case_name, v),
+                    None => println!("{}", case_name),
+                }
+            }
             Err(e) => println!("error: {}", e),
         }
     }
@@ -1065,9 +1894,9 @@ async fn run_repl() -> Result<()> {
 ///
 /// For Pack package imports, creates bridge functions that:
 /// 1. Accept simple signature (i32 args)
-/// 2. Encode to PackValue
-/// 3. Call Pack instance via call_with_value (Graph ABI)
-/// 4. Decode result back to i32
+/// 2. Encode to CGRF via generated wrapper
+/// 3. Call Pack instance via Graph ABI bridge
+/// 4. Decode result back (scalar or compound)
 async fn eval_expression(
     compiler_wasm: &[u8],
     runtime: &AsyncRuntime,
@@ -1076,19 +1905,43 @@ async fn eval_expression(
     functions: &[String],
     imports: &[LoadedInterface],
     loaded_packages: &HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>>,
-) -> Result<i32> {
+    record_defs: &HashMap<String, ReplRecordDef>,
+    variant_defs: &HashMap<String, ReplVariantDef>,
+) -> Result<EvalResult> {
+    // Preprocess string literals in expression and function definitions.
+    // (str.const "hello") -> (i32.const <addr>) with data segments.
+    // Process everything in a single pass to get consistent addresses.
+    let mut full_text = String::new();
+    for f in functions {
+        full_text.push_str(f);
+        full_text.push('\n');
+    }
+    full_text.push_str(expr);
+    let (processed_full, all_strings) = preprocess_string_literals(&full_text);
+
+    // Split back into functions and expression
+    let mut processed_functions = Vec::new();
+    let mut remaining = processed_full.as_str();
+    for _f in functions {
+        if let Some(newline_pos) = remaining.find('\n') {
+            processed_functions.push(remaining[..newline_pos].to_string());
+            remaining = &remaining[newline_pos + 1..];
+        }
+    }
+    let processed_expr = remaining.to_string();
+
     // Find which imported functions are used in the expression or user-defined functions
     let mut used_imports: Vec<(&LoadedInterface, &ExportedFunction)> = Vec::new();
     for imp in imports {
         for export in &imp.exports {
             // Check if this function name appears in the expression
             // Simple heuristic: look for (funcname or funcname)
-            let mut is_used = expr.contains(&format!("({}", export.name))
-                           || expr.contains(&format!(" {}", export.name));
+            let mut is_used = processed_expr.contains(&format!("({}", export.name))
+                           || processed_expr.contains(&format!(" {}", export.name));
 
             // Also check if any user-defined function uses this import
             if !is_used {
-                for func_def in functions {
+                for func_def in &processed_functions {
                     if func_def.contains(&format!("({}", export.name))
                     || func_def.contains(&format!(" {}", export.name)) {
                         is_used = true;
@@ -1103,8 +1956,30 @@ async fn eval_expression(
         }
     }
 
+    // Check if any used import has Pack component source (needs wrapper infrastructure)
+    let has_pack_imports = used_imports.iter().any(|(imp, _)| {
+        matches!(imp.source, ImportSource::Component(_))
+    });
+
+    // Infer the return type of the expression
+    let return_type = infer_return_type(&processed_expr, record_defs, variant_defs, &used_imports);
+    let needs_memory_export = matches!(
+        return_type,
+        ReplReturnType::NativeString | ReplReturnType::NativeRecord(_) | ReplReturnType::NativeVariant(_)
+    );
+
     // Generate source with all functions and an eval wrapper
     let mut source = String::new();
+
+    // Add type definitions so the self-hosted compiler can build its context
+    for (_, vdef) in variant_defs {
+        source.push_str(&vdef.original_source);
+        source.push('\n');
+    }
+    for (_, rdef) in record_defs {
+        source.push_str(&rdef.original_source);
+        source.push('\n');
+    }
 
     // Add stub function definitions for imported functions so the compiler knows their types.
     // These will be replaced with actual imports when we post-process the WAT.
@@ -1135,14 +2010,14 @@ async fn eval_expression(
         ));
     }
 
-    // Add all function definitions
-    for func in functions {
+    // Add all function definitions (preprocessed for string literals)
+    for func in &processed_functions {
         source.push_str(func);
         source.push('\n');
     }
 
     // Inline bindings into the expression
-    let mut inlined_expr = expr.to_string();
+    let mut inlined_expr = processed_expr.clone();
     for (name, value) in bindings {
         // Simple string replacement (not perfect but works for basic cases)
         inlined_expr = inlined_expr.replace(
@@ -1185,7 +2060,7 @@ async fn eval_expression(
         other => anyhow::bail!("Expected WAT string, got {:?}", other),
     };
 
-    // Post-process WAT to inject import declarations
+    // Post-process WAT to inject import declarations, globals, and data segments
     // The self-hosted compiler doesn't support (import ...) yet, so we:
     // 1. Add stub functions to the source (done above)
     // 2. Post-process WAT to remove stubs and add real imports
@@ -1269,6 +2144,16 @@ async fn eval_expression(
             }
         }
 
+        // Generate data segments for string literals
+        let mut data_segments = String::new();
+        for (addr, string_val) in &all_strings {
+            let encoded = encode_string_data_segment(string_val);
+            data_segments.push_str(&format!(
+                "  (data (i32.const {}) \"{}\")\n",
+                addr, encoded
+            ));
+        }
+
         // Build result, inserting imports after (module and wrappers before closing )
         let mut result = String::new();
         let mut _memory_exported = false;
@@ -1290,8 +2175,8 @@ async fn eval_expression(
                 result.push_str(&wrapper_wat);
             }
 
-            // For Pack imports, ensure memory is exported (bridge needs to access it)
-            if !wrapper_wat.is_empty() && line.contains("(memory") && !line.contains("export") {
+            // Ensure memory is exported when needed (Pack imports or native compound results)
+            if (!wrapper_wat.is_empty() || needs_memory_export) && line.contains("(memory") && !line.contains("export") {
                 // Replace non-exported memory with exported memory
                 let exported_line = line.replace("(memory", "(memory (export \"memory\")");
                 result.push_str(&exported_line);
@@ -1309,6 +2194,40 @@ async fn eval_expression(
                 if !wrapper_wat.is_empty() && !lines.iter().any(|l| l.contains("(memory")) {
                     result.push_str("  (memory (export \"memory\") 1)\n");
                     _memory_exported = true;
+                }
+                // Add result globals for compound result reading
+                if !wrapper_wat.is_empty() {
+                    result.push_str("  (global $__result_ptr (export \"__result_ptr\") (mut i32) (i32.const 0))\n");
+                    result.push_str("  (global $__result_len (export \"__result_len\") (mut i32) (i32.const 0))\n");
+                }
+                // Add data segments for string literals
+                if !data_segments.is_empty() {
+                    result.push_str(&data_segments);
+                }
+            }
+        }
+        result
+    } else if needs_memory_export || !all_strings.is_empty() {
+        // No Pack imports, but we need memory export for native compound types
+        // or data segments for string literals
+        let mut result = String::new();
+        for line in wat.lines() {
+            if needs_memory_export && line.contains("(memory") && !line.contains("export") {
+                let exported_line = line.replace("(memory", "(memory (export \"memory\")");
+                result.push_str(&exported_line);
+                result.push('\n');
+                continue;
+            }
+            result.push_str(line);
+            result.push('\n');
+            if line.trim().starts_with("(module") {
+                // Add data segments for string literals
+                for (addr, string_val) in &all_strings {
+                    let encoded = encode_string_data_segment(string_val);
+                    result.push_str(&format!(
+                        "  (data (i32.const {}) \"{}\")\n",
+                        addr, encoded
+                    ));
                 }
             }
         }
@@ -1471,8 +2390,85 @@ async fn eval_expression(
     let mut results = vec![wasmtime::Val::I32(0)];
     eval_func.call(&mut store, &[], &mut results)?;
 
-    match results.into_iter().next() {
-        Some(wasmtime::Val::I32(n)) => Ok(n),
-        other => anyhow::bail!("Expected i32 result, got {:?}", other),
+    // Determine result type based on inference
+    match return_type {
+        ReplReturnType::NativeString => {
+            let ptr = match results.first() {
+                Some(wasmtime::Val::I32(n)) => *n,
+                _ => anyhow::bail!("Expected i32 pointer for string result"),
+            };
+            let memory = instance.get_memory(&mut store, "memory")
+                .context("memory not found for string result")?;
+            let s = read_string_from_memory(&memory, &store, ptr)?;
+            Ok(EvalResult::NativeString(s))
+        }
+        ReplReturnType::NativeRecord(ref type_name) => {
+            let ptr = match results.first() {
+                Some(wasmtime::Val::I32(n)) => *n,
+                _ => anyhow::bail!("Expected i32 pointer for record result"),
+            };
+            let rec_def = record_defs.get(type_name)
+                .with_context(|| format!("Record type '{}' not found", type_name))?;
+            let memory = instance.get_memory(&mut store, "memory")
+                .context("memory not found for record result")?;
+            let fields = read_record_from_memory(&memory, &store, ptr, rec_def)?;
+            Ok(EvalResult::NativeRecord {
+                type_name: type_name.clone(),
+                fields,
+            })
+        }
+        ReplReturnType::NativeVariant(ref type_name) => {
+            let ptr = match results.first() {
+                Some(wasmtime::Val::I32(n)) => *n,
+                _ => anyhow::bail!("Expected i32 pointer for variant result"),
+            };
+            let var_def = variant_defs.get(type_name)
+                .with_context(|| format!("Variant type '{}' not found", type_name))?;
+            let memory = instance.get_memory(&mut store, "memory")
+                .context("memory not found for variant result")?;
+            let (case_name, payload) = read_variant_from_memory(&memory, &store, ptr, var_def)?;
+            Ok(EvalResult::NativeVariant {
+                type_name: type_name.clone(),
+                case_name,
+                payload,
+            })
+        }
+        ReplReturnType::PackCompound => {
+            if has_pack_imports {
+                // Read compound result from CGRF via globals
+                let result_ptr_global = instance.get_global(&mut store, "__result_ptr")
+                    .context("__result_ptr global not found")?;
+                let result_len_global = instance.get_global(&mut store, "__result_len")
+                    .context("__result_len global not found")?;
+
+                let result_ptr = result_ptr_global.get(&mut store).unwrap_i32() as usize;
+                let result_len = result_len_global.get(&mut store).unwrap_i32() as usize;
+
+                if result_ptr > 0 && result_len > 0 {
+                    let memory = instance.get_memory(&mut store, "memory")
+                        .context("memory not found for compound result")?;
+
+                    let mut cgrf_buf = vec![0u8; result_len];
+                    memory.read(&store, result_ptr, &mut cgrf_buf)
+                        .context("failed to read compound result CGRF")?;
+
+                    let value = pack::decode(&cgrf_buf)
+                        .context("failed to decode compound result CGRF")?;
+
+                    return Ok(EvalResult::Compound(value));
+                }
+            }
+            // Fall through to scalar
+            match results.into_iter().next() {
+                Some(wasmtime::Val::I32(n)) => Ok(EvalResult::Scalar(n)),
+                other => anyhow::bail!("Expected i32 result, got {:?}", other),
+            }
+        }
+        ReplReturnType::Scalar => {
+            match results.into_iter().next() {
+                Some(wasmtime::Val::I32(n)) => Ok(EvalResult::Scalar(n)),
+                other => anyhow::bail!("Expected i32 result, got {:?}", other),
+            }
+        }
     }
 }
