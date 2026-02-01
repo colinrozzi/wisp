@@ -1981,9 +1981,10 @@ async fn eval_expression(
         source.push('\n');
     }
 
-    // Add stub function definitions for imported functions so the compiler knows their types.
-    // These will be replaced with actual imports when we post-process the WAT.
-    for (_imp, func) in &used_imports {
+    // For host imports: generate native (import ...) declarations that the self-hosted
+    // compiler handles directly. For Pack component imports: generate stub functions
+    // that will be replaced with Graph ABI imports during WAT post-processing.
+    for (imp, func) in &used_imports {
         // Generate parameter list with proper types
         let params: Vec<String> = func.sig.params.iter()
             .enumerate()
@@ -1996,18 +1997,28 @@ async fn eval_expression(
             .map(|t| t.to_wisp())
             .unwrap_or("s32");
 
-        // Generate stub body that matches return type
-        let stub_body = match func.sig.results.first() {
-            Some(WasmType::I32) | None => "(i32.const 0)",
-            Some(WasmType::I64) => "(i64.const 0)",
-            Some(WasmType::F32) => "(f32.const 0)",
-            Some(WasmType::F64) => "(f64.const 0)",
-        };
-
-        source.push_str(&format!(
-            "(fn {} ({}) {} {})\n",
-            func.name, params_str, return_type, stub_body
-        ));
+        match &imp.source {
+            ImportSource::Host => {
+                // Native import declaration — the self-hosted compiler emits WAT import directly
+                source.push_str(&format!(
+                    "(import {} {} ({}) {})\n",
+                    imp.interface, func.name, params_str, return_type
+                ));
+            }
+            ImportSource::Component(_) => {
+                // Stub function for Pack imports — will be replaced during WAT post-processing
+                let stub_body = match func.sig.results.first() {
+                    Some(WasmType::I32) | None => "(i32.const 0)",
+                    Some(WasmType::I64) => "(i64.const 0)",
+                    Some(WasmType::F32) => "(f32.const 0)",
+                    Some(WasmType::F64) => "(f64.const 0)",
+                };
+                source.push_str(&format!(
+                    "(fn {} ({}) {} {})\n",
+                    func.name, params_str, return_type, stub_body
+                ));
+            }
+        }
     }
 
     // Add all function definitions (preprocessed for string literals)
@@ -2060,16 +2071,18 @@ async fn eval_expression(
         other => anyhow::bail!("Expected WAT string, got {:?}", other),
     };
 
-    // Post-process WAT to inject import declarations, globals, and data segments
-    // The self-hosted compiler doesn't support (import ...) yet, so we:
-    // 1. Add stub functions to the source (done above)
-    // 2. Post-process WAT to remove stubs and add real imports
-    let wat = if !used_imports.is_empty() {
-        // Collect the names of stub functions we need to remove
-        let stub_names: Vec<&str> = used_imports.iter().map(|(_, f)| f.name.as_str()).collect();
+    // Post-process WAT for Pack component imports and data segments.
+    // Host imports are now handled natively by the self-hosted compiler (no post-processing needed).
+    // Pack component imports still need: stub removal + Graph ABI raw import + CGRF wrappers.
+    let has_pack_stubs = used_imports.iter().any(|(imp, _)| matches!(imp.source, ImportSource::Component(_)));
+    let wat = if has_pack_stubs || !all_strings.is_empty() || needs_memory_export {
+        // Collect stub names only for Pack component imports (host imports have no stubs)
+        let stub_names: Vec<&str> = used_imports.iter()
+            .filter(|(imp, _)| matches!(imp.source, ImportSource::Component(_)))
+            .map(|(_, f)| f.name.as_str())
+            .collect();
 
         // Filter out stub function definitions and error lines
-        // We need to track when we're inside a stub function to remove multi-line bodies
         let mut in_stub_func = false;
         let mut paren_depth = 0;
 
@@ -2080,18 +2093,16 @@ async fn eval_expression(
                     return false;
                 }
 
-                // Check if this starts a stub function
+                // Check if this starts a stub function (only Pack stubs)
                 for name in &stub_names {
                     if line.contains(&format!("(func ${} ", name)) && !line.contains("(call") {
                         in_stub_func = true;
-                        // Count opening parens
                         paren_depth = line.chars().filter(|c| *c == '(').count() as i32
                                     - line.chars().filter(|c| *c == ')').count() as i32;
                         return false;
                     }
                 }
 
-                // If we're in a stub function, track parens until we close
                 if in_stub_func {
                     paren_depth += line.chars().filter(|c| *c == '(').count() as i32
                                  - line.chars().filter(|c| *c == ')').count() as i32;
@@ -2105,43 +2116,20 @@ async fn eval_expression(
             })
             .collect();
 
-        // Generate Graph ABI imports and CGRF wrapper functions
+        // Generate Graph ABI imports and CGRF wrapper functions (Pack component imports only)
         let mut import_wat = String::new();
         let mut wrapper_wat = String::new();
 
         for (imp, func) in &used_imports {
-            match &imp.source {
-                ImportSource::Host => {
-                    // Host functions use simple signatures (handled in instantiation)
-                    let params: Vec<&str> = func.sig.params.iter()
-                        .map(|t| t.to_wat())
-                        .collect();
-                    let params_str = params.iter()
-                        .map(|t| format!("(param {})", t))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let results_str = func.sig.results.iter()
-                        .map(|t| format!("(result {})", t.to_wat()))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-
-                    import_wat.push_str(&format!(
-                        "  (import \"{}\" \"{}\" (func ${} {} {}))\n",
-                        imp.interface, func.name, func.name, params_str, results_str
-                    ));
-                }
-                ImportSource::Component(_) => {
-                    // Pack packages use Graph ABI: generate raw import + wrapper
-                    // Raw import with Graph ABI signature
-                    import_wat.push_str(&format!(
-                        "  (import \"{}\" \"{}\" (func $__raw_{} (param i32 i32 i32 i32) (result i32)))\n",
-                        imp.interface, func.name, func.name
-                    ));
-
-                    // Generate wrapper function that encodes args and decodes result
-                    wrapper_wat.push_str(&generate_cgrf_wrapper(func));
-                }
+            if let ImportSource::Component(_) = &imp.source {
+                // Pack packages use Graph ABI: generate raw import + wrapper
+                import_wat.push_str(&format!(
+                    "  (import \"{}\" \"{}\" (func $__raw_{} (param i32 i32 i32 i32) (result i32)))\n",
+                    imp.interface, func.name, func.name
+                ));
+                wrapper_wat.push_str(&generate_cgrf_wrapper(func));
             }
+            // Host imports: already in WAT from the self-hosted compiler, no post-processing needed
         }
 
         // Generate data segments for string literals
@@ -2154,7 +2142,7 @@ async fn eval_expression(
             ));
         }
 
-        // Build result, inserting imports after (module and wrappers before closing )
+        // Build result, inserting Pack imports/wrappers and data segments
         let mut result = String::new();
         let mut _memory_exported = false;
 
@@ -2177,7 +2165,6 @@ async fn eval_expression(
 
             // Ensure memory is exported when needed (Pack imports or native compound results)
             if (!wrapper_wat.is_empty() || needs_memory_export) && line.contains("(memory") && !line.contains("export") {
-                // Replace non-exported memory with exported memory
                 let exported_line = line.replace("(memory", "(memory (export \"memory\")");
                 result.push_str(&exported_line);
                 result.push('\n');
@@ -2189,18 +2176,18 @@ async fn eval_expression(
             result.push('\n');
 
             if line.trim().starts_with("(module") {
-                result.push_str(&import_wat);
-                // Add memory if not present and we have Pack imports (CGRF wrappers need it)
+                // Inject Pack Graph ABI imports after (module
+                if !import_wat.is_empty() {
+                    result.push_str(&import_wat);
+                }
                 if !wrapper_wat.is_empty() && !lines.iter().any(|l| l.contains("(memory")) {
                     result.push_str("  (memory (export \"memory\") 1)\n");
                     _memory_exported = true;
                 }
-                // Add result globals for compound result reading
                 if !wrapper_wat.is_empty() {
                     result.push_str("  (global $__result_ptr (export \"__result_ptr\") (mut i32) (i32.const 0))\n");
                     result.push_str("  (global $__result_len (export \"__result_len\") (mut i32) (i32.const 0))\n");
                 }
-                // Add data segments for string literals
                 if !data_segments.is_empty() {
                     result.push_str(&data_segments);
                 }
