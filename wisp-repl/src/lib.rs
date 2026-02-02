@@ -17,9 +17,19 @@ pub enum Value {
     Str(String),
 
     // Compound types WITH explicit type info
-    List { elem_type: Type, items: Vec<Value> },
-    Option { inner_type: Type, value: Option<Box<Value>> },
-    Result { ok_type: Type, err_type: Type, value: std::result::Result<Box<Value>, Box<Value>> },
+    List {
+        elem_type: Type,
+        items: Vec<Value>,
+    },
+    Option {
+        inner_type: Type,
+        value: Option<Box<Value>>,
+    },
+    Result {
+        ok_type: Type,
+        err_type: Type,
+        value: std::result::Result<Box<Value>, Box<Value>>,
+    },
 
     // User-defined types - ordered fields, multi-value payload
     Record {
@@ -45,9 +55,9 @@ impl Value {
             Value::Str(_) => Type::Str,
             Value::List { elem_type, .. } => Type::List(Box::new(elem_type.clone())),
             Value::Option { inner_type, .. } => Type::Option(Box::new(inner_type.clone())),
-            Value::Result { ok_type, err_type, .. } => {
-                Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
-            }
+            Value::Result {
+                ok_type, err_type, ..
+            } => Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone())),
             Value::Record { type_name, .. } => Type::Record(type_name.clone()),
             Value::Variant { type_name, .. } => Type::Variant(type_name.clone()),
         }
@@ -69,7 +79,11 @@ impl Value {
                 inner_type: inner_type.clone(),
                 value: value.as_ref().map(|v| Box::new(v.to_inline())),
             },
-            Value::Result { ok_type, err_type, value } => InlineValue::Result {
+            Value::Result {
+                ok_type,
+                err_type,
+                value,
+            } => InlineValue::Result {
                 ok_type: ok_type.clone(),
                 err_type: err_type.clone(),
                 value: match value {
@@ -198,7 +212,7 @@ mod tests {
 
     /// Helper to run a compiled package and get the i32 result
     fn run_eval_i32(wasm_bytes: &[u8]) -> anyhow::Result<i32> {
-        use wasmtime::{component::Component, component::Linker, component::Val, Engine, Store};
+        use wasmtime::{Engine, Store, component::Component, component::Linker, component::Val};
 
         let engine = Engine::default();
         let component = Component::new(&engine, wasm_bytes)?;
@@ -257,8 +271,7 @@ mod tests {
         state.bindings.insert("c".to_string(), Value::S32(4));
 
         // (a + b) * c = (2 + 3) * 4 = 20
-        let wasm =
-            compile_repl("(i32.mul (i32.add a b) c)", &state).expect("compile failed");
+        let wasm = compile_repl("(i32.mul (i32.add a b) c)", &state).expect("compile failed");
         let result = run_eval_i32(&wasm).expect("run failed");
         assert_eq!(result, 20);
     }
@@ -300,8 +313,8 @@ mod tests {
         let bindings: HashMap<String, InlineValue> = HashMap::new();
         let functions = vec![];
 
-        let wat = compile_repl_expr_pack_wat("42", &bindings, &functions)
-            .expect("WAT generation failed");
+        let wat =
+            compile_repl_expr_pack_wat("42", &bindings, &functions).expect("WAT generation failed");
 
         // Print the WAT for inspection
         eprintln!("Generated WAT:\n{}", wat);

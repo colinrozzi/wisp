@@ -1,8 +1,8 @@
-use pack::abi::Value as PackValue;
 use pack::Runtime;
-use rustyline::error::ReadlineError;
+use pack::abi::Value as PackValue;
 use rustyline::DefaultEditor;
-use wisp_repl::{compile_repl_pack, ReplState, Value};
+use rustyline::error::ReadlineError;
+use wisp_repl::{ReplState, Value, compile_repl_pack};
 
 fn main() -> anyhow::Result<()> {
     println!("Wisp REPL v0.1.0 (pack runtime)");
@@ -143,7 +143,13 @@ use wisp::compiler::Type;
 fn pack_type_to_wisp_type(cvt: &pack::abi::ValueType) -> Type {
     use pack::abi::ValueType;
     match cvt {
-        ValueType::Bool | ValueType::S8 | ValueType::S16 | ValueType::S32 | ValueType::U8 | ValueType::U16 | ValueType::U32 => Type::S32,
+        ValueType::Bool
+        | ValueType::S8
+        | ValueType::S16
+        | ValueType::S32
+        | ValueType::U8
+        | ValueType::U16
+        | ValueType::U32 => Type::S32,
         ValueType::S64 | ValueType::U64 => Type::S64,
         ValueType::F32 => Type::F32,
         ValueType::F64 => Type::F64,
@@ -182,7 +188,11 @@ fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
                 .map(pack_to_repl_value)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         }),
-        PackValue::Result { ok_type, err_type, value } => Ok(Value::Result {
+        PackValue::Result {
+            ok_type,
+            err_type,
+            value,
+        } => Ok(Value::Result {
             ok_type: pack_type_to_wisp_type(ok_type),
             err_type: pack_type_to_wisp_type(err_type),
             value: match value {
@@ -193,16 +203,19 @@ fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
         PackValue::Record { type_name, fields } => {
             let converted_fields = fields
                 .iter()
-                .map(|(name, value)| {
-                    Ok((name.clone(), pack_to_repl_value(value)?))
-                })
+                .map(|(name, value)| Ok((name.clone(), pack_to_repl_value(value)?)))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             Ok(Value::Record {
                 type_name: type_name.clone(),
                 fields: converted_fields,
             })
         }
-        PackValue::Variant { type_name, case_name, tag: _, payload } => Ok(Value::Variant {
+        PackValue::Variant {
+            type_name,
+            case_name,
+            tag: _,
+            payload,
+        } => Ok(Value::Variant {
             type_name: type_name.clone(),
             case: case_name.clone(),
             payload: payload

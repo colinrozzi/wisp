@@ -36,9 +36,19 @@ pub enum InlineValue {
     Str(String),
 
     // Compound types WITH explicit type info
-    List { elem_type: Type, items: Vec<InlineValue> },
-    Option { inner_type: Type, value: Option<Box<InlineValue>> },
-    Result { ok_type: Type, err_type: Type, value: std::result::Result<Box<InlineValue>, Box<InlineValue>> },
+    List {
+        elem_type: Type,
+        items: Vec<InlineValue>,
+    },
+    Option {
+        inner_type: Type,
+        value: Option<Box<InlineValue>>,
+    },
+    Result {
+        ok_type: Type,
+        err_type: Type,
+        value: std::result::Result<Box<InlineValue>, Box<InlineValue>>,
+    },
 
     // User-defined types - ordered fields, multi-value payload
     Record {
@@ -63,9 +73,9 @@ impl InlineValue {
             InlineValue::Str(_) => Type::Str,
             InlineValue::List { elem_type, .. } => Type::List(Box::new(elem_type.clone())),
             InlineValue::Option { inner_type, .. } => Type::Option(Box::new(inner_type.clone())),
-            InlineValue::Result { ok_type, err_type, .. } => {
-                Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
-            }
+            InlineValue::Result {
+                ok_type, err_type, ..
+            } => Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone())),
             InlineValue::Record { type_name, .. } => Type::Record(type_name.clone()),
             InlineValue::Variant { type_name, .. } => Type::Variant(type_name.clone()),
         }
@@ -357,9 +367,9 @@ fn encode_component(
 
             if deps_path.exists() {
                 // Load all WIT packages from the deps directory
-                resolve
-                    .push_path(&deps_path)
-                    .with_context(|| format!("failed to load WIT deps from {}", deps_path.display()))?;
+                resolve.push_path(&deps_path).with_context(|| {
+                    format!("failed to load WIT deps from {}", deps_path.display())
+                })?;
             } else {
                 bail!("WIT deps path not found: {}", deps_path.display());
             }
@@ -942,8 +952,8 @@ struct PendingFunction {
 /// External WIT interface reference (e.g., "theater:simple/runtime")
 #[derive(Debug, Clone)]
 pub struct ExternalInterface {
-    pub package: String,      // e.g., "theater:simple"
-    pub interface: String,    // e.g., "runtime"
+    pub package: String,   // e.g., "theater:simple"
+    pub interface: String, // e.g., "runtime"
 }
 
 impl ExternalInterface {
@@ -969,9 +979,9 @@ impl ExternalInterface {
 #[derive(Debug, Clone, Default)]
 pub struct WorldConfig {
     pub name: String,
-    pub wit_deps: Option<PathBuf>,           // Path to wit deps directory
-    pub external_imports: Vec<ExternalInterface>,  // e.g., theater:simple/runtime
-    pub external_exports: Vec<ExternalInterface>,  // e.g., theater:simple/actor
+    pub wit_deps: Option<PathBuf>, // Path to wit deps directory
+    pub external_imports: Vec<ExternalInterface>, // e.g., theater:simple/runtime
+    pub external_exports: Vec<ExternalInterface>, // e.g., theater:simple/actor
 }
 
 /// An exported function, possibly with an alias name.
@@ -985,11 +995,17 @@ pub struct ExportDef {
 
 impl ExportDef {
     fn simple(name: String) -> Self {
-        ExportDef { export_name: name.clone(), func_name: name }
+        ExportDef {
+            export_name: name.clone(),
+            func_name: name,
+        }
     }
 
     fn aliased(export_name: String, func_name: String) -> Self {
-        ExportDef { export_name, func_name }
+        ExportDef {
+            export_name,
+            func_name,
+        }
     }
 }
 
@@ -1050,14 +1066,14 @@ fn lookup_wasm_instr(name: &str) -> Option<WasmInstrInfo> {
         }),
 
         // i32 bitwise operations
-        "i32.and" | "i32.or" | "i32.xor" | "i32.shl" | "i32.shr_s" | "i32.shr_u"
-        | "i32.rotl" | "i32.rotr" => Some(WasmInstrInfo {
+        "i32.and" | "i32.or" | "i32.xor" | "i32.shl" | "i32.shr_s" | "i32.shr_u" | "i32.rotl"
+        | "i32.rotr" => Some(WasmInstrInfo {
             params: vec![Type::S32, Type::S32],
             result: Type::S32,
         }),
         // i64 bitwise operations
-        "i64.and" | "i64.or" | "i64.xor" | "i64.shl" | "i64.shr_s" | "i64.shr_u"
-        | "i64.rotl" | "i64.rotr" => Some(WasmInstrInfo {
+        "i64.and" | "i64.or" | "i64.xor" | "i64.shl" | "i64.shr_s" | "i64.shr_u" | "i64.rotl"
+        | "i64.rotr" => Some(WasmInstrInfo {
             params: vec![Type::S64, Type::S64],
             result: Type::S64,
         }),
@@ -2014,8 +2030,7 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                                         }
                                     }
                                     if hex.len() == 2 {
-                                        let byte =
-                                            u8::from_str_radix(&hex, 16).unwrap();
+                                        let byte = u8::from_str_radix(&hex, 16).unwrap();
                                         content.push(byte as char);
                                     } else {
                                         content.push('\\');
@@ -3789,7 +3804,10 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                                         ));
                                     }
                                     if export_set.insert(func.name.clone()) {
-                                        exports.push(ExportDef::aliased(alias.clone(), func.name.clone()));
+                                        exports.push(ExportDef::aliased(
+                                            alias.clone(),
+                                            func.name.clone(),
+                                        ));
                                     }
                                     pending.push(func);
                                 }
@@ -3884,7 +3902,9 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                     }
                     SExpr::Sym(sym, _) if sym == "world" => {
                         if world_config.is_some() {
-                            return Err(ctx.error("only one (world ...) declaration is allowed", &span));
+                            return Err(
+                                ctx.error("only one (world ...) declaration is allowed", &span)
+                            );
                         }
                         world_config = Some(parse_world_form(&items, ctx)?);
                     }
@@ -3894,11 +3914,19 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         }
                         let offset = match &items[1] {
                             SExpr::Int { value, .. } => *value as i32,
-                            _ => return Err(ctx.error("data offset must be an integer", items[1].span())),
+                            _ => {
+                                return Err(
+                                    ctx.error("data offset must be an integer", items[1].span())
+                                );
+                            }
                         };
                         let bytes = match &items[2] {
                             SExpr::Str(s, _) => s.bytes().collect::<Vec<u8>>(),
-                            _ => return Err(ctx.error("data content must be a string", items[2].span())),
+                            _ => {
+                                return Err(
+                                    ctx.error("data content must be a string", items[2].span())
+                                );
+                            }
                         };
                         data_segments.push(DataSegment { offset, bytes });
                     }
@@ -4043,42 +4071,57 @@ fn parse_world_form(items: &[SExpr], ctx: &CompileContext) -> Result<WorldConfig
                             }
                             other => {
                                 // Try to extract string literal if parser supports it
-                                return Err(ctx.error("wit-deps path must be a string or symbol", other.span()));
+                                return Err(ctx.error(
+                                    "wit-deps path must be a string or symbol",
+                                    other.span(),
+                                ));
                             }
                         }
                     }
                     SExpr::Sym(sym, _) if sym == "import" => {
                         if sub_items.len() != 2 {
-                            return Err(ctx.error("import expects an interface reference", sub_span));
+                            return Err(
+                                ctx.error("import expects an interface reference", sub_span)
+                            );
                         }
                         match &sub_items[1] {
-                            SExpr::Sym(iface_ref, _) => {
-                                match ExternalInterface::parse(iface_ref) {
-                                    Some(ext) => external_imports.push(ext),
-                                    None => return Err(ctx.error(
-                                        format!("invalid interface reference '{}', expected 'pkg:ns/iface'", iface_ref),
-                                        sub_span,
-                                    )),
-                                }
+                            SExpr::Sym(iface_ref, _) => match ExternalInterface::parse(iface_ref) {
+                                Some(ext) => external_imports.push(ext),
+                                None => return Err(ctx.error(
+                                    format!(
+                                        "invalid interface reference '{}', expected 'pkg:ns/iface'",
+                                        iface_ref
+                                    ),
+                                    sub_span,
+                                )),
+                            },
+                            other => {
+                                return Err(ctx
+                                    .error("import expects an interface reference", other.span()));
                             }
-                            other => return Err(ctx.error("import expects an interface reference", other.span())),
                         }
                     }
                     SExpr::Sym(sym, _) if sym == "export" => {
                         if sub_items.len() != 2 {
-                            return Err(ctx.error("export expects an interface reference", sub_span));
+                            return Err(
+                                ctx.error("export expects an interface reference", sub_span)
+                            );
                         }
                         match &sub_items[1] {
-                            SExpr::Sym(iface_ref, _) => {
-                                match ExternalInterface::parse(iface_ref) {
-                                    Some(ext) => external_exports.push(ext),
-                                    None => return Err(ctx.error(
-                                        format!("invalid interface reference '{}', expected 'pkg:ns/iface'", iface_ref),
-                                        sub_span,
-                                    )),
-                                }
+                            SExpr::Sym(iface_ref, _) => match ExternalInterface::parse(iface_ref) {
+                                Some(ext) => external_exports.push(ext),
+                                None => return Err(ctx.error(
+                                    format!(
+                                        "invalid interface reference '{}', expected 'pkg:ns/iface'",
+                                        iface_ref
+                                    ),
+                                    sub_span,
+                                )),
+                            },
+                            other => {
+                                return Err(ctx
+                                    .error("export expects an interface reference", other.span()));
                             }
-                            other => return Err(ctx.error("export expects an interface reference", other.span())),
                         }
                     }
                     other => {
@@ -4832,8 +4875,7 @@ fn parse_expr(
                             "expected: (ok ok-type err-type value)",
                         ));
                     }
-                    let ok_type =
-                        parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
+                    let ok_type = parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
                     let err_type =
                         parse_type_expr(&items[2], &variant_names, &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
@@ -4851,8 +4893,7 @@ fn parse_expr(
                             "expected: (err ok-type err-type value)",
                         ));
                     }
-                    let ok_type =
-                        parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
+                    let ok_type = parse_type_expr(&items[1], &variant_names, &HashSet::new(), ctx)?;
                     let err_type =
                         parse_type_expr(&items[2], &variant_names, &HashSet::new(), ctx)?;
                     let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
@@ -5288,7 +5329,10 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
     }
 
     for export in &prog.exports {
-        out.push_str(&format!("  (export \"{}\" (func ${}))\n", export.export_name, export.func_name));
+        out.push_str(&format!(
+            "  (export \"{}\" (func ${}))\n",
+            export.export_name, export.func_name
+        ));
     }
 
     // Export memory for component model
@@ -6625,7 +6669,10 @@ fn gen_expr(
             let idx_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}    i32.const 0\n", pad));
             out.push_str(&format!("{}    local.set {}\n", pad, idx_local));
-            out.push_str(&format!("{}    block (result i32) ;; comparison result\n", pad));
+            out.push_str(&format!(
+                "{}    block (result i32) ;; comparison result\n",
+                pad
+            ));
             out.push_str(&format!("{}      loop ;; compare loop\n", pad));
             // Check if idx >= len (done comparing)
             out.push_str(&format!("{}        local.get {}\n", pad, idx_local));
@@ -6660,7 +6707,10 @@ fn gen_expr(
             out.push_str(&format!("{}        local.set {}\n", pad, idx_local));
             out.push_str(&format!("{}        br 0 ;; continue loop\n", pad));
             out.push_str(&format!("{}      end ;; loop\n", pad));
-            out.push_str(&format!("{}      i32.const 1 ;; fallback (empty strings)\n", pad));
+            out.push_str(&format!(
+                "{}      i32.const 1 ;; fallback (empty strings)\n",
+                pad
+            ));
             out.push_str(&format!("{}    end ;; comparison result block\n", pad));
             out.push_str(&format!("{}  end ;; if\n", pad));
             out.push_str(&format!("{}end ;; string-eq outer\n", pad));
@@ -7467,15 +7517,12 @@ fn generate_write_type_tag(out: &mut String, ty: &Type, base_local: &str, offset
 
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str => 1,
-        Type::List(inner) => {
-            1 + generate_write_type_tag(out, inner, base_local, offset + 1)
-        }
-        Type::Option(inner) => {
-            1 + generate_write_type_tag(out, inner, base_local, offset + 1)
-        }
+        Type::List(inner) => 1 + generate_write_type_tag(out, inner, base_local, offset + 1),
+        Type::Option(inner) => 1 + generate_write_type_tag(out, inner, base_local, offset + 1),
         Type::Result(ok, err) => {
             let ok_size = generate_write_type_tag(out, ok, base_local, offset + 1);
-            let err_size = generate_write_type_tag(out, err, base_local, offset + 1 + ok_size as i32);
+            let err_size =
+                generate_write_type_tag(out, err, base_local, offset + 1 + ok_size as i32);
             1 + ok_size + err_size
         }
         Type::Record(name) | Type::Variant(name) | Type::Resource(name) => {
@@ -7728,9 +7775,7 @@ fn generate_pack_wrapper(
         Type::S64 => out.push_str("    (local $value i64)\n"),
         Type::F32 => out.push_str("    (local $value f32)\n"),
         Type::F64 => out.push_str("    (local $value f64)\n"),
-        Type::Str | Type::Record(_) | Type::Option(_) => {
-            out.push_str("    (local $value i32)\n")
-        }
+        Type::Str | Type::Record(_) | Type::Option(_) => out.push_str("    (local $value i32)\n"),
         Type::Variant(_) => {
             out.push_str("    (local $value i32)\n");
             // $tag local needed for v2 case name lookup
@@ -7775,7 +7820,10 @@ fn generate_pack_wrapper(
 
     // Additional locals needed for record/option/variant/result decoding
     let needs_compound_decode = func.params.iter().any(|p| {
-        matches!(p.ty, Type::Record(_) | Type::Option(_) | Type::Variant(_) | Type::Result(_, _))
+        matches!(
+            p.ty,
+            Type::Record(_) | Type::Option(_) | Type::Variant(_) | Type::Result(_, _)
+        )
     });
     if needs_compound_decode {
         out.push_str("    (local $rec_ptr i32)\n");
@@ -7790,7 +7838,8 @@ fn generate_pack_wrapper(
     // Local for runtime offset tracking in tuple decoding
     // Needed when any tuple element has variable size (strings, lists, etc.)
     let needs_runtime_offset = func.params.len() > 1
-        && func.params
+        && func
+            .params
             .iter()
             .any(|p| matches!(p.ty, Type::Str | Type::List(_)));
     if needs_runtime_offset {
@@ -7872,10 +7921,10 @@ fn generate_pack_wrapper(
     // Allocate output buffer (guest-allocates ABI)
     // Use a conservative size based on return type
     let alloc_size = match &func.return_type {
-        Type::S32 | Type::F32 => 32,      // 28 bytes needed
-        Type::S64 | Type::F64 => 40,      // 32 bytes needed
-        Type::Str => 4096,                 // Variable, allocate generously
-        Type::List(_) => 16384,            // Lists can be large
+        Type::S32 | Type::F32 => 32, // 28 bytes needed
+        Type::S64 | Type::F64 => 40, // 32 bytes needed
+        Type::Str => 4096,           // Variable, allocate generously
+        Type::List(_) => 16384,      // Lists can be large
         Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) => 4096,
         _ => 4096,
     };
@@ -8120,9 +8169,173 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
         out.push_str("    i32.store\n");
         out.push_str("    i32.const 24\n"); // total length
         out.push_str("    local.set $in_len\n");
+    } else if import.params.len() == 1 && matches!(import.params[0].ty, Type::S32) {
+        // Single s32 argument — encode as CGRF S32 node
+        let param_name = &import.params[0].name;
+        out.push_str("    ;; Encode single s32 argument to CGRF\n");
+        // CGRF header (16 bytes)
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 6\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n"); // node_count = 1
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n"); // root_index = 0
+        out.push_str("    i32.store\n");
+        // S32 node: kind=0x02, flags=0, reserved=0, payload_len=4, value
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 16\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_S32 as i32));
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 17\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 18\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 20\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 4\n"); // payload_len = 4
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 24\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    local.get ${}\n", param_name));
+        out.push_str("    i32.store\n");
+        out.push_str("    i32.const 28\n"); // total = 16 header + 8 node header + 4 payload
+        out.push_str("    local.set $in_len\n");
+    } else if import.params.iter().all(|p| matches!(p.ty, Type::S32)) {
+        // Multiple s32 arguments — encode as CGRF tuple of S32 nodes
+        // CGRF layout: children first, tuple root last
+        // header(16) + n * s32_node(12) + tuple_node(8 + 4*n)
+        let n = import.params.len();
+        let s32_node_size = 12; // 8 header + 4 payload
+        let tuple_payload_len = 4 * n; // child indices, 4 bytes each
+        let tuple_node_total = 8 + tuple_payload_len;
+        let total_len = 16 + n * s32_node_size + tuple_node_total;
+
+        out.push_str(&format!(
+            "    ;; Encode {} s32 arguments as CGRF tuple (children first)\n",
+            n
+        ));
+        // CGRF header
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 6\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", n + 1)); // node_count = n children + 1 tuple
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", n)); // root_index = n (tuple is last)
+        out.push_str("    i32.store\n");
+
+        // Write S32 child nodes first, starting at offset 16
+        for (i, param) in import.params.iter().enumerate() {
+            let node_offset = 16 + i * s32_node_size;
+            // kind = S32
+            out.push_str("    local.get $in_buf\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", CGRF_S32 as i32));
+            out.push_str("    i32.store8\n");
+            // flags
+            out.push_str("    local.get $in_buf\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset + 1));
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 0\n");
+            out.push_str("    i32.store8\n");
+            // reserved
+            out.push_str("    local.get $in_buf\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset + 2));
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 0\n");
+            out.push_str("    i32.store16\n");
+            // payload_len = 4
+            out.push_str("    local.get $in_buf\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset + 4));
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.store\n");
+            // payload value
+            out.push_str("    local.get $in_buf\n");
+            out.push_str(&format!("    i32.const {}\n", node_offset + 8));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    local.get ${}\n", param.name));
+            out.push_str("    i32.store\n");
+        }
+
+        // Write tuple node last, after all children
+        let tuple_offset = 16 + n * s32_node_size;
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", tuple_offset));
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE as i32));
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", tuple_offset + 1));
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", tuple_offset + 2));
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", tuple_offset + 4));
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", tuple_payload_len));
+        out.push_str("    i32.store\n");
+
+        // Write child indices (0, 1, 2, ...)
+        for i in 0..n {
+            out.push_str("    local.get $in_buf\n");
+            out.push_str(&format!("    i32.const {}\n", tuple_offset + 8 + i * 4));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", i)); // child node index
+            out.push_str("    i32.store\n");
+        }
+
+        out.push_str(&format!("    i32.const {}\n", total_len));
+        out.push_str("    local.set $in_len\n");
     } else {
-        // TODO: support other argument patterns
-        out.push_str("    ;; TODO: encode arguments for this import\n");
+        // Unsupported argument types for import wrapper
+        out.push_str("    ;; WARNING: unsupported import argument types, passing empty\n");
         out.push_str("    i32.const 0\n");
         out.push_str("    local.set $in_len\n");
     }
@@ -8144,14 +8357,35 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
     out.push_str("    i32.load\n");
     out.push_str("    local.set $out_len\n");
 
-    // For now, just return 0 (success) for void-returning imports
-    // TODO: decode result from $out_ptr for non-void imports
-    out.push_str("    ;; Return result\n");
+    // Decode result from CGRF output buffer
+    // The result is a single CGRF node: header(16) + node_header(8) + payload
+    // The scalar value is at $out_ptr + 24
+    out.push_str("    ;; Decode result from CGRF\n");
     match &import.return_type {
-        Type::S32 => out.push_str("    i32.const 0\n"),
-        Type::S64 => out.push_str("    i64.const 0\n"),
-        Type::F32 => out.push_str("    f32.const 0\n"),
-        Type::F64 => out.push_str("    f64.const 0\n"),
+        Type::S32 => {
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    i32.const 24\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+        }
+        Type::S64 => {
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    i32.const 24\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i64.load\n");
+        }
+        Type::F32 => {
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    i32.const 24\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    f32.load\n");
+        }
+        Type::F64 => {
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    i32.const 24\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    f64.load\n");
+        }
         _ => out.push_str("    i32.const 0\n"),
     }
 
@@ -8696,7 +8930,7 @@ fn generate_cgrf_encode_option(out: &mut String, inner_ty: &Type) {
     // For s32: header(16) + option_node(8 + payload_some) + inner_node(8 + 4)
     let inner_node_size = match inner_ty {
         Type::S32 => 8 + 4, // node header + s32 payload
-        _ => 8, // just node header as placeholder
+        _ => 8,             // just node header as placeholder
     };
     let total_some = 16 + 8 + payload_some + inner_node_size;
     let total_none = 16 + 8 + payload_none;
@@ -8965,11 +9199,7 @@ fn generate_cgrf_encode_record(
     let field_count = record_def.fields.len();
 
     // Calculate field names size
-    let field_names_size: usize = record_def
-        .fields
-        .iter()
-        .map(|f| 4 + f.name.len())
-        .sum();
+    let field_names_size: usize = record_def.fields.iter().map(|f| 4 + f.name.len()).sum();
 
     // CGRF v2 Record payload layout:
     // - type_name_len: 4 bytes
@@ -9204,7 +9434,10 @@ fn generate_cgrf_encode_variant(
             break;
         }
         if case.payload.len() == 1 {
-            if !matches!(case.payload[0], Type::S32 | Type::S64 | Type::F32 | Type::F64) {
+            if !matches!(
+                case.payload[0],
+                Type::S32 | Type::S64 | Type::F32 | Type::F64
+            ) {
                 all_simple = false;
                 break;
             }
@@ -9218,7 +9451,12 @@ fn generate_cgrf_encode_variant(
     }
 
     // Find the max case name length for buffer sizing
-    let max_case_name_len = variant_def.cases.iter().map(|c| c.name.len()).max().unwrap_or(0);
+    let max_case_name_len = variant_def
+        .cases
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0);
 
     out.push_str(&format!("    ;; Encode variant '{}' (CGRF v2)\n", name));
 
@@ -9907,11 +10145,7 @@ fn generate_cgrf_decode_record(
     out.push_str(&format!("    ;; Decode record '{}' (CGRF v2)\n", rec_name));
 
     // Calculate total size needed for wisp record
-    let record_size: usize = record_def
-        .fields
-        .iter()
-        .map(|f| type_size(&f.ty))
-        .sum();
+    let record_size: usize = record_def.fields.iter().map(|f| type_size(&f.ty)).sum();
 
     // Allocate heap space
     out.push_str("    global.get $__heap_ptr\n");
@@ -9938,7 +10172,10 @@ fn generate_cgrf_decode_record(
     for (i, field) in record_def.fields.iter().enumerate() {
         let wisp_field_offset = record_def.field_offset(i);
 
-        out.push_str(&format!("    ;; Field {} '{}' at wisp offset {}\n", i, field.name, wisp_field_offset));
+        out.push_str(&format!(
+            "    ;; Field {} '{}' at wisp offset {}\n",
+            i, field.name, wisp_field_offset
+        ));
 
         // Calculate CGRF node payload offset (skip 8-byte node header)
         let payload_offset = child_node_offset + 8;
@@ -10006,7 +10243,10 @@ fn generate_cgrf_decode_record(
                 child_node_offset += 16; // 8 header + 8 payload for F64
             }
             _ => {
-                out.push_str(&format!("    ;; TODO: decode non-scalar field '{}'\n", field.name));
+                out.push_str(&format!(
+                    "    ;; TODO: decode non-scalar field '{}'\n",
+                    field.name
+                ));
                 child_node_offset += 12; // Assume 12 as fallback
             }
         }
@@ -10023,11 +10263,7 @@ fn generate_cgrf_decode_record(
 /// - For None: just option node
 ///
 /// Option node payload: [has_value: u8, child_index: u32 (if has_value)]
-fn generate_cgrf_decode_option(
-    out: &mut String,
-    inner_ty: &Type,
-    param_name: &str,
-) {
+fn generate_cgrf_decode_option(out: &mut String, inner_ty: &Type, param_name: &str) {
     out.push_str("    ;; Decode option\n");
 
     // Wisp option layout: [tag: i32 (0=none, 1=some), payload if some]
@@ -10309,12 +10545,7 @@ fn generate_cgrf_decode_variant(
 /// - Payload value node after result node
 ///
 /// Wisp result layout: [tag: i32 (0=ok, 1=err), payload]
-fn generate_cgrf_decode_result(
-    out: &mut String,
-    ok_ty: &Type,
-    err_ty: &Type,
-    param_name: &str,
-) {
+fn generate_cgrf_decode_result(out: &mut String, ok_ty: &Type, err_ty: &Type, param_name: &str) {
     out.push_str("    ;; Decode result from CGRF v2 (depth-first encoded)\n");
 
     // Calculate result size for allocation
@@ -10417,11 +10648,7 @@ fn generate_cgrf_decode_result(
 /// - Node 3: List at offset 52 (root, contains type tag + count + indices)
 ///
 /// Wisp list layout: { len: i32, cap: i32, data_ptr: i32 }
-fn generate_cgrf_decode_list(
-    out: &mut String,
-    elem_ty: &Type,
-    param_name: &str,
-) {
+fn generate_cgrf_decode_list(out: &mut String, elem_ty: &Type, param_name: &str) {
     out.push_str("    ;; Decode list from CGRF v2 (depth-first encoded)\n");
 
     // Element nodes are encoded first, starting at offset 16
@@ -10438,7 +10665,7 @@ fn generate_cgrf_decode_list(
     // For list<s32>, element nodes are 12 bytes each
     let elem_node_size = match elem_ty {
         Type::S64 | Type::F64 => 16, // 8 header + 8 payload
-        _ => 12,                      // 8 header + 4 payload
+        _ => 12,                     // 8 header + 4 payload
     };
 
     // Root offset = 16 + root_index * elem_node_size
@@ -10778,7 +11005,10 @@ fn generate_decode_record_at_offset(
         }
     };
 
-    out.push_str(&format!("    ;; Decode record '{}' at $child_offset (CGRF v2)\n", rec_name));
+    out.push_str(&format!(
+        "    ;; Decode record '{}' at $child_offset (CGRF v2)\n",
+        rec_name
+    ));
 
     // Allocate wisp record on heap
     let rec_size = rec_def.size();
@@ -10908,11 +11138,7 @@ fn generate_decode_record_at_offset(
 }
 
 /// Decode an option from the node at $child_offset.
-fn generate_decode_option_at_offset(
-    out: &mut String,
-    inner_ty: &Type,
-    param_name: &str,
-) {
+fn generate_decode_option_at_offset(out: &mut String, inner_ty: &Type, param_name: &str) {
     out.push_str("    ;; Decode option at $child_offset (CGRF v2)\n");
 
     let inner_size = type_size(inner_ty);
@@ -11013,7 +11239,10 @@ fn generate_decode_variant_at_offset(
         }
     };
 
-    out.push_str(&format!("    ;; Decode variant '{}' at $child_offset\n", var_name));
+    out.push_str(&format!(
+        "    ;; Decode variant '{}' at $child_offset\n",
+        var_name
+    ));
 
     let var_size = var_def.size();
     out.push_str("    global.get $__heap_ptr\n");
@@ -11313,7 +11542,7 @@ fn generate_cgrf_decode_tuple_param(
         for i in 0..param_idx {
             node_offset += match &all_params[i].ty {
                 Type::S64 | Type::F64 => 16, // 8 header + 8 payload
-                _ => 12,                      // 8 header + 4 payload (s32, f32, etc.)
+                _ => 12,                     // 8 header + 4 payload (s32, f32, etc.)
             };
         }
 

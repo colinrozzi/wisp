@@ -4,19 +4,32 @@ use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn read_string_from_memory(memory: &wasmtime::Memory, store: &wasmtime::Store<()>, ptr: i32) -> String {
+fn read_string_from_memory(
+    memory: &wasmtime::Memory,
+    store: &wasmtime::Store<()>,
+    ptr: i32,
+) -> String {
     let mut len_buf = [0u8; 4];
-    memory.read(store, ptr as usize, &mut len_buf).expect("failed to read len");
+    memory
+        .read(store, ptr as usize, &mut len_buf)
+        .expect("failed to read len");
     let len = i32::from_le_bytes(len_buf) as usize;
 
     let mut str_buf = vec![0u8; len];
-    memory.read(store, (ptr + 4) as usize, &mut str_buf).expect("failed to read string");
+    memory
+        .read(store, (ptr + 4) as usize, &mut str_buf)
+        .expect("failed to read string");
     String::from_utf8(str_buf).expect("invalid utf8")
 }
 
 /// Write a string to memory in CGRF format
 /// Returns the total number of bytes written
-fn write_cgrf_string(memory: &wasmtime::Memory, store: &mut wasmtime::Store<()>, ptr: i32, s: &str) -> usize {
+fn write_cgrf_string(
+    memory: &wasmtime::Memory,
+    store: &mut wasmtime::Store<()>,
+    ptr: i32,
+    s: &str,
+) -> usize {
     let bytes = s.as_bytes();
     let str_len = bytes.len() as u32;
 
@@ -36,15 +49,25 @@ fn write_cgrf_string(memory: &wasmtime::Memory, store: &mut wasmtime::Store<()>,
     let mut offset = ptr as usize;
 
     // Write CGRF header
-    memory.write(&mut *store, offset, &magic.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &magic.to_le_bytes())
+        .unwrap();
     offset += 4;
-    memory.write(&mut *store, offset, &version.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &version.to_le_bytes())
+        .unwrap();
     offset += 2;
-    memory.write(&mut *store, offset, &flags.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &flags.to_le_bytes())
+        .unwrap();
     offset += 2;
-    memory.write(&mut *store, offset, &node_count.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &node_count.to_le_bytes())
+        .unwrap();
     offset += 4;
-    memory.write(&mut *store, offset, &root_index.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &root_index.to_le_bytes())
+        .unwrap();
     offset += 4;
 
     // Write node header
@@ -52,13 +75,19 @@ fn write_cgrf_string(memory: &wasmtime::Memory, store: &mut wasmtime::Store<()>,
     offset += 1;
     memory.write(&mut *store, offset, &[node_flags]).unwrap();
     offset += 1;
-    memory.write(&mut *store, offset, &reserved.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &reserved.to_le_bytes())
+        .unwrap();
     offset += 2;
-    memory.write(&mut *store, offset, &payload_len.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &payload_len.to_le_bytes())
+        .unwrap();
     offset += 4;
 
     // Write string length (payload)
-    memory.write(&mut *store, offset, &str_len.to_le_bytes()).unwrap();
+    memory
+        .write(&mut *store, offset, &str_len.to_le_bytes())
+        .unwrap();
     offset += 4;
 
     // Write string bytes
@@ -100,7 +129,11 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
 
     // Debug: print memory size
     let mem_size = memory.data_size(&store);
-    println!("Memory size: {} bytes ({} pages)", mem_size, mem_size / 65536);
+    println!(
+        "Memory size: {} bytes ({} pages)",
+        mem_size,
+        mem_size / 65536
+    );
 
     // Memory layout to avoid heap conflicts:
     // - Heap starts at 0xC000 and grows upward
@@ -112,7 +145,9 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
     let current_pages = (memory.data_size(&store) / 65536) as u64;
     if target_pages > current_pages {
         let pages_needed = target_pages - current_pages;
-        memory.grow(&mut store, pages_needed).expect("failed to grow memory");
+        memory
+            .grow(&mut store, pages_needed)
+            .expect("failed to grow memory");
     }
 
     // Layout:
@@ -131,7 +166,11 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
 
     // Write input string in CGRF format
     let in_len = write_cgrf_string(&memory, &mut store, in_ptr, input) as i32;
-    println!("Input string size: {} bytes, CGRF size: {}", input.len(), in_len);
+    println!(
+        "Input string size: {} bytes, CGRF size: {}",
+        input.len(),
+        in_len
+    );
     println!("Input at: 0x{:x}-0x{:x}", in_ptr, in_ptr + in_len);
 
     let mut results = [wasmtime::Val::I32(0)];
@@ -149,11 +188,15 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
 
     // CGRF string format: offset 24 = string length, offset 28 = string bytes (inline)
     let mut len_buf = [0u8; 4];
-    memory.read(&store, (out_ptr + 24) as usize, &mut len_buf).expect("failed to read string len");
+    memory
+        .read(&store, (out_ptr + 24) as usize, &mut len_buf)
+        .expect("failed to read string len");
     let str_len = i32::from_le_bytes(len_buf) as usize;
 
     let mut str_buf = vec![0u8; str_len];
-    memory.read(&store, (out_ptr + 28) as usize, &mut str_buf).expect("failed to read string data");
+    memory
+        .read(&store, (out_ptr + 28) as usize, &mut str_buf)
+        .expect("failed to read string data");
     String::from_utf8(str_buf).expect("invalid utf8")
 }
 
@@ -207,17 +250,22 @@ fn compile_and_call_string(source: &str, func_name: &str) -> String {
 
     // CGRF string format: offset 24 = string length, offset 28 = string bytes (inline)
     let mut len_buf = [0u8; 4];
-    memory.read(&store, (out_ptr + 24) as usize, &mut len_buf).expect("failed to read string len");
+    memory
+        .read(&store, (out_ptr + 24) as usize, &mut len_buf)
+        .expect("failed to read string len");
     let str_len = i32::from_le_bytes(len_buf) as usize;
 
     let mut str_buf = vec![0u8; str_len];
-    memory.read(&store, (out_ptr + 28) as usize, &mut str_buf).expect("failed to read string data");
+    memory
+        .read(&store, (out_ptr + 28) as usize, &mut str_buf)
+        .expect("failed to read string data");
     String::from_utf8(str_buf).expect("invalid utf8")
 }
 
 // Read the self-hosted compiler source
 fn get_compiler_source() -> String {
-    std::fs::read_to_string("examples/wisp-compiler.lisp").expect("failed to read wisp-compiler.lisp")
+    std::fs::read_to_string("examples/wisp-compiler.lisp")
+        .expect("failed to read wisp-compiler.lisp")
 }
 
 #[test]
@@ -243,10 +291,26 @@ fn test_self_hosted_identity_wat() {
 
     // Check that the output looks like valid WAT
     assert!(wat.contains("(module"), "should contain module: {}", wat);
-    assert!(wat.contains("(func $identity"), "should contain identity func: {}", wat);
-    assert!(wat.contains("(param $x i32)"), "should contain param: {}", wat);
-    assert!(wat.contains("(result i32)"), "should contain result: {}", wat);
-    assert!(wat.contains("(local.get $x)"), "should contain local.get: {}", wat);
+    assert!(
+        wat.contains("(func $identity"),
+        "should contain identity func: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(param $x i32)"),
+        "should contain param: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(result i32)"),
+        "should contain result: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(local.get $x)"),
+        "should contain local.get: {}",
+        wat
+    );
 }
 
 #[test]
@@ -255,11 +319,31 @@ fn test_self_hosted_factorial_wat() {
 
     // Check that the output looks like valid WAT for factorial
     assert!(wat.contains("(module"), "should contain module: {}", wat);
-    assert!(wat.contains("(func $factorial"), "should contain factorial func: {}", wat);
-    assert!(wat.contains("(param $n i32)"), "should contain param: {}", wat);
-    assert!(wat.contains("(result i32)"), "should contain result: {}", wat);
-    assert!(wat.contains("call $factorial"), "should contain recursive call: {}", wat);
-    assert!(wat.contains("i32.le_s"), "should contain comparison: {}", wat);
+    assert!(
+        wat.contains("(func $factorial"),
+        "should contain factorial func: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(param $n i32)"),
+        "should contain param: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(result i32)"),
+        "should contain result: {}",
+        wat
+    );
+    assert!(
+        wat.contains("call $factorial"),
+        "should contain recursive call: {}",
+        wat
+    );
+    assert!(
+        wat.contains("i32.le_s"),
+        "should contain comparison: {}",
+        wat
+    );
     assert!(wat.contains("i32.mul"), "should contain multiply: {}", wat);
     assert!(wat.contains("(export"), "should contain export: {}", wat);
 }
@@ -268,10 +352,15 @@ fn test_self_hosted_factorial_wat() {
 fn test_bootstrap_compile_simple() {
     // Test that compile-source can compile a simple program
     let simple_program = "(fn identity ((x s32)) s32 x)";
-    let wat = compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", simple_program);
+    let wat =
+        compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", simple_program);
 
     assert!(wat.contains("(module"), "should contain module: {}", wat);
-    assert!(wat.contains("(func $identity"), "should contain identity func: {}", wat);
+    assert!(
+        wat.contains("(func $identity"),
+        "should contain identity func: {}",
+        wat
+    );
 }
 
 #[test]
@@ -302,13 +391,30 @@ fn test_bootstrap_compile_medium() {
 (export factorial)
 (export fibonacci)
 "#;
-    let wat = compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", medium_program);
+    let wat =
+        compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", medium_program);
 
     assert!(wat.contains("(module"), "should contain module: {}", wat);
-    assert!(wat.contains("(func $factorial"), "should contain factorial func: {}", wat);
-    assert!(wat.contains("(func $fibonacci"), "should contain fibonacci func: {}", wat);
-    assert!(wat.contains("(func $is-even"), "should contain is-even func: {}", wat);
-    assert!(wat.contains("(func $is-odd"), "should contain is-odd func: {}", wat);
+    assert!(
+        wat.contains("(func $factorial"),
+        "should contain factorial func: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(func $fibonacci"),
+        "should contain fibonacci func: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(func $is-even"),
+        "should contain is-even func: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(func $is-odd"),
+        "should contain is-odd func: {}",
+        wat
+    );
 }
 
 #[test]
@@ -396,12 +502,25 @@ fn test_bootstrap_compile_large() {
 (export gcd)
 (export lcm)
 "#;
-    let wat = compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", large_program);
+    let wat =
+        compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", large_program);
 
     assert!(wat.contains("(module"), "should contain module: {}", wat);
-    assert!(wat.contains("(func $is-whitespace"), "should contain is-whitespace func: {}", wat);
-    assert!(wat.contains("(func $factorial"), "should contain factorial func: {}", wat);
-    assert!(wat.contains("(func $gcd"), "should contain gcd func: {}", wat);
+    assert!(
+        wat.contains("(func $is-whitespace"),
+        "should contain is-whitespace func: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(func $factorial"),
+        "should contain factorial func: {}",
+        wat
+    );
+    assert!(
+        wat.contains("(func $gcd"),
+        "should contain gcd func: {}",
+        wat
+    );
 }
 
 #[test]
@@ -437,12 +556,24 @@ fn test_compile_with_string_literal() {
 (fn greet-length () s32
   (string-len (get-greeting)))
 "#;
-    let wat = compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", source_with_string);
+    let wat = compile_and_call_with_string_arg(
+        &get_compiler_source(),
+        "compile-source",
+        source_with_string,
+    );
 
     println!("Output for string literal test:\n{}", wat);
 
-    assert!(wat.contains("(func $get-greeting"), "should contain get-greeting func: {}", &wat[..500.min(wat.len())]);
-    assert!(wat.contains("(func $greet-length"), "should contain greet-length func: {}", &wat[..500.min(wat.len())]);
+    assert!(
+        wat.contains("(func $get-greeting"),
+        "should contain get-greeting func: {}",
+        &wat[..500.min(wat.len())]
+    );
+    assert!(
+        wat.contains("(func $greet-length"),
+        "should contain greet-length func: {}",
+        &wat[..500.min(wat.len())]
+    );
 }
 
 #[test]
@@ -452,7 +583,8 @@ fn test_bootstrap_self_compile() {
     let compiler_source = get_compiler_source();
     println!("Compiler source length: {} chars", compiler_source.len());
 
-    let wat = compile_and_call_with_string_arg(&compiler_source, "compile-source", &compiler_source);
+    let wat =
+        compile_and_call_with_string_arg(&compiler_source, "compile-source", &compiler_source);
 
     println!("Output length: {} chars", wat.len());
     println!("Output preview:\n{}", &wat[..2000.min(wat.len())]);
@@ -462,20 +594,28 @@ fn test_bootstrap_self_compile() {
     let has_tokenize_acc = wat.contains("(func $tokenize-acc");
     let has_parse = wat.contains("(func $parse");
     let has_compile = wat.contains("(func $compile");
-    println!("Has tokenize: {}, tokenize-acc: {}, parse: {}, compile: {}", has_tokenize, has_tokenize_acc, has_parse, has_compile);
+    println!(
+        "Has tokenize: {}, tokenize-acc: {}, parse: {}, compile: {}",
+        has_tokenize, has_tokenize_acc, has_parse, has_compile
+    );
 
     // Find where user functions start (after runtime helpers)
     if let Some(pos) = wat.find("(func $is-whitespace") {
         println!("First user function at offset {}", pos);
-        println!("User functions preview:\n{}", &wat[pos..(pos+2000).min(wat.len())]);
+        println!(
+            "User functions preview:\n{}",
+            &wat[pos..(pos + 2000).min(wat.len())]
+        );
     }
 
     // List all function definitions
     println!("\n--- All function definitions ---");
     for (i, _) in wat.match_indices("(func $") {
         // Extract just the function name
-        let rest = &wat[i+7..]; // skip "(func $"
-        let end = rest.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(50);
+        let rest = &wat[i + 7..]; // skip "(func $"
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(50);
         let name = &rest[..end];
         println!("  {}: ${}", i, name);
     }
@@ -489,9 +629,15 @@ fn test_bootstrap_self_compile() {
 
     // Check for key functions from the compiler (tokenize or tokenize-acc)
     let has_any_tokenize = has_tokenize || has_tokenize_acc;
-    assert!(has_any_tokenize, "should contain tokenize or tokenize-acc func");
+    assert!(
+        has_any_tokenize,
+        "should contain tokenize or tokenize-acc func"
+    );
     assert!(wat.contains("(func $parse"), "should contain parse func");
-    assert!(wat.contains("(func $compile"), "should contain compile func");
+    assert!(
+        wat.contains("(func $compile"),
+        "should contain compile func"
+    );
 }
 
 #[test]
@@ -510,7 +656,8 @@ fn test_bootstrap_v2_compiles_factorial() {
     // Load the self-compiled module directly from WAT
     let module = Module::new(&engine, &wat).expect("failed to parse self-compiled WAT");
     let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[]).expect("failed to instantiate v2 compiler");
+    let instance =
+        Instance::new(&mut store, &module, &[]).expect("failed to instantiate v2 compiler");
 
     let func = instance
         .get_func(&mut store, "compile-source")
@@ -550,18 +697,35 @@ fn test_bootstrap_v2_compiles_factorial() {
 
     // Read the result
     let mut len_buf = [0u8; 4];
-    memory.read(&store, (out_ptr + 24) as usize, &mut len_buf).expect("failed to read len");
+    memory
+        .read(&store, (out_ptr + 24) as usize, &mut len_buf)
+        .expect("failed to read len");
     let str_len = i32::from_le_bytes(len_buf) as usize;
 
     let mut str_buf = vec![0u8; str_len];
-    memory.read(&store, (out_ptr + 28) as usize, &mut str_buf).expect("failed to read string");
+    memory
+        .read(&store, (out_ptr + 28) as usize, &mut str_buf)
+        .expect("failed to read string");
     let v2_output = String::from_utf8(str_buf).expect("invalid utf8");
 
-    println!("V2 compiler output ({} chars):\n{}", v2_output.len(), &v2_output[..500.min(v2_output.len())]);
+    println!(
+        "V2 compiler output ({} chars):\n{}",
+        v2_output.len(),
+        &v2_output[..500.min(v2_output.len())]
+    );
 
-    assert!(v2_output.contains("(module"), "v2 output should contain module");
-    assert!(v2_output.contains("(func $factorial"), "v2 output should contain factorial");
-    assert!(v2_output.contains("i32.mul"), "v2 output should contain multiply");
+    assert!(
+        v2_output.contains("(module"),
+        "v2 output should contain module"
+    );
+    assert!(
+        v2_output.contains("(func $factorial"),
+        "v2 output should contain factorial"
+    );
+    assert!(
+        v2_output.contains("i32.mul"),
+        "v2 output should contain multiply"
+    );
 
     println!("V2 compiler successfully compiled factorial!");
 }

@@ -15,16 +15,16 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::RwLock as SyncRwLock;
 use std::sync::Mutex;
+use std::sync::RwLock as SyncRwLock;
 
 use anyhow::{Context, Result};
 use theater::actor::handle::ActorHandle;
 use theater::actor::store::ActorStore;
 use theater::chain::StateChain;
-use theater::pack_bridge::{AsyncRuntime, PackInstance, Ctx, Value};
 use theater::id::TheaterId;
 use theater::messages::TheaterCommand;
+use theater::pack_bridge::{AsyncRuntime, Ctx, PackInstance, Value};
 use theater::ValueType;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -35,9 +35,7 @@ use pack::Runtime as PackRuntime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -47,9 +45,7 @@ async fn main() -> Result<()> {
     }
 
     if args.len() >= 4 && args[1] == "--compile-run" {
-        let func_args: Vec<i32> = args[4..].iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let func_args: Vec<i32> = args[4..].iter().filter_map(|s| s.parse().ok()).collect();
         return run_compile_and_execute(&args[2], &args[3], &func_args).await;
     }
 
@@ -61,13 +57,12 @@ async fn main() -> Result<()> {
         return run_repl().await;
     }
 
-    let wasm_path = args.get(1)
+    let wasm_path = args
+        .get(1)
         .map(|s| s.as_str())
         .unwrap_or("examples/wisp-compiler.wasm");
 
-    let func_name = args.get(2)
-        .map(|s| s.as_str())
-        .unwrap_or("compile-source");
+    let func_name = args.get(2).map(|s| s.as_str()).unwrap_or("compile-source");
 
     // Optional: string argument for the function
     let arg = args.get(3).cloned();
@@ -91,35 +86,27 @@ async fn main() -> Result<()> {
     )));
     let actor_handle = ActorHandle::new(operation_tx, info_tx, control_tx);
 
-    let actor_store = ActorStore::new(
-        actor_id.clone(),
-        theater_tx.clone(),
-        actor_handle,
-        chain,
-    );
+    let actor_store = ActorStore::new(actor_id.clone(), theater_tx.clone(), actor_handle, chain);
 
-    let mut instance = PackInstance::new(
-        "wisp-test",
-        &wasm_bytes,
-        &runtime,
-        actor_store,
-        |builder| {
+    let mut instance =
+        PackInstance::new("wisp-test", &wasm_bytes, &runtime, actor_store, |builder| {
             // theater:simple/runtime - log function
-            builder
-                .interface("theater:simple/runtime")?
-                .func_typed("log", |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+            builder.interface("theater:simple/runtime")?.func_typed(
+                "log",
+                |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
                     let msg = match input {
                         Value::String(s) => s,
                         _ => format!("{:?}", input),
                     };
                     info!("[ACTOR LOG] {}", msg);
                     Value::Tuple(vec![])
-                })?;
+                },
+            )?;
 
             // theater:simple/assembler - wat-to-wasm function
-            builder
-                .interface("theater:simple/assembler")?
-                .func_typed("wat-to-wasm", |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+            builder.interface("theater:simple/assembler")?.func_typed(
+                "wat-to-wasm",
+                |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
                     let wat = match input {
                         Value::String(s) => s,
                         _ => {
@@ -157,12 +144,12 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                })?;
+                },
+            )?;
 
             Ok(())
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     info!("PackInstance created successfully");
     info!("Calling function: {}", func_name);
@@ -183,7 +170,9 @@ async fn main() -> Result<()> {
         Value::S32(n) => println!("{}", n),
         Value::S64(n) => println!("{}", n),
         Value::String(s) => println!("{}", s),
-        Value::Result { value: Ok(inner), .. } => {
+        Value::Result {
+            value: Ok(inner), ..
+        } => {
             match *inner {
                 Value::List { items, .. } => {
                     // If it's a list of bytes, show length
@@ -192,7 +181,9 @@ async fn main() -> Result<()> {
                 other => println!("Success: {:?}", other),
             }
         }
-        Value::Result { value: Err(inner), .. } => {
+        Value::Result {
+            value: Err(inner), ..
+        } => {
             println!("Error: {:?}", inner);
         }
         other => println!("{:?}", other),
@@ -219,20 +210,25 @@ async fn run_compile_pipeline(source: &str) -> Result<()> {
         &runtime,
         actor_store,
         |builder| {
-            builder.interface("theater:simple/runtime")?
-                .func_typed("log", |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+            builder.interface("theater:simple/runtime")?.func_typed(
+                "log",
+                |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
                     if let Value::String(s) = input {
                         info!("[COMPILER] {}", s);
                     }
                     Value::Tuple(vec![])
-                })?;
+                },
+            )?;
             Ok(())
         },
-    ).await?;
+    )
+    .await?;
 
     // Step 2: Compile source to WAT
     info!("Compiling source to WAT...");
-    let result = instance.call_value("compile-source", &Value::String(source.to_string())).await?;
+    let result = instance
+        .call_value("compile-source", &Value::String(source.to_string()))
+        .await?;
 
     let wat = match result {
         Value::String(s) => s,
@@ -243,15 +239,13 @@ async fn run_compile_pipeline(source: &str) -> Result<()> {
 
     // Step 3: Assemble WAT to WASM
     info!("Assembling WAT to WASM...");
-    let wasm_bytes = wat::parse_str(&wat)
-        .context("Failed to assemble WAT to WASM")?;
+    let wasm_bytes = wat::parse_str(&wat).context("Failed to assemble WAT to WASM")?;
 
     info!("Generated {} bytes of WASM", wasm_bytes.len());
 
     // Verify it's valid WASM
     let engine = Engine::default();
-    Module::new(&engine, &wasm_bytes)
-        .context("Generated WASM is invalid")?;
+    Module::new(&engine, &wasm_bytes).context("Generated WASM is invalid")?;
 
     info!("WASM validated successfully!");
     println!("Success: {} bytes of valid WASM", wasm_bytes.len());
@@ -261,7 +255,10 @@ async fn run_compile_pipeline(source: &str) -> Result<()> {
 
 /// Compile source and run a function from it
 async fn run_compile_and_execute(source: &str, func_name: &str, func_args: &[i32]) -> Result<()> {
-    info!("Compile and execute: {} -> {} with args {:?}", source, func_name, func_args);
+    info!(
+        "Compile and execute: {} -> {} with args {:?}",
+        source, func_name, func_args
+    );
 
     // Step 1: Load the self-hosted compiler
     let compiler_wasm = std::fs::read("examples/wisp-compiler.wasm")
@@ -276,16 +273,20 @@ async fn run_compile_and_execute(source: &str, func_name: &str, func_args: &[i32
         &runtime,
         actor_store,
         |builder| {
-            builder.interface("theater:simple/runtime")?
+            builder
+                .interface("theater:simple/runtime")?
                 .func_typed("log", |_ctx: &mut Ctx<'_, ActorStore>, _input: Value| {
                     Value::Tuple(vec![])
                 })?;
             Ok(())
         },
-    ).await?;
+    )
+    .await?;
 
     // Step 2: Compile source to WAT
-    let result = instance.call_value("compile-source", &Value::String(source.to_string())).await?;
+    let result = instance
+        .call_value("compile-source", &Value::String(source.to_string()))
+        .await?;
 
     let wat = match result {
         Value::String(s) => s,
@@ -293,10 +294,13 @@ async fn run_compile_and_execute(source: &str, func_name: &str, func_args: &[i32
     };
 
     // Step 3: Assemble WAT to WASM
-    let wasm_bytes = wat::parse_str(&wat)
-        .context("Failed to assemble WAT")?;
+    let wasm_bytes = wat::parse_str(&wat).context("Failed to assemble WAT")?;
 
-    info!("Compiled {} bytes of source to {} bytes of WASM", source.len(), wasm_bytes.len());
+    info!(
+        "Compiled {} bytes of source to {} bytes of WASM",
+        source.len(),
+        wasm_bytes.len()
+    );
 
     // Step 4: Load and run the compiled module
     let mut config = wasmtime::Config::new();
@@ -306,7 +310,8 @@ async fn run_compile_and_execute(source: &str, func_name: &str, func_args: &[i32
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])?;
 
-    let func = instance.get_func(&mut store, func_name)
+    let func = instance
+        .get_func(&mut store, func_name)
         .with_context(|| format!("Function '{}' not found", func_name))?;
 
     let ty = func.ty(&store);
@@ -367,20 +372,21 @@ async fn run_compose(wrapper_path: &str, expr_path: &str) -> Result<()> {
     let expr_instance = Instance::new(&mut store, &expr_module, &[])?;
 
     // Get the eval function from expression module
-    let eval_func = expr_instance.get_func(&mut store, "eval")
+    let eval_func = expr_instance
+        .get_func(&mut store, "eval")
         .context("Expression module must export 'eval'")?;
 
     // Instantiate wrapper with the eval import
-    let wrapper_instance = Instance::new(&mut store, &wrapper_module, &[
-        eval_func.into(),
-    ])?;
+    let wrapper_instance = Instance::new(&mut store, &wrapper_module, &[eval_func.into()])?;
 
     // Call init on the wrapper
-    let init_func = wrapper_instance.get_func(&mut store, "init")
+    let init_func = wrapper_instance
+        .get_func(&mut store, "init")
         .context("Wrapper must export 'init'")?;
 
     // Allocate buffers for CGRF calling convention
-    let memory = wrapper_instance.get_memory(&mut store, "memory")
+    let memory = wrapper_instance
+        .get_memory(&mut store, "memory")
         .context("Wrapper must export 'memory'")?;
 
     let in_ptr = 32768i32;
@@ -389,24 +395,28 @@ async fn run_compose(wrapper_path: &str, expr_path: &str) -> Result<()> {
 
     // Write empty input (CGRF header for empty tuple)
     let in_buf: [u8; 24] = [
-        0x43, 0x47, 0x52, 0x46,  // Magic "CGRF"
-        0x02, 0x00,              // Version 2
-        0x00, 0x00,              // Padding
-        0x01, 0x00, 0x00, 0x00,  // Num values: 1
-        0x00, 0x00, 0x00, 0x00,  // Reserved
-        0x08,                    // Type: tuple
-        0x00, 0x00, 0x00,        // Padding
-        0x00, 0x00, 0x00, 0x00,  // Size: 0 (empty tuple)
+        0x43, 0x47, 0x52, 0x46, // Magic "CGRF"
+        0x02, 0x00, // Version 2
+        0x00, 0x00, // Padding
+        0x01, 0x00, 0x00, 0x00, // Num values: 1
+        0x00, 0x00, 0x00, 0x00, // Reserved
+        0x08, // Type: tuple
+        0x00, 0x00, 0x00, // Padding
+        0x00, 0x00, 0x00, 0x00, // Size: 0 (empty tuple)
     ];
     memory.write(&mut store, in_ptr as usize, &in_buf)?;
 
     let mut results = vec![wasmtime::Val::I32(0)];
-    init_func.call(&mut store, &[
-        wasmtime::Val::I32(in_ptr),
-        wasmtime::Val::I32(24),
-        wasmtime::Val::I32(out_ptr),
-        wasmtime::Val::I32(out_cap),
-    ], &mut results)?;
+    init_func.call(
+        &mut store,
+        &[
+            wasmtime::Val::I32(in_ptr),
+            wasmtime::Val::I32(24),
+            wasmtime::Val::I32(out_ptr),
+            wasmtime::Val::I32(out_cap),
+        ],
+        &mut results,
+    )?;
 
     // Read result from output buffer
     let mut out_buf = [0u8; 32];
@@ -414,17 +424,27 @@ async fn run_compose(wrapper_path: &str, expr_path: &str) -> Result<()> {
 
     // Parse CGRF result
     let tag = u32::from_le_bytes([out_buf[0], out_buf[1], out_buf[2], out_buf[3]]);
-    if tag == 0x46524743 {  // "CGRF"
+    if tag == 0x46524743 {
+        // "CGRF"
         let type_tag = out_buf[16];
         match type_tag {
-            2 => {  // s32
-                let value = i32::from_le_bytes([out_buf[24], out_buf[25], out_buf[26], out_buf[27]]);
+            2 => {
+                // s32
+                let value =
+                    i32::from_le_bytes([out_buf[24], out_buf[25], out_buf[26], out_buf[27]]);
                 println!("{}", value);
             }
-            3 => {  // s64
+            3 => {
+                // s64
                 let value = i64::from_le_bytes([
-                    out_buf[24], out_buf[25], out_buf[26], out_buf[27],
-                    out_buf[28], out_buf[29], out_buf[30], out_buf[31],
+                    out_buf[24],
+                    out_buf[25],
+                    out_buf[26],
+                    out_buf[27],
+                    out_buf[28],
+                    out_buf[29],
+                    out_buf[30],
+                    out_buf[31],
                 ]);
                 println!("{}", value);
             }
@@ -522,7 +542,6 @@ struct LoadedInterface {
     exports: Vec<ExportedFunction>,
 }
 
-
 /// A field in a user-defined record type
 #[derive(Debug, Clone)]
 struct ReplRecordField {
@@ -574,9 +593,16 @@ enum EvalResult {
     /// Native string from WASM linear memory
     NativeString(String),
     /// Native record from WASM linear memory
-    NativeRecord { type_name: String, fields: Vec<(String, i32)> },
+    NativeRecord {
+        type_name: String,
+        fields: Vec<(String, i32)>,
+    },
     /// Native variant from WASM linear memory
-    NativeVariant { type_name: String, case_name: String, payload: Option<i32> },
+    NativeVariant {
+        type_name: String,
+        case_name: String,
+        payload: Option<i32>,
+    },
 }
 
 /// Check if a Pack TypeDesc is a compound type (not a scalar)
@@ -620,16 +646,10 @@ fn format_value(value: &pack::abi::Value) -> String {
             let inner: Vec<String> = items.iter().map(format_value).collect();
             format!("[{}]", inner.join(", "))
         }
-        pack::abi::Value::Option {
-            value: Some(v), ..
-        } => format!("some({})", format_value(v)),
+        pack::abi::Value::Option { value: Some(v), .. } => format!("some({})", format_value(v)),
         pack::abi::Value::Option { value: None, .. } => "none".to_string(),
-        pack::abi::Value::Result {
-            value: Ok(v), ..
-        } => format!("ok({})", format_value(v)),
-        pack::abi::Value::Result {
-            value: Err(v), ..
-        } => format!("err({})", format_value(v)),
+        pack::abi::Value::Result { value: Ok(v), .. } => format!("ok({})", format_value(v)),
+        pack::abi::Value::Result { value: Err(v), .. } => format!("err({})", format_value(v)),
         pack::abi::Value::Record {
             type_name, fields, ..
         } => {
@@ -729,7 +749,11 @@ fn type_desc_display(td: &pack::TypeDesc) -> String {
         pack::TypeDesc::Flags => "flags".to_string(),
         pack::TypeDesc::List(inner) => format!("list<{}>", type_desc_display(inner)),
         pack::TypeDesc::Option(inner) => format!("option<{}>", type_desc_display(inner)),
-        pack::TypeDesc::Result { ok, err } => format!("result<{}, {}>", type_desc_display(ok), type_desc_display(err)),
+        pack::TypeDesc::Result { ok, err } => format!(
+            "result<{}, {}>",
+            type_desc_display(ok),
+            type_desc_display(err)
+        ),
         pack::TypeDesc::Record { name, .. } => name.clone(),
         pack::TypeDesc::Variant { name, .. } => name.clone(),
         pack::TypeDesc::Tuple(elems) => {
@@ -743,16 +767,26 @@ fn type_desc_display(td: &pack::TypeDesc) -> String {
 /// Convert a Pack TypeDesc to a WASM-level type
 fn type_desc_to_wasm(td: &pack::TypeDesc) -> WasmType {
     match td {
-        pack::TypeDesc::S32 | pack::TypeDesc::U32 | pack::TypeDesc::Bool
-        | pack::TypeDesc::U8 | pack::TypeDesc::U16 | pack::TypeDesc::S8
-        | pack::TypeDesc::S16 | pack::TypeDesc::Char | pack::TypeDesc::Flags => WasmType::I32,
+        pack::TypeDesc::S32
+        | pack::TypeDesc::U32
+        | pack::TypeDesc::Bool
+        | pack::TypeDesc::U8
+        | pack::TypeDesc::U16
+        | pack::TypeDesc::S8
+        | pack::TypeDesc::S16
+        | pack::TypeDesc::Char
+        | pack::TypeDesc::Flags => WasmType::I32,
         pack::TypeDesc::S64 | pack::TypeDesc::U64 => WasmType::I64,
         pack::TypeDesc::F32 => WasmType::F32,
         pack::TypeDesc::F64 => WasmType::F64,
         // Compound types are all i32 pointers/handles at the WASM level
-        pack::TypeDesc::String | pack::TypeDesc::List(_) | pack::TypeDesc::Option(_)
-        | pack::TypeDesc::Result { .. } | pack::TypeDesc::Record { .. }
-        | pack::TypeDesc::Variant { .. } | pack::TypeDesc::Tuple(_)
+        pack::TypeDesc::String
+        | pack::TypeDesc::List(_)
+        | pack::TypeDesc::Option(_)
+        | pack::TypeDesc::Result { .. }
+        | pack::TypeDesc::Record { .. }
+        | pack::TypeDesc::Variant { .. }
+        | pack::TypeDesc::Tuple(_)
         | pack::TypeDesc::Value => WasmType::I32,
     }
 }
@@ -779,79 +813,109 @@ struct CgrfTypeInfo {
 fn cgrf_type_info(td: &pack::TypeDesc) -> CgrfTypeInfo {
     match td {
         pack::TypeDesc::Bool => CgrfTypeInfo {
-            tag: 0x01, payload_size: 1,
-            store_instr: "i32.store8", load_instr: "i32.load8_u",
+            tag: 0x01,
+            payload_size: 1,
+            store_instr: "i32.store8",
+            load_instr: "i32.load8_u",
             is_dynamic: false,
         },
         pack::TypeDesc::S32 => CgrfTypeInfo {
-            tag: 0x02, payload_size: 4,
-            store_instr: "i32.store", load_instr: "i32.load",
+            tag: 0x02,
+            payload_size: 4,
+            store_instr: "i32.store",
+            load_instr: "i32.load",
             is_dynamic: false,
         },
         pack::TypeDesc::S64 => CgrfTypeInfo {
-            tag: 0x03, payload_size: 8,
-            store_instr: "i64.store", load_instr: "i64.load",
+            tag: 0x03,
+            payload_size: 8,
+            store_instr: "i64.store",
+            load_instr: "i64.load",
             is_dynamic: false,
         },
         pack::TypeDesc::F32 => CgrfTypeInfo {
-            tag: 0x04, payload_size: 4,
-            store_instr: "f32.store", load_instr: "f32.load",
+            tag: 0x04,
+            payload_size: 4,
+            store_instr: "f32.store",
+            load_instr: "f32.load",
             is_dynamic: false,
         },
         pack::TypeDesc::F64 => CgrfTypeInfo {
-            tag: 0x05, payload_size: 8,
-            store_instr: "f64.store", load_instr: "f64.load",
+            tag: 0x05,
+            payload_size: 8,
+            store_instr: "f64.store",
+            load_instr: "f64.load",
             is_dynamic: false,
         },
         pack::TypeDesc::String => CgrfTypeInfo {
-            tag: 0x06, payload_size: 0, // dynamic: 4 + string length
-            store_instr: "", load_instr: "",
+            tag: 0x06,
+            payload_size: 0, // dynamic: 4 + string length
+            store_instr: "",
+            load_instr: "",
             is_dynamic: true,
         },
         pack::TypeDesc::U8 => CgrfTypeInfo {
-            tag: 0x0C, payload_size: 1,
-            store_instr: "i32.store8", load_instr: "i32.load8_u",
+            tag: 0x0C,
+            payload_size: 1,
+            store_instr: "i32.store8",
+            load_instr: "i32.load8_u",
             is_dynamic: false,
         },
         pack::TypeDesc::S8 => CgrfTypeInfo {
-            tag: 0x10, payload_size: 1,
-            store_instr: "i32.store8", load_instr: "i32.load8_s",
+            tag: 0x10,
+            payload_size: 1,
+            store_instr: "i32.store8",
+            load_instr: "i32.load8_s",
             is_dynamic: false,
         },
         pack::TypeDesc::U16 => CgrfTypeInfo {
-            tag: 0x0D, payload_size: 2,
-            store_instr: "i32.store16", load_instr: "i32.load16_u",
+            tag: 0x0D,
+            payload_size: 2,
+            store_instr: "i32.store16",
+            load_instr: "i32.load16_u",
             is_dynamic: false,
         },
         pack::TypeDesc::S16 => CgrfTypeInfo {
-            tag: 0x11, payload_size: 2,
-            store_instr: "i32.store16", load_instr: "i32.load16_s",
+            tag: 0x11,
+            payload_size: 2,
+            store_instr: "i32.store16",
+            load_instr: "i32.load16_s",
             is_dynamic: false,
         },
         pack::TypeDesc::U32 => CgrfTypeInfo {
-            tag: 0x0E, payload_size: 4,
-            store_instr: "i32.store", load_instr: "i32.load",
+            tag: 0x0E,
+            payload_size: 4,
+            store_instr: "i32.store",
+            load_instr: "i32.load",
             is_dynamic: false,
         },
         pack::TypeDesc::U64 => CgrfTypeInfo {
-            tag: 0x0F, payload_size: 8,
-            store_instr: "i64.store", load_instr: "i64.load",
+            tag: 0x0F,
+            payload_size: 8,
+            store_instr: "i64.store",
+            load_instr: "i64.load",
             is_dynamic: false,
         },
         pack::TypeDesc::Char => CgrfTypeInfo {
-            tag: 0x12, payload_size: 4,
-            store_instr: "i32.store", load_instr: "i32.load",
+            tag: 0x12,
+            payload_size: 4,
+            store_instr: "i32.store",
+            load_instr: "i32.load",
             is_dynamic: false,
         },
         pack::TypeDesc::Flags => CgrfTypeInfo {
-            tag: 0x13, payload_size: 4,
-            store_instr: "i32.store", load_instr: "i32.load",
+            tag: 0x13,
+            payload_size: 4,
+            store_instr: "i32.store",
+            load_instr: "i32.load",
             is_dynamic: false,
         },
         // For other compound types, fall back to S32 (pointer/handle)
         _ => CgrfTypeInfo {
-            tag: 0x02, payload_size: 4,
-            store_instr: "i32.store", load_instr: "i32.load",
+            tag: 0x02,
+            payload_size: 4,
+            store_instr: "i32.store",
+            load_instr: "i32.load",
             is_dynamic: false,
         },
     }
@@ -871,28 +935,35 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
 
     // Buffer locations (fixed offsets in linear memory)
     // Use low offsets that fit within a single 64KB memory page
-    let in_buf: i32 = 0x2000;        // Input buffer at 8KB (up to 8KB for input CGRF)
-    let out_ptr_slot: i32 = 0x4000;  // Slot for callee to write output ptr
-    let out_len_slot: i32 = 0x4004;  // Slot for callee to write output len
+    let in_buf: i32 = 0x2000; // Input buffer at 8KB (up to 8KB for input CGRF)
+    let out_ptr_slot: i32 = 0x4000; // Slot for callee to write output ptr
+    let out_len_slot: i32 = 0x4004; // Slot for callee to write output len
 
     // Get rich type info for params and result
     let param_infos: Vec<CgrfTypeInfo> = if let Some(ref rich) = func.rich_sig {
         rich.params.iter().map(|p| cgrf_type_info(&p.ty)).collect()
     } else {
-        func.sig.params.iter().map(|_| cgrf_type_info(&pack::TypeDesc::S32)).collect()
+        func.sig
+            .params
+            .iter()
+            .map(|_| cgrf_type_info(&pack::TypeDesc::S32))
+            .collect()
     };
 
     let has_dynamic_params = param_infos.iter().any(|ti| ti.is_dynamic);
 
     let result_info = if let Some(ref rich) = func.rich_sig {
-        rich.results.first()
+        rich.results
+            .first()
             .map(|td| cgrf_type_info(td))
             .unwrap_or_else(|| cgrf_type_info(&pack::TypeDesc::S32))
     } else {
         cgrf_type_info(&pack::TypeDesc::S32)
     };
 
-    let result_is_compound = func.rich_sig.as_ref()
+    let result_is_compound = func
+        .rich_sig
+        .as_ref()
         .and_then(|r| r.results.first())
         .map(|td| is_compound_type(td))
         .unwrap_or(false);
@@ -903,7 +974,12 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         out.push_str(&format!("(param $p{} {}) ", i, ty.to_wat()));
     }
 
-    let result_type = func.sig.results.first().map(|t| t.to_wat()).unwrap_or("i32");
+    let result_type = func
+        .sig
+        .results
+        .first()
+        .map(|t| t.to_wat())
+        .unwrap_or("i32");
     out.push_str(&format!("(result {})\n", result_type));
 
     // Local variables
@@ -927,7 +1003,7 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         // Empty tuple
         emit_cgrf_header(&mut out, in_buf, 1, 0);
         emit_node_header(&mut out, in_buf + 16, 0x0B, 4); // Tuple tag, count-only payload
-        // Tuple count = 0
+                                                          // Tuple count = 0
         out.push_str(&format!("    i32.const {}\n", in_buf + 24));
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store\n");
@@ -1008,13 +1084,15 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         let total_nodes = 1 + num_params;
 
         // Calculate child node sizes (each has 8-byte header + variable payload)
-        let child_node_sizes: Vec<usize> = param_infos.iter()
-            .map(|ti| 8 + ti.payload_size)
-            .collect();
+        let child_node_sizes: Vec<usize> =
+            param_infos.iter().map(|ti| 8 + ti.payload_size).collect();
         let total_child_bytes: usize = child_node_sizes.iter().sum();
         let total_size = 16 + 8 + tuple_payload + total_child_bytes;
 
-        out.push_str(&format!("    ;; Encode tuple of {} scalar values\n", num_params));
+        out.push_str(&format!(
+            "    ;; Encode tuple of {} scalar values\n",
+            num_params
+        ));
         emit_cgrf_header(&mut out, in_buf, total_nodes as u32, 0);
         emit_node_header(&mut out, in_buf + 16, 0x0B, tuple_payload as u32);
 
@@ -1050,7 +1128,10 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         let tuple_payload = 4 + 4 * num_params;
         let total_nodes = 1 + num_params;
 
-        out.push_str(&format!("    ;; Encode tuple of {} mixed values (has dynamic types)\n", num_params));
+        out.push_str(&format!(
+            "    ;; Encode tuple of {} mixed values (has dynamic types)\n",
+            num_params
+        ));
 
         // Read string lengths first
         for (i, ti) in param_infos.iter().enumerate() {
@@ -1139,7 +1220,10 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
             } else {
                 // Scalar child - fixed size
                 let node_size = 8 + ti.payload_size;
-                out.push_str(&format!("    ;; Child {} (scalar, {} bytes)\n", i, node_size));
+                out.push_str(&format!(
+                    "    ;; Child {} (scalar, {} bytes)\n",
+                    i, node_size
+                ));
                 // Node header - tag
                 out.push_str("    local.get $write_pos\n");
                 out.push_str(&format!("    i32.const {}\n", ti.tag));
@@ -1217,7 +1301,10 @@ fn generate_cgrf_wrapper(func: &ExportedFunction) -> String {
         // Scalar result: decode from CGRF output
         // CGRF format: header(16) + node header(8) + payload
         // Value is at out_ptr + 24
-        out.push_str(&format!("    ;; Decode {} result\n", result_info.load_instr));
+        out.push_str(&format!(
+            "    ;; Decode {} result\n",
+            result_info.load_instr
+        ));
         out.push_str("    local.get $out_ptr\n");
         out.push_str("    i32.const 24\n");
         out.push_str("    i32.add\n");
@@ -1291,7 +1378,7 @@ fn parse_import(line: &str) -> Option<(String, ImportSource)> {
         ImportSource::Host
     } else if source_str.starts_with('"') && source_str.ends_with('"') {
         // It's a file path
-        let path = source_str[1..source_str.len()-1].to_string();
+        let path = source_str[1..source_str.len() - 1].to_string();
         ImportSource::Component(PathBuf::from(path))
     } else {
         return None;
@@ -1315,26 +1402,22 @@ fn load_interface(
         ImportSource::Host => {
             // Known host interfaces with their signatures
             let exports = match interface {
-                "theater:simple/runtime" => vec![
-                    ExportedFunction {
-                        name: "log".to_string(),
-                        sig: FunctionSig {
-                            params: vec![], // Takes a string via CGRF, not supported yet
-                            results: vec![],
-                        },
-                        rich_sig: None,
+                "theater:simple/runtime" => vec![ExportedFunction {
+                    name: "log".to_string(),
+                    sig: FunctionSig {
+                        params: vec![], // Takes a string via CGRF, not supported yet
+                        results: vec![],
                     },
-                ],
-                "theater:simple/assembler" => vec![
-                    ExportedFunction {
-                        name: "wat-to-wasm".to_string(),
-                        sig: FunctionSig {
-                            params: vec![], // Takes a string via CGRF
-                            results: vec![], // Returns result<list<u8>, string>
-                        },
-                        rich_sig: None,
+                    rich_sig: None,
+                }],
+                "theater:simple/assembler" => vec![ExportedFunction {
+                    name: "wat-to-wasm".to_string(),
+                    sig: FunctionSig {
+                        params: vec![],  // Takes a string via CGRF
+                        results: vec![], // Returns result<list<u8>, string>
                     },
-                ],
+                    rich_sig: None,
+                }],
                 "wisp:repl/debug" => vec![
                     ExportedFunction {
                         name: "print-i32".to_string(),
@@ -1385,11 +1468,13 @@ fn load_interface(
             // Load the Pack package if not already loaded
             if !loaded_packages.contains_key(path) {
                 // Load with pack::Runtime
-                let module = pack_runtime.load_module(&bytes)
+                let module = pack_runtime
+                    .load_module(&bytes)
                     .with_context(|| format!("Failed to load Pack package: {}", path.display()))?;
 
-                let instance = module.instantiate()
-                    .with_context(|| format!("Failed to instantiate Pack package: {}", path.display()))?;
+                let instance = module.instantiate().with_context(|| {
+                    format!("Failed to instantiate Pack package: {}", path.display())
+                })?;
 
                 loaded_packages.insert(path.clone(), Arc::new(Mutex::new(instance)));
             }
@@ -1401,10 +1486,14 @@ fn load_interface(
                 match instance.types() {
                     Ok(metadata) => {
                         for func_sig in &metadata.exports {
-                            let wasm_params: Vec<WasmType> = func_sig.params.iter()
+                            let wasm_params: Vec<WasmType> = func_sig
+                                .params
+                                .iter()
                                 .map(|p| type_desc_to_wasm(&p.ty))
                                 .collect();
-                            let wasm_results: Vec<WasmType> = func_sig.results.iter()
+                            let wasm_results: Vec<WasmType> = func_sig
+                                .results
+                                .iter()
                                 .map(|td| type_desc_to_wasm(td))
                                 .collect();
 
@@ -1420,16 +1509,23 @@ fn load_interface(
                                 }),
                             });
                         }
-                        info!("Loaded Pack package: {} with {} typed exports",
-                            path.display(), exports.len());
+                        info!(
+                            "Loaded Pack package: {} with {} typed exports",
+                            path.display(),
+                            exports.len()
+                        );
                     }
                     Err(pack::MetadataError::NotFound) => {
                         // No __pack_types - fall back to discovering Graph ABI exports
-                        warn!("Pack package {} has no type metadata, falling back to heuristic",
-                            path.display());
+                        warn!(
+                            "Pack package {} has no type metadata, falling back to heuristic",
+                            path.display()
+                        );
                         let engine = wasmtime::Engine::default();
-                        let wasm_module = wasmtime::Module::new(&engine, &bytes)
-                            .with_context(|| format!("Failed to parse Pack package: {}", path.display()))?;
+                        let wasm_module =
+                            wasmtime::Module::new(&engine, &bytes).with_context(|| {
+                                format!("Failed to parse Pack package: {}", path.display())
+                            })?;
 
                         for export in wasm_module.exports() {
                             if let wasmtime::ExternType::Func(func_ty) = export.ty() {
@@ -1455,11 +1551,17 @@ fn load_interface(
                                 }
                             }
                         }
-                        info!("Loaded Pack package: {} with Graph ABI exports (no metadata)",
-                            path.display());
+                        info!(
+                            "Loaded Pack package: {} with Graph ABI exports (no metadata)",
+                            path.display()
+                        );
                     }
                     Err(e) => {
-                        warn!("Failed to read type metadata from {}: {}", path.display(), e);
+                        warn!(
+                            "Failed to read type metadata from {}: {}",
+                            path.display(),
+                            e
+                        );
                     }
                 }
             }
@@ -1495,7 +1597,10 @@ fn parse_variant_def(line: &str) -> Option<ReplVariantDef> {
             }
             let case_name = parts[0].to_string();
             let has_payload = parts.len() > 1;
-            cases.push(ReplVariantCase { name: case_name, has_payload });
+            cases.push(ReplVariantCase {
+                name: case_name,
+                has_payload,
+            });
             pos = end + 1;
         } else {
             pos += 1;
@@ -1572,7 +1677,9 @@ fn infer_return_type(
 
     // Check for Pack compound import call
     for (_, func) in used_imports {
-        if func.rich_sig.as_ref()
+        if func
+            .rich_sig
+            .as_ref()
             .and_then(|r| r.results.first())
             .map(|td| is_compound_type(td))
             .unwrap_or(false)
@@ -1616,14 +1723,20 @@ fn infer_return_type(
 
 /// Read a string from WASM linear memory at the given pointer.
 /// Format: [len:u32][utf8_bytes...]
-fn read_string_from_memory(memory: &wasmtime::Memory, store: &Store<()>, ptr: i32) -> Result<String> {
+fn read_string_from_memory(
+    memory: &wasmtime::Memory,
+    store: &Store<()>,
+    ptr: i32,
+) -> Result<String> {
     let mut len_buf = [0u8; 4];
-    memory.read(store, ptr as usize, &mut len_buf)
+    memory
+        .read(store, ptr as usize, &mut len_buf)
         .context("failed to read string length")?;
     let len = u32::from_le_bytes(len_buf) as usize;
 
     let mut str_buf = vec![0u8; len];
-    memory.read(store, (ptr as usize) + 4, &mut str_buf)
+    memory
+        .read(store, (ptr as usize) + 4, &mut str_buf)
         .context("failed to read string bytes")?;
 
     String::from_utf8(str_buf).context("invalid UTF-8 in string")
@@ -1641,7 +1754,8 @@ fn read_record_from_memory(
     for (i, field) in rec_def.fields.iter().enumerate() {
         let offset = (i * 4) as usize;
         let mut buf = [0u8; 4];
-        memory.read(store, (ptr as usize) + offset, &mut buf)
+        memory
+            .read(store, (ptr as usize) + offset, &mut buf)
             .context("failed to read record field")?;
         let value = i32::from_le_bytes(buf);
         fields.push((field.name.clone(), value));
@@ -1658,18 +1772,24 @@ fn read_variant_from_memory(
     var_def: &ReplVariantDef,
 ) -> Result<(String, Option<i32>)> {
     let mut tag_buf = [0u8; 4];
-    memory.read(store, ptr as usize, &mut tag_buf)
+    memory
+        .read(store, ptr as usize, &mut tag_buf)
         .context("failed to read variant tag")?;
     let tag = i32::from_le_bytes(tag_buf) as usize;
 
     if tag >= var_def.cases.len() {
-        anyhow::bail!("variant tag {} out of range (max {})", tag, var_def.cases.len() - 1);
+        anyhow::bail!(
+            "variant tag {} out of range (max {})",
+            tag,
+            var_def.cases.len() - 1
+        );
     }
 
     let case = &var_def.cases[tag];
     let payload = if case.has_payload {
         let mut payload_buf = [0u8; 4];
-        memory.read(store, (ptr as usize) + 4, &mut payload_buf)
+        memory
+            .read(store, (ptr as usize) + 4, &mut payload_buf)
             .context("failed to read variant payload")?;
         Some(i32::from_le_bytes(payload_buf))
     } else {
@@ -1752,7 +1872,10 @@ async fn run_repl() -> Result<()> {
             // Store function definition
             functions.push(line.to_string());
             // Extract function name for display
-            if let Some(name) = line.strip_prefix("(fn ").and_then(|s| s.split_whitespace().next()) {
+            if let Some(name) = line
+                .strip_prefix("(fn ")
+                .and_then(|s| s.split_whitespace().next())
+            {
                 println!("defined function {}", name);
             }
             continue;
@@ -1786,16 +1909,28 @@ async fn run_repl() -> Result<()> {
             if !variant_defs.is_empty() {
                 println!("variants:");
                 for (name, vdef) in &variant_defs {
-                    let cases: Vec<String> = vdef.cases.iter().map(|c| {
-                        if c.has_payload { format!("{}(_)", c.name) } else { c.name.clone() }
-                    }).collect();
+                    let cases: Vec<String> = vdef
+                        .cases
+                        .iter()
+                        .map(|c| {
+                            if c.has_payload {
+                                format!("{}(_)", c.name)
+                            } else {
+                                c.name.clone()
+                            }
+                        })
+                        .collect();
                     println!("  {} = {}", name, cases.join(" | "));
                 }
             }
             if !record_defs.is_empty() {
                 println!("records:");
                 for (name, rdef) in &record_defs {
-                    let fields: Vec<String> = rdef.fields.iter().map(|f| format!("{}: {}", f.name, f.ty)).collect();
+                    let fields: Vec<String> = rdef
+                        .fields
+                        .iter()
+                        .map(|f| format!("{}: {}", f.name, f.ty))
+                        .collect();
                     println!("  {} {{ {} }}", name, fields.join(", "));
                 }
             }
@@ -1805,22 +1940,41 @@ async fn run_repl() -> Result<()> {
                     ImportSource::Host => "host".to_string(),
                     ImportSource::Component(p) => p.display().to_string(),
                 };
-                println!("  {} from {} ({} exports)", imp.interface, source_name, imp.exports.len());
+                println!(
+                    "  {} from {} ({} exports)",
+                    imp.interface,
+                    source_name,
+                    imp.exports.len()
+                );
                 for func in &imp.exports {
                     // Prefer rich type names when available
                     if let Some(ref rich) = func.rich_sig {
-                        let params: Vec<String> = rich.params.iter()
+                        let params: Vec<String> = rich
+                            .params
+                            .iter()
                             .map(|p| format!("{}: {}", p.name, type_desc_display(&p.ty)))
                             .collect();
-                        let results: Vec<String> = rich.results.iter()
+                        let results: Vec<String> = rich
+                            .results
+                            .iter()
                             .map(|td| type_desc_display(td))
                             .collect();
-                        let result_str = if results.is_empty() { "()".to_string() } else { results.join(", ") };
+                        let result_str = if results.is_empty() {
+                            "()".to_string()
+                        } else {
+                            results.join(", ")
+                        };
                         println!("    {}({}) -> {}", func.name, params.join(", "), result_str);
                     } else {
-                        let params: Vec<&str> = func.sig.params.iter().map(|t| t.to_wisp()).collect();
-                        let results: Vec<&str> = func.sig.results.iter().map(|t| t.to_wisp()).collect();
-                        let result_str = if results.is_empty() { "()".to_string() } else { results.join(", ") };
+                        let params: Vec<&str> =
+                            func.sig.params.iter().map(|t| t.to_wisp()).collect();
+                        let results: Vec<&str> =
+                            func.sig.results.iter().map(|t| t.to_wisp()).collect();
+                        let result_str = if results.is_empty() {
+                            "()".to_string()
+                        } else {
+                            results.join(", ")
+                        };
                         println!("    {}({}) -> {}", func.name, params.join(", "), result_str);
                     }
                 }
@@ -1850,9 +2004,8 @@ async fn run_repl() -> Result<()> {
                             };
                             println!("loaded interface {} from {}", loaded.interface, source_name);
                             if !loaded.exports.is_empty() {
-                                let export_names: Vec<&str> = loaded.exports.iter()
-                                    .map(|e| e.name.as_str())
-                                    .collect();
+                                let export_names: Vec<&str> =
+                                    loaded.exports.iter().map(|e| e.name.as_str()).collect();
                                 println!("  exports: {}", export_names.join(", "));
                             }
                             imports.push(loaded);
@@ -1860,7 +2013,9 @@ async fn run_repl() -> Result<()> {
                         Err(e) => println!("error loading import: {}", e),
                     }
                 }
-                None => println!("error: invalid import syntax. Use: (import <interface> from <source>)"),
+                None => println!(
+                    "error: invalid import syntax. Use: (import <interface> from <source>)"
+                ),
             }
             continue;
         }
@@ -1874,22 +2029,35 @@ async fn run_repl() -> Result<()> {
         }
 
         // Compile and evaluate expression
-        match eval_expression(&compiler_wasm, &runtime, line, &bindings, &functions, &imports, &loaded_packages, &record_defs, &variant_defs).await {
+        match eval_expression(
+            &compiler_wasm,
+            &runtime,
+            line,
+            &bindings,
+            &functions,
+            &imports,
+            &loaded_packages,
+            &record_defs,
+            &variant_defs,
+        )
+        .await
+        {
             Ok(EvalResult::Scalar(n)) => println!("{}", n),
             Ok(EvalResult::Compound(v)) => println!("{}", format_value(&v)),
             Ok(EvalResult::NativeString(s)) => println!("\"{}\"", s),
             Ok(EvalResult::NativeRecord { type_name, fields }) => {
-                let field_strs: Vec<String> = fields.iter()
+                let field_strs: Vec<String> = fields
+                    .iter()
                     .map(|(name, val)| format!("{}: {}", name, val))
                     .collect();
                 println!("{}{{ {} }}", type_name, field_strs.join(", "));
             }
-            Ok(EvalResult::NativeVariant { case_name, payload, .. }) => {
-                match payload {
-                    Some(v) => println!("{}({})", case_name, v),
-                    None => println!("{}", case_name),
-                }
-            }
+            Ok(EvalResult::NativeVariant {
+                case_name, payload, ..
+            }) => match payload {
+                Some(v) => println!("{}({})", case_name, v),
+                None => println!("{}", case_name),
+            },
             Err(e) => println!("error: {}", e),
         }
     }
@@ -1901,26 +2069,24 @@ async fn run_repl() -> Result<()> {
 /// Test an actor by loading its WASM module and calling init via Pack
 async fn test_actor_command(line: &str) -> Result<()> {
     // Parse path from (test-actor "path.wasm") or (test-actor path.wasm)
-    let inner = line.strip_prefix("(test-actor ").and_then(|s| s.strip_suffix(')'))
+    let inner = line
+        .strip_prefix("(test-actor ")
+        .and_then(|s| s.strip_suffix(')'))
         .ok_or_else(|| anyhow::anyhow!("invalid syntax. Use: (test-actor \"path.wasm\")"))?;
     let path = inner.trim().trim_matches('"');
 
     println!("Loading actor from {}...", path);
 
-    let wasm_bytes = std::fs::read(path)
-        .with_context(|| format!("Failed to read {}", path))?;
+    let wasm_bytes = std::fs::read(path).with_context(|| format!("Failed to read {}", path))?;
 
     // Load via Pack's AsyncInstance
     let runtime = AsyncRuntime::new();
     let actor_store = create_actor_store();
 
-    let mut instance = PackInstance::new(
-        "actor",
-        &wasm_bytes,
-        &runtime,
-        actor_store,
-        |_builder| Ok(()),
-    ).await?;
+    let mut instance = PackInstance::new("actor", &wasm_bytes, &runtime, actor_store, |_builder| {
+        Ok(())
+    })
+    .await?;
 
     // Build init input: Tuple(Option<List<U8>>(None), Tuple([]))
     let state = pack::abi::Value::Option {
@@ -1931,7 +2097,9 @@ async fn test_actor_command(line: &str) -> Result<()> {
     let input = pack::abi::Value::Tuple(vec![state, params]);
 
     // Call the init function via Pack's Graph ABI
-    let result = instance.call_value("theater:simple/actor.init", &input).await;
+    let result = instance
+        .call_value("theater:simple/actor.init", &input)
+        .await;
     match result {
         Ok(value) => println!("init returned: {}", format_value(&value)),
         Err(e) => println!("init failed: {}", e),
@@ -1987,13 +2155,14 @@ async fn eval_expression(
             // Check if this function name appears in the expression
             // Simple heuristic: look for (funcname or funcname)
             let mut is_used = processed_expr.contains(&format!("({}", export.name))
-                           || processed_expr.contains(&format!(" {}", export.name));
+                || processed_expr.contains(&format!(" {}", export.name));
 
             // Also check if any user-defined function uses this import
             if !is_used {
                 for func_def in &processed_functions {
                     if func_def.contains(&format!("({}", export.name))
-                    || func_def.contains(&format!(" {}", export.name)) {
+                        || func_def.contains(&format!(" {}", export.name))
+                    {
                         is_used = true;
                         break;
                     }
@@ -2007,15 +2176,17 @@ async fn eval_expression(
     }
 
     // Check if any used import has Pack component source (needs wrapper infrastructure)
-    let has_pack_imports = used_imports.iter().any(|(imp, _)| {
-        matches!(imp.source, ImportSource::Component(_))
-    });
+    let has_pack_imports = used_imports
+        .iter()
+        .any(|(imp, _)| matches!(imp.source, ImportSource::Component(_)));
 
     // Infer the return type of the expression
     let return_type = infer_return_type(&processed_expr, record_defs, variant_defs, &used_imports);
     let needs_memory_export = matches!(
         return_type,
-        ReplReturnType::NativeString | ReplReturnType::NativeRecord(_) | ReplReturnType::NativeVariant(_)
+        ReplReturnType::NativeString
+            | ReplReturnType::NativeRecord(_)
+            | ReplReturnType::NativeVariant(_)
     );
 
     // Generate source with all functions and an eval wrapper
@@ -2036,14 +2207,20 @@ async fn eval_expression(
     // that will be replaced with Graph ABI imports during WAT post-processing.
     for (imp, func) in &used_imports {
         // Generate parameter list with proper types
-        let params: Vec<String> = func.sig.params.iter()
+        let params: Vec<String> = func
+            .sig
+            .params
+            .iter()
             .enumerate()
             .map(|(i, ty)| format!("(p{} {})", i, ty.to_wisp()))
             .collect();
         let params_str = params.join(" ");
 
         // Generate return type (default to s32 if no results)
-        let return_type = func.sig.results.first()
+        let return_type = func
+            .sig
+            .results
+            .first()
             .map(|t| t.to_wisp())
             .unwrap_or("s32");
 
@@ -2081,18 +2258,12 @@ async fn eval_expression(
     let mut inlined_expr = processed_expr.clone();
     for (name, value) in bindings {
         // Simple string replacement (not perfect but works for basic cases)
-        inlined_expr = inlined_expr.replace(
-            &format!(" {} ", name),
-            &format!(" (i32.const {}) ", value),
-        );
-        inlined_expr = inlined_expr.replace(
-            &format!(" {})", name),
-            &format!(" (i32.const {}))", value),
-        );
-        inlined_expr = inlined_expr.replace(
-            &format!("({} ", name),
-            &format!("((i32.const {}) ", value),
-        );
+        inlined_expr =
+            inlined_expr.replace(&format!(" {} ", name), &format!(" (i32.const {}) ", value));
+        inlined_expr =
+            inlined_expr.replace(&format!(" {})", name), &format!(" (i32.const {}))", value));
+        inlined_expr =
+            inlined_expr.replace(&format!("({} ", name), &format!("((i32.const {}) ", value));
     }
 
     // Wrap expression in eval function
@@ -2100,21 +2271,20 @@ async fn eval_expression(
 
     // Compile using self-hosted compiler
     let actor_store = create_actor_store();
-    let mut compiler = PackInstance::new(
-        "compiler",
-        compiler_wasm,
-        runtime,
-        actor_store,
-        |builder| {
-            builder.interface("theater:simple/runtime")?
+    let mut compiler =
+        PackInstance::new("compiler", compiler_wasm, runtime, actor_store, |builder| {
+            builder
+                .interface("theater:simple/runtime")?
                 .func_typed("log", |_ctx: &mut Ctx<'_, ActorStore>, _input: Value| {
                     Value::Tuple(vec![])
                 })?;
             Ok(())
-        },
-    ).await?;
+        })
+        .await?;
 
-    let result = compiler.call_value("compile-source", &Value::String(source.clone())).await?;
+    let result = compiler
+        .call_value("compile-source", &Value::String(source.clone()))
+        .await?;
 
     let wat = match result {
         Value::String(s) => s,
@@ -2124,10 +2294,13 @@ async fn eval_expression(
     // Post-process WAT for Pack component imports and data segments.
     // Host imports are now handled natively by the self-hosted compiler (no post-processing needed).
     // Pack component imports still need: stub removal + Graph ABI raw import + CGRF wrappers.
-    let has_pack_stubs = used_imports.iter().any(|(imp, _)| matches!(imp.source, ImportSource::Component(_)));
+    let has_pack_stubs = used_imports
+        .iter()
+        .any(|(imp, _)| matches!(imp.source, ImportSource::Component(_)));
     let wat = if has_pack_stubs || !all_strings.is_empty() || needs_memory_export {
         // Collect stub names only for Pack component imports (host imports have no stubs)
-        let stub_names: Vec<&str> = used_imports.iter()
+        let stub_names: Vec<&str> = used_imports
+            .iter()
             .filter(|(imp, _)| matches!(imp.source, ImportSource::Component(_)))
             .map(|(_, f)| f.name.as_str())
             .collect();
@@ -2136,7 +2309,8 @@ async fn eval_expression(
         let mut in_stub_func = false;
         let mut paren_depth = 0;
 
-        let lines: Vec<&str> = wat.lines()
+        let lines: Vec<&str> = wat
+            .lines()
             .filter(|line| {
                 // Remove error lines
                 if line.contains("(error:") {
@@ -2148,14 +2322,14 @@ async fn eval_expression(
                     if line.contains(&format!("(func ${} ", name)) && !line.contains("(call") {
                         in_stub_func = true;
                         paren_depth = line.chars().filter(|c| *c == '(').count() as i32
-                                    - line.chars().filter(|c| *c == ')').count() as i32;
+                            - line.chars().filter(|c| *c == ')').count() as i32;
                         return false;
                     }
                 }
 
                 if in_stub_func {
                     paren_depth += line.chars().filter(|c| *c == '(').count() as i32
-                                 - line.chars().filter(|c| *c == ')').count() as i32;
+                        - line.chars().filter(|c| *c == ')').count() as i32;
                     if paren_depth <= 0 {
                         in_stub_func = false;
                     }
@@ -2186,10 +2360,7 @@ async fn eval_expression(
         let mut data_segments = String::new();
         for (addr, string_val) in &all_strings {
             let encoded = encode_string_data_segment(string_val);
-            data_segments.push_str(&format!(
-                "  (data (i32.const {}) \"{}\")\n",
-                addr, encoded
-            ));
+            data_segments.push_str(&format!("  (data (i32.const {}) \"{}\")\n", addr, encoded));
         }
 
         // Build result, inserting Pack imports/wrappers and data segments
@@ -2199,7 +2370,8 @@ async fn eval_expression(
         for line in &lines {
             if line.trim() == ")" && !wrapper_wat.is_empty() {
                 // Insert __pack_alloc for guest-allocates ABI
-                result.push_str("  (func (export \"__pack_alloc\") (param $size i32) (result i32)\n");
+                result
+                    .push_str("  (func (export \"__pack_alloc\") (param $size i32) (result i32)\n");
                 result.push_str("    (local $ptr i32)\n");
                 result.push_str("    global.get $__heap_ptr\n");
                 result.push_str("    local.set $ptr\n");
@@ -2214,7 +2386,10 @@ async fn eval_expression(
             }
 
             // Ensure memory is exported when needed (Pack imports or native compound results)
-            if (!wrapper_wat.is_empty() || needs_memory_export) && line.contains("(memory") && !line.contains("export") {
+            if (!wrapper_wat.is_empty() || needs_memory_export)
+                && line.contains("(memory")
+                && !line.contains("export")
+            {
                 let exported_line = line.replace("(memory", "(memory (export \"memory\")");
                 result.push_str(&exported_line);
                 result.push('\n');
@@ -2261,10 +2436,7 @@ async fn eval_expression(
                 // Add data segments for string literals
                 for (addr, string_val) in &all_strings {
                     let encoded = encode_string_data_segment(string_val);
-                    result.push_str(&format!(
-                        "  (data (i32.const {}) \"{}\")\n",
-                        addr, encoded
-                    ));
+                    result.push_str(&format!("  (data (i32.const {}) \"{}\")\n", addr, encoded));
                 }
             }
         }
@@ -2279,8 +2451,8 @@ async fn eval_expression(
     }
 
     // Assemble WAT to WASM
-    let wasm_bytes = wat::parse_str(&wat)
-        .with_context(|| format!("Failed to assemble WAT:\n{}", wat))?;
+    let wasm_bytes =
+        wat::parse_str(&wat).with_context(|| format!("Failed to assemble WAT:\n{}", wat))?;
 
     // Load and run
     let mut config = wasmtime::Config::new();
@@ -2336,7 +2508,8 @@ async fn eval_expression(
             }
             ImportSource::Component(path) => {
                 // Get the loaded Pack instance
-                let pack_instance = loaded_packages.get(path)
+                let pack_instance = loaded_packages
+                    .get(path)
                     .with_context(|| format!("Pack package not loaded: {}", path.display()))?
                     .clone();
 
@@ -2356,57 +2529,88 @@ async fn eval_expression(
                     &mut store,
                     wasmtime::FuncType::new(
                         &engine,
-                        [wasmtime::ValType::I32, wasmtime::ValType::I32, wasmtime::ValType::I32, wasmtime::ValType::I32],
+                        [
+                            wasmtime::ValType::I32,
+                            wasmtime::ValType::I32,
+                            wasmtime::ValType::I32,
+                            wasmtime::ValType::I32,
+                        ],
                         [wasmtime::ValType::I32],
                     ),
-                    move |mut caller: wasmtime::Caller<'_, ()>, params: &[wasmtime::Val], results: &mut [wasmtime::Val]| {
+                    move |mut caller: wasmtime::Caller<'_, ()>,
+                          params: &[wasmtime::Val],
+                          results: &mut [wasmtime::Val]| {
                         let in_ptr = params[0].unwrap_i32() as usize;
                         let in_len = params[1].unwrap_i32() as usize;
                         let out_ptr_ptr = params[2].unwrap_i32() as usize;
                         let out_len_ptr = params[3].unwrap_i32() as usize;
 
                         // Get memory from the expression module
-                        let memory = caller.get_export("memory")
+                        let memory = caller
+                            .get_export("memory")
                             .and_then(|e| e.into_memory())
                             .ok_or_else(|| wasmtime::Error::msg("no memory export"))?;
 
                         // Read CGRF input from expression's memory
                         let mut in_buf = vec![0u8; in_len];
-                        memory.read(&caller, in_ptr, &mut in_buf)
-                            .map_err(|e| wasmtime::Error::msg(format!("failed to read input: {}", e)))?;
+                        memory.read(&caller, in_ptr, &mut in_buf).map_err(|e| {
+                            wasmtime::Error::msg(format!("failed to read input: {}", e))
+                        })?;
 
                         // Decode CGRF to pack::Value
-                        let input = pack::decode(&in_buf)
-                            .map_err(|e| wasmtime::Error::msg(format!("failed to decode CGRF: {}", e)))?;
+                        let input = pack::decode(&in_buf).map_err(|e| {
+                            wasmtime::Error::msg(format!("failed to decode CGRF: {}", e))
+                        })?;
 
                         // Call Pack instance via call_with_value
                         let mut instance = pack_instance.lock().unwrap();
-                        let output = instance.call_with_value(&func_name, &input)
-                            .map_err(|e| wasmtime::Error::msg(format!("Pack call failed: {}", e)))?;
+                        let output = instance.call_with_value(&func_name, &input).map_err(|e| {
+                            wasmtime::Error::msg(format!("Pack call failed: {}", e))
+                        })?;
 
                         // Encode result back to CGRF
-                        let out_buf = pack::encode(&output)
-                            .map_err(|e| wasmtime::Error::msg(format!("failed to encode result: {}", e)))?;
+                        let out_buf = pack::encode(&output).map_err(|e| {
+                            wasmtime::Error::msg(format!("failed to encode result: {}", e))
+                        })?;
 
                         // Guest-allocates ABI: allocate output buffer in expression's memory
-                        let pack_alloc = caller.get_export("__pack_alloc")
+                        let pack_alloc = caller
+                            .get_export("__pack_alloc")
                             .and_then(|e| e.into_func())
                             .ok_or_else(|| wasmtime::Error::msg("no __pack_alloc export"))?;
 
                         let mut alloc_result = [wasmtime::Val::I32(0)];
-                        pack_alloc.call(&mut caller, &[wasmtime::Val::I32(out_buf.len() as i32)], &mut alloc_result)
-                            .map_err(|e| wasmtime::Error::msg(format!("__pack_alloc failed: {}", e)))?;
+                        pack_alloc
+                            .call(
+                                &mut caller,
+                                &[wasmtime::Val::I32(out_buf.len() as i32)],
+                                &mut alloc_result,
+                            )
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("__pack_alloc failed: {}", e))
+                            })?;
                         let out_ptr = alloc_result[0].unwrap_i32() as usize;
 
                         // Write result to allocated buffer
-                        memory.write(&mut caller, out_ptr, &out_buf)
-                            .map_err(|e| wasmtime::Error::msg(format!("failed to write output: {}", e)))?;
+                        memory.write(&mut caller, out_ptr, &out_buf).map_err(|e| {
+                            wasmtime::Error::msg(format!("failed to write output: {}", e))
+                        })?;
 
                         // Write ptr and len to the slots
-                        memory.write(&mut caller, out_ptr_ptr, &(out_ptr as i32).to_le_bytes())
-                            .map_err(|e| wasmtime::Error::msg(format!("failed to write out_ptr: {}", e)))?;
-                        memory.write(&mut caller, out_len_ptr, &(out_buf.len() as i32).to_le_bytes())
-                            .map_err(|e| wasmtime::Error::msg(format!("failed to write out_len: {}", e)))?;
+                        memory
+                            .write(&mut caller, out_ptr_ptr, &(out_ptr as i32).to_le_bytes())
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to write out_ptr: {}", e))
+                            })?;
+                        memory
+                            .write(
+                                &mut caller,
+                                out_len_ptr,
+                                &(out_buf.len() as i32).to_le_bytes(),
+                            )
+                            .map_err(|e| {
+                                wasmtime::Error::msg(format!("failed to write out_len: {}", e))
+                            })?;
 
                         // Return 0 for success
                         results[0] = wasmtime::Val::I32(0);
@@ -2421,7 +2625,8 @@ async fn eval_expression(
 
     let instance = Instance::new(&mut store, &module, &extern_imports)?;
 
-    let eval_func = instance.get_func(&mut store, "eval")
+    let eval_func = instance
+        .get_func(&mut store, "eval")
         .context("eval function not found")?;
 
     let mut results = vec![wasmtime::Val::I32(0)];
@@ -2434,7 +2639,8 @@ async fn eval_expression(
                 Some(wasmtime::Val::I32(n)) => *n,
                 _ => anyhow::bail!("Expected i32 pointer for string result"),
             };
-            let memory = instance.get_memory(&mut store, "memory")
+            let memory = instance
+                .get_memory(&mut store, "memory")
                 .context("memory not found for string result")?;
             let s = read_string_from_memory(&memory, &store, ptr)?;
             Ok(EvalResult::NativeString(s))
@@ -2444,9 +2650,11 @@ async fn eval_expression(
                 Some(wasmtime::Val::I32(n)) => *n,
                 _ => anyhow::bail!("Expected i32 pointer for record result"),
             };
-            let rec_def = record_defs.get(type_name)
+            let rec_def = record_defs
+                .get(type_name)
                 .with_context(|| format!("Record type '{}' not found", type_name))?;
-            let memory = instance.get_memory(&mut store, "memory")
+            let memory = instance
+                .get_memory(&mut store, "memory")
                 .context("memory not found for record result")?;
             let fields = read_record_from_memory(&memory, &store, ptr, rec_def)?;
             Ok(EvalResult::NativeRecord {
@@ -2459,9 +2667,11 @@ async fn eval_expression(
                 Some(wasmtime::Val::I32(n)) => *n,
                 _ => anyhow::bail!("Expected i32 pointer for variant result"),
             };
-            let var_def = variant_defs.get(type_name)
+            let var_def = variant_defs
+                .get(type_name)
                 .with_context(|| format!("Variant type '{}' not found", type_name))?;
-            let memory = instance.get_memory(&mut store, "memory")
+            let memory = instance
+                .get_memory(&mut store, "memory")
                 .context("memory not found for variant result")?;
             let (case_name, payload) = read_variant_from_memory(&memory, &store, ptr, var_def)?;
             Ok(EvalResult::NativeVariant {
@@ -2473,24 +2683,28 @@ async fn eval_expression(
         ReplReturnType::PackCompound => {
             if has_pack_imports {
                 // Read compound result from CGRF via globals
-                let result_ptr_global = instance.get_global(&mut store, "__result_ptr")
+                let result_ptr_global = instance
+                    .get_global(&mut store, "__result_ptr")
                     .context("__result_ptr global not found")?;
-                let result_len_global = instance.get_global(&mut store, "__result_len")
+                let result_len_global = instance
+                    .get_global(&mut store, "__result_len")
                     .context("__result_len global not found")?;
 
                 let result_ptr = result_ptr_global.get(&mut store).unwrap_i32() as usize;
                 let result_len = result_len_global.get(&mut store).unwrap_i32() as usize;
 
                 if result_ptr > 0 && result_len > 0 {
-                    let memory = instance.get_memory(&mut store, "memory")
+                    let memory = instance
+                        .get_memory(&mut store, "memory")
                         .context("memory not found for compound result")?;
 
                     let mut cgrf_buf = vec![0u8; result_len];
-                    memory.read(&store, result_ptr, &mut cgrf_buf)
+                    memory
+                        .read(&store, result_ptr, &mut cgrf_buf)
                         .context("failed to read compound result CGRF")?;
 
-                    let value = pack::decode(&cgrf_buf)
-                        .context("failed to decode compound result CGRF")?;
+                    let value =
+                        pack::decode(&cgrf_buf).context("failed to decode compound result CGRF")?;
 
                     return Ok(EvalResult::Compound(value));
                 }
@@ -2501,11 +2715,9 @@ async fn eval_expression(
                 other => anyhow::bail!("Expected i32 result, got {:?}", other),
             }
         }
-        ReplReturnType::Scalar => {
-            match results.into_iter().next() {
-                Some(wasmtime::Val::I32(n)) => Ok(EvalResult::Scalar(n)),
-                other => anyhow::bail!("Expected i32 result, got {:?}", other),
-            }
-        }
+        ReplReturnType::Scalar => match results.into_iter().next() {
+            Some(wasmtime::Val::I32(n)) => Ok(EvalResult::Scalar(n)),
+            other => anyhow::bail!("Expected i32 result, got {:?}", other),
+        },
     }
 }

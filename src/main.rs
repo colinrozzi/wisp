@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use wasmtime::{
-    Engine, Store, Module, Instance, Func,
+    Engine, Instance, Module, Store,
     component::{Component, Linker, Type, Val, types::ComponentItem},
 };
 
@@ -40,9 +40,9 @@ enum Command {
         /// Integer arguments to pass to the function.
         #[arg(value_name = "ARGS")]
         args: Vec<String>,
-        /// Optional dependency to satisfy imports, in the form `module=path.wasm`.
+        /// Dependencies to satisfy imports, in the form `module=path.wasm`.
         #[arg(long = "dep", value_name = "MOD=PATH")]
-        dep: Option<String>,
+        dep: Vec<String>,
     },
     /// Run a function from a raw WebAssembly module (not component).
     RunModule {
@@ -58,6 +58,9 @@ enum Command {
         /// String input to pass to the function (for CGRF encoding).
         #[arg(long = "input", value_name = "STRING")]
         input: Option<String>,
+        /// Dependencies to satisfy imports, in the form `module=path.wasm`.
+        #[arg(long = "dep", value_name = "MOD=PATH")]
+        dep: Vec<String>,
     },
 }
 
@@ -71,8 +74,14 @@ fn main() -> Result<()> {
             func,
             args,
             dep,
-        } => run_package(&package, &func, &args, dep.as_deref())?,
-        Command::RunModule { module, func, args, input } => run_module(&module, &func, &args, input.as_deref())?,
+        } => run_package(&package, &func, &args, &dep)?,
+        Command::RunModule {
+            module,
+            func,
+            args,
+            input,
+            dep,
+        } => run_module(&module, &func, &args, input.as_deref(), &dep)?,
     }
 
     Ok(())
@@ -117,19 +126,14 @@ fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("  {}", artifacts.wasm.display());
 }
 
-fn run_package(
-    package_path: &Path,
-    func: &str,
-    args: &[String],
-    dep: Option<&str>,
-) -> Result<()> {
+fn run_package(package_path: &Path, func: &str, args: &[String], deps: &[String]) -> Result<()> {
     let engine = Engine::default();
     let component = Component::from_file(&engine, package_path)
         .with_context(|| format!("failed to load package {}", package_path.display()))?;
     let mut store = Store::new(&engine, ());
     let mut linker = Linker::new(&engine);
 
-    if let Some(dep) = dep {
+    for dep in deps {
         let (module, path) = parse_dep_arg(dep)?;
         let dep_component = Component::from_file(&engine, &path)
             .with_context(|| format!("failed to load dependency {}", path.display()))?;
@@ -252,15 +256,233 @@ fn parse_dep_arg(dep: &str) -> Result<(String, PathBuf)> {
     Ok((module.to_string(), PathBuf::from(path)))
 }
 
-fn run_module(module_path: &Path, func: &str, args: &[i32], input: Option<&str>) -> Result<()> {
+fn run_module(
+    module_path: &Path,
+    func: &str,
+    args: &[i32],
+    input: Option<&str>,
+    deps: &[String],
+) -> Result<()> {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, module_path)
         .with_context(|| format!("failed to load module {}", module_path.display()))?;
     let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])
-        .context("failed to instantiate module")?;
+
+    // Load and instantiate dependency modules
+    let mut dep_instances: std::collections::HashMap<String, Instance> =
+        std::collections::HashMap::new();
+    for dep_str in deps {
+        let (name, path) = parse_dep_arg(dep_str)?;
+        let dep_module = Module::from_file(&engine, &path)
+            .with_context(|| format!("failed to load dependency module {}", path.display()))?;
+        let dep_instance = Instance::new(&mut store, &dep_module, &[]).with_context(|| {
+            format!("failed to instantiate dependency module {}", path.display())
+        })?;
+        dep_instances.insert(name, dep_instance);
+    }
+
+    // Build CGRF bridge functions for each import.
+    // Each bridge copies data between the caller's memory and the dep's memory,
+    // since each module has its own isolated linear memory.
+    let mut imports: Vec<wasmtime::Extern> = Vec::new();
+    for import in module.imports() {
+        let dep_name = import.module().to_string();
+        let func_name = import.name().to_string();
+        let dep_instance = *dep_instances.get(&dep_name).ok_or_else(|| {
+            anyhow!(
+                "missing dependency '{}' for import '{}.{}'",
+                dep_name,
+                dep_name,
+                func_name
+            )
+        })?;
+
+        // Get the dep's exported function and memory handles
+        let dep_func = dep_instance
+            .get_func(&mut store, &func_name)
+            .ok_or_else(|| anyhow!("dependency '{}' missing export '{}'", dep_name, func_name))?;
+        let dep_memory = dep_instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow!("dependency '{}' has no memory export", dep_name))?;
+        let dep_alloc = dep_instance
+            .get_func(&mut store, "__pack_alloc")
+            .ok_or_else(|| anyhow!("dependency '{}' missing __pack_alloc", dep_name))?;
+
+        let bridge = wasmtime::Func::new(
+            &mut store,
+            wasmtime::FuncType::new(
+                &engine,
+                [
+                    wasmtime::ValType::I32,
+                    wasmtime::ValType::I32,
+                    wasmtime::ValType::I32,
+                    wasmtime::ValType::I32,
+                ],
+                [wasmtime::ValType::I32],
+            ),
+            move |mut caller: wasmtime::Caller<'_, ()>,
+                  params: &[wasmtime::Val],
+                  results: &mut [wasmtime::Val]| {
+                let in_ptr = params[0].unwrap_i32() as usize;
+                let in_len = params[1].unwrap_i32() as usize;
+                let out_ptr_ptr = params[2].unwrap_i32() as usize;
+                let out_len_ptr = params[3].unwrap_i32() as usize;
+
+                // 1. Read CGRF input from caller's memory
+                let caller_memory = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .ok_or_else(|| wasmtime::Error::msg("caller has no memory export"))?;
+                let mut in_buf = vec![0u8; in_len];
+                if in_len > 0 {
+                    caller_memory
+                        .read(&caller, in_ptr, &mut in_buf)
+                        .map_err(|e| {
+                            wasmtime::Error::msg(format!("failed to read caller input: {}", e))
+                        })?;
+                }
+
+                // 2. Decode, re-encode, and write to dep's memory
+                let cgrf_bytes = if in_len > 0 {
+                    // Decode from caller, re-encode for dep (same format, but
+                    // we need to place bytes in dep's address space)
+                    in_buf.clone()
+                } else {
+                    // No input — encode empty tuple
+                    pack::encode(&pack::abi::Value::Tuple(vec![])).map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to encode empty input: {}", e))
+                    })?
+                };
+
+                // Allocate input buffer in dep's memory
+                let mut alloc_result = [wasmtime::Val::I32(0)];
+                dep_alloc
+                    .call(
+                        &mut caller,
+                        &[wasmtime::Val::I32(cgrf_bytes.len() as i32)],
+                        &mut alloc_result,
+                    )
+                    .map_err(|e| wasmtime::Error::msg(format!("dep __pack_alloc failed: {}", e)))?;
+                let dep_in_ptr = alloc_result[0].unwrap_i32();
+
+                dep_memory
+                    .write(&mut caller, dep_in_ptr as usize, &cgrf_bytes)
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to write to dep memory: {}", e))
+                    })?;
+
+                // Allocate slots for output ptr and len in dep's memory
+                dep_alloc
+                    .call(&mut caller, &[wasmtime::Val::I32(8)], &mut alloc_result)
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("dep __pack_alloc for slots failed: {}", e))
+                    })?;
+                let dep_slots_ptr = alloc_result[0].unwrap_i32();
+                dep_memory
+                    .write(&mut caller, dep_slots_ptr as usize, &[0u8; 8])
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to init dep slots: {}", e))
+                    })?;
+
+                // 3. Call the dep's function
+                let mut call_result = [wasmtime::Val::I32(0)];
+                dep_func
+                    .call(
+                        &mut caller,
+                        &[
+                            wasmtime::Val::I32(dep_in_ptr),
+                            wasmtime::Val::I32(cgrf_bytes.len() as i32),
+                            wasmtime::Val::I32(dep_slots_ptr),
+                            wasmtime::Val::I32(dep_slots_ptr + 4),
+                        ],
+                        &mut call_result,
+                    )
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("dep function call failed: {}", e))
+                    })?;
+
+                // 4. Read output from dep's memory
+                let mut ptr_buf = [0u8; 4];
+                let mut len_buf = [0u8; 4];
+                dep_memory
+                    .read(&caller, dep_slots_ptr as usize, &mut ptr_buf)
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to read dep out_ptr: {}", e))
+                    })?;
+                dep_memory
+                    .read(&caller, (dep_slots_ptr + 4) as usize, &mut len_buf)
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to read dep out_len: {}", e))
+                    })?;
+                let dep_out_ptr = i32::from_le_bytes(ptr_buf) as usize;
+                let dep_out_len = i32::from_le_bytes(len_buf) as usize;
+
+                let mut out_buf = vec![0u8; dep_out_len];
+                dep_memory
+                    .read(&caller, dep_out_ptr, &mut out_buf)
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to read dep output: {}", e))
+                    })?;
+
+                // 5. Allocate output buffer in caller's memory and write result
+                let caller_alloc = caller
+                    .get_export("__pack_alloc")
+                    .and_then(|e| e.into_func())
+                    .ok_or_else(|| wasmtime::Error::msg("caller has no __pack_alloc"))?;
+
+                caller_alloc
+                    .call(
+                        &mut caller,
+                        &[wasmtime::Val::I32(out_buf.len() as i32)],
+                        &mut alloc_result,
+                    )
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("caller __pack_alloc failed: {}", e))
+                    })?;
+                let caller_out_ptr = alloc_result[0].unwrap_i32() as usize;
+
+                let caller_memory = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .ok_or_else(|| wasmtime::Error::msg("caller has no memory export"))?;
+                caller_memory
+                    .write(&mut caller, caller_out_ptr, &out_buf)
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to write output to caller: {}", e))
+                    })?;
+
+                // 6. Update caller's output pointer and length slots
+                caller_memory
+                    .write(
+                        &mut caller,
+                        out_ptr_ptr,
+                        &(caller_out_ptr as i32).to_le_bytes(),
+                    )
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to write caller out_ptr: {}", e))
+                    })?;
+                caller_memory
+                    .write(
+                        &mut caller,
+                        out_len_ptr,
+                        &(out_buf.len() as i32).to_le_bytes(),
+                    )
+                    .map_err(|e| {
+                        wasmtime::Error::msg(format!("failed to write caller out_len: {}", e))
+                    })?;
+
+                results[0] = wasmtime::Val::I32(0);
+                Ok(())
+            },
+        );
+
+        imports.push(bridge.into());
+    }
+
+    let instance =
+        Instance::new(&mut store, &module, &imports).context("failed to instantiate module")?;
     let func_ref = instance
         .get_func(&mut store, func)
         .with_context(|| format!("export '{}' not found", func))?;
@@ -268,63 +490,44 @@ fn run_module(module_path: &Path, func: &str, args: &[i32], input: Option<&str>)
     let ty = func_ref.ty(&store);
     let num_params = ty.params().len();
 
-    // Check if this is a composite-ABI function (4 params: in_ptr, in_len, out_ptr, out_cap)
+    // Check if this is a Pack ABI function (4 params: in_ptr, in_len, out_ptr_ptr, out_len_ptr)
     if num_params == 4 && args.is_empty() {
-        // Composite calling convention - allocate memory for input and output
         let memory = instance
             .get_memory(&mut store, "memory")
             .context("module has no memory export")?;
+        let pack_alloc = instance
+            .get_func(&mut store, "__pack_alloc")
+            .context("module has no __pack_alloc export")?;
 
-        // Encode input as CGRF if provided
-        let (in_ptr, in_len) = if let Some(input_str) = input {
-            // CGRF string format:
-            // Offset 0: Magic "CGRF" (4 bytes)
-            // Offset 4: Version (2 bytes) = 2
-            // Offset 6: Padding (2 bytes)
-            // Offset 8: Num values (4 bytes) = 1
-            // Offset 12: Reserved (4 bytes) = 0
-            // Offset 16: Type tag (1 byte) = 6 (string)
-            // Offset 17-19: Padding (3 bytes)
-            // Offset 20: Size (4 bytes) = 4 + len
-            // Offset 24: String length (4 bytes)
-            // Offset 28: String data
-            let str_bytes = input_str.as_bytes();
-            let header_size = 28usize;
-            let total_size = header_size + str_bytes.len();
-
-            let in_ptr = 8192i32; // Use 8KB for input buffer
-            let mut in_buf = vec![0u8; total_size];
-
-            // Magic "CGRF"
-            in_buf[0..4].copy_from_slice(&0x46524743u32.to_le_bytes());
-            // Version 2
-            in_buf[4..6].copy_from_slice(&2u16.to_le_bytes());
-            // Num values = 1
-            in_buf[8..12].copy_from_slice(&1u32.to_le_bytes());
-            // Type tag = 6 (string)
-            in_buf[16] = 6;
-            // Size = 4 + len
-            in_buf[20..24].copy_from_slice(&((4 + str_bytes.len()) as u32).to_le_bytes());
-            // String length
-            in_buf[24..28].copy_from_slice(&(str_bytes.len() as u32).to_le_bytes());
-            // String data
-            in_buf[28..].copy_from_slice(str_bytes);
-
-            memory.write(&mut store, in_ptr as usize, &in_buf)?;
-            (in_ptr, total_size as i32)
+        // Encode input as CGRF
+        let in_bytes = if let Some(input_str) = input {
+            pack::encode(&pack::abi::Value::String(input_str.to_string()))
+                .context("failed to encode input string")?
         } else {
-            (0, 0)
+            pack::encode(&pack::abi::Value::Tuple(vec![]))
+                .context("failed to encode empty input")?
         };
 
-        // Use address 0 for output buffer
-        let out_ptr = 0i32;
-        let out_cap = 8192i32; // Increase output capacity
+        // Allocate input buffer in module's memory
+        let mut alloc_result = [wasmtime::Val::I32(0)];
+        pack_alloc.call(
+            &mut store,
+            &[wasmtime::Val::I32(in_bytes.len() as i32)],
+            &mut alloc_result,
+        )?;
+        let in_ptr = alloc_result[0].unwrap_i32();
+        memory.write(&mut store, in_ptr as usize, &in_bytes)?;
+
+        // Allocate slots for output pointer and length
+        pack_alloc.call(&mut store, &[wasmtime::Val::I32(8)], &mut alloc_result)?;
+        let slots_ptr = alloc_result[0].unwrap_i32();
+        memory.write(&mut store, slots_ptr as usize, &[0u8; 8])?;
 
         let params = vec![
-            wasmtime::Val::I32(in_ptr),  // in_ptr
-            wasmtime::Val::I32(in_len),  // in_len
-            wasmtime::Val::I32(out_ptr), // out_ptr
-            wasmtime::Val::I32(out_cap), // out_cap
+            wasmtime::Val::I32(in_ptr),
+            wasmtime::Val::I32(in_bytes.len() as i32),
+            wasmtime::Val::I32(slots_ptr),     // out_ptr_ptr
+            wasmtime::Val::I32(slots_ptr + 4), // out_len_ptr
         ];
         let mut results = vec![wasmtime::Val::I32(0)];
 
@@ -332,58 +535,33 @@ fn run_module(module_path: &Path, func: &str, args: &[i32], input: Option<&str>)
             .call(&mut store, &params, &mut results)
             .with_context(|| format!("failed to invoke '{}'", func))?;
 
-        // Read the composite result from memory
-        // Format (from WAT analysis):
-        // - Offset 0: Tag "FCSF" (4 bytes) = 0x46435346
-        // - Offset 4: Variant type (2 bytes), 2=s32, 3=s64
-        // - Offset 6: Padding (2 bytes)
-        // - Offset 8: Num payloads (4 bytes)
-        // - Offset 12: Reserved (4 bytes)
-        // - Offset 16: Type tag (1 byte)
-        // - Offset 17-19: Padding (3 bytes)
-        // - Offset 20: Size (4 bytes)
-        // - Offset 24: Actual value (4 bytes for s32, 8 bytes for s64)
-        let mut buf = [0u8; 32];
-        memory.read(&store, out_ptr as usize, &mut buf)?;
+        let status = results[0].unwrap_i32();
+        if status != 0 {
+            bail!("function '{}' returned error status {}", func, status);
+        }
 
-        // Check the tag (first 4 bytes should be 0x46524743 = "CGRF")
-        let tag = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if tag == 0x46524743 {
-            // Check type tag at offset 16
-            let type_tag = buf[16];
-            match type_tag {
-                2 => {
-                    // s32: read 4 bytes at offset 24
-                    let value = i32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
-                    println!("{}", value);
-                }
-                3 => {
-                    // s64: read 8 bytes at offset 24
-                    let value = i64::from_le_bytes([
-                        buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-                    ]);
-                    println!("{}", value);
-                }
-                6 => {
-                    // String: length at offset 24, data starts at offset 28
-                    let str_len = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]) as usize;
-                    let mut str_buf = vec![0u8; str_len];
-                    memory.read(&store, out_ptr as usize + 28, &mut str_buf)?;
-                    let s = String::from_utf8_lossy(&str_buf);
-                    println!("{}", s);
-                }
-                _ => {
-                    // Just print the raw result code
-                    if let wasmtime::Val::I32(n) = results[0] {
-                        println!("(composite result, type={}, bytes written={})", type_tag, n);
-                    }
-                }
-            }
-        } else {
-            // Not a composite result, print raw
-            if let wasmtime::Val::I32(n) = results[0] {
-                println!("(raw result: {})", n);
-            }
+        // Read output pointer and length from the slots
+        let mut ptr_buf = [0u8; 4];
+        let mut len_buf = [0u8; 4];
+        memory.read(&store, slots_ptr as usize, &mut ptr_buf)?;
+        memory.read(&store, (slots_ptr + 4) as usize, &mut len_buf)?;
+        let out_ptr = i32::from_le_bytes(ptr_buf) as usize;
+        let out_len = i32::from_le_bytes(len_buf) as usize;
+
+        // Read and decode the CGRF result
+        let mut out_buf = vec![0u8; out_len];
+        memory.read(&store, out_ptr, &mut out_buf)?;
+
+        let value = pack::decode(&out_buf)
+            .with_context(|| format!("failed to decode CGRF result from '{}'", func))?;
+
+        match value {
+            pack::abi::Value::S32(n) => println!("{}", n),
+            pack::abi::Value::S64(n) => println!("{}", n),
+            pack::abi::Value::F32(n) => println!("{}", n),
+            pack::abi::Value::F64(n) => println!("{}", n),
+            pack::abi::Value::String(s) => println!("{}", s),
+            other => println!("{:?}", other),
         }
     } else {
         // Standard calling convention

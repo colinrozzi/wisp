@@ -41,9 +41,9 @@ fn compile_and_run(source: &str) -> i32 {
     // Allocate buffers in WASM linear memory
     // Use addresses that won't conflict with the heap (heap starts at 49152)
     let in_ptr: i32 = 0x1000; // input buffer at 4096
-    let in_len: i32 = 0;      // no input params
+    let in_len: i32 = 0; // no input params
     let out_ptr: i32 = 0x2000; // output buffer at 8192
-    let out_cap: i32 = 256;   // 256 bytes capacity
+    let out_cap: i32 = 256; // 256 bytes capacity
 
     // Call the CGRF wrapper
     let mut results = [wasmtime::Val::I32(0)];
