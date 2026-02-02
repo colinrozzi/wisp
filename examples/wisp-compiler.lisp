@@ -282,11 +282,17 @@
 (fn is-lst ((e sexpr)) s32
   (match e ((sym s) (i32.const 0)) ((num n) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 1))))
 
+(fn is-str ((e sexpr)) s32
+  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 0)) ((str s) (i32.const 1)) ((lst l) (i32.const 0))))
+
 (fn get-sym ((e sexpr)) string
   (match e ((sym s) s) ((num n) "") ((str s) "") ((lst l) "")))
 
 (fn get-num ((e sexpr)) s32
   (match e ((sym s) (i32.const 0)) ((num n) n) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
+
+(fn get-str ((e sexpr)) string
+  (match e ((sym s) "") ((num n) "") ((str s) s) ((lst l) "")))
 
 (fn get-lst ((e sexpr)) (list sexpr)
   (match e ((sym s) (list-new sexpr)) ((num n) (list-new sexpr)) ((str s) (list-new sexpr)) ((lst l) l)))
@@ -1236,28 +1242,121 @@
                 "(error: params)")
               "(error: name)")))))))
 
-; Compile (export (fn ...))
+; Compile (export (fn ...)) or (export "alias" (fn ...))
 (fn compile-export ((items (list sexpr)) (ctx compile-ctx)) string
   (if (i32.lt_s (list-len items) (i32.const 2))
     "(error: export needs body)"
-    (let (body-expr (list-get items (i32.const 1)))
-      (if (is-lst body-expr)
-        (let (body-items (get-lst body-expr))
-          (if (i32.gt_s (list-len body-items) (i32.const 1))
-            (let (head (list-get body-items (i32.const 0)))
-              (if (is-sym head)
-                (if (string=? (get-sym head) "fn")
-                  (let (fn-name (get-sym (list-get body-items (i32.const 1))))
-                    (let (fn-wat (compile-fn-def body-items ctx))
-                      (string-append fn-wat
-                        (string-append "\n  (export \""
-                          (string-append fn-name
-                            (string-append "\" (func $"
-                              (string-append fn-name "))")))))))
-                  "(error: expected fn)")
-                "(error: expected symbol)"))
-            "(error: empty body)"))
-        "(error: expected list)"))))
+    ; Check for aliased export: (export "alias" (fn ...)) - 3 items
+    (if (i32.ge_s (list-len items) (i32.const 3))
+      (if (is-str (list-get items (i32.const 1)))
+        (let (export-name (get-str (list-get items (i32.const 1))))
+          (let (fn-expr (list-get items (i32.const 2)))
+            (if (is-lst fn-expr)
+              (let (fn-items (get-lst fn-expr))
+                (if (i32.gt_s (list-len fn-items) (i32.const 1))
+                  (let (head (list-get fn-items (i32.const 0)))
+                    (if (is-sym head)
+                      (if (string=? (get-sym head) "fn")
+                        (let (fn-name (get-sym (list-get fn-items (i32.const 1))))
+                          (let (fn-wat (compile-fn-def fn-items ctx))
+                            (string-append fn-wat
+                              (string-append "\n  (export \""
+                                (string-append export-name
+                                  (string-append "\" (func $"
+                                    (string-append fn-name "))")))))))
+                        "(error: expected fn)")
+                      "(error: expected symbol)"))
+                  "(error: empty fn body)"))
+              "(error: expected fn list)")))
+        ; Fall through to standard export
+        (compile-export-simple items ctx))
+      ; Standard export: (export (fn ...)) - 2 items
+      (compile-export-simple items ctx))))
+
+; Compile standard (export (fn ...)) without alias
+(fn compile-export-simple ((items (list sexpr)) (ctx compile-ctx)) string
+  (let (body-expr (list-get items (i32.const 1)))
+    (if (is-lst body-expr)
+      (let (body-items (get-lst body-expr))
+        (if (i32.gt_s (list-len body-items) (i32.const 1))
+          (let (head (list-get body-items (i32.const 0)))
+            (if (is-sym head)
+              (if (string=? (get-sym head) "fn")
+                (let (fn-name (get-sym (list-get body-items (i32.const 1))))
+                  (let (fn-wat (compile-fn-def body-items ctx))
+                    (string-append fn-wat
+                      (string-append "\n  (export \""
+                        (string-append fn-name
+                          (string-append "\" (func $"
+                            (string-append fn-name "))")))))))
+                "(error: expected fn)")
+              "(error: expected symbol)"))
+          "(error: empty body)"))
+      "(error: expected list)")))
+
+; ============================================================
+; Data Segment Helpers
+; ============================================================
+
+; Convert a nibble (0-15) to a single hex character string
+(fn nibble-to-hex ((n s32)) string
+  (substring "0123456789abcdef" n (i32.add n (i32.const 1))))
+
+; Convert a byte (0-255) to a 2-character hex string
+(fn byte-to-hex ((b s32)) string
+  (string-append (nibble-to-hex (i32.shr_u b (i32.const 4)))
+                 (nibble-to-hex (i32.and b (i32.const 15)))))
+
+; Escape raw data string for WAT data segment format
+; Handles \xHH sequences from tokenizer, hex-encodes other bytes
+(fn escape-data-for-wat ((s string) (idx s32) (len s32) (acc string)) string
+  (if (i32.ge_s idx len)
+    acc
+    (let (b (string-ref s idx))
+      (if (i32.and
+            (i32.eq b (i32.const 92))
+            (i32.ge_s (i32.sub len idx) (i32.const 4)))
+        ; Might be \xHH escape
+        (if (i32.eq (string-ref s (i32.add idx (i32.const 1))) (i32.const 120))
+          ; \xHH - pass through the two hex digits as \HH
+          (escape-data-for-wat s (i32.add idx (i32.const 4)) len
+            (string-append acc
+              (string-append "\\"
+                (substring s (i32.add idx (i32.const 2)) (i32.add idx (i32.const 4))))))
+          ; Backslash but not \x - hex encode the backslash
+          (escape-data-for-wat s (i32.add idx (i32.const 1)) len
+            (string-append acc "\\5c")))
+        ; Regular byte - hex encode it
+        (escape-data-for-wat s (i32.add idx (i32.const 1)) len
+          (string-append acc (string-append "\\" (byte-to-hex b))))))))
+
+; Compile a single (data offset "bytes") form to WAT
+(fn compile-one-data ((items (list sexpr))) string
+  (let (offset-val (get-num (list-get items (i32.const 1))))
+    (let (raw-str (get-str (list-get items (i32.const 2))))
+      (let (escaped (escape-data-for-wat raw-str (i32.const 0) (string-len raw-str) ""))
+        (string-append "  (data (i32.const "
+          (string-append (i32-to-string offset-val)
+            (string-append ") \""
+              (string-append escaped "\")\n"))))))))
+
+; Collect and compile all data segments from top-level forms
+(fn compile-data-segments ((forms (list sexpr)) (idx s32) (len s32) (acc string)) string
+  (if (i32.ge_s idx len)
+    acc
+    (let (form (list-get forms idx))
+      (let (new-acc
+        (if (is-lst form)
+          (let (items (get-lst form))
+            (if (i32.gt_s (list-len items) (i32.const 0))
+              (if (is-sym (list-get items (i32.const 0)))
+                (if (string=? (get-sym (list-get items (i32.const 0))) "data")
+                  (string-append acc (compile-one-data items))
+                  acc)
+                acc)
+              acc))
+          acc))
+        (compile-data-segments forms (i32.add idx (i32.const 1)) len new-acc)))))
 
 ; Helper to compile based on form name
 (fn compile-by-name ((name string) (items (list sexpr)) (ctx compile-ctx)) string
@@ -1271,7 +1370,9 @@
           ""
           (if (string=? name "import")
             ""
-            "(error: unknown form)"))))))
+            (if (string=? name "data")
+              ""
+              "(error: unknown form)")))))))
 
 ; Compile a top-level form
 (fn compile-toplevel ((form sexpr) (ctx compile-ctx)) string
@@ -1314,11 +1415,13 @@
             (let (body (compile-toplevels forms (i32.const 0) (list-len forms) "" ctx))
               (let (runtime (get-runtime))
                 (let (import-wat (compile-imports imports (i32.const 0) (list-len imports) ""))
-                  (string-append "(module\n"
-                    (string-append import-wat
-                      (string-append "  (memory 1)\n"
-                        (string-append runtime
-                          (string-append body "\n)"))))))))))))))
+                  (let (data-wat (compile-data-segments forms (i32.const 0) (list-len forms) ""))
+                    (string-append "(module\n"
+                      (string-append import-wat
+                        (string-append "  (memory (export \"memory\") 1)\n"
+                          (string-append data-wat
+                            (string-append runtime
+                              (string-append body "\n)"))))))))))))))))
 
 ; ============================================================
 ; Test Exports

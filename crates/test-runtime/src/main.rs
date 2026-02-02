@@ -1865,6 +1865,14 @@ async fn run_repl() -> Result<()> {
             continue;
         }
 
+        if line.starts_with("(test-actor ") {
+            match test_actor_command(line).await {
+                Ok(()) => {}
+                Err(e) => println!("error: {}", e),
+            }
+            continue;
+        }
+
         // Compile and evaluate expression
         match eval_expression(&compiler_wasm, &runtime, line, &bindings, &functions, &imports, &loaded_packages, &record_defs, &variant_defs).await {
             Ok(EvalResult::Scalar(n)) => println!("{}", n),
@@ -1887,6 +1895,48 @@ async fn run_repl() -> Result<()> {
     }
 
     println!("\nGoodbye!");
+    Ok(())
+}
+
+/// Test an actor by loading its WASM module and calling init via Pack
+async fn test_actor_command(line: &str) -> Result<()> {
+    // Parse path from (test-actor "path.wasm") or (test-actor path.wasm)
+    let inner = line.strip_prefix("(test-actor ").and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| anyhow::anyhow!("invalid syntax. Use: (test-actor \"path.wasm\")"))?;
+    let path = inner.trim().trim_matches('"');
+
+    println!("Loading actor from {}...", path);
+
+    let wasm_bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read {}", path))?;
+
+    // Load via Pack's AsyncInstance
+    let runtime = AsyncRuntime::new();
+    let actor_store = create_actor_store();
+
+    let mut instance = PackInstance::new(
+        "actor",
+        &wasm_bytes,
+        &runtime,
+        actor_store,
+        |_builder| Ok(()),
+    ).await?;
+
+    // Build init input: Tuple(Option<List<U8>>(None), Tuple([]))
+    let state = pack::abi::Value::Option {
+        inner_type: ValueType::List(Box::new(ValueType::U8)),
+        value: None,
+    };
+    let params = pack::abi::Value::Tuple(vec![]);
+    let input = pack::abi::Value::Tuple(vec![state, params]);
+
+    // Call the init function via Pack's Graph ABI
+    let result = instance.call_value("theater:simple/actor.init", &input).await;
+    match result {
+        Ok(value) => println!("init returned: {}", format_value(&value)),
+        Err(e) => println!("init failed: {}", e),
+    }
+
     Ok(())
 }
 

@@ -974,16 +974,42 @@ pub struct WorldConfig {
     pub external_exports: Vec<ExternalInterface>,  // e.g., theater:simple/actor
 }
 
+/// An exported function, possibly with an alias name.
+#[derive(Debug, Clone)]
+pub struct ExportDef {
+    /// The name this function is exported as (may differ from func_name for aliased exports)
+    pub export_name: String,
+    /// The internal function name
+    pub func_name: String,
+}
+
+impl ExportDef {
+    fn simple(name: String) -> Self {
+        ExportDef { export_name: name.clone(), func_name: name }
+    }
+
+    fn aliased(export_name: String, func_name: String) -> Self {
+        ExportDef { export_name, func_name }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DataSegment {
+    pub offset: i32,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub struct Program {
     pub functions: Vec<Function>,
     pub imports: Vec<Import>,
-    pub exports: Vec<String>,
+    pub exports: Vec<ExportDef>,
     pub globals: Vec<Global>,
     pub records: Vec<RecordDef>,
     pub variants: Vec<VariantDef>,
     pub resources: Vec<ResourceDef>,
     pub world_config: Option<WorldConfig>,
+    pub data_segments: Vec<DataSegment>,
 }
 
 #[derive(Debug, Clone)]
@@ -1975,6 +2001,28 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                                 'r' => content.push('\r'),
                                 '"' => content.push('"'),
                                 '\\' => content.push('\\'),
+                                'x' => {
+                                    // \xHH hex escape
+                                    let mut hex = String::new();
+                                    for _ in 0..2 {
+                                        if let Some(&h) = chars.peek() {
+                                            if h.is_ascii_hexdigit() {
+                                                hex.push(h);
+                                                chars.next();
+                                                column += 1;
+                                            }
+                                        }
+                                    }
+                                    if hex.len() == 2 {
+                                        let byte =
+                                            u8::from_str_radix(&hex, 16).unwrap();
+                                        content.push(byte as char);
+                                    } else {
+                                        content.push('\\');
+                                        content.push('x');
+                                        content.push_str(&hex);
+                                    }
+                                }
                                 _ => {
                                     content.push('\\');
                                     content.push(escaped);
@@ -3654,6 +3702,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut resources = Vec::new();
     let mut resource_names: HashSet<String> = HashSet::new();
     let mut world_config: Option<WorldConfig> = None;
+    let mut data_segments = Vec::new();
 
     // First pass: collect type names (records, variants, resources) so we can distinguish them
     for form in &forms {
@@ -3723,39 +3772,68 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         pending.push(func);
                     }
                     SExpr::Sym(sym, _) if sym == "export" => {
-                        if items.len() != 2 {
-                            return Err(ctx.error("export expects exactly one argument", &span));
-                        }
-                        match &items[1] {
-                            SExpr::Sym(name, _) => {
-                                if export_set.insert(name.clone()) {
-                                    exports.push(name.clone());
+                        if items.len() == 3 {
+                            // (export "alias" (fn ...)) - aliased export
+                            match (&items[1], &items[2]) {
+                                (SExpr::Str(alias, _), SExpr::List(_, inner_span)) => {
+                                    let func = parse_fn_form(
+                                        items[2].clone(),
+                                        &variant_names,
+                                        &resource_names,
+                                        ctx,
+                                    )?;
+                                    if !defined.insert(func.name.clone()) {
+                                        return Err(ctx.error(
+                                            format!("duplicate function '{}'", func.name),
+                                            inner_span,
+                                        ));
+                                    }
+                                    if export_set.insert(func.name.clone()) {
+                                        exports.push(ExportDef::aliased(alias.clone(), func.name.clone()));
+                                    }
+                                    pending.push(func);
                                 }
-                            }
-                            SExpr::List(_, inner_span) => {
-                                let func = parse_fn_form(
-                                    items[1].clone(),
-                                    &variant_names,
-                                    &resource_names,
-                                    ctx,
-                                )?;
-                                if !defined.insert(func.name.clone()) {
+                                _ => {
                                     return Err(ctx.error(
-                                        format!("duplicate function '{}'", func.name),
-                                        inner_span,
+                                        "aliased export expects (export \"name\" (fn ...))",
+                                        &span,
                                     ));
                                 }
-                                if export_set.insert(func.name.clone()) {
-                                    exports.push(func.name.clone());
+                            }
+                        } else if items.len() == 2 {
+                            match &items[1] {
+                                SExpr::Sym(name, _) => {
+                                    if export_set.insert(name.clone()) {
+                                        exports.push(ExportDef::simple(name.clone()));
+                                    }
                                 }
-                                pending.push(func);
+                                SExpr::List(_, inner_span) => {
+                                    let func = parse_fn_form(
+                                        items[1].clone(),
+                                        &variant_names,
+                                        &resource_names,
+                                        ctx,
+                                    )?;
+                                    if !defined.insert(func.name.clone()) {
+                                        return Err(ctx.error(
+                                            format!("duplicate function '{}'", func.name),
+                                            inner_span,
+                                        ));
+                                    }
+                                    if export_set.insert(func.name.clone()) {
+                                        exports.push(ExportDef::simple(func.name.clone()));
+                                    }
+                                    pending.push(func);
+                                }
+                                other => {
+                                    return Err(ctx.error(
+                                        "export argument must be a symbol or (fn ...)",
+                                        other.span(),
+                                    ));
+                                }
                             }
-                            other => {
-                                return Err(ctx.error(
-                                    "export argument must be a symbol or (fn ...)",
-                                    other.span(),
-                                ));
-                            }
+                        } else {
+                            return Err(ctx.error("export expects 1 or 2 arguments", &span));
                         }
                     }
                     SExpr::Sym(sym, _) if sym == "import" => {
@@ -3810,11 +3888,25 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         }
                         world_config = Some(parse_world_form(&items, ctx)?);
                     }
+                    SExpr::Sym(sym, _) if sym == "data" => {
+                        if items.len() != 3 {
+                            return Err(ctx.error("data expects (data <offset> <string>)", &span));
+                        }
+                        let offset = match &items[1] {
+                            SExpr::Int { value, .. } => *value as i32,
+                            _ => return Err(ctx.error("data offset must be an integer", items[1].span())),
+                        };
+                        let bytes = match &items[2] {
+                            SExpr::Str(s, _) => s.bytes().collect::<Vec<u8>>(),
+                            _ => return Err(ctx.error("data content must be a string", items[2].span())),
+                        };
+                        data_segments.push(DataSegment { offset, bytes });
+                    }
                     other => {
                         return Err(ctx.error_with_note(
                             "unknown top-level form",
                             other.span(),
-                            "expected 'fn', 'export', 'import', 'global', 'record', 'variant', 'resource', or 'world'"
+                            "expected 'fn', 'export', 'import', 'global', 'record', 'variant', 'resource', 'world', or 'data'"
                         ));
                     }
                 }
@@ -3851,16 +3943,16 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
         }
     }
 
-    for (export, export_span) in exports.iter().zip(export_set.iter()) {
-        if !signatures.contains_key(export) {
+    for export in exports.iter() {
+        if !signatures.contains_key(&export.func_name) {
             return Err(ctx.error(
-                format!("cannot export undefined function '{}'", export),
+                format!("cannot export undefined function '{}'", export.func_name),
                 &Span::dummy(),
             ));
         }
-        if imported.contains(export) {
+        if imported.contains(&export.func_name) {
             return Err(ctx.error(
-                format!("cannot export imported function '{}'", export),
+                format!("cannot export imported function '{}'", export.func_name),
                 &Span::dummy(),
             ));
         }
@@ -3909,6 +4001,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
         variants,
         resources,
         world_config,
+        data_segments,
     })
 }
 
@@ -5068,6 +5161,15 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
     // Larger initial size needed for programs that do heavy string/list allocation
     out.push_str("  (memory 4000 4000)\n");
 
+    // Emit data segments
+    for seg in &prog.data_segments {
+        out.push_str(&format!("  (data (i32.const {}) \"", seg.offset));
+        for byte in &seg.bytes {
+            out.push_str(&format!("\\{:02x}", byte));
+        }
+        out.push_str("\")\n");
+    }
+
     // Build global type map for codegen
     let mut globals_map = HashMap::new();
     for global in &prog.globals {
@@ -5116,7 +5218,7 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
 
     // Generate functions
     for func in &prog.functions {
-        let is_exported = prog.exports.contains(&func.name);
+        let is_exported = prog.exports.iter().any(|e| e.func_name == func.name);
         let needs_wrapper = is_exported && function_needs_abi_wrapper(func);
 
         // If this function is exported and needs a wrapper, name the internal function differently
@@ -5186,7 +5288,7 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
     }
 
     for export in &prog.exports {
-        out.push_str(&format!("  (export \"{}\" (func ${}))\n", export, export));
+        out.push_str(&format!("  (export \"{}\" (func ${}))\n", export.export_name, export.func_name));
     }
 
     // Export memory for component model
@@ -6997,8 +7099,8 @@ fn generate_wit(prog: &Program) -> String {
 
         // Also include any local exports that aren't part of external interfaces
         for export in &prog.exports {
-            let func = find_function(prog, export);
-            out.push_str(&format!("  export {}: func(", export));
+            let func = find_function(prog, &export.func_name);
+            out.push_str(&format!("  export {}: func(", export.export_name));
             for (i, param) in func.params.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
@@ -7077,8 +7179,8 @@ fn generate_wit(prog: &Program) -> String {
             out.push_str("  }\n");
         }
         for export in &prog.exports {
-            let func = find_function(prog, export);
-            out.push_str(&format!("  export {}: func(", export));
+            let func = find_function(prog, &export.func_name);
+            out.push_str(&format!("  export {}: func(", export.export_name));
             for (i, param) in func.params.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
@@ -7174,12 +7276,13 @@ pub fn compile_repl_expr(
     let prog = Program {
         functions: all_functions,
         imports: vec![],
-        exports: vec!["eval".to_string()],
+        exports: vec![ExportDef::simple("eval".to_string())],
         globals: vec![],
         records: vec![],
         variants: vec![],
         resources: vec![],
         world_config: None,
+        data_segments: vec![],
     };
 
     // Type check the full program
@@ -7420,6 +7523,15 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
     // Large initial size needed for bootstrap compilation of the 42KB compiler
     out.push_str("  (memory (export \"memory\") 16000 16000)\n");
 
+    // Emit data segments
+    for seg in &prog.data_segments {
+        out.push_str(&format!("  (data (i32.const {}) \"", seg.offset));
+        for byte in &seg.bytes {
+            out.push_str(&format!("\\{:02x}", byte));
+        }
+        out.push_str("\")\n");
+    }
+
     // Heap pointer for allocations, starts after output buffer
     out.push_str(&format!(
         "  (global $__heap_ptr (mut i32) (i32.const {}))\n",
@@ -7569,8 +7681,16 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
 
     // Generate Pack wrappers for exported functions
     for export in &prog.exports {
-        let func = find_function(prog, export);
-        generate_pack_wrapper(&mut out, func, &records_map, &variants_map);
+        let func = find_function(prog, &export.func_name);
+        if export.export_name != export.func_name {
+            // Aliased export: function already has the correct ABI, just export it directly
+            out.push_str(&format!(
+                "  (export \"{}\" (func ${}))\n",
+                export.export_name, export.func_name
+            ));
+        } else {
+            generate_pack_wrapper(&mut out, func, &records_map, &variants_map);
+        }
     }
 
     out.push_str(")\n");
@@ -11363,12 +11483,13 @@ pub fn compile_repl_expr_pack(
     let prog = Program {
         functions: all_functions,
         imports: vec![],
-        exports: vec!["eval".to_string()],
+        exports: vec![ExportDef::simple("eval".to_string())],
         globals: vec![],
         records: vec![],
         variants: vec![],
         resources: vec![],
         world_config: None,
+        data_segments: vec![],
     };
 
     // Type check
@@ -11443,12 +11564,13 @@ pub fn compile_repl_expr_pack_wat(
     let prog = Program {
         functions: all_functions,
         imports: vec![],
-        exports: vec!["eval".to_string()],
+        exports: vec![ExportDef::simple("eval".to_string())],
         globals: vec![],
         records: vec![],
         variants: vec![],
         resources: vec![],
         world_config: None,
+        data_segments: vec![],
     };
 
     let full_signatures = collect_signatures(&prog)?;
