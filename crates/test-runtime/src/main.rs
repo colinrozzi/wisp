@@ -65,6 +65,14 @@ async fn main() -> Result<()> {
         return run_test_messaging(wasm_path).await;
     }
 
+    if args.len() >= 2 && args[1] == "--test-repl-actor" {
+        let wasm_path = args
+            .get(2)
+            .map(|s| s.as_str())
+            .unwrap_or("examples/actors/repl-actor.wasm");
+        return run_test_repl_actor(wasm_path).await;
+    }
+
     let wasm_path = args
         .get(1)
         .map(|s| s.as_str())
@@ -634,6 +642,406 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     println!("Chain verified: {}", verified);
 
     Ok(())
+}
+
+/// Test harness for the REPL actor.
+///
+/// This loads the REPL actor and the Wisp compiler, then evaluates expressions
+/// via handle-request, with results compiled and executed in real-time.
+async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
+    use theater::events::{ChainEventData, ChainEventPayload};
+    use theater::events::wasm::WasmEventData;
+    use theater::pack_bridge::AsyncCtx;
+
+    println!("=== REPL Actor Test ===");
+    println!();
+
+    // Load the compiler WASM
+    let compiler_path = "examples/wisp-compiler.wasm";
+    let compiler_bytes = std::fs::read(compiler_path)
+        .with_context(|| format!("Failed to read compiler: {}", compiler_path))?;
+    info!("Loaded {} bytes from {}", compiler_bytes.len(), compiler_path);
+
+    // Create compiler PackInstance
+    let runtime = AsyncRuntime::new();
+    let compiler_store = create_actor_store();
+    let compiler_instance = PackInstance::new(
+        "wisp-compiler",
+        &compiler_bytes,
+        &runtime,
+        compiler_store,
+        |builder| {
+            // Compiler needs log function
+            builder.interface("theater:simple/runtime")?.func_typed(
+                "log",
+                |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+                    let msg = match input {
+                        Value::String(s) => s,
+                        _ => format!("{:?}", input),
+                    };
+                    info!("[COMPILER LOG] {}", msg);
+                    Value::Tuple(vec![])
+                },
+            )?;
+            // Compiler needs assembler
+            builder.interface("theater:simple/assembler")?.func_typed(
+                "wat-to-wasm",
+                |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+                    let wat = match input {
+                        Value::String(s) => s,
+                        _ => {
+                            return Value::Result {
+                                ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                err_type: ValueType::String,
+                                value: Err(Box::new(Value::String(
+                                    "expected string argument".to_string(),
+                                ))),
+                            }
+                        }
+                    };
+                    match wat::parse_str(&wat) {
+                        Ok(wasm_bytes) => {
+                            let bytes: Vec<Value> = wasm_bytes.into_iter().map(Value::U8).collect();
+                            Value::Result {
+                                ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                err_type: ValueType::String,
+                                value: Ok(Box::new(Value::List {
+                                    elem_type: ValueType::U8,
+                                    items: bytes,
+                                })),
+                            }
+                        }
+                        Err(e) => Value::Result {
+                            ok_type: ValueType::List(Box::new(ValueType::U8)),
+                            err_type: ValueType::String,
+                            value: Err(Box::new(Value::String(e.to_string()))),
+                        },
+                    }
+                },
+            )?;
+            Ok(())
+        },
+    )
+    .await?;
+
+    // Wrap compiler in Arc<tokio::sync::Mutex> for async sharing
+    let compiler = Arc::new(tokio::sync::Mutex::new(compiler_instance));
+
+    // Load the REPL actor WASM
+    let actor_bytes = std::fs::read(wasm_path)
+        .with_context(|| format!("Failed to read {}", wasm_path))?;
+    info!("Loaded {} bytes from {}", actor_bytes.len(), wasm_path);
+
+    let actor_store = create_actor_store();
+    let compiler_for_closure = compiler.clone();
+
+    let mut instance = PackInstance::new(
+        "repl-actor-test",
+        &actor_bytes,
+        &runtime,
+        actor_store,
+        move |builder| {
+            // theater:simple/runtime.log
+            builder.interface("theater:simple/runtime")?.func_typed(
+                "log",
+                |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+                    let msg = match input {
+                        Value::String(s) => s,
+                        _ => format!("{:?}", input),
+                    };
+                    println!("  [ACTOR LOG] {}", msg);
+                    Value::Tuple(vec![])
+                },
+            )?;
+
+            // wisp:evaluator.eval-request
+            // Takes: tuple(string, list<u8>) where string is request_id, list<u8> is body (source)
+            // Returns: tuple(option<list<u8>>) where the option contains the result
+            let compiler_clone = compiler_for_closure.clone();
+            builder.interface("wisp:evaluator")?.func_async(
+                "eval-request",
+                move |_ctx: AsyncCtx<ActorStore>, input: Value| {
+                    let compiler = compiler_clone.clone();
+                    async move {
+                        // Extract params: Tuple([String(request_id), List{...body_bytes}])
+                        let (request_id, source) = match input {
+                            Value::Tuple(fields) => {
+                                let req_id = match &fields[0] {
+                                    Value::String(s) => s.clone(),
+                                    _ => "unknown".to_string(),
+                                };
+                                let source = match &fields[1] {
+                                    Value::List { items, .. } => {
+                                        let bytes: Vec<u8> = items.iter().map(|v| match v {
+                                            Value::U8(b) => *b,
+                                            _ => 0,
+                                        }).collect();
+                                        String::from_utf8_lossy(&bytes).to_string()
+                                    }
+                                    _ => String::new(),
+                                };
+                                (req_id, source)
+                            }
+                            _ => ("unknown".to_string(), String::new()),
+                        };
+
+                        info!("[EVAL-REQUEST] request_id={}, source={}", request_id, source);
+
+                        // Wrap source for compilation: (export (fn eval () s32 <source>))
+                        let wrapped_source = format!(
+                            "(export (fn eval () s32 {}))",
+                            source
+                        );
+
+                        // Call compiler to get WAT
+                        let mut compiler_guard = compiler.lock().await;
+                        let compile_result = compiler_guard
+                            .call_value("compile-source", &Value::String(wrapped_source))
+                            .await;
+
+                        let wat = match compile_result {
+                            Ok(Value::String(s)) => s,
+                            Ok(other) => {
+                                warn!("[EVAL-REQUEST] Compiler returned non-string: {:?}", other);
+                                return make_eval_response(None);
+                            }
+                            Err(e) => {
+                                warn!("[EVAL-REQUEST] Compile error: {}", e);
+                                return make_eval_response(None);
+                            }
+                        };
+                        drop(compiler_guard);
+
+                        info!("[EVAL-REQUEST] Got WAT ({} bytes)", wat.len());
+
+                        // Assemble WAT -> WASM
+                        let wasm_bytes = match wat::parse_str(&wat) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                warn!("[EVAL-REQUEST] WAT parse error: {}", e);
+                                return make_eval_response(None);
+                            }
+                        };
+
+                        info!("[EVAL-REQUEST] Assembled to {} bytes of WASM", wasm_bytes.len());
+
+                        // Load and run the WASM module
+                        let mut config = wasmtime::Config::new();
+                        config.wasm_tail_call(true);
+                        let engine = match Engine::new(&config) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                warn!("[EVAL-REQUEST] Engine creation error: {}", e);
+                                return make_eval_response(None);
+                            }
+                        };
+
+                        let module = match Module::new(&engine, &wasm_bytes) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!("[EVAL-REQUEST] Module creation error: {}", e);
+                                return make_eval_response(None);
+                            }
+                        };
+
+                        let mut store = Store::new(&engine, ());
+                        let instance = match Instance::new(&mut store, &module, &[]) {
+                            Ok(i) => i,
+                            Err(e) => {
+                                warn!("[EVAL-REQUEST] Instantiation error: {}", e);
+                                return make_eval_response(None);
+                            }
+                        };
+
+                        let eval_func = match instance.get_typed_func::<(), i32>(&mut store, "eval") {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!("[EVAL-REQUEST] Function lookup error: {}", e);
+                                return make_eval_response(None);
+                            }
+                        };
+
+                        let result = match eval_func.call(&mut store, ()) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!("[EVAL-REQUEST] Execution error: {}", e);
+                                return make_eval_response(None);
+                            }
+                        };
+
+                        info!("[EVAL-REQUEST] Result: {}", result);
+
+                        // Encode result as UTF-8 bytes
+                        let result_str = result.to_string();
+                        let result_bytes: Vec<u8> = result_str.into_bytes();
+
+                        make_eval_response(Some(result_bytes))
+                    }
+                },
+            )?;
+            Ok(())
+        },
+    )
+    .await?;
+
+    // --- Test flow ---
+
+    // 1. Call init
+    println!("[1/4] Calling init...");
+    let init_func = "theater:simple/actor.init";
+
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+            function_name: init_func.to_string(),
+            params: vec![],
+        }),
+    })?;
+
+    let init_state: Option<Vec<u8>> = None;
+    let init_input = Value::Tuple(vec![state_to_value(&init_state), Value::Tuple(vec![])]);
+    let init_result = instance.call_value(init_func, &init_input).await?;
+
+    let (state, _) = decode_actor_result(&init_result)?;
+
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+            function_name: init_func.to_string(),
+            result: (None, vec![]),
+        }),
+    })?;
+
+    println!("  init returned Ok, state: {}", format_state(&state));
+    println!();
+
+    // 2. Evaluate first expression
+    let test_cases = vec![
+        ("(i32.add (i32.const 40) (i32.const 2))", "42"),
+        ("(i32.mul (i32.const 6) (i32.const 7))", "42"),
+    ];
+
+    let mut current_state = state;
+
+    for (i, (expr, expected)) in test_cases.iter().enumerate() {
+        println!("[{}/4] Evaluating: {}", i + 2, expr);
+
+        let request_func = "theater:simple/message-server-client.handle-request";
+
+        instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+                function_name: request_func.to_string(),
+                params: vec![],
+            }),
+        })?;
+
+        // handle-request params: (state, tuple(string, list<u8>))
+        let request_id = format!("test-{}", i);
+        let body_bytes = expr.as_bytes();
+
+        let request_input = Value::Tuple(vec![
+            state_to_value(&current_state),
+            Value::Tuple(vec![
+                Value::String(request_id),
+                bytes_to_value(body_bytes),
+            ]),
+        ]);
+
+        let request_result = instance.call_value(request_func, &request_input).await?;
+
+        let (new_state, extras) = decode_actor_result(&request_result)?;
+
+        // Extract response from extras: tuple(option<list<u8>>)
+        let response = if let Some(Value::Tuple(response_fields)) = extras.first() {
+            match response_fields.first() {
+                Some(Value::Option { value: Some(list_val), .. }) => {
+                    match list_val.as_ref() {
+                        Value::List { items, .. } => {
+                            let bytes: Vec<u8> = items.iter().map(|v| match v {
+                                Value::U8(b) => *b,
+                                _ => 0,
+                            }).collect();
+                            String::from_utf8_lossy(&bytes).to_string()
+                        }
+                        _ => "?".to_string(),
+                    }
+                }
+                Some(Value::Option { value: None, .. }) => "None".to_string(),
+                _ => format!("{:?}", response_fields),
+            }
+        } else {
+            "N/A".to_string()
+        };
+
+        instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+                function_name: request_func.to_string(),
+                result: (None, vec![]),
+            }),
+        })?;
+
+        println!("  Result: {} (expected: {})", response, expected);
+        if response == *expected {
+            println!("  [OK]");
+        } else {
+            println!("  [MISMATCH]");
+        }
+        println!();
+
+        current_state = new_state;
+    }
+
+    // Print event chain
+    let chain = instance.actor_store.chain.read().unwrap();
+    let events = chain.get_events();
+    println!("=== Event Chain ({} events) ===", events.len());
+    for event in events {
+        let hash_prefix = hex::encode(&event.hash[..std::cmp::min(4, event.hash.len())]);
+        let summary = if let Ok(payload) = serde_json::from_slice::<ChainEventPayload>(&event.data) {
+            match payload {
+                ChainEventPayload::Wasm(WasmEventData::WasmCall { function_name, .. }) => {
+                    format!("WasmCall {{ function: \"{}\" }}", function_name)
+                }
+                ChainEventPayload::Wasm(WasmEventData::WasmResult { function_name, .. }) => {
+                    format!("WasmResult {{ function: \"{}\" }}", function_name)
+                }
+                ChainEventPayload::Wasm(WasmEventData::WasmError { function_name, message }) => {
+                    format!("WasmError {{ function: \"{}\", message: \"{}\" }}", function_name, message)
+                }
+                other => format!("{:?}", other),
+            }
+        } else {
+            format!("(raw: {} bytes)", event.data.len())
+        };
+        println!("  [{}] {} — {}", hash_prefix, event.event_type, summary);
+    }
+    println!();
+
+    let verified = chain.verify();
+    println!("Chain verified: {}", verified);
+
+    Ok(())
+}
+
+/// Helper to create the eval-request response value
+fn make_eval_response(result_bytes: Option<Vec<u8>>) -> Value {
+    // Returns: tuple(option<list<u8>>)
+    let option_value = match result_bytes {
+        Some(bytes) => Value::Option {
+            inner_type: ValueType::List(Box::new(ValueType::U8)),
+            value: Some(Box::new(Value::List {
+                elem_type: ValueType::U8,
+                items: bytes.into_iter().map(Value::U8).collect(),
+            })),
+        },
+        None => Value::Option {
+            inner_type: ValueType::List(Box::new(ValueType::U8)),
+            value: None,
+        },
+    };
+    Value::Tuple(vec![option_value])
 }
 
 /// Compose wrapper + expression modules and call init
