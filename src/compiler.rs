@@ -21,6 +21,8 @@ pub enum Type {
     Str,                          // UTF-8 string
     Resource(String),             // resource handle (opaque i32)
     Borrow(Box<Type>),            // borrow<T> - borrowed reference
+    Tuple(Vec<Type>),             // tuple<T1, T2, ...> - product type
+    U8,                           // unsigned 8-bit integer
 }
 
 /// A value that can be inlined during REPL compilation
@@ -589,6 +591,10 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// Construct a tuple: (tuple e1 e2 ...)
+    TupleConstruct {
+        values: Vec<Expr>,
+    },
 }
 
 /// A single arm in a match expression
@@ -758,13 +764,15 @@ fn type_size(ty: &Type) -> usize {
     match ty {
         Type::S32 | Type::F32 => 4,
         Type::S64 | Type::F64 => 8,
-        // Records, variants, options, results, lists, and strings are pointer-sized
+        Type::U8 => 4, // stored as i32 in Wisp memory; byte-packing only in list<u8> data arrays
+        // Records, variants, options, results, lists, strings, and tuples are pointer-sized
         Type::Record(_)
         | Type::Variant(_)
         | Type::Option(_)
         | Type::Result(_, _)
         | Type::List(_)
-        | Type::Str => 4,
+        | Type::Str
+        | Type::Tuple(_) => 4,
         // Resources and borrows are i32 handles
         Type::Resource(_) | Type::Borrow(_) => 4,
     }
@@ -773,13 +781,14 @@ fn type_size(ty: &Type) -> usize {
 /// Check if a type requires heap allocation
 fn type_needs_heap(ty: &Type) -> bool {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 => false,
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::U8 => false,
         Type::Record(_)
         | Type::Variant(_)
         | Type::Option(_)
         | Type::Result(_, _)
         | Type::List(_)
-        | Type::Str => true,
+        | Type::Str
+        | Type::Tuple(_) => true,
         // Resources don't need heap - they're opaque handles managed externally
         Type::Resource(_) | Type::Borrow(_) => false,
     }
@@ -815,6 +824,7 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
         Expr::Substring { .. } | Expr::StringAppend { .. } => true, // allocate new strings
         Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
+        Expr::TupleConstruct { .. } => true,
     }
 }
 
@@ -1760,6 +1770,14 @@ fn check_expr(
                 Box::new(err_type.clone()),
             ))
         }
+        // Tuple constructor
+        Expr::TupleConstruct { values } => {
+            let elem_types: Vec<Type> = values
+                .iter()
+                .map(|v| check_expr(v, env, signatures, globals, records, variants))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Type::Tuple(elem_types))
+        }
         // List operations
         Expr::ListNew { elem_type } => Ok(Type::List(Box::new(elem_type.clone()))),
         Expr::ListPush { list, value } => {
@@ -1858,12 +1876,14 @@ fn check_expr(
 fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
+        Type::U8 => bail!("{}: expected numeric type, got u8", msg),
         Type::Record(name) => bail!("{}: expected numeric type, got record '{}'", msg, name),
         Type::Variant(name) => bail!("{}: expected numeric type, got variant '{}'", msg, name),
         Type::Option(_) => bail!("{}: expected numeric type, got option", msg),
         Type::Result(_, _) => bail!("{}: expected numeric type, got result", msg),
         Type::List(_) => bail!("{}: expected numeric type, got list", msg),
         Type::Str => bail!("{}: expected numeric type, got string", msg),
+        Type::Tuple(_) => bail!("{}: expected numeric type, got tuple", msg),
         Type::Resource(name) => bail!("{}: expected numeric type, got resource '{}'", msg, name),
         Type::Borrow(_) => bail!("{}: expected numeric type, got borrow", msg),
     }
@@ -4528,6 +4548,20 @@ fn parse_type_expr(
                     let inner = parse_type_expr(&items[1], variant_names, resource_names, ctx)?;
                     Ok(Type::Borrow(Box::new(inner)))
                 }
+                SExpr::Sym(s, _) if s == "tuple" => {
+                    if items.len() < 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid tuple type",
+                            span,
+                            "expected: (tuple T1 T2 ...)",
+                        ));
+                    }
+                    let elems: Vec<Type> = items[1..]
+                        .iter()
+                        .map(|item| parse_type_expr(item, variant_names, resource_names, ctx))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Type::Tuple(elems))
+                }
                 _ => Err(ctx.error("unknown parameterized type", span)),
             }
         }
@@ -4547,6 +4581,7 @@ fn parse_type_symbol(
         "s64" => Ok(Type::S64),
         "f32" => Ok(Type::F32),
         "f64" => Ok(Type::F64),
+        "u8" => Ok(Type::U8),
         "string" => Ok(Type::Str),
         // Check if this is a variant type name
         other if variant_names.contains(other) => Ok(Type::Variant(other.to_string())),
@@ -4559,7 +4594,7 @@ fn parse_type_symbol(
 }
 
 fn is_type_symbol(sym: &str) -> bool {
-    matches!(sym, "s32" | "s64" | "f32" | "f64" | "string")
+    matches!(sym, "s32" | "s64" | "f32" | "f64" | "u8" | "string")
 }
 
 fn parse_expr(
@@ -4902,6 +4937,21 @@ fn parse_expr(
                         err_type,
                         value: Box::new(value),
                     })
+                }
+                // Tuple constructor: (tuple expr1 expr2 ...)
+                SExpr::Sym(sym, _sym_span) if sym == "tuple" => {
+                    if items.len() < 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'tuple' expression",
+                            list_span,
+                            "expected: (tuple value1 value2 ...)",
+                        ));
+                    }
+                    let values: Vec<Expr> = items[1..]
+                        .iter()
+                        .map(|item| parse_expr(item, vars, functions, records, variants, ctx))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Expr::TupleConstruct { values })
                 }
                 // List operations
                 SExpr::Sym(sym, _sym_span) if sym == "list-new" => {
@@ -5638,6 +5688,8 @@ fn gen_expr(
                     | Type::Result(_, _)
                     | Type::List(_)
                     | Type::Str
+                    | Type::Tuple(_)
+                    | Type::U8
                     | Type::Resource(_)
                     | Type::Borrow(_) => "i32.store",
                 };
@@ -5688,6 +5740,8 @@ fn gen_expr(
                 | Type::Result(_, _)
                 | Type::List(_)
                 | Type::Str
+                | Type::Tuple(_)
+                | Type::U8
                 | Type::Resource(_)
                 | Type::Borrow(_) => "i32.load",
             };
@@ -5754,6 +5808,8 @@ fn gen_expr(
                     | Type::Result(_, _)
                     | Type::List(_)
                     | Type::Str
+                    | Type::Tuple(_)
+                    | Type::U8
                     | Type::Resource(_)
                     | Type::Borrow(_) => "i32.store",
                 };
@@ -5830,6 +5886,8 @@ fn gen_expr(
                                 | Type::Result(_, _)
                                 | Type::List(_)
                                 | Type::Str
+                                | Type::Tuple(_)
+                                | Type::U8
                                 | Type::Resource(_)
                                 | Type::Borrow(_) => "i32.load",
                             };
@@ -5931,6 +5989,8 @@ fn gen_expr(
                                 | Type::Result(_, _)
                                 | Type::List(_)
                                 | Type::Str
+                                | Type::Tuple(_)
+                                | Type::U8
                                 | Type::Resource(_)
                                 | Type::Borrow(_) => "i32.load",
                             };
@@ -6061,6 +6121,8 @@ fn gen_expr(
                                 | Type::Result(_, _)
                                 | Type::List(_)
                                 | Type::Str
+                                | Type::Tuple(_)
+                                | Type::U8
                                 | Type::Resource(_)
                                 | Type::Borrow(_) => "i32.load",
                             };
@@ -6268,6 +6330,56 @@ fn gen_expr(
             // Return pointer
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             Type::Result(Box::new(ok_type.clone()), Box::new(err_type.clone()))
+        }
+        // Tuple: evaluate values, allocate, store fields contiguously
+        Expr::TupleConstruct { values } => {
+            // First evaluate each value into a temp local, collecting types
+            let mut value_types = Vec::new();
+            let mut value_locals = Vec::new();
+            for val in values {
+                let val_ty = gen_expr(
+                    val, out, indent, env, signatures, globals, records, variants, false,
+                );
+                let tmp_local = env.declare_local(val_ty.clone());
+                out.push_str(&format!("{}local.set {}\n", pad, tmp_local));
+                value_locals.push(tmp_local);
+                value_types.push(val_ty);
+            }
+
+            // Allocate tuple on heap
+            let total_size: usize = value_types.iter().map(|t| type_size(t)).sum();
+            let ptr_local = env.declare_local(Type::S32);
+
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
+
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const {}\n", pad, total_size));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store each field from temp locals
+            let mut field_offset = 0;
+            for (val_ty, val_local) in value_types.iter().zip(value_locals.iter()) {
+                out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+                if field_offset > 0 {
+                    out.push_str(&format!("{}i32.const {}\n", pad, field_offset));
+                    out.push_str(&format!("{}i32.add\n", pad));
+                }
+                out.push_str(&format!("{}local.get {}\n", pad, val_local));
+                let store_instr = match val_ty {
+                    Type::S64 => "i64.store",
+                    Type::F32 => "f32.store",
+                    Type::F64 => "f64.store",
+                    _ => "i32.store", // s32, u8, pointers
+                };
+                out.push_str(&format!("{}{}\n", pad, store_instr));
+                field_offset += type_size(val_ty);
+            }
+
+            // Return pointer
+            out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
+            Type::Tuple(value_types)
         }
         // List: new - allocate header (len=0, cap=0, data=null)
         Expr::ListNew { elem_type } => {
@@ -6820,13 +6932,15 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::S64 => "i64",
         Type::F32 => "f32",
         Type::F64 => "f64",
+        Type::U8 => "i32",
         // All compound types are pointer-sized (i32 handles)
         Type::Record(_)
         | Type::Variant(_)
         | Type::Option(_)
         | Type::Result(_, _)
         | Type::List(_)
-        | Type::Str => "i32",
+        | Type::Str
+        | Type::Tuple(_) => "i32",
         // Resources are i32 handles
         Type::Resource(_) | Type::Borrow(_) => "i32",
     }
@@ -6838,6 +6952,7 @@ fn wit_type(ty: &Type) -> String {
         Type::S64 => "s64".to_string(),
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
+        Type::U8 => "u8".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
         Type::Option(inner) => format!("option<{}>", wit_type(inner)),
         Type::Result(ok, err) => format!("result<{}, {}>", wit_type(ok), wit_type(err)),
@@ -6845,6 +6960,10 @@ fn wit_type(ty: &Type) -> String {
         Type::Str => "string".to_string(),
         Type::Resource(name) => name.clone(),
         Type::Borrow(inner) => format!("borrow<{}>", wit_type(inner)),
+        Type::Tuple(elems) => {
+            let inner: Vec<String> = elems.iter().map(|t| wit_type(t)).collect();
+            format!("tuple<{}>", inner.join(", "))
+        }
     }
 }
 
@@ -6913,6 +7032,14 @@ fn flatten_type(
         Type::Str => {
             // String is pointer + length (canonical ABI)
             vec![Type::S32, Type::S32]
+        }
+        Type::Tuple(_) => {
+            // Tuple is a pointer
+            vec![Type::S32]
+        }
+        Type::U8 => {
+            // U8 is stored as i32
+            vec![Type::S32]
         }
         Type::Resource(_) | Type::Borrow(_) => {
             // Resources and borrows are i32 handles
@@ -7104,6 +7231,8 @@ fn store_instr(ty: &Type) -> &'static str {
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
+        | Type::Tuple(_)
+        | Type::U8
         | Type::Resource(_)
         | Type::Borrow(_) => "i32.store",
     }
@@ -7123,6 +7252,8 @@ fn load_instr(ty: &Type) -> &'static str {
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
+        | Type::Tuple(_)
+        | Type::U8
         | Type::Resource(_)
         | Type::Borrow(_) => "i32.load",
     }
@@ -7479,10 +7610,12 @@ fn type_to_tag(ty: &Type) -> u8 {
         Type::S64 => CGRF_S64,
         Type::F32 => CGRF_F32,
         Type::F64 => CGRF_F64,
+        Type::U8 => CGRF_U8,
         Type::Str => CGRF_STRING,
         Type::List(_) => CGRF_LIST,
         Type::Option(_) => CGRF_OPTION,
         Type::Result(_, _) => CGRF_RESULT,
+        Type::Tuple(_) => CGRF_TUPLE,
         Type::Record(_) => CGRF_RECORD,
         Type::Variant(_) => CGRF_VARIANT,
         Type::Resource(_) => CGRF_RECORD, // Resources are treated as records for now
@@ -7494,10 +7627,11 @@ fn type_to_tag(ty: &Type) -> u8 {
 /// Simple types are 1 byte, compound types include nested type info
 fn type_tag_size(ty: &Type) -> usize {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str => 1,
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => 1,
         Type::List(inner) => 1 + type_tag_size(inner),
         Type::Option(inner) => 1 + type_tag_size(inner),
         Type::Result(ok, err) => 1 + type_tag_size(ok) + type_tag_size(err),
+        Type::Tuple(elems) => 1 + 4 + elems.iter().map(|t| type_tag_size(t)).sum::<usize>(),
         Type::Record(name) | Type::Variant(name) | Type::Resource(name) => 1 + 4 + name.len(),
         Type::Borrow(inner) => type_tag_size(inner),
     }
@@ -7516,7 +7650,7 @@ fn generate_write_type_tag(out: &mut String, ty: &Type, base_local: &str, offset
     out.push_str("    i32.store8\n");
 
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str => 1,
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => 1,
         Type::List(inner) => 1 + generate_write_type_tag(out, inner, base_local, offset + 1),
         Type::Option(inner) => 1 + generate_write_type_tag(out, inner, base_local, offset + 1),
         Type::Result(ok, err) => {
@@ -7524,6 +7658,21 @@ fn generate_write_type_tag(out: &mut String, ty: &Type, base_local: &str, offset
             let err_size =
                 generate_write_type_tag(out, err, base_local, offset + 1 + ok_size as i32);
             1 + ok_size + err_size
+        }
+        Type::Tuple(elems) => {
+            // Write element count (u32)
+            out.push_str(&format!("    local.get {}\n", base_local));
+            out.push_str(&format!("    i32.const {}\n", offset + 1));
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", elems.len()));
+            out.push_str("    i32.store\n");
+            // Write each element type tag
+            let mut elem_offset = offset + 5; // 1 (tag) + 4 (count)
+            for elem in elems {
+                let sz = generate_write_type_tag(out, elem, base_local, elem_offset);
+                elem_offset += sz as i32;
+            }
+            (elem_offset - offset) as usize
         }
         Type::Record(name) | Type::Variant(name) | Type::Resource(name) => {
             // Write name length
@@ -7729,15 +7878,7 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
     // Generate Pack wrappers for exported functions
     for export in &prog.exports {
         let func = find_function(prog, &export.func_name);
-        if export.export_name != export.func_name {
-            // Aliased export: function already has the correct ABI, just export it directly
-            out.push_str(&format!(
-                "  (export \"{}\" (func ${}))\n",
-                export.export_name, export.func_name
-            ));
-        } else {
-            generate_pack_wrapper(&mut out, func, &records_map, &variants_map);
-        }
+        generate_pack_wrapper(&mut out, func, &export.export_name, &records_map, &variants_map);
     }
 
     out.push_str(")\n");
@@ -7752,10 +7893,10 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
 fn generate_pack_wrapper(
     out: &mut String,
     func: &Function,
+    export_name: &str,
     records: &HashMap<String, RecordDef>,
     variants: &HashMap<String, VariantDef>,
 ) {
-    let export_name = &func.name;
     let wrapper_name = format!("{}__export", func.name);
     let internal_name = format!("${}", func.name);
 
@@ -7769,32 +7910,12 @@ fn generate_pack_wrapper(
     out.push_str("    (local $bytes_written i32)\n");
 
     // Declare local for the result value (locals must be at the top)
-    // All compound types (strings, records, etc.) are i32 pointers
+    // S64 and F32/F64 use their native types; everything else is i32 (value or pointer)
     match &func.return_type {
-        Type::S32 => out.push_str("    (local $value i32)\n"),
         Type::S64 => out.push_str("    (local $value i64)\n"),
         Type::F32 => out.push_str("    (local $value f32)\n"),
         Type::F64 => out.push_str("    (local $value f64)\n"),
-        Type::Str | Type::Record(_) | Type::Option(_) => out.push_str("    (local $value i32)\n"),
-        Type::Variant(_) => {
-            out.push_str("    (local $value i32)\n");
-            // $tag local needed for v2 case name lookup
-            out.push_str("    (local $tag i32)\n");
-        }
-        Type::Result(_, _) => {
-            out.push_str("    (local $value i32)\n");
-            // $tag local needed for result encoding (though not currently used)
-            out.push_str("    (local $tag i32)\n");
-        }
-        Type::List(_) => {
-            out.push_str("    (local $value i32)\n");
-            // Additional locals needed for list encoding loop
-            out.push_str("    (local $i i32)\n");
-            out.push_str("    (local $len i32)\n");
-            out.push_str("    (local $data_ptr i32)\n");
-            out.push_str("    (local $node_offset i32)\n");
-        }
-        _ => {}
+        _ => out.push_str("    (local $value i32)\n"),
     }
 
     // Declare locals for parameters
@@ -7876,14 +7997,73 @@ fn generate_pack_wrapper(
         out.push_str("    (local $data_len i32)\n");
     }
 
+    // Locals for recursive CGRF encoding of return value
+    out.push_str("    (local $buf_cursor i32)\n");
+    out.push_str("    (local $node_idx i32)\n");
+    out.push_str("    (local $enc_root_idx i32)\n");
+    out.push_str("    (local $enc_header_start i32)\n");
+    out.push_str("    (local $enc_tmp i32)\n");
+    out.push_str("    (local $enc_tmp_i64 i64)\n");
+    out.push_str("    (local $enc_tmp_f32 f32)\n");
+    out.push_str("    (local $enc_tmp_f64 f64)\n");
+    out.push_str("    (local $enc_save_child i32)\n");
+    out.push_str("    (local $enc_save_root i32)\n");
+    out.push_str("    (local $enc_tuple_header i32)\n");
+    out.push_str("    (local $enc_tuple_ci_pos i32)\n");
+    out.push_str("    (local $enc_list_header i32)\n");
+    out.push_str("    (local $enc_list_ci_pos i32)\n");
+    out.push_str("    (local $enc_list_i i32)\n");
+    out.push_str("    (local $enc_list_len i32)\n");
+    out.push_str("    (local $enc_list_data i32)\n");
+    out.push_str("    (local $enc_list_root_idx i32)\n");
+
+    // Locals for recursive CGRF decoding of input parameters
+    out.push_str("    (local $dec_node_offset i32)\n");
+    out.push_str("    (local $dec_result i32)\n");
+    out.push_str("    (local $dec_child_idx i32)\n");
+    out.push_str("    (local $dec_scan_offset i32)\n");
+    out.push_str("    (local $dec_scan_i i32)\n");
+    out.push_str("    (local $dec_payload_len i32)\n");
+    out.push_str("    (local $dec_tmp i32)\n");
+    out.push_str("    (local $dec_opt_ptr i32)\n");
+    out.push_str("    (local $dec_opt_node_offset i32)\n");
+    out.push_str("    (local $dec_list_ptr i32)\n");
+    out.push_str("    (local $dec_list_data i32)\n");
+    out.push_str("    (local $dec_list_len i32)\n");
+    out.push_str("    (local $dec_list_i i32)\n");
+    out.push_str("    (local $dec_list_node_offset i32)\n");
+
     // Decode input parameters from CGRF
     if !func.params.is_empty() {
         out.push_str("    ;; Decode input parameters from CGRF\n");
 
         if func.params.len() == 1 {
-            // Single parameter: root node is the value directly
+            // Single parameter: use recursive decoder for compound types,
+            // fall back to old decoder for simple types
             let param = &func.params[0];
-            generate_cgrf_decode_param(out, &param.ty, &param.name, 0, false, records, variants);
+            let use_recursive = matches!(
+                param.ty,
+                Type::Option(_) | Type::List(_) | Type::Tuple(_) | Type::Result(_, _)
+            );
+            if use_recursive {
+                // Read root_index from CGRF header
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $dec_child_idx\n");
+                // Find root node offset
+                generate_dec_find_node_by_index(out);
+                // Decode recursively
+                generate_cgrf_decode_recursive(out, &param.ty, records, variants);
+                // Store result
+                out.push_str("    local.get $dec_result\n");
+                out.push_str(&format!("    local.set $param_{}\n", param.name));
+            } else {
+                generate_cgrf_decode_param(
+                    out, &param.ty, &param.name, 0, false, records, variants,
+                );
+            }
         } else {
             // Multiple parameters: root is a tuple, decode each element
             out.push_str("    ;; Multiple params - expecting tuple root\n");
@@ -7932,43 +8112,45 @@ fn generate_pack_wrapper(
     out.push_str("    call $__alloc\n");
     out.push_str("    local.set $out_ptr\n");
 
-    // Encode result based on return type
-    match &func.return_type {
-        Type::S32 => {
-            generate_cgrf_encode_s32(out);
-        }
-        Type::S64 => {
-            generate_cgrf_encode_s64(out);
-        }
-        Type::F32 => {
-            generate_cgrf_encode_f32(out);
-        }
-        Type::F64 => {
-            generate_cgrf_encode_f64(out);
-        }
-        Type::Str => {
-            generate_cgrf_encode_string(out);
-        }
-        Type::Option(inner_ty) => {
-            generate_cgrf_encode_option(out, inner_ty);
-        }
-        Type::List(elem_ty) => {
-            generate_cgrf_encode_list(out, elem_ty, records, variants);
-        }
-        Type::Record(name) => {
-            generate_cgrf_encode_record(out, name, records, variants);
-        }
-        Type::Variant(name) => {
-            generate_cgrf_encode_variant(out, name, records, variants);
-        }
-        Type::Result(ok_ty, err_ty) => {
-            generate_cgrf_encode_result(out, ok_ty, err_ty, records, variants);
-        }
-        _ => {
-            out.push_str("    ;; TODO: encode non-scalar return types\n");
-            out.push_str("    i32.const 28\n"); // Minimum size for error
-        }
-    }
+    // Encode result using recursive CGRF encoder
+    out.push_str("    ;; Encode result value to CGRF (recursive encoder)\n");
+    out.push_str("    i32.const 16\n");
+    out.push_str("    local.set $buf_cursor\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    local.set $node_idx\n");
+    generate_cgrf_encode_recursive(out, &func.return_type, "$value", records, variants);
+    // Write CGRF header at offset 0
+    out.push_str("    ;; Write CGRF header\n");
+    // Magic
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+    out.push_str("    i32.store\n");
+    // Version
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+    out.push_str("    i32.store16\n");
+    // Flags
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 6\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+    // Node count
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $node_idx\n");
+    out.push_str("    i32.store\n");
+    // Root index
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $enc_root_idx\n");
+    out.push_str("    i32.store\n");
+    // Push bytes_written ($buf_cursor) for the ABI return
+    out.push_str("    local.get $buf_cursor\n");
 
     // Guest-allocates ABI: save bytes_written, write ptr/len to slots, return 0
     out.push_str("    local.set $bytes_written\n");
@@ -8390,6 +8572,1146 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
     }
 
     out.push_str("  )\n");
+}
+
+// =============================================================================
+// Recursive CGRF encoding
+// =============================================================================
+
+/// Compute the type tag bytes for a type at compile time.
+fn type_tag_bytes(ty: &Type) -> Vec<u8> {
+    let mut bytes = vec![type_to_tag(ty)];
+    match ty {
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => {}
+        Type::List(inner) => bytes.extend(type_tag_bytes(inner)),
+        Type::Option(inner) => bytes.extend(type_tag_bytes(inner)),
+        Type::Result(ok, err) => {
+            bytes.extend(type_tag_bytes(ok));
+            bytes.extend(type_tag_bytes(err));
+        }
+        Type::Tuple(elems) => {
+            let count = elems.len() as u32;
+            bytes.extend(count.to_le_bytes());
+            for elem in elems {
+                bytes.extend(type_tag_bytes(elem));
+            }
+        }
+        Type::Record(name) | Type::Variant(name) | Type::Resource(name) => {
+            let name_len = name.len() as u32;
+            bytes.extend(name_len.to_le_bytes());
+            bytes.extend(name.bytes());
+        }
+        Type::Borrow(inner) => return type_tag_bytes(inner),
+    }
+    bytes
+}
+
+/// Generate WAT to write type tag bytes at $out_ptr + $buf_cursor, advancing $buf_cursor.
+fn generate_write_type_tag_at_cursor(out: &mut String, ty: &Type) {
+    let bytes = type_tag_bytes(ty);
+    for (i, byte) in bytes.iter().enumerate() {
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    i32.add\n");
+        if i > 0 {
+            out.push_str(&format!("    i32.const {}\n", i));
+            out.push_str("    i32.add\n");
+        }
+        out.push_str(&format!("    i32.const {}\n", byte));
+        out.push_str("    i32.store8\n");
+    }
+    // Advance cursor
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str(&format!("    i32.const {}\n", bytes.len()));
+    out.push_str("    i32.add\n");
+    out.push_str("    local.set $buf_cursor\n");
+}
+
+/// Write a CGRF node header at $buf_cursor (kind, flags=0, reserved=0, payload_len=0).
+/// Advances $buf_cursor by 8. Caller must patch payload_len at $enc_header_start + 4.
+fn generate_write_node_header(out: &mut String, kind: u8) {
+    // Save header start position
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    local.set $enc_header_start\n");
+    // kind
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", kind as i32));
+    out.push_str("    i32.store8\n");
+    // flags = 0
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store8\n");
+    // reserved = 0
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 2\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+    // payload_len = 0 (placeholder)
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store\n");
+    // Advance cursor past header
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.set $buf_cursor\n");
+}
+
+/// Patch the payload_len at $enc_header_start + 4 to be ($buf_cursor - $enc_header_start - 8).
+fn generate_patch_payload_len(out: &mut String) {
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    local.get $enc_header_start\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    local.get $enc_header_start\n");
+    out.push_str("    i32.sub\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.sub\n");
+    out.push_str("    i32.store\n");
+}
+
+/// Load the inner value from a Wisp compound type at value_local + offset into $enc_tmp.
+/// Handles different type sizes (i32/i64/f32/f64).
+fn generate_load_inner_value(out: &mut String, inner_ty: &Type, value_local: &str, offset: usize) {
+    out.push_str(&format!("    local.get {}\n", value_local));
+    if offset > 0 {
+        out.push_str(&format!("    i32.const {}\n", offset));
+        out.push_str("    i32.add\n");
+    }
+    match inner_ty {
+        Type::S64 => {
+            out.push_str("    i64.load\n");
+            out.push_str("    local.set $enc_tmp_i64\n");
+        }
+        Type::F32 => {
+            out.push_str("    f32.load\n");
+            out.push_str("    local.set $enc_tmp_f32\n");
+        }
+        Type::F64 => {
+            out.push_str("    f64.load\n");
+            out.push_str("    local.set $enc_tmp_f64\n");
+        }
+        _ => {
+            // i32 or pointer
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $enc_tmp\n");
+        }
+    }
+}
+
+/// Get the local name for a value of a given type.
+fn enc_local_for_type(ty: &Type) -> &'static str {
+    match ty {
+        Type::S64 => "$enc_tmp_i64",
+        Type::F32 => "$enc_tmp_f32",
+        Type::F64 => "$enc_tmp_f64",
+        _ => "$enc_tmp",
+    }
+}
+
+/// Recursively encode a Wisp value as CGRF nodes.
+///
+/// Required locals in the wrapper function:
+///   $out_ptr, $buf_cursor, $node_idx, $enc_root_idx,
+///   $enc_header_start, $enc_tmp (i32), $enc_tmp_i64 (i64),
+///   $enc_tmp_f32 (f32), $enc_tmp_f64 (f64),
+///   $enc_save_child (i32), $enc_save_root (i32),
+///   $enc_tuple_header (i32), $enc_tuple_ci_pos (i32),
+///   $enc_list_header (i32), $enc_list_ci_pos (i32),
+///   $enc_list_i (i32), $enc_list_len (i32),
+///   $enc_list_data (i32), $enc_list_root_idx (i32)
+///
+/// After return:
+///   - $buf_cursor advanced past all written nodes
+///   - $node_idx incremented
+///   - $enc_root_idx = node index of the root of this subtree
+fn generate_cgrf_encode_recursive(
+    out: &mut String,
+    ty: &Type,
+    value_local: &str,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
+) {
+    match ty {
+        Type::S32 | Type::U8 | Type::S64 | Type::F32 | Type::F64 => {
+            let (kind, payload_size, store_instr) = match ty {
+                Type::S32 => (CGRF_S32, 4, "i32.store"),
+                Type::U8 => (CGRF_U8, 1, "i32.store8"),
+                Type::S64 => (CGRF_S64, 8, "i64.store"),
+                Type::F32 => (CGRF_F32, 4, "f32.store"),
+                Type::F64 => (CGRF_F64, 8, "f64.store"),
+                _ => unreachable!(),
+            };
+            out.push_str(&format!("    ;; encode {:?}\n", ty));
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    local.set $enc_root_idx\n");
+            generate_write_node_header(out, kind);
+            // Write payload
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str(&format!("    {}\n", store_instr));
+            // Patch payload_len
+            generate_patch_payload_len(out);
+            // Advance cursor
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str(&format!("    i32.const {}\n", payload_size));
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $buf_cursor\n");
+            // Increment node_idx
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    i32.const 1\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $node_idx\n");
+        }
+        Type::Str => {
+            out.push_str("    ;; encode string\n");
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    local.set $enc_root_idx\n");
+            generate_write_node_header(out, CGRF_STRING);
+            // Read string length
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $enc_tmp\n");
+            // Write length to payload
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $enc_tmp\n");
+            out.push_str("    i32.store\n");
+            // Copy string data
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n"); // dest
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n"); // src
+            out.push_str("    local.get $enc_tmp\n"); // len
+            out.push_str("    memory.copy\n");
+            // Advance cursor past payload
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    local.get $enc_tmp\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $buf_cursor\n");
+            // Patch payload_len
+            generate_patch_payload_len(out);
+            // Increment node_idx
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    i32.const 1\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $node_idx\n");
+        }
+        Type::Option(inner_ty) => {
+            // Option: [tag:i32 (0=none, 1=some), payload:T at +4]
+            // CGRF: if Some, encode child first, then option node (depth-first)
+            // Option payload: type_tag + presence:u8 + optional child_index:u32
+            out.push_str("    ;; encode option\n");
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.load\n"); // tag: 0=none, 1=some
+            out.push_str("    (if\n");
+            out.push_str("      (then\n");
+            out.push_str("        ;; Some: encode child first\n");
+            generate_load_inner_value(out, inner_ty, value_local, 4);
+            let child_local = enc_local_for_type(inner_ty);
+            generate_cgrf_encode_recursive(out, inner_ty, child_local, records, variants);
+            // Save child's node index
+            out.push_str("        local.get $enc_root_idx\n");
+            out.push_str("        local.set $enc_save_child\n");
+            // Now write the option node
+            out.push_str("        local.get $node_idx\n");
+            out.push_str("        local.set $enc_root_idx\n");
+            generate_write_node_header(out, CGRF_OPTION);
+            // Write type tag
+            generate_write_type_tag_at_cursor(out, inner_ty);
+            // Write presence = 1
+            out.push_str("        local.get $out_ptr\n");
+            out.push_str("        local.get $buf_cursor\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.store8\n");
+            out.push_str("        local.get $buf_cursor\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.set $buf_cursor\n");
+            // Write child index
+            out.push_str("        local.get $out_ptr\n");
+            out.push_str("        local.get $buf_cursor\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $enc_save_child\n");
+            out.push_str("        i32.store\n");
+            out.push_str("        local.get $buf_cursor\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.set $buf_cursor\n");
+            // Patch payload_len
+            generate_patch_payload_len(out);
+            // Increment node_idx
+            out.push_str("        local.get $node_idx\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.set $node_idx\n");
+            out.push_str("      )\n");
+            out.push_str("      (else\n");
+            out.push_str("        ;; None: write option node only\n");
+            out.push_str("        local.get $node_idx\n");
+            out.push_str("        local.set $enc_root_idx\n");
+            generate_write_node_header(out, CGRF_OPTION);
+            generate_write_type_tag_at_cursor(out, inner_ty);
+            // Write presence = 0
+            out.push_str("        local.get $out_ptr\n");
+            out.push_str("        local.get $buf_cursor\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.const 0\n");
+            out.push_str("        i32.store8\n");
+            out.push_str("        local.get $buf_cursor\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.set $buf_cursor\n");
+            // Patch payload_len
+            generate_patch_payload_len(out);
+            // Increment node_idx
+            out.push_str("        local.get $node_idx\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.set $node_idx\n");
+            out.push_str("      )\n");
+            out.push_str("    )\n");
+        }
+        Type::Result(ok_ty, err_ty) => {
+            // Result: [tag:i32 (0=ok, 1=err), payload:max(T,E) at +4]
+            // CGRF: encode payload child first, then result node
+            // Result payload: ok_type_tag + err_type_tag + tag:u32 + has_payload:u8 + child_index:u32
+            out.push_str("    ;; encode result\n");
+            // Encode payload child first
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.load\n"); // tag: 0=ok, 1=err
+            out.push_str("    (if\n");
+            out.push_str("      (then\n");
+            out.push_str("        ;; Err branch: encode err value\n");
+            generate_load_inner_value(out, err_ty, value_local, 4);
+            let err_local = enc_local_for_type(err_ty);
+            generate_cgrf_encode_recursive(out, err_ty, err_local, records, variants);
+            out.push_str("      )\n");
+            out.push_str("      (else\n");
+            out.push_str("        ;; Ok branch: encode ok value\n");
+            generate_load_inner_value(out, ok_ty, value_local, 4);
+            let ok_local = enc_local_for_type(ok_ty);
+            generate_cgrf_encode_recursive(out, ok_ty, ok_local, records, variants);
+            out.push_str("      )\n");
+            out.push_str("    )\n");
+            // Save child index
+            out.push_str("    local.get $enc_root_idx\n");
+            out.push_str("    local.set $enc_save_child\n");
+            // Write result node
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    local.set $enc_root_idx\n");
+            generate_write_node_header(out, CGRF_RESULT);
+            // Write ok_type tag
+            generate_write_type_tag_at_cursor(out, ok_ty);
+            // Write err_type tag
+            generate_write_type_tag_at_cursor(out, err_ty);
+            // Write tag (0=ok, 1=err)
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.load\n");
+            out.push_str("    i32.store\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $buf_cursor\n");
+            // Write has_payload = 1
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 1\n");
+            out.push_str("    i32.store8\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.const 1\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $buf_cursor\n");
+            // Write child index
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $enc_save_child\n");
+            out.push_str("    i32.store\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $buf_cursor\n");
+            // Patch payload_len
+            generate_patch_payload_len(out);
+            // Increment node_idx
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    i32.const 1\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $node_idx\n");
+        }
+        Type::Tuple(elem_types) => {
+            // Tuple in-memory: [field0, field1, ...] at value_local (contiguous heap)
+            // Strategy: write tuple node header first, reserve space for payload,
+            // then encode children. Each child's node index is written back into
+            // the child_indices array. Uses $enc_tuple_ci_pos and $enc_tuple_header
+            // which are NOT overwritten by recursive encode calls (List uses its own locals).
+            out.push_str("    ;; encode tuple\n");
+            let n = elem_types.len();
+
+            // Save this tuple's node index and preserve it across child encoding
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    local.set $enc_root_idx\n");
+            out.push_str("    local.get $enc_root_idx\n");
+            out.push_str("    local.set $enc_save_root\n");
+            // Increment node_idx for the tuple node itself
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    i32.const 1\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $node_idx\n");
+
+            // Write tuple node header (saves $enc_header_start)
+            generate_write_node_header(out, CGRF_TUPLE);
+            // Save header start for later payload_len patching
+            out.push_str("    local.get $enc_header_start\n");
+            out.push_str("    local.set $enc_tuple_header\n");
+
+            // Write child_count
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", n));
+            out.push_str("    i32.store\n");
+
+            // Save position of child_indices array
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $enc_tuple_ci_pos\n");
+
+            // Advance cursor past child_count + child_indices slots
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str(&format!("    i32.const {}\n", 4 + 4 * n));
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $buf_cursor\n");
+
+            // Encode each child element
+            let mut field_offset = 0;
+            for (i, elem_ty) in elem_types.iter().enumerate() {
+                out.push_str(&format!("    ;; encode tuple element {}\n", i));
+                generate_load_inner_value(out, elem_ty, value_local, field_offset);
+                let child_local = enc_local_for_type(elem_ty);
+                generate_cgrf_encode_recursive(out, elem_ty, child_local, records, variants);
+                // Write child's node index to child_indices[i]
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    local.get $enc_tuple_ci_pos\n");
+                out.push_str("    i32.add\n");
+                if i > 0 {
+                    out.push_str(&format!("    i32.const {}\n", i * 4));
+                    out.push_str("    i32.add\n");
+                }
+                out.push_str("    local.get $enc_root_idx\n");
+                out.push_str("    i32.store\n");
+                field_offset += type_size(elem_ty);
+            }
+
+            // Patch tuple node's payload_len
+            // payload_len = $buf_cursor - $enc_tuple_header - 8
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $enc_tuple_header\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    local.get $enc_tuple_header\n");
+            out.push_str("    i32.sub\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.sub\n");
+            out.push_str("    i32.store\n");
+
+            // Restore $enc_root_idx to the tuple's node index (saved before child encoding)
+            out.push_str("    local.get $enc_save_root\n");
+            out.push_str("    local.set $enc_root_idx\n");
+        }
+        Type::List(elem_ty) => {
+            // List in-memory: [len:i32, cap:i32, data_ptr:i32] at value_local
+            // Strategy: write list node header first, reserve space for type_tag +
+            // count + child_indices, then loop encoding each element.
+            // Uses $enc_list_* locals which are NOT overwritten by Tuple encoding.
+            out.push_str("    ;; encode list\n");
+
+            let elem_size = type_size(elem_ty);
+
+            // Read list length
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $enc_list_len\n");
+
+            // Read data pointer (at value_local + 8)
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $enc_list_data\n");
+
+            // Save this list's node index
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    local.set $enc_root_idx\n");
+            out.push_str("    local.get $enc_root_idx\n");
+            out.push_str("    local.set $enc_list_root_idx\n");
+
+            // Increment node_idx for the list node itself
+            out.push_str("    local.get $node_idx\n");
+            out.push_str("    i32.const 1\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $node_idx\n");
+
+            // Write list node header
+            generate_write_node_header(out, CGRF_LIST);
+            out.push_str("    local.get $enc_header_start\n");
+            out.push_str("    local.set $enc_list_header\n");
+
+            // Write type tag
+            generate_write_type_tag_at_cursor(out, elem_ty);
+
+            // Write count
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $enc_list_len\n");
+            out.push_str("    i32.store\n");
+
+            // Save position of child_indices array
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $enc_list_ci_pos\n");
+
+            // Advance cursor past count + child_indices slots (4 + 4 * len)
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $enc_list_len\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.mul\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.set $buf_cursor\n");
+
+            // Initialize loop counter
+            out.push_str("    i32.const 0\n");
+            out.push_str("    local.set $enc_list_i\n");
+
+            // Loop: encode each element
+            out.push_str("    block $list_break\n");
+            out.push_str("      loop $list_loop\n");
+            out.push_str("        local.get $enc_list_i\n");
+            out.push_str("        local.get $enc_list_len\n");
+            out.push_str("        i32.ge_u\n");
+            out.push_str("        br_if $list_break\n");
+
+            // Load element value from data array
+            out.push_str("        local.get $enc_list_data\n");
+            out.push_str("        local.get $enc_list_i\n");
+            if elem_size > 1 {
+                out.push_str(&format!("        i32.const {}\n", elem_size));
+                out.push_str("        i32.mul\n");
+            }
+            out.push_str("        i32.add\n");
+            // Load based on element type
+            match elem_ty.as_ref() {
+                Type::S64 => {
+                    out.push_str("        i64.load\n");
+                    out.push_str("        local.set $enc_tmp_i64\n");
+                }
+                Type::F32 => {
+                    out.push_str("        f32.load\n");
+                    out.push_str("        local.set $enc_tmp_f32\n");
+                }
+                Type::F64 => {
+                    out.push_str("        f64.load\n");
+                    out.push_str("        local.set $enc_tmp_f64\n");
+                }
+                _ => {
+                    // i32, u8, pointers — all stored as i32 in Wisp memory
+                    out.push_str("        i32.load\n");
+                    out.push_str("        local.set $enc_tmp\n");
+                }
+            }
+
+            let child_local = enc_local_for_type(elem_ty);
+            generate_cgrf_encode_recursive(out, elem_ty, child_local, records, variants);
+
+            // Write child's node index to child_indices[$enc_list_i]
+            out.push_str("        local.get $out_ptr\n");
+            out.push_str("        local.get $enc_list_ci_pos\n");
+            out.push_str("        local.get $enc_list_i\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $enc_root_idx\n");
+            out.push_str("        i32.store\n");
+
+            // Increment loop counter
+            out.push_str("        local.get $enc_list_i\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.set $enc_list_i\n");
+            out.push_str("        br $list_loop\n");
+            out.push_str("      end\n");
+            out.push_str("    end\n");
+
+            // Patch list node's payload_len using $enc_list_header
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $enc_list_header\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $buf_cursor\n");
+            out.push_str("    local.get $enc_list_header\n");
+            out.push_str("    i32.sub\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.sub\n");
+            out.push_str("    i32.store\n");
+
+            // Restore $enc_root_idx to the list's node index
+            out.push_str("    local.get $enc_list_root_idx\n");
+            out.push_str("    local.set $enc_root_idx\n");
+        }
+        _ => {
+            out.push_str(&format!("    ;; TODO: recursive encode for {:?}\n", ty));
+        }
+    }
+}
+
+// =============================================================================
+// Recursive CGRF decoding
+// =============================================================================
+
+/// Generate WAT to scan from offset 16 to find node at index $dec_child_idx.
+/// After execution, $dec_node_offset holds the byte offset of the target node.
+///
+/// Required locals: $dec_child_idx, $dec_node_offset, $dec_scan_offset,
+///   $dec_scan_i, $dec_payload_len
+fn generate_dec_find_node_by_index(out: &mut String) {
+    out.push_str("    ;; Find node at index $dec_child_idx\n");
+    out.push_str("    i32.const 16\n");
+    out.push_str("    local.set $dec_scan_offset\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    local.set $dec_scan_i\n");
+    out.push_str("    (block $dec_found\n");
+    out.push_str("      (loop $dec_scan\n");
+    out.push_str("        local.get $dec_scan_i\n");
+    out.push_str("        local.get $dec_child_idx\n");
+    out.push_str("        i32.ge_u\n");
+    out.push_str("        br_if $dec_found\n");
+    // Read payload_len at scan_offset + 4
+    out.push_str("        local.get $in_ptr\n");
+    out.push_str("        local.get $dec_scan_offset\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.const 4\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        i32.load\n");
+    out.push_str("        local.set $dec_payload_len\n");
+    // Advance: scan_offset += 8 + payload_len
+    out.push_str("        local.get $dec_scan_offset\n");
+    out.push_str("        i32.const 8\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.get $dec_payload_len\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $dec_scan_offset\n");
+    // scan_i++
+    out.push_str("        local.get $dec_scan_i\n");
+    out.push_str("        i32.const 1\n");
+    out.push_str("        i32.add\n");
+    out.push_str("        local.set $dec_scan_i\n");
+    out.push_str("        br $dec_scan\n");
+    out.push_str("      )\n");
+    out.push_str("    )\n");
+    out.push_str("    local.get $dec_scan_offset\n");
+    out.push_str("    local.set $dec_node_offset\n");
+}
+
+/// Recursively decode a CGRF node into a Wisp in-memory value.
+///
+/// Required locals in the wrapper function:
+///   $in_ptr, $dec_node_offset, $dec_result (i32),
+///   $dec_child_idx, $dec_scan_offset, $dec_scan_i, $dec_payload_len,
+///   $dec_tmp, $dec_opt_ptr, $dec_opt_node_offset,
+///   $dec_list_ptr, $dec_list_data, $dec_list_len, $dec_list_i,
+///   $dec_list_node_offset
+///
+/// Input: $dec_node_offset = byte offset of the node in the CGRF buffer
+/// Output: $dec_result = decoded value (i32 pointer or scalar)
+fn generate_cgrf_decode_recursive(
+    out: &mut String,
+    ty: &Type,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
+) {
+    match ty {
+        Type::S32 => {
+            out.push_str("    ;; decode s32\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::U8 => {
+            out.push_str("    ;; decode u8\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load8_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::S64 => {
+            // For S64 params, store the i64 value in a temp location on the heap
+            // and return a pointer. This is a simplification; full support would
+            // need a separate $dec_result_i64 local.
+            out.push_str("    ;; decode s64 (store on heap as i64)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i64.load\n");
+            // For now just truncate to i32 — proper i64 support needs separate local
+            out.push_str("    i32.wrap_i64\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::F32 => {
+            out.push_str("    ;; decode f32\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    f32.load\n");
+            out.push_str("    i32.reinterpret_f32\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::F64 => {
+            out.push_str("    ;; decode f64\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    f64.load\n");
+            // Truncate for i32 result — proper f64 support needs separate local
+            out.push_str("    i64.reinterpret_f64\n");
+            out.push_str("    i32.wrap_i64\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::Str => {
+            out.push_str("    ;; decode string\n");
+            // Read string length from payload (at node + 8)
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $dec_tmp\n"); // string length
+
+            // Allocate wisp string: 4 + length
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    local.set $dec_result\n");
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $dec_tmp\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    global.set $__heap_ptr\n");
+
+            // Store length
+            out.push_str("    local.get $dec_result\n");
+            out.push_str("    local.get $dec_tmp\n");
+            out.push_str("    i32.store\n");
+
+            // Copy string data: src = in_ptr + node + 12, dest = result + 4
+            out.push_str("    local.get $dec_result\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n"); // dest
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 12\n");
+            out.push_str("    i32.add\n"); // src: node + 8 (header) + 4 (len prefix)
+            out.push_str("    local.get $dec_tmp\n"); // len
+            out.push_str("    memory.copy\n");
+        }
+        Type::Option(inner_ty) => {
+            let tag_size = type_tag_size(inner_ty);
+            let presence_offset = 8 + tag_size;
+            let child_idx_offset = presence_offset + 1;
+
+            // Allocate option struct: [tag:i32, payload:T]
+            let inner_size = type_size(inner_ty);
+            let opt_size = 4 + inner_size;
+            out.push_str("    ;; decode option\n");
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    local.set $dec_opt_ptr\n");
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str(&format!("    i32.const {}\n", opt_size));
+            out.push_str("    i32.add\n");
+            out.push_str("    global.set $__heap_ptr\n");
+
+            // Save option node offset for reading child_index
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    local.set $dec_opt_node_offset\n");
+
+            // Read presence byte
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", presence_offset));
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load8_u\n");
+
+            out.push_str("    (if\n");
+            out.push_str("      (then\n");
+            // Some: tag = 1
+            out.push_str("        local.get $dec_opt_ptr\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.store\n");
+
+            // Read child_index
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        local.get $dec_opt_node_offset\n");
+            out.push_str("        i32.add\n");
+            out.push_str(&format!("        i32.const {}\n", child_idx_offset));
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.load\n");
+            out.push_str("        local.set $dec_child_idx\n");
+
+            // Find child node → $dec_node_offset
+            generate_dec_find_node_by_index(out);
+
+            // Recursively decode child
+            generate_cgrf_decode_recursive(out, inner_ty, records, variants);
+
+            // Store decoded value at $dec_opt_ptr + 4
+            out.push_str("        local.get $dec_opt_ptr\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $dec_result\n");
+            out.push_str("        i32.store\n");
+
+            out.push_str("      )\n");
+            out.push_str("      (else\n");
+            // None: tag = 0
+            out.push_str("        local.get $dec_opt_ptr\n");
+            out.push_str("        i32.const 0\n");
+            out.push_str("        i32.store\n");
+            out.push_str("      )\n");
+            out.push_str("    )\n");
+
+            // Result = option pointer
+            out.push_str("    local.get $dec_opt_ptr\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::List(elem_ty) => {
+            let tag_size = type_tag_size(elem_ty);
+            let count_offset = 8 + tag_size;
+            let child_indices_offset = count_offset + 4;
+            let elem_size = type_size(elem_ty);
+
+            out.push_str("    ;; decode list\n");
+
+            // Save list node offset
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    local.set $dec_list_node_offset\n");
+
+            // Read count
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", count_offset));
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $dec_list_len\n");
+
+            // Allocate list struct (12 bytes: len, cap, data_ptr)
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    local.set $dec_list_ptr\n");
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    i32.const 12\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    global.set $__heap_ptr\n");
+
+            // Set len
+            out.push_str("    local.get $dec_list_ptr\n");
+            out.push_str("    local.get $dec_list_len\n");
+            out.push_str("    i32.store\n");
+
+            // Set cap = len
+            out.push_str("    local.get $dec_list_ptr\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $dec_list_len\n");
+            out.push_str("    i32.store\n");
+
+            // Allocate data array: elem_size * len
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    local.set $dec_list_data\n");
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str(&format!("    i32.const {}\n", elem_size));
+            out.push_str("    local.get $dec_list_len\n");
+            out.push_str("    i32.mul\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    global.set $__heap_ptr\n");
+
+            // Set data_ptr
+            out.push_str("    local.get $dec_list_ptr\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $dec_list_data\n");
+            out.push_str("    i32.store\n");
+
+            // Loop: decode each element
+            out.push_str("    i32.const 0\n");
+            out.push_str("    local.set $dec_list_i\n");
+
+            out.push_str("    block $dec_list_break\n");
+            out.push_str("      loop $dec_list_loop\n");
+            out.push_str("        local.get $dec_list_i\n");
+            out.push_str("        local.get $dec_list_len\n");
+            out.push_str("        i32.ge_u\n");
+            out.push_str("        br_if $dec_list_break\n");
+
+            // Read child_index for element i
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        local.get $dec_list_node_offset\n");
+            out.push_str("        i32.add\n");
+            out.push_str(&format!(
+                "        i32.const {}\n",
+                child_indices_offset
+            ));
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $dec_list_i\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.mul\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.load\n");
+            out.push_str("        local.set $dec_child_idx\n");
+
+            // Find child node
+            generate_dec_find_node_by_index(out);
+
+            // Decode child
+            generate_cgrf_decode_recursive(out, elem_ty, records, variants);
+
+            // Store decoded value in data array
+            out.push_str("        local.get $dec_list_data\n");
+            out.push_str("        local.get $dec_list_i\n");
+            if elem_size > 1 {
+                out.push_str(&format!("        i32.const {}\n", elem_size));
+                out.push_str("        i32.mul\n");
+            }
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $dec_result\n");
+            out.push_str("        i32.store\n");
+
+            // Increment
+            out.push_str("        local.get $dec_list_i\n");
+            out.push_str("        i32.const 1\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.set $dec_list_i\n");
+            out.push_str("        br $dec_list_loop\n");
+            out.push_str("      end\n");
+            out.push_str("    end\n");
+
+            // Result = list pointer
+            out.push_str("    local.get $dec_list_ptr\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::Tuple(elem_types) => {
+            let child_indices_offset = 12; // 8 (node header) + 4 (child_count)
+
+            out.push_str("    ;; decode tuple\n");
+
+            // Save tuple node offset (survives child decoding since $dec_tmp
+            // is only used by scalar decode and string length — neither of which
+            // would be a tuple's child in a way that clobbers during our field loop)
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    local.set $dec_opt_node_offset\n"); // reuse for tuple node offset
+
+            // Allocate tuple: sum of type_size for each field
+            let tuple_size: usize = elem_types.iter().map(|t| type_size(t)).sum();
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    local.set $dec_opt_ptr\n"); // reuse for tuple ptr (survives child decode)
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str(&format!("    i32.const {}\n", tuple_size));
+            out.push_str("    i32.add\n");
+            out.push_str("    global.set $__heap_ptr\n");
+
+            // Decode each field
+            let mut field_offset = 0;
+            for (i, elem_ty) in elem_types.iter().enumerate() {
+                out.push_str(&format!("    ;; decode tuple field {}\n", i));
+
+                // Read child_index for field i from tuple node
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $dec_opt_node_offset\n"); // tuple node offset
+                out.push_str("    i32.add\n");
+                out.push_str(&format!(
+                    "    i32.const {}\n",
+                    child_indices_offset + i * 4
+                ));
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $dec_child_idx\n");
+
+                // Find child node
+                generate_dec_find_node_by_index(out);
+
+                // Decode child
+                generate_cgrf_decode_recursive(out, elem_ty, records, variants);
+
+                // Store decoded value at tuple_ptr + field_offset
+                out.push_str("    local.get $dec_opt_ptr\n"); // tuple ptr (saved above)
+                if field_offset > 0 {
+                    out.push_str(&format!("    i32.const {}\n", field_offset));
+                    out.push_str("    i32.add\n");
+                }
+                out.push_str("    local.get $dec_result\n"); // child's decoded value
+                out.push_str("    i32.store\n");
+
+                field_offset += type_size(elem_ty);
+            }
+
+            // Result = tuple pointer
+            out.push_str("    local.get $dec_opt_ptr\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::Result(ok_ty, err_ty) => {
+            let ok_tag_size = type_tag_size(ok_ty);
+            let err_tag_size = type_tag_size(err_ty);
+            let tag_offset = 8 + ok_tag_size + err_tag_size; // after header + ok_type + err_type
+            let has_payload_offset = tag_offset + 4;
+            let child_idx_offset = has_payload_offset + 1;
+
+            // Allocate result struct: [tag:i32, payload:max(T,E)]
+            let ok_size = type_size(ok_ty);
+            let err_size = type_size(err_ty);
+            let payload_size = std::cmp::max(ok_size, err_size);
+            let result_size = 4 + payload_size;
+
+            out.push_str("    ;; decode result\n");
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str("    local.set $dec_result\n");
+            out.push_str("    global.get $__heap_ptr\n");
+            out.push_str(&format!("    i32.const {}\n", result_size));
+            out.push_str("    i32.add\n");
+            out.push_str("    global.set $__heap_ptr\n");
+
+            // Save result pointer (will be overwritten by child decode)
+            out.push_str("    local.get $dec_result\n");
+            out.push_str("    local.set $dec_opt_ptr\n"); // reuse for result ptr save
+
+            // Save node offset
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    local.set $dec_opt_node_offset\n"); // reuse for result node offset save
+
+            // Read tag (0=ok, 1=err)
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", tag_offset));
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $dec_tmp\n"); // tag
+
+            // Store tag in result struct
+            out.push_str("    local.get $dec_opt_ptr\n");
+            out.push_str("    local.get $dec_tmp\n");
+            out.push_str("    i32.store\n");
+
+            // Read has_payload
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_opt_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    i32.const {}\n", has_payload_offset));
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load8_u\n");
+
+            out.push_str("    (if\n");
+            out.push_str("      (then\n");
+
+            // Read child_index
+            out.push_str("        local.get $in_ptr\n");
+            out.push_str("        local.get $dec_opt_node_offset\n");
+            out.push_str("        i32.add\n");
+            out.push_str(&format!("        i32.const {}\n", child_idx_offset));
+            out.push_str("        i32.add\n");
+            out.push_str("        i32.load\n");
+            out.push_str("        local.set $dec_child_idx\n");
+
+            // Find child node
+            generate_dec_find_node_by_index(out);
+
+            // Decode based on tag: if tag == 0, it's ok (decode ok_ty), else err (decode err_ty)
+            out.push_str("        local.get $dec_tmp\n"); // tag
+            out.push_str("        (if\n");
+            out.push_str("          (then\n");
+            out.push_str("            ;; err payload\n");
+            generate_cgrf_decode_recursive(out, err_ty, records, variants);
+            out.push_str("          )\n");
+            out.push_str("          (else\n");
+            out.push_str("            ;; ok payload\n");
+            generate_cgrf_decode_recursive(out, ok_ty, records, variants);
+            out.push_str("          )\n");
+            out.push_str("        )\n");
+
+            // Store payload at result_ptr + 4
+            out.push_str("        local.get $dec_opt_ptr\n");
+            out.push_str("        i32.const 4\n");
+            out.push_str("        i32.add\n");
+            out.push_str("        local.get $dec_result\n");
+            out.push_str("        i32.store\n");
+
+            out.push_str("      )\n");
+            out.push_str("    )\n");
+
+            // Result = result struct pointer
+            out.push_str("    local.get $dec_opt_ptr\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        _ => {
+            out.push_str(&format!(
+                "    ;; TODO: recursive decode for {:?}\n",
+                ty
+            ));
+            out.push_str("    i32.const 0\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+    }
 }
 
 /// Generate WAT code to encode an i32 value on the stack to CGRF at $out_ptr.
