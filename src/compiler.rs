@@ -7774,6 +7774,10 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
         HEAP_START_OFFSET
     ));
 
+    // Encoder stack pointer for nested Tuple/List encoding (0xB000-0xBFFF = 4KB)
+    // Each frame saves 12 bytes: (enc_tuple_header, enc_tuple_ci_pos, enc_save_root)
+    out.push_str("  (global $enc_tuple_sp (mut i32) (i32.const 0xB000))\n");
+
     // Emit user-defined globals
     for global in &prog.globals {
         let mutability = if global.mutable { "mut" } else { "" };
@@ -8023,18 +8027,30 @@ fn generate_pack_wrapper(
         && func.params.iter().any(|p| {
             matches!(
                 p.ty,
-                Type::Record(_) | Type::Option(_) | Type::Variant(_) | Type::Result(_, _)
+                Type::Record(_)
+                    | Type::Option(_)
+                    | Type::Variant(_)
+                    | Type::Result(_, _)
+                    | Type::Tuple(_)
+                    | Type::List(_)
             )
         });
     if needs_tree_traversal {
         out.push_str("    (local $tuple_offset i32)\n");
-        out.push_str("    (local $child_idx i32)\n");
-        out.push_str("    (local $child_offset i32)\n");
-        out.push_str("    (local $scan_i i32)\n");
-        out.push_str("    (local $payload_len i32)\n");
-        // Additional locals for v2 record decoding (reading type_name_len, field_name_len, etc.)
-        out.push_str("    (local $str_len i32)\n");
-        out.push_str("    (local $data_len i32)\n");
+        // Only declare tree traversal locals not already declared by needs_compound_decode
+        if !needs_compound_decode {
+            out.push_str("    (local $child_idx i32)\n");
+            out.push_str("    (local $child_offset i32)\n");
+            out.push_str("    (local $scan_i i32)\n");
+            out.push_str("    (local $payload_len i32)\n");
+        }
+        // Only declare if not already declared above
+        if !needs_string_decode {
+            out.push_str("    (local $str_len i32)\n");
+        }
+        if !needs_runtime_offset {
+            out.push_str("    (local $data_len i32)\n");
+        }
     }
 
     // Locals for recursive CGRF encoding of return value
@@ -9038,8 +9054,11 @@ fn generate_cgrf_encode_recursive(
             // Tuple in-memory: [field0, field1, ...] at value_local (contiguous heap)
             // Strategy: write tuple node header first, reserve space for payload,
             // then encode children. Each child's node index is written back into
-            // the child_indices array. Uses $enc_tuple_ci_pos and $enc_tuple_header
-            // which are NOT overwritten by recursive encode calls (List uses its own locals).
+            // the child_indices array.
+            //
+            // Uses a memory-based stack ($enc_tuple_sp) to save/restore
+            // $enc_tuple_header, $enc_tuple_ci_pos, and $enc_save_root so that
+            // nested Tuple encoding works correctly at arbitrary depth.
             out.push_str("    ;; encode tuple\n");
             let n = elem_types.len();
 
@@ -9079,6 +9098,27 @@ fn generate_cgrf_encode_recursive(
             out.push_str("    i32.add\n");
             out.push_str("    local.set $buf_cursor\n");
 
+            // Push tuple encoder state onto memory stack (12 bytes per frame)
+            // [enc_tuple_header, enc_tuple_ci_pos, enc_save_root]
+            out.push_str("    ;; push tuple encoder state\n");
+            out.push_str("    global.get $enc_tuple_sp\n");
+            out.push_str("    local.get $enc_tuple_header\n");
+            out.push_str("    i32.store\n");
+            out.push_str("    global.get $enc_tuple_sp\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $enc_tuple_ci_pos\n");
+            out.push_str("    i32.store\n");
+            out.push_str("    global.get $enc_tuple_sp\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $enc_save_root\n");
+            out.push_str("    i32.store\n");
+            out.push_str("    global.get $enc_tuple_sp\n");
+            out.push_str("    i32.const 12\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    global.set $enc_tuple_sp\n");
+
             // Encode each child element
             let mut field_offset = 0;
             for (i, elem_ty) in elem_types.iter().enumerate() {
@@ -9086,6 +9126,25 @@ fn generate_cgrf_encode_recursive(
                 generate_load_inner_value(out, elem_ty, value_local, field_offset);
                 let child_local = enc_local_for_type(elem_ty);
                 generate_cgrf_encode_recursive(out, elem_ty, child_local, records, variants);
+
+                // Restore tuple encoder state from stack (peek, not pop)
+                out.push_str("    ;; restore tuple encoder state\n");
+                out.push_str("    global.get $enc_tuple_sp\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.sub\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $enc_tuple_header\n");
+                out.push_str("    global.get $enc_tuple_sp\n");
+                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.sub\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $enc_tuple_ci_pos\n");
+                out.push_str("    global.get $enc_tuple_sp\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.sub\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $enc_save_root\n");
+
                 // Write child's node index to child_indices[i]
                 out.push_str("    local.get $out_ptr\n");
                 out.push_str("    local.get $enc_tuple_ci_pos\n");
@@ -9098,6 +9157,13 @@ fn generate_cgrf_encode_recursive(
                 out.push_str("    i32.store\n");
                 field_offset += type_size(elem_ty);
             }
+
+            // Pop tuple encoder state from stack
+            out.push_str("    ;; pop tuple encoder state\n");
+            out.push_str("    global.get $enc_tuple_sp\n");
+            out.push_str("    i32.const 12\n");
+            out.push_str("    i32.sub\n");
+            out.push_str("    global.set $enc_tuple_sp\n");
 
             // Patch tuple node's payload_len (only the tuple's own data, not children)
             // payload = child_count(4) + N * child_index(4)
@@ -12964,7 +13030,12 @@ fn generate_cgrf_decode_tuple_param(
                 out.push_str("    f64.load\n");
                 out.push_str(&format!("    local.set $param_{}\n", param_name));
             }
-            Type::Record(_) | Type::Option(_) | Type::Variant(_) | Type::Result(_, _) => {
+            Type::Record(_)
+            | Type::Option(_)
+            | Type::Variant(_)
+            | Type::Result(_, _)
+            | Type::Tuple(_)
+            | Type::List(_) => {
                 // Complex types need tree traversal
                 out.push_str(&format!(
                     "    ;; Decode tuple element {} ({}) via tree traversal\n",
@@ -13013,6 +13084,17 @@ fn generate_cgrf_decode_tuple_param(
                     }
                     Type::Result(ok_ty, err_ty) => {
                         generate_decode_result_at_offset(out, ok_ty, err_ty, param_name);
+                    }
+                    Type::Tuple(_) | Type::List(_) => {
+                        // Bridge to recursive decoder: $child_offset -> $dec_node_offset
+                        out.push_str("    local.get $child_offset\n");
+                        out.push_str("    local.set $dec_node_offset\n");
+                        generate_cgrf_decode_recursive(out, param_ty, records, variants);
+                        out.push_str("    local.get $dec_result\n");
+                        out.push_str(&format!(
+                            "    local.set $param_{}\n",
+                            param_name
+                        ));
                     }
                     _ => unreachable!(),
                 }

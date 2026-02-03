@@ -1,0 +1,9 @@
+name = "messaging-actor"
+version = "0.1.0"
+package = "/home/colin/work/wisp/examples/actors/messaging-actor.wasm"
+
+[[handler]]
+type = "message-server"
+
+[[handler]]
+type = "runtime"

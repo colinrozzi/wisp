@@ -57,6 +57,14 @@ async fn main() -> Result<()> {
         return run_repl().await;
     }
 
+    if args.len() >= 2 && args[1] == "--test-messaging" {
+        let wasm_path = args
+            .get(2)
+            .map(|s| s.as_str())
+            .unwrap_or("examples/actors/messaging-actor.wasm");
+        return run_test_messaging(wasm_path).await;
+    }
+
     let wasm_path = args
         .get(1)
         .map(|s| s.as_str())
@@ -347,6 +355,285 @@ fn create_actor_store() -> ActorStore {
     let actor_handle = ActorHandle::new(operation_tx, info_tx, control_tx);
 
     ActorStore::new(actor_id, theater_tx, actor_handle, chain)
+}
+
+/// Build an Option<List<U8>> value from an Option<Vec<u8>>.
+fn state_to_value(state: &Option<Vec<u8>>) -> Value {
+    Value::Option {
+        inner_type: ValueType::List(Box::new(ValueType::U8)),
+        value: state
+            .as_ref()
+            .map(|bytes| Box::new(Value::List {
+                elem_type: ValueType::U8,
+                items: bytes.iter().copied().map(Value::U8).collect(),
+            })),
+    }
+}
+
+/// Build a List<U8> value from a byte slice.
+fn bytes_to_value(bytes: &[u8]) -> Value {
+    Value::List {
+        elem_type: ValueType::U8,
+        items: bytes.iter().copied().map(Value::U8).collect(),
+    }
+}
+
+/// Decode a Result variant returned by actor functions.
+///
+/// Actor functions return: result<tuple<...>, string>
+/// The Ok payload is a tuple whose first element is the new state (option<list<u8>>)
+/// and remaining elements are function-specific return values.
+///
+/// Returns (new_state, extra_values) on Ok, or the error string on Err.
+fn decode_actor_result(value: &Value) -> Result<(Option<Vec<u8>>, Vec<Value>)> {
+    match value {
+        Value::Result { value: Ok(inner), .. } => {
+            // inner is a Tuple
+            match inner.as_ref() {
+                Value::Tuple(fields) => {
+                    // First field is the new state: Option<List<U8>>
+                    let new_state = match fields.first() {
+                        Some(Value::Option { value: Some(list_val), .. }) => {
+                            match list_val.as_ref() {
+                                Value::List { items, .. } => {
+                                    let bytes: Vec<u8> = items.iter().map(|v| match v {
+                                        Value::U8(b) => *b,
+                                        _ => 0,
+                                    }).collect();
+                                    Some(bytes)
+                                }
+                                _ => None,
+                            }
+                        }
+                        Some(Value::Option { value: None, .. }) => None,
+                        _ => None,
+                    };
+                    let extras = fields[1..].to_vec();
+                    Ok((new_state, extras))
+                }
+                other => anyhow::bail!("Expected tuple in Ok result, got: {:?}", other),
+            }
+        }
+        Value::Result { value: Err(inner), .. } => {
+            anyhow::bail!("Actor returned error: {:?}", inner)
+        }
+        other => anyhow::bail!("Expected Result value, got: {:?}", other),
+    }
+}
+
+/// Format an optional state for display.
+fn format_state(state: &Option<Vec<u8>>) -> String {
+    match state {
+        None => "None".to_string(),
+        Some(bytes) => format!("Some({} bytes)", bytes.len()),
+    }
+}
+
+/// Test harness for messaging actors.
+///
+/// Loads a messaging actor WASM and calls init, handle-send, and handle-request
+/// in sequence, threading state between calls and recording events to the chain.
+async fn run_test_messaging(wasm_path: &str) -> Result<()> {
+    use theater::events::{ChainEventData, ChainEventPayload};
+    use theater::events::wasm::WasmEventData;
+
+    println!("=== Messaging Actor Test ===");
+    println!();
+
+    let wasm_bytes = std::fs::read(wasm_path)
+        .with_context(|| format!("Failed to read {}", wasm_path))?;
+    info!("Loaded {} bytes from {}", wasm_bytes.len(), wasm_path);
+
+    let runtime = AsyncRuntime::new();
+    let actor_store = create_actor_store();
+
+    let mut instance = PackInstance::new(
+        "messaging-actor-test",
+        &wasm_bytes,
+        &runtime,
+        actor_store,
+        |builder| {
+            builder.interface("theater:simple/runtime")?.func_typed(
+                "log",
+                |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+                    let msg = match input {
+                        Value::String(s) => s,
+                        _ => format!("{:?}", input),
+                    };
+                    info!("[ACTOR LOG] {}", msg);
+                    Value::Tuple(vec![])
+                },
+            )?;
+            Ok(())
+        },
+    )
+    .await?;
+
+    // --- 1/3: Call init ---
+    println!("[1/3] Calling init...");
+    let init_func = "theater:simple/actor.init";
+
+    // Record WasmCall event
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+            function_name: init_func.to_string(),
+            params: vec![],
+        }),
+    })?;
+
+    let init_state: Option<Vec<u8>> = None;
+    let init_input = Value::Tuple(vec![state_to_value(&init_state), Value::Tuple(vec![])]);
+    let init_result = instance.call_value(init_func, &init_input).await?;
+
+    let (state, _) = decode_actor_result(&init_result)?;
+
+    // Record WasmResult event
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+            function_name: init_func.to_string(),
+            result: (None, vec![]),
+        }),
+    })?;
+
+    println!("  init returned Ok, state: {}", format_state(&state));
+    println!();
+
+    // --- 2/3: Call handle-send ---
+    let send_msg = b"Hello from test!";
+    println!("[2/3] Calling handle-send with \"Hello from test!\"...");
+    let send_func = "theater:simple/message-server-client.handle-send";
+
+    // Record WasmCall event
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+            function_name: send_func.to_string(),
+            params: vec![],
+        }),
+    })?;
+
+    // handle-send params: (state, tuple(list<u8>))
+    let send_input = Value::Tuple(vec![
+        state_to_value(&state),
+        Value::Tuple(vec![bytes_to_value(send_msg)]),
+    ]);
+    let send_result = instance.call_value(send_func, &send_input).await?;
+
+    let (state, _) = decode_actor_result(&send_result)?;
+
+    // Record WasmResult event
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+            function_name: send_func.to_string(),
+            result: (None, vec![]),
+        }),
+    })?;
+
+    println!("  handle-send returned Ok, state: {}", format_state(&state));
+    println!();
+
+    // --- 3/3: Call handle-request ---
+    let request_id = "test-request-1";
+    let request_body = b"Ping";
+    println!("[3/3] Calling handle-request with \"Ping\"...");
+    let request_func = "theater:simple/message-server-client.handle-request";
+
+    // Record WasmCall event
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+            function_name: request_func.to_string(),
+            params: vec![],
+        }),
+    })?;
+
+    // handle-request params: (state, tuple(string, list<u8>))
+    let request_input = Value::Tuple(vec![
+        state_to_value(&state),
+        Value::Tuple(vec![
+            Value::String(request_id.to_string()),
+            bytes_to_value(request_body),
+        ]),
+    ]);
+    let request_result = instance.call_value(request_func, &request_input).await?;
+
+    let (state, extras) = decode_actor_result(&request_result)?;
+
+    // Extract the response from extras: tuple(option<list<u8>>)
+    let response_desc = if let Some(Value::Tuple(response_fields)) = extras.first() {
+        match response_fields.first() {
+            Some(Value::Option { value: Some(list_val), .. }) => {
+                match list_val.as_ref() {
+                    Value::List { items, .. } => format!("Some({} bytes)", items.len()),
+                    _ => "Some(?)".to_string(),
+                }
+            }
+            Some(Value::Option { value: None, .. }) => "None".to_string(),
+            _ => format!("{:?}", response_fields),
+        }
+    } else {
+        "N/A".to_string()
+    };
+
+    // Record WasmResult event
+    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
+        event_type: "wasm".to_string(),
+        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+            function_name: request_func.to_string(),
+            result: (None, vec![]),
+        }),
+    })?;
+
+    println!(
+        "  handle-request returned Ok, state: {}, response: {}",
+        format_state(&state),
+        response_desc
+    );
+    println!();
+
+    // --- Print event chain ---
+    let chain = instance.actor_store.chain.read().unwrap();
+    let events = chain.get_events();
+    println!("=== Event Chain ({} events) ===", events.len());
+    for event in events {
+        let hash_prefix = hex::encode(&event.hash[..std::cmp::min(4, event.hash.len())]);
+        // Try to deserialize the event data for a readable summary
+        let summary = if let Ok(payload) = serde_json::from_slice::<ChainEventPayload>(&event.data)
+        {
+            match payload {
+                ChainEventPayload::Wasm(WasmEventData::WasmCall { function_name, .. }) => {
+                    format!("WasmCall {{ function: \"{}\" }}", function_name)
+                }
+                ChainEventPayload::Wasm(WasmEventData::WasmResult {
+                    function_name, ..
+                }) => {
+                    format!("WasmResult {{ function: \"{}\" }}", function_name)
+                }
+                ChainEventPayload::Wasm(WasmEventData::WasmError {
+                    function_name,
+                    message,
+                }) => {
+                    format!(
+                        "WasmError {{ function: \"{}\", message: \"{}\" }}",
+                        function_name, message
+                    )
+                }
+                other => format!("{:?}", other),
+            }
+        } else {
+            format!("(raw: {} bytes)", event.data.len())
+        };
+        println!("  [{}] {} — {}", hash_prefix, event.event_type, summary);
+    }
+    println!();
+
+    let verified = chain.verify();
+    println!("Chain verified: {}", verified);
+
+    Ok(())
 }
 
 /// Compose wrapper + expression modules and call init
