@@ -1,0 +1,6 @@
+name = "typed-actor"
+version = "0.1.0"
+package = "/home/colin/work/wisp/examples/actors/typed-actor.wasm"
+
+[[handler]]
+type = "runtime"

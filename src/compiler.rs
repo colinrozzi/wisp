@@ -8094,7 +8094,32 @@ fn generate_pack_wrapper(
                 out.push_str("    local.set $dec_child_idx\n");
                 // Find root node offset
                 generate_dec_find_node_by_index(out);
-                // Decode recursively
+                // Check if root is a Tuple wrapper (e.g. Theater sends Tuple(state, params))
+                // If so, unwrap by following child_indices[0] to the actual parameter node
+                // Node tag byte: Tuple = 0x0B
+                out.push_str("    ;; Check if root is a Tuple wrapper and unwrap if so\n");
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    local.get $dec_node_offset\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load8_u\n");
+                out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE));
+                out.push_str("    i32.eq\n");
+                out.push_str("    (if\n");
+                out.push_str("      (then\n");
+                // Tuple node: [tag:4][payload_len:4][child_count:4][child_indices:4*N]
+                // child_indices[0] is at node_offset + 12
+                out.push_str("        local.get $in_ptr\n");
+                out.push_str("        local.get $dec_node_offset\n");
+                out.push_str("        i32.add\n");
+                out.push_str("        i32.const 12\n");
+                out.push_str("        i32.add\n");
+                out.push_str("        i32.load\n");
+                out.push_str("        local.set $dec_child_idx\n");
+                // Find the actual parameter node
+                generate_dec_find_node_by_index(out);
+                out.push_str("      )\n");
+                out.push_str("    )\n");
+                // Decode recursively (now pointing at the actual parameter node)
                 generate_cgrf_decode_recursive(out, &param.ty, records, variants);
                 // Store result
                 out.push_str("    local.get $dec_result\n");
@@ -9074,18 +9099,15 @@ fn generate_cgrf_encode_recursive(
                 field_offset += type_size(elem_ty);
             }
 
-            // Patch tuple node's payload_len
-            // payload_len = $buf_cursor - $enc_tuple_header - 8
+            // Patch tuple node's payload_len (only the tuple's own data, not children)
+            // payload = child_count(4) + N * child_index(4)
+            let tuple_payload_len = 4 + 4 * n;
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $enc_tuple_header\n");
             out.push_str("    i32.add\n");
             out.push_str("    i32.const 4\n");
             out.push_str("    i32.add\n");
-            out.push_str("    local.get $buf_cursor\n");
-            out.push_str("    local.get $enc_tuple_header\n");
-            out.push_str("    i32.sub\n");
-            out.push_str("    i32.const 8\n");
-            out.push_str("    i32.sub\n");
+            out.push_str(&format!("    i32.const {}\n", tuple_payload_len));
             out.push_str("    i32.store\n");
 
             // Restore $enc_root_idx to the tuple's node index (saved before child encoding)
@@ -9220,17 +9242,19 @@ fn generate_cgrf_encode_recursive(
             out.push_str("      end\n");
             out.push_str("    end\n");
 
-            // Patch list node's payload_len using $enc_list_header
+            // Patch list node's payload_len (only the list's own data, not children)
+            // payload = type_tag + count(4) + len * child_index(4)
+            let tag_size = type_tag_size(elem_ty);
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $enc_list_header\n");
             out.push_str("    i32.add\n");
             out.push_str("    i32.const 4\n");
             out.push_str("    i32.add\n");
-            out.push_str("    local.get $buf_cursor\n");
-            out.push_str("    local.get $enc_list_header\n");
-            out.push_str("    i32.sub\n");
-            out.push_str("    i32.const 8\n");
-            out.push_str("    i32.sub\n");
+            out.push_str(&format!("    i32.const {}\n", tag_size + 4));
+            out.push_str("    local.get $enc_list_len\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.mul\n");
+            out.push_str("    i32.add\n");
             out.push_str("    i32.store\n");
 
             // Restore $enc_root_idx to the list's node index

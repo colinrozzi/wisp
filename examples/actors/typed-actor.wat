@@ -404,6 +404,57 @@
     )
     local.get $dec_scan_offset
     local.set $dec_node_offset
+    ;; Check if root is a Tuple wrapper and unwrap if so
+    local.get $in_ptr
+    local.get $dec_node_offset
+    i32.add
+    i32.load8_u
+    i32.const 11
+    i32.eq
+    (if
+      (then
+        local.get $in_ptr
+        local.get $dec_node_offset
+        i32.add
+        i32.const 12
+        i32.add
+        i32.load
+        local.set $dec_child_idx
+    ;; Find node at index $dec_child_idx
+    i32.const 16
+    local.set $dec_scan_offset
+    i32.const 0
+    local.set $dec_scan_i
+    (block $dec_found
+      (loop $dec_scan
+        local.get $dec_scan_i
+        local.get $dec_child_idx
+        i32.ge_u
+        br_if $dec_found
+        local.get $in_ptr
+        local.get $dec_scan_offset
+        i32.add
+        i32.const 4
+        i32.add
+        i32.load
+        local.set $dec_payload_len
+        local.get $dec_scan_offset
+        i32.const 8
+        i32.add
+        local.get $dec_payload_len
+        i32.add
+        local.set $dec_scan_offset
+        local.get $dec_scan_i
+        i32.const 1
+        i32.add
+        local.set $dec_scan_i
+        br $dec_scan
+      )
+    )
+    local.get $dec_scan_offset
+    local.set $dec_node_offset
+      )
+    )
     ;; decode option
     global.get $__heap_ptr
     local.set $dec_opt_ptr
@@ -940,11 +991,11 @@
     i32.add
     i32.const 4
     i32.add
-    local.get $buf_cursor
-    local.get $enc_list_header
-    i32.sub
-    i32.const 8
-    i32.sub
+    i32.const 5
+    local.get $enc_list_len
+    i32.const 4
+    i32.mul
+    i32.add
     i32.store
     local.get $enc_list_root_idx
     local.set $enc_root_idx
@@ -1122,11 +1173,7 @@
     i32.add
     i32.const 4
     i32.add
-    local.get $buf_cursor
-    local.get $enc_tuple_header
-    i32.sub
     i32.const 8
-    i32.sub
     i32.store
     local.get $enc_save_root
     local.set $enc_root_idx
