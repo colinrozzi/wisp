@@ -7887,7 +7887,7 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
     // Generate import wrapper functions
     // These have the original wisp signature but internally encode args and call the raw import
     for import in &prog.imports {
-        generate_import_wrapper(&mut out, import);
+        generate_import_wrapper(&mut out, import, &records_map, &variants_map);
     }
 
     // Generate internal functions
@@ -8064,6 +8064,7 @@ fn generate_pack_wrapper(
     out.push_str("    (local $enc_tmp_f64 f64)\n");
     out.push_str("    (local $enc_save_child i32)\n");
     out.push_str("    (local $enc_save_root i32)\n");
+    out.push_str("    (local $enc_result_ptr i32)\n");
     out.push_str("    (local $enc_tuple_header i32)\n");
     out.push_str("    (local $enc_tuple_ci_pos i32)\n");
     out.push_str("    (local $enc_list_header i32)\n");
@@ -8083,6 +8084,8 @@ fn generate_pack_wrapper(
     out.push_str("    (local $dec_tmp i32)\n");
     out.push_str("    (local $dec_opt_ptr i32)\n");
     out.push_str("    (local $dec_opt_node_offset i32)\n");
+    out.push_str("    (local $dec_tuple_ptr i32)\n");
+    out.push_str("    (local $dec_tuple_node_offset i32)\n");
     out.push_str("    (local $dec_list_ptr i32)\n");
     out.push_str("    (local $dec_list_data i32)\n");
     out.push_str("    (local $dec_list_len i32)\n");
@@ -8255,7 +8258,12 @@ fn generate_pack_wrapper(
 /// 1. Encodes arguments to CGRF in a buffer
 /// 2. Calls the raw import (which has Pack/Graph ABI signature)
 /// 3. Decodes the result (if any)
-fn generate_import_wrapper(out: &mut String, import: &Import) {
+fn generate_import_wrapper(
+    out: &mut String,
+    import: &Import,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
+) {
     let wrapper_name = &import.name;
     let raw_name = format!("$__raw_{}", import.name);
 
@@ -8276,6 +8284,50 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
     out.push_str("    (local $out_ptr i32)\n");
     out.push_str("    (local $out_len i32)\n");
     out.push_str("    (local $status i32)\n");
+
+    // Check if we need extra locals for tuple encoding (must declare all locals upfront)
+    if import.params.len() == 1 {
+        if let Type::Tuple(field_types) = &import.params[0].ty {
+            let all_encodable = field_types.iter().all(|ty| match ty {
+                Type::Str => true,
+                Type::List(inner) => matches!(inner.as_ref(), Type::U8),
+                _ => false,
+            });
+            if all_encodable {
+                out.push_str("    (local $write_offset i32)\n");
+                out.push_str("    (local $i i32)\n");
+                for i in 0..field_types.len() {
+                    out.push_str(&format!("    (local $field{}_ptr i32)\n", i));
+                    out.push_str(&format!("    (local $field{}_len i32)\n", i));
+                }
+            }
+        }
+    }
+
+    // Check if we need decoder locals for complex return types
+    let needs_complex_decode = matches!(
+        &import.return_type,
+        Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Str
+    );
+    if needs_complex_decode {
+        out.push_str("    (local $in_ptr i32)\n"); // for decoder - points to output buffer
+        out.push_str("    (local $dec_node_offset i32)\n");
+        out.push_str("    (local $dec_result i32)\n");
+        out.push_str("    (local $dec_child_idx i32)\n");
+        out.push_str("    (local $dec_scan_offset i32)\n");
+        out.push_str("    (local $dec_scan_i i32)\n");
+        out.push_str("    (local $dec_payload_len i32)\n");
+        out.push_str("    (local $dec_tmp i32)\n");
+        out.push_str("    (local $dec_opt_ptr i32)\n");
+        out.push_str("    (local $dec_opt_node_offset i32)\n");
+        out.push_str("    (local $dec_tuple_ptr i32)\n");
+        out.push_str("    (local $dec_tuple_node_offset i32)\n");
+        out.push_str("    (local $dec_list_ptr i32)\n");
+        out.push_str("    (local $dec_list_data i32)\n");
+        out.push_str("    (local $dec_list_len i32)\n");
+        out.push_str("    (local $dec_list_i i32)\n");
+        out.push_str("    (local $dec_list_node_offset i32)\n");
+    }
 
     // Use fixed buffer locations for import calls
     // Import input buffer at 0x8000
@@ -8596,6 +8648,396 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
 
         out.push_str(&format!("    i32.const {}\n", total_len));
         out.push_str("    local.set $in_len\n");
+    } else if import.params.len() == 1 {
+        // Single complex parameter - check if it's a tuple we can encode
+        if let Type::Tuple(field_types) = &import.params[0].ty {
+            // We can encode tuples containing strings and list<u8>
+            let param_name = &import.params[0].name;
+            let n = field_types.len();
+
+            // Check if all fields are encodable (string or list<u8>)
+            let all_encodable = field_types.iter().all(|ty| match ty {
+                Type::Str => true,
+                Type::List(inner) => matches!(inner.as_ref(), Type::U8),
+                _ => false,
+            });
+
+            if all_encodable {
+                // For tuple(string, list<u8>), we need to create nodes in the right order:
+                // - U8 nodes for list elements first (dynamic count based on list length)
+                // - List node (pointing to U8 nodes)
+                // - String node
+                // - Tuple node (root)
+                //
+                // Node indices:
+                // - Nodes 0 to L-1: U8 element nodes (L = list length)
+                // - Node L: list node
+                // - Node L+1: string node
+                // - Node L+2: tuple node (root)
+                //
+                // For tuple(string, list<u8>), the tuple children are [L+1, L] (string, list)
+
+                out.push_str(&format!(
+                    "    ;; Encode tuple({}) parameter with {} fields (with proper list encoding)\n",
+                    field_types
+                        .iter()
+                        .map(|t| format!("{:?}", t))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    n
+                ));
+
+                // Extract field pointers and lengths first
+                for (i, _field_ty) in field_types.iter().enumerate() {
+                    out.push_str(&format!("    ;; Extract field {} from tuple\n", i));
+                    out.push_str(&format!("    local.get ${}\n", param_name));
+                    out.push_str(&format!("    i32.const {}\n", i * 4));
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.load\n");
+                    out.push_str(&format!("    local.set $field{}_ptr\n", i));
+                    // Load length (both string and list<u8> have length at offset 0)
+                    out.push_str(&format!("    local.get $field{}_ptr\n", i));
+                    out.push_str("    i32.load\n");
+                    out.push_str(&format!("    local.set $field{}_len\n", i));
+                }
+
+                // For simplicity, handle the specific case of tuple(string, list<u8>)
+                // Field 0 = string, Field 1 = list<u8>
+                if n == 2
+                    && matches!(field_types[0], Type::Str)
+                    && matches!(&field_types[1], Type::List(inner) if matches!(inner.as_ref(), Type::U8))
+                {
+                    // Write CGRF header (will patch node_count and root_index later)
+                    out.push_str("    ;; CGRF header (node_count and root_index patched later)\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+                    out.push_str("    i32.store\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+                    out.push_str("    i32.store16\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    i32.const 6\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    i32.store16\n");
+                    // node_count = list_len + 3 (U8 nodes + list + string + tuple)
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    i32.const 8\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field1_len\n");
+                    out.push_str("    i32.const 3\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.store\n");
+                    // root_index = list_len + 2 (tuple is last)
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    i32.const 12\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field1_len\n");
+                    out.push_str("    i32.const 2\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.store\n");
+
+                    // Start writing nodes after header
+                    out.push_str("    i32.const 16\n");
+                    out.push_str("    local.set $write_offset\n");
+
+                    // Write U8 nodes for list elements (nodes 0 to L-1)
+                    // Each U8 node: kind(1) + flags(1) + reserved(2) + payload_len(4) + value(1) = 9 bytes
+                    out.push_str("    ;; Write U8 nodes for list elements\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    local.set $i\n");
+                    out.push_str("    (block $u8_done\n");
+                    out.push_str("      (loop $u8_loop\n");
+                    out.push_str("        local.get $i\n");
+                    out.push_str("        local.get $field1_len\n");
+                    out.push_str("        i32.ge_u\n");
+                    out.push_str("        br_if $u8_done\n");
+                    // Write U8 node header
+                    out.push_str("        ;; U8 node header\n");
+                    out.push_str("        local.get $in_buf\n");
+                    out.push_str("        local.get $write_offset\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str(&format!("        i32.const {}\n", CGRF_U8 as i32));
+                    out.push_str("        i32.store8\n");
+                    out.push_str("        local.get $in_buf\n");
+                    out.push_str("        local.get $write_offset\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 1\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 0\n");
+                    out.push_str("        i32.store8\n");
+                    out.push_str("        local.get $in_buf\n");
+                    out.push_str("        local.get $write_offset\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 2\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 0\n");
+                    out.push_str("        i32.store16\n");
+                    out.push_str("        local.get $in_buf\n");
+                    out.push_str("        local.get $write_offset\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 4\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 1\n"); // payload_len = 1
+                    out.push_str("        i32.store\n");
+                    // Write U8 value
+                    // Wisp list layout: {len, cap, data_ptr} - data is at offset 8
+                    // Each element in list<u8> is stored as i32 (4 bytes) per type_size()
+                    out.push_str("        local.get $in_buf\n");
+                    out.push_str("        local.get $write_offset\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 8\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        local.get $field1_ptr\n");
+                    out.push_str("        i32.const 8\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.load\n"); // load data_ptr
+                    out.push_str("        local.get $i\n");
+                    out.push_str("        i32.const 4\n"); // each element is 4 bytes
+                    out.push_str("        i32.mul\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.load8_u\n"); // load low byte of the i32 element
+                    out.push_str("        i32.store8\n");
+                    // Advance
+                    out.push_str("        local.get $write_offset\n");
+                    out.push_str("        i32.const 9\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        local.set $write_offset\n");
+                    out.push_str("        local.get $i\n");
+                    out.push_str("        i32.const 1\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        local.set $i\n");
+                    out.push_str("        br $u8_loop\n");
+                    out.push_str("      )\n");
+                    out.push_str("    )\n");
+
+                    // Write list node (node L)
+                    // payload = elem_type(1) + count(4) + child_indices(4*L)
+                    out.push_str("    ;; Write list node\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str(&format!("    i32.const {}\n", CGRF_LIST as i32));
+                    out.push_str("    i32.store8\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 1\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    i32.store8\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 2\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    i32.store16\n");
+                    // payload_len = 1 + 4 + 4*L
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field1_len\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.mul\n");
+                    out.push_str("    i32.const 5\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.store\n");
+                    // elem_type = U8
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 8\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str(&format!("    i32.const {}\n", CGRF_U8 as i32));
+                    out.push_str("    i32.store8\n");
+                    // count
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 9\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field1_len\n");
+                    out.push_str("    i32.store\n");
+                    // child indices (0, 1, 2, ...)
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    local.set $i\n");
+                    out.push_str("    (block $idx_done\n");
+                    out.push_str("      (loop $idx_loop\n");
+                    out.push_str("        local.get $i\n");
+                    out.push_str("        local.get $field1_len\n");
+                    out.push_str("        i32.ge_u\n");
+                    out.push_str("        br_if $idx_done\n");
+                    out.push_str("        local.get $in_buf\n");
+                    out.push_str("        local.get $write_offset\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 13\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        local.get $i\n");
+                    out.push_str("        i32.const 4\n");
+                    out.push_str("        i32.mul\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        local.get $i\n");
+                    out.push_str("        i32.store\n");
+                    out.push_str("        local.get $i\n");
+                    out.push_str("        i32.const 1\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        local.set $i\n");
+                    out.push_str("        br $idx_loop\n");
+                    out.push_str("      )\n");
+                    out.push_str("    )\n");
+                    // Advance offset: 8 + 1 + 4 + 4*L
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.const 13\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field1_len\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.mul\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.set $write_offset\n");
+
+                    // Write string node (node L+1)
+                    out.push_str("    ;; Write string node\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str(&format!("    i32.const {}\n", CGRF_STRING as i32));
+                    out.push_str("    i32.store8\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 1\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    i32.store8\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 2\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    i32.store16\n");
+                    // payload_len = 4 + string_len
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field0_len\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.store\n");
+                    // string length prefix
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 8\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field0_len\n");
+                    out.push_str("    i32.store\n");
+                    // copy string data
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 12\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field0_ptr\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field0_len\n");
+                    out.push_str("    memory.copy\n");
+                    // Advance offset
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.const 12\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field0_len\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.set $write_offset\n");
+
+                    // Write tuple node (node L+2, root)
+                    // Children are [L+1, L] (string at L+1, list at L)
+                    out.push_str("    ;; Write tuple node (root)\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE as i32));
+                    out.push_str("    i32.store8\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 1\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    i32.store8\n");
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 2\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    i32.store16\n");
+                    // payload_len = 4 (count) + 8 (2 child indices)
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 4\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 12\n");
+                    out.push_str("    i32.store\n");
+                    // count = 2
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 8\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 2\n");
+                    out.push_str("    i32.store\n");
+                    // child[0] = L+1 (string node index)
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 12\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field1_len\n");
+                    out.push_str("    i32.const 1\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.store\n");
+                    // child[1] = L (list node index)
+                    out.push_str("    local.get $in_buf\n");
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.const 16\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.get $field1_len\n");
+                    out.push_str("    i32.store\n");
+
+                    // total length = write_offset + 20 (tuple node: 8 header + 12 payload)
+                    out.push_str("    local.get $write_offset\n");
+                    out.push_str("    i32.const 20\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    local.set $in_len\n");
+                } else {
+                    // Generic tuple encoding (not yet supported)
+                    out.push_str("    ;; WARNING: generic tuple encoding not yet supported\n");
+                    out.push_str("    i32.const 0\n");
+                    out.push_str("    local.set $in_len\n");
+                }
+            } else {
+                // Tuple with unsupported field types
+                out.push_str("    ;; WARNING: tuple contains unsupported field types, passing empty\n");
+                out.push_str("    i32.const 0\n");
+                out.push_str("    local.set $in_len\n");
+            }
+        } else {
+            // Non-tuple complex parameter
+            out.push_str("    ;; WARNING: unsupported single complex parameter type, passing empty\n");
+            out.push_str("    i32.const 0\n");
+            out.push_str("    local.set $in_len\n");
+        }
     } else {
         // Unsupported argument types for import wrapper
         out.push_str("    ;; WARNING: unsupported import argument types, passing empty\n");
@@ -8648,6 +9090,24 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
             out.push_str("    i32.const 24\n");
             out.push_str("    i32.add\n");
             out.push_str("    f64.load\n");
+        }
+        Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Str => {
+            // Use recursive decoder for complex types
+            // Set up $in_ptr to point to the output buffer (becomes input for decoding)
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.set $in_ptr\n");
+            // Read root index from header (offset 12) and find that node
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    i32.const 12\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $dec_child_idx\n");
+            // Scan to find the root node
+            generate_dec_find_node_by_index(out);
+            // Decode the value recursively from the root node
+            generate_cgrf_decode_recursive(out, &import.return_type, records, variants);
+            // Result is in $dec_result
+            out.push_str("    local.get $dec_result\n");
         }
         _ => out.push_str("    i32.const 0\n"),
     }
@@ -8848,13 +9308,13 @@ fn generate_cgrf_encode_recursive(
             out.push_str("    i32.add\n");
             out.push_str(&format!("    local.get {}\n", value_local));
             out.push_str(&format!("    {}\n", store_instr));
-            // Patch payload_len
-            generate_patch_payload_len(out);
-            // Advance cursor
+            // Advance cursor BEFORE patching payload_len
             out.push_str("    local.get $buf_cursor\n");
             out.push_str(&format!("    i32.const {}\n", payload_size));
             out.push_str("    i32.add\n");
             out.push_str("    local.set $buf_cursor\n");
+            // Patch payload_len (now cursor is correctly positioned)
+            generate_patch_payload_len(out);
             // Increment node_idx
             out.push_str("    local.get $node_idx\n");
             out.push_str("    i32.const 1\n");
@@ -8983,19 +9443,22 @@ fn generate_cgrf_encode_recursive(
             // CGRF: encode payload child first, then result node
             // Result payload: ok_type_tag + err_type_tag + tag:u32 + has_payload:u8 + child_index:u32
             out.push_str("    ;; encode result\n");
-            // Encode payload child first
+            // Save result pointer before encoding payload (encoding may clobber value_local)
             out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    local.set $enc_result_ptr\n");
+            // Encode payload child first
+            out.push_str("    local.get $enc_result_ptr\n");
             out.push_str("    i32.load\n"); // tag: 0=ok, 1=err
             out.push_str("    (if\n");
             out.push_str("      (then\n");
             out.push_str("        ;; Err branch: encode err value\n");
-            generate_load_inner_value(out, err_ty, value_local, 4);
+            generate_load_inner_value(out, err_ty, "$enc_result_ptr", 4);
             let err_local = enc_local_for_type(err_ty);
             generate_cgrf_encode_recursive(out, err_ty, err_local, records, variants);
             out.push_str("      )\n");
             out.push_str("      (else\n");
             out.push_str("        ;; Ok branch: encode ok value\n");
-            generate_load_inner_value(out, ok_ty, value_local, 4);
+            generate_load_inner_value(out, ok_ty, "$enc_result_ptr", 4);
             let ok_local = enc_local_for_type(ok_ty);
             generate_cgrf_encode_recursive(out, ok_ty, ok_local, records, variants);
             out.push_str("      )\n");
@@ -9011,11 +9474,11 @@ fn generate_cgrf_encode_recursive(
             generate_write_type_tag_at_cursor(out, ok_ty);
             // Write err_type tag
             generate_write_type_tag_at_cursor(out, err_ty);
-            // Write tag (0=ok, 1=err)
+            // Write tag (0=ok, 1=err) - use saved result pointer
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $buf_cursor\n");
             out.push_str("    i32.add\n");
-            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    local.get $enc_result_ptr\n");
             out.push_str("    i32.load\n");
             out.push_str("    i32.store\n");
             out.push_str("    local.get $buf_cursor\n");
@@ -9098,8 +9561,8 @@ fn generate_cgrf_encode_recursive(
             out.push_str("    i32.add\n");
             out.push_str("    local.set $buf_cursor\n");
 
-            // Push tuple encoder state onto memory stack (12 bytes per frame)
-            // [enc_tuple_header, enc_tuple_ci_pos, enc_save_root]
+            // Push tuple encoder state onto memory stack (16 bytes per frame)
+            // [enc_tuple_header, enc_tuple_ci_pos, enc_save_root, tuple_val]
             out.push_str("    ;; push tuple encoder state\n");
             out.push_str("    global.get $enc_tuple_sp\n");
             out.push_str("    local.get $enc_tuple_header\n");
@@ -9114,8 +9577,14 @@ fn generate_cgrf_encode_recursive(
             out.push_str("    i32.add\n");
             out.push_str("    local.get $enc_save_root\n");
             out.push_str("    i32.store\n");
+            // Save the tuple value pointer so we can reload it after each element
             out.push_str("    global.get $enc_tuple_sp\n");
             out.push_str("    i32.const 12\n");
+            out.push_str("    i32.add\n");
+            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    i32.store\n");
+            out.push_str("    global.get $enc_tuple_sp\n");
+            out.push_str("    i32.const 16\n");
             out.push_str("    i32.add\n");
             out.push_str("    global.set $enc_tuple_sp\n");
 
@@ -9130,20 +9599,26 @@ fn generate_cgrf_encode_recursive(
                 // Restore tuple encoder state from stack (peek, not pop)
                 out.push_str("    ;; restore tuple encoder state\n");
                 out.push_str("    global.get $enc_tuple_sp\n");
-                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.const 16\n");
                 out.push_str("    i32.sub\n");
                 out.push_str("    i32.load\n");
                 out.push_str("    local.set $enc_tuple_header\n");
                 out.push_str("    global.get $enc_tuple_sp\n");
-                out.push_str("    i32.const 8\n");
+                out.push_str("    i32.const 12\n");
                 out.push_str("    i32.sub\n");
                 out.push_str("    i32.load\n");
                 out.push_str("    local.set $enc_tuple_ci_pos\n");
                 out.push_str("    global.get $enc_tuple_sp\n");
-                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.const 8\n");
                 out.push_str("    i32.sub\n");
                 out.push_str("    i32.load\n");
                 out.push_str("    local.set $enc_save_root\n");
+                // Restore the tuple value pointer
+                out.push_str("    global.get $enc_tuple_sp\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.sub\n");
+                out.push_str("    i32.load\n");
+                out.push_str(&format!("    local.set {}\n", value_local));
 
                 // Write child's node index to child_indices[i]
                 out.push_str("    local.get $out_ptr\n");
@@ -9161,7 +9636,7 @@ fn generate_cgrf_encode_recursive(
             // Pop tuple encoder state from stack
             out.push_str("    ;; pop tuple encoder state\n");
             out.push_str("    global.get $enc_tuple_sp\n");
-            out.push_str("    i32.const 12\n");
+            out.push_str("    i32.const 16\n");
             out.push_str("    i32.sub\n");
             out.push_str("    global.set $enc_tuple_sp\n");
 
@@ -9686,16 +10161,14 @@ fn generate_cgrf_decode_recursive(
 
             out.push_str("    ;; decode tuple\n");
 
-            // Save tuple node offset (survives child decoding since $dec_tmp
-            // is only used by scalar decode and string length — neither of which
-            // would be a tuple's child in a way that clobbers during our field loop)
+            // Save tuple node offset (survives child decoding)
             out.push_str("    local.get $dec_node_offset\n");
-            out.push_str("    local.set $dec_opt_node_offset\n"); // reuse for tuple node offset
+            out.push_str("    local.set $dec_tuple_node_offset\n");
 
             // Allocate tuple: sum of type_size for each field
             let tuple_size: usize = elem_types.iter().map(|t| type_size(t)).sum();
             out.push_str("    global.get $__heap_ptr\n");
-            out.push_str("    local.set $dec_opt_ptr\n"); // reuse for tuple ptr (survives child decode)
+            out.push_str("    local.set $dec_tuple_ptr\n");
             out.push_str("    global.get $__heap_ptr\n");
             out.push_str(&format!("    i32.const {}\n", tuple_size));
             out.push_str("    i32.add\n");
@@ -9708,7 +10181,7 @@ fn generate_cgrf_decode_recursive(
 
                 // Read child_index for field i from tuple node
                 out.push_str("    local.get $in_ptr\n");
-                out.push_str("    local.get $dec_opt_node_offset\n"); // tuple node offset
+                out.push_str("    local.get $dec_tuple_node_offset\n");
                 out.push_str("    i32.add\n");
                 out.push_str(&format!(
                     "    i32.const {}\n",
@@ -9725,7 +10198,7 @@ fn generate_cgrf_decode_recursive(
                 generate_cgrf_decode_recursive(out, elem_ty, records, variants);
 
                 // Store decoded value at tuple_ptr + field_offset
-                out.push_str("    local.get $dec_opt_ptr\n"); // tuple ptr (saved above)
+                out.push_str("    local.get $dec_tuple_ptr\n");
                 if field_offset > 0 {
                     out.push_str(&format!("    i32.const {}\n", field_offset));
                     out.push_str("    i32.add\n");
@@ -9737,7 +10210,7 @@ fn generate_cgrf_decode_recursive(
             }
 
             // Result = tuple pointer
-            out.push_str("    local.get $dec_opt_ptr\n");
+            out.push_str("    local.get $dec_tuple_ptr\n");
             out.push_str("    local.set $dec_result\n");
         }
         Type::Result(ok_ty, err_ty) => {

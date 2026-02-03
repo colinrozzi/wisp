@@ -771,11 +771,20 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
                                     _ => "unknown".to_string(),
                                 };
                                 let source = match &fields[1] {
-                                    Value::List { items, .. } => {
+                                    Value::List { items, elem_type } => {
+                                        info!("[DEBUG] List has {} items, elem_type={:?}", items.len(), elem_type);
+                                        // Show first 10 items
+                                        for (i, v) in items.iter().take(10).enumerate() {
+                                            info!("[DEBUG] items[{}] = {:?}", i, v);
+                                        }
                                         let bytes: Vec<u8> = items.iter().map(|v| match v {
                                             Value::U8(b) => *b,
-                                            _ => 0,
+                                            other => {
+                                                warn!("[DEBUG] Non-U8 item: {:?}", other);
+                                                0
+                                            }
                                         }).collect();
+                                        info!("[DEBUG] Decoded bytes (first 20): {:?}", &bytes[..bytes.len().min(20)]);
                                         String::from_utf8_lossy(&bytes).to_string()
                                     }
                                     _ => String::new(),
@@ -874,8 +883,29 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
                         // Encode result as UTF-8 bytes
                         let result_str = result.to_string();
                         let result_bytes: Vec<u8> = result_str.into_bytes();
+                        info!("[EVAL-REQUEST] result_bytes = {:?}", result_bytes);
 
-                        make_eval_response(Some(result_bytes))
+                        let response = make_eval_response(Some(result_bytes));
+                        // Debug: encode to see CGRF bytes
+                        let encoded = pack::abi::encode(&response).unwrap();
+                        info!("[EVAL-REQUEST] CGRF response ({} bytes): {:02x?}", encoded.len(), &encoded[..]);
+                        // Debug: parse option node structure
+                        if encoded.len() > 70 {
+                            info!("[EVAL-REQUEST] Option node at offset 55: kind={:02x}, payload_len={}, type_tag={:02x} {:02x}, has_value={:02x}, child_idx={}",
+                                encoded[55],
+                                u32::from_le_bytes(encoded[59..63].try_into().unwrap()),
+                                encoded[63], encoded[64],
+                                encoded[65],
+                                u32::from_le_bytes(encoded[66..70].try_into().unwrap())
+                            );
+                        }
+                        info!("[EVAL-REQUEST] CGRF header: magic={:08x}, version={}, node_count={}, root_index={}",
+                            u32::from_le_bytes(encoded[0..4].try_into().unwrap()),
+                            u16::from_le_bytes(encoded[4..6].try_into().unwrap()),
+                            u32::from_le_bytes(encoded[8..12].try_into().unwrap()),
+                            u32::from_le_bytes(encoded[12..16].try_into().unwrap())
+                        );
+                        response
                     }
                 },
             )?;
@@ -951,6 +981,11 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
         let request_result = instance.call_value(request_func, &request_input).await?;
 
         let (new_state, extras) = decode_actor_result(&request_result)?;
+
+        info!("[DEBUG] extras has {} elements", extras.len());
+        for (i, extra) in extras.iter().enumerate() {
+            info!("[DEBUG] extras[{}] = {:?}", i, extra);
+        }
 
         // Extract response from extras: tuple(option<list<u8>>)
         let response = if let Some(Value::Tuple(response_fields)) = extras.first() {
