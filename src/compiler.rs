@@ -499,6 +499,9 @@ pub enum Expr {
         value: Box<Expr>,
         body: Box<Expr>,
     },
+    Begin {
+        exprs: Vec<Expr>,
+    },
     WasmInstr {
         name: String,
         args: Vec<Expr>,
@@ -807,6 +810,7 @@ fn expr_uses_heap(expr: &Expr) -> bool {
             else_branch,
         } => expr_uses_heap(cond) || expr_uses_heap(then_branch) || expr_uses_heap(else_branch),
         Expr::Let { value, body, .. } => expr_uses_heap(value) || expr_uses_heap(body),
+        Expr::Begin { exprs } => exprs.iter().any(expr_uses_heap),
         Expr::WasmInstr { args, .. } => args.iter().any(expr_uses_heap),
         Expr::GlobalSet { value, .. } => expr_uses_heap(value),
         Expr::RecordConstruct { fields, .. } => true, // records need heap
@@ -1420,6 +1424,13 @@ fn check_expr(
             let mut next_env = env.clone();
             next_env.insert(name.clone(), value_ty);
             check_expr(body, &next_env, signatures, globals, records, variants)
+        }
+        Expr::Begin { exprs } => {
+            let mut last_ty = Type::S32;
+            for expr in exprs {
+                last_ty = check_expr(expr, env, signatures, globals, records, variants)?;
+            }
+            Ok(last_ty)
         }
         Expr::WasmInstr { name, args } => {
             let instr_info = lookup_wasm_instr(name)
@@ -4784,6 +4795,20 @@ fn parse_expr(
                         body: Box::new(body_expr),
                     })
                 }
+                SExpr::Sym(sym, _sym_span) if sym == "begin" => {
+                    if items.len() < 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'begin' expression",
+                            list_span,
+                            "expected: (begin expr1 expr2 ...)",
+                        ));
+                    }
+                    let mut exprs = Vec::new();
+                    for item in &items[1..] {
+                        exprs.push(parse_expr(item, vars, functions, records, variants, ctx)?);
+                    }
+                    Ok(Expr::Begin { exprs })
+                }
                 SExpr::Sym(sym, _sym_span) if sym == "match" => {
                     // (match expr ((case var1 var2) body) ...)
                     if items.len() < 3 {
@@ -5554,6 +5579,21 @@ fn gen_expr(
             );
             env.pop_binding();
             body_ty
+        }
+        Expr::Begin { exprs } => {
+            let mut last_ty = Type::S32;
+            for (i, expr) in exprs.iter().enumerate() {
+                let is_last = i == exprs.len() - 1;
+                last_ty = gen_expr(
+                    expr, out, indent, env, signatures, globals, records, variants,
+                    is_last && is_tail,
+                );
+                if !is_last {
+                    // Drop the value of non-final expressions
+                    out.push_str(&format!("{}drop\n", pad));
+                }
+            }
+            last_ty
         }
         Expr::WasmInstr { name, args } => {
             let instr_info = lookup_wasm_instr(name)

@@ -163,7 +163,6 @@
     (local i32)
     (local i32)
     (local i32)
-    (local i32)
     global.get $__heap_ptr
     local.set 1
     global.get $__heap_ptr
@@ -295,33 +294,33 @@
     i32.store8
     local.get 1
     call $log
-    local.set 2
+    drop
     global.get $__heap_ptr
-    local.set 3
+    local.set 2
     global.get $__heap_ptr
     i32.const 8
     i32.add
     global.set $__heap_ptr
-    local.get 3
+    local.get 2
     i32.const 0
     i32.store
-    local.get 3
+    local.get 2
     i32.const 4
     i32.add
     local.get 0
-    local.set 4
+    local.set 3
     global.get $__heap_ptr
-    local.set 5
+    local.set 4
     global.get $__heap_ptr
     i32.const 4
     i32.add
     global.set $__heap_ptr
-    local.get 5
+    local.get 4
+    local.get 3
+    i32.store
     local.get 4
     i32.store
-    local.get 5
-    i32.store
-    local.get 3
+    local.get 2
   )
   (func $init__export (export "theater:simple/actor.init") (param $in_ptr i32) (param $in_len i32) (param $out_ptr_ptr i32) (param $out_len_ptr i32) (result i32)
     (local $out_ptr i32)

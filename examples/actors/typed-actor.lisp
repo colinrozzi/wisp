@@ -9,6 +9,7 @@
 
 (export "theater:simple/actor.init"
   (fn init ((state (option (list u8)))) (result (tuple (option (list u8))) string)
-    (let (_ (log "Typed actor initialized!"))
+    (begin
+      (log "Typed actor initialized!")
       (ok (tuple (option (list u8))) string
           (tuple state)))))
