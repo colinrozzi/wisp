@@ -644,6 +644,50 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Infer the scalar return type from an expression.
+///
+/// Looks at the expression prefix to determine the appropriate WASM type:
+/// - i32.* or (s32 ...) → s32
+/// - i64.* or (s64 ...) → s64
+/// - f32.* → f32
+/// - f64.* → f64
+/// - Default: s32
+fn infer_scalar_type(expr: &str) -> &'static str {
+    let trimmed = expr.trim();
+
+    // Extract first symbol from the expression
+    let first_part = if trimmed.starts_with('(') {
+        trimmed[1..].split_whitespace().next().unwrap_or("")
+    } else {
+        trimmed.split_whitespace().next().unwrap_or("")
+    };
+
+    // Check for explicit type casts
+    if first_part == "s64" || first_part == "i64" {
+        return "s64";
+    }
+    if first_part == "f32" {
+        return "f32";
+    }
+    if first_part == "f64" {
+        return "f64";
+    }
+
+    // Check for WASM instruction prefixes
+    if first_part.starts_with("i64.") {
+        return "s64";
+    }
+    if first_part.starts_with("f32.") {
+        return "f32";
+    }
+    if first_part.starts_with("f64.") {
+        return "f64";
+    }
+
+    // Default to s32 (covers i32.* and everything else)
+    "s32"
+}
+
 /// Test harness for the REPL actor.
 ///
 /// This loads the REPL actor and the Wisp compiler, then evaluates expressions
@@ -796,10 +840,14 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
 
                         info!("[EVAL-REQUEST] request_id={}, source={}", request_id, source);
 
-                        // Wrap source for compilation: (export (fn eval () s32 <source>))
+                        // Infer return type from expression
+                        let return_type = infer_scalar_type(&source);
+                        info!("[EVAL-REQUEST] inferred return type: {}", return_type);
+
+                        // Wrap source for compilation with inferred type
                         let wrapped_source = format!(
-                            "(export (fn eval () s32 {}))",
-                            source
+                            "(export (fn eval () {} {}))",
+                            return_type, source
                         );
 
                         // Call compiler to get WAT
@@ -862,26 +910,89 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
                             }
                         };
 
-                        let eval_func = match instance.get_typed_func::<(), i32>(&mut store, "eval") {
-                            Ok(f) => f,
-                            Err(e) => {
-                                warn!("[EVAL-REQUEST] Function lookup error: {}", e);
+                        // Call eval function with appropriate type
+                        let result_str = match return_type {
+                            "s32" => {
+                                let eval_func = match instance.get_typed_func::<(), i32>(&mut store, "eval") {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Function lookup error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                };
+                                match eval_func.call(&mut store, ()) {
+                                    Ok(r) => {
+                                        info!("[EVAL-REQUEST] Result (i32): {}", r);
+                                        r.to_string()
+                                    }
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Execution error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                }
+                            }
+                            "s64" => {
+                                let eval_func = match instance.get_typed_func::<(), i64>(&mut store, "eval") {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Function lookup error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                };
+                                match eval_func.call(&mut store, ()) {
+                                    Ok(r) => {
+                                        info!("[EVAL-REQUEST] Result (i64): {}", r);
+                                        r.to_string()
+                                    }
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Execution error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                }
+                            }
+                            "f32" => {
+                                let eval_func = match instance.get_typed_func::<(), f32>(&mut store, "eval") {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Function lookup error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                };
+                                match eval_func.call(&mut store, ()) {
+                                    Ok(r) => {
+                                        info!("[EVAL-REQUEST] Result (f32): {}", r);
+                                        r.to_string()
+                                    }
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Execution error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                }
+                            }
+                            "f64" => {
+                                let eval_func = match instance.get_typed_func::<(), f64>(&mut store, "eval") {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Function lookup error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                };
+                                match eval_func.call(&mut store, ()) {
+                                    Ok(r) => {
+                                        info!("[EVAL-REQUEST] Result (f64): {}", r);
+                                        r.to_string()
+                                    }
+                                    Err(e) => {
+                                        warn!("[EVAL-REQUEST] Execution error: {}", e);
+                                        return make_eval_response(None);
+                                    }
+                                }
+                            }
+                            _ => {
+                                warn!("[EVAL-REQUEST] Unknown return type: {}", return_type);
                                 return make_eval_response(None);
                             }
                         };
-
-                        let result = match eval_func.call(&mut store, ()) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                warn!("[EVAL-REQUEST] Execution error: {}", e);
-                                return make_eval_response(None);
-                            }
-                        };
-
-                        info!("[EVAL-REQUEST] Result: {}", result);
-
-                        // Encode result as UTF-8 bytes
-                        let result_str = result.to_string();
                         let result_bytes: Vec<u8> = result_str.into_bytes();
                         info!("[EVAL-REQUEST] result_bytes = {:?}", result_bytes);
 
@@ -916,8 +1027,24 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
 
     // --- Test flow ---
 
+    // Test cases: (expression, expected_result)
+    // Note: The self-hosted compiler tokenizer truncates float literals to integers,
+    // so 3.14 becomes 3, 2.86 becomes 2, etc. This is a known limitation.
+    let test_cases = vec![
+        // i32 (s32)
+        ("(i32.add (i32.const 40) (i32.const 2))", "42"),
+        ("(i32.mul (i32.const 6) (i32.const 7))", "42"),
+        // i64 (s64) - this is the key test for the s64 fix
+        ("(i64.add (i64.const 1000000000000) (i64.const 1))", "1000000000001"),
+        // f32 (float literals truncated to int: 3.14 -> 3, 2.86 -> 2, so 3+2=5)
+        ("(f32.add (f32.const 3.14) (f32.const 2.86))", "5"),
+        // f64 (float literals truncated to int: 3.14... -> 3, 2.0 -> 2, so 3*2=6)
+        ("(f64.mul (f64.const 3.14159265359) (f64.const 2.0))", "6"),
+    ];
+    let total_steps = test_cases.len() + 1; // +1 for init
+
     // 1. Call init
-    println!("[1/4] Calling init...");
+    println!("[1/{}] Calling init...", total_steps);
     let init_func = "theater:simple/actor.init";
 
     instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
@@ -945,16 +1072,11 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
     println!("  init returned Ok, state: {}", format_state(&state));
     println!();
 
-    // 2. Evaluate first expression
-    let test_cases = vec![
-        ("(i32.add (i32.const 40) (i32.const 2))", "42"),
-        ("(i32.mul (i32.const 6) (i32.const 7))", "42"),
-    ];
-
+    // 2. Evaluate expressions
     let mut current_state = state;
 
     for (i, (expr, expected)) in test_cases.iter().enumerate() {
-        println!("[{}/4] Evaluating: {}", i + 2, expr);
+        println!("[{}/{}] Evaluating: {}", i + 2, total_steps, expr);
 
         let request_func = "theater:simple/message-server-client.handle-request";
 

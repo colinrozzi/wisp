@@ -3,13 +3,19 @@
 ; Combines tokenizer, parser, and code generator
 
 ; ============================================================
+; Global for i64 extraction workaround (match bug with i64 return types)
+; ============================================================
+
+(global $__temp_i64 s64 mut 0s64)
+
+; ============================================================
 ; Token Type
 ; ============================================================
 
 (variant token
   (lparen)
   (rparen)
-  (number s32)
+  (number s64)
   (symbol string)
   (str-lit string))
 
@@ -19,7 +25,7 @@
 
 (variant sexpr
   (sym string)
-  (num s32)
+  (num s64)
   (str string)
   (lst (list sexpr)))
 
@@ -103,17 +109,17 @@
   (tok token)
   (new-pos s32))
 
-(fn parse-number-value ((src string) (pos s32) (len s32) (acc s32)) token-result
+(fn parse-number-value ((src string) (pos s32) (len s32) (acc s64)) token-result
   (if (i32.ge_s pos len)
     (token-result (number acc) pos)
     (let (c (string-ref src pos))
       (if (is-digit c)
         (parse-number-value src (i32.add pos (i32.const 1)) len
-          (i32.add (i32.mul acc (i32.const 10)) (digit-value c)))
+          (i64.add (i64.mul acc (i64.const 10)) (i64.extend_i32_s (digit-value c))))
         (token-result (number acc) pos)))))
 
 (fn read-number ((src string) (pos s32) (len s32)) token-result
-  (parse-number-value src pos len (i32.const 0)))
+  (parse-number-value src pos len (i64.const 0)))
 
 (fn find-symbol-end ((src string) (pos s32) (len s32)) s32
   (if (i32.ge_s pos len)
@@ -161,7 +167,7 @@
                   (if (is-digit next-c)
                     (let (result (read-number src (i32.add pos (i32.const 1)) len))
                       (match (token-result.tok result)
-                        ((number n) (token-result (number (i32.sub (i32.const 0) n)) (token-result.new-pos result)))
+                        ((number n) (token-result (number (i64.sub (i64.const 0) n)) (token-result.new-pos result)))
                         ((lparen) result)
                         ((rparen) result)
                         ((symbol s) result)
@@ -288,8 +294,23 @@
 (fn get-sym ((e sexpr)) string
   (match e ((sym s) s) ((num n) "") ((str s) "") ((lst l) "")))
 
+; Return s32 truncated value for compatibility (match bug with i64 return types)
 (fn get-num ((e sexpr)) s32
-  (match e ((sym s) (i32.const 0)) ((num n) n) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
+  (match e ((sym s) (i32.const 0)) ((num n) (i32.wrap_i64 n)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
+
+; Return full s64 value using global variable workaround (match bug with i64 return types)
+; The match stores the value in $__temp_i64, then we read it back
+(fn get-num-i64-helper ((e sexpr)) s32
+  (match e
+    ((sym s) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
+    ((num n) (begin (global.set $__temp_i64 n) (i32.const 1)))
+    ((str s) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
+    ((lst l) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))))
+
+(fn get-num-i64 ((e sexpr)) s64
+  (begin
+    (get-num-i64-helper e)
+    (global.get $__temp_i64)))
 
 (fn get-str ((e sexpr)) string
   (match e ((sym s) "") ((num n) "") ((str s) s) ((lst l) "")))
@@ -553,6 +574,25 @@
       (string-append "-" (i32-to-string-pos (i32.sub (i32.const 0) n) ""))
       (i32-to-string-pos n ""))))
 
+; Convert i64 to string for large numbers
+; Note: The let binding for result prevents tail call optimization, working around
+; a compiler bug with mixed i64/i32 tail call arguments
+(fn i64-to-string-pos ((n s64) (acc string)) string
+  (if (i64.eq n (i64.const 0))
+    acc
+    (let (digit (i32.wrap_i64 (i64.rem_s n (i64.const 10))))
+      (let (rest (i64.div_s n (i64.const 10)))
+        (let (new-acc (string-append (digit-to-string digit) acc))
+          (let (result (i64-to-string-pos rest new-acc))
+            result))))))
+
+(fn i64-to-string ((n s64)) string
+  (if (i64.eq n (i64.const 0))
+    "0"
+    (if (i64.lt_s n (i64.const 0))
+      (string-append "-" (i64-to-string-pos (i64.sub (i64.const 0) n) ""))
+      (i64-to-string-pos n ""))))
+
 ; ============================================================
 ; Code Generator
 ; ============================================================
@@ -636,8 +676,11 @@
                   (if (string=? name "lst") (i32.const 3)
                     (i32.const -1)))))))))))
 
-(fn compile-number ((n s32)) string
-  (string-append "(i32.const " (string-append (i32-to-string n) ")")))
+; Compile a number literal - use i32.const for small numbers, i64.const for large
+(fn compile-number ((n s64)) string
+  (if (i32.and (i64.ge_s n (i64.const -2147483648)) (i64.le_s n (i64.const 2147483647)))
+    (string-append "(i32.const " (string-append (i64-to-string n) ")"))
+    (string-append "(i64.const " (string-append (i64-to-string n) ")"))))
 
 (fn compile-var ((name string)) string
   (string-append "(local.get $" (string-append name ")")))
@@ -707,7 +750,7 @@
     (if (is-const-instr instr)
       (let (arg (list-get args (i32.const 0)))
         (if (is-num arg)
-          (string-append "(" (string-append instr (string-append " " (string-append (i32-to-string (get-num arg)) ")"))))
+          (string-append "(" (string-append instr (string-append " " (string-append (i64-to-string (get-num-i64 arg)) ")"))))
           (string-append "(" (string-append instr " (error: const expects number))"))))
       (let (compiled-args (compile-args args (i32.const 0) (list-len args) "" ctx))
         (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")"))))))))
@@ -817,7 +860,7 @@
       (if (is-const-instr instr)
         (let (arg (list-get args (i32.const 0)))
           (if (is-num arg)
-            (string-append "(" (string-append instr (string-append " " (string-append (i32-to-string (get-num arg)) ")"))))
+            (string-append "(" (string-append instr (string-append " " (string-append (i64-to-string (get-num-i64 arg)) ")"))))
             (string-append "(" (string-append instr " (error: const expects number))"))))
         (let (compiled-args (compile-args-sub args (i32.const 0) (list-len args) "" binding-name scrutinee-wat ctx))
           (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")")))))))))
