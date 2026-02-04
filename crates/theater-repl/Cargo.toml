@@ -4,14 +4,27 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Core theater dependencies
-theater = { path = "../../../../theater/crates/theater" }
+# Theater runtime
+theater = { path = "/home/colin/work/theater/crates/theater" }
+theater-handler-runtime = { path = "/home/colin/work/theater/crates/theater-handler-runtime" }
+theater-handler-supervisor = { path = "/home/colin/work/theater/crates/theater-handler-supervisor" }
+theater-handler-message-server = { path = "/home/colin/work/theater/crates/theater-handler-message-server" }
+theater-handler-store = { path = "/home/colin/work/theater/crates/theater-handler-store" }
 
-# Pack for composition (future: linking compiler with repl-actor)
-pack = { path = "../../../../pack" }
+# Wisp-specific handler
+theater-handler-wisp = { path = "../theater-handler-wisp" }
 
-# WAT to WASM conversion (for assembler host function)
+# Pack for static composition (still needed for merging WASM modules)
+pack = { path = "../../../pack" }
+
+# Wasmtime for expression actor execution (spawn-and-wait)
+wasmtime = "21.0"
+
+# WAT to WASM conversion
 wat = "1"
+
+# WASM validation
+wasmparser = "0.219"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -23,5 +36,5 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Serialization (for parsing results)
-serde_json = "1.0"
+# UUID for request IDs
+uuid = { version = "1", features = ["v4"] }

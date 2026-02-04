@@ -2082,6 +2082,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "wasm-encoder 0.219.2",
+ "wasmparser 0.219.2",
  "wasmtime 27.0.0",
 ]
 
@@ -3048,6 +3050,96 @@ dependencies = [
  "toml",
  "tracing",
  "wasmtime 31.0.0",
+]
+
+[[package]]
+name = "theater-handler-message-server"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "theater",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "theater-handler-runtime"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "theater",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "theater-handler-store"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "theater",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "wasmtime 31.0.0",
+]
+
+[[package]]
+name = "theater-handler-supervisor"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "theater",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "theater-handler-wisp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "theater",
+ "tokio",
+ "tracing",
+ "wat",
+]
+
+[[package]]
+name = "theater-repl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pack",
+ "theater",
+ "theater-handler-message-server",
+ "theater-handler-runtime",
+ "theater-handler-store",
+ "theater-handler-supervisor",
+ "theater-handler-wisp",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wasmparser 0.219.2",
+ "wasmtime 21.0.2",
+ "wat",
 ]
 
 [[package]]

@@ -1,0 +1,21 @@
+[package]
+name = "theater-handler-wisp"
+version = "0.1.0"
+edition = "2021"
+description = "Theater handler for Wisp-specific host functions (assembler, helpers)"
+
+[dependencies]
+# Theater core
+theater = { path = "/home/colin/work/theater/crates/theater" }
+
+# WAT to WASM assembly
+wat = "1.222"
+
+# Async runtime
+tokio = { version = "1", features = ["sync"] }
+
+# Logging
+tracing = "0.1"
+
+# Error handling
+anyhow = "1"

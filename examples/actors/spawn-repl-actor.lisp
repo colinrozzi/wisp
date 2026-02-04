@@ -1,41 +1,49 @@
-; spawn-repl-actor.lisp — Theater actor that evaluates Wisp expressions by spawning child actors
+; spawn-repl-actor.lisp — Theater actor with WASM-to-WASM compilation and actor spawning
 ;
-; This implements the "minimal host, maximal WASM" architecture:
-; - Compilation happens in WASM (via linked wisp-compiler)
-; - Execution happens by spawning expression-actors
-; - Results come back via handle-child-exit
+; This actor demonstrates the full eval loop with actor spawning:
+; 1. Receives expression from user
+; 2. Wraps expression as module source (host helper)
+; 3. Compiles source to WAT via WASM-to-WASM call to linked compiler!
+; 4. Assembles WAT to WASM bytes (wat-to-wasm host function)
+; 5. Spawns expression-actor with the WASM bytes and waits for result
 ;
 ; Imports:
 ;   theater:simple/runtime.log — logging
-;   wisp:compiler/compiler.compile-source — WASM-to-WASM call to linked compiler
-;   wisp:assembler/runtime.wat-to-wasm — host function to assemble WAT to WASM
-;   wisp:repl/helpers.wrap-expression — host helper to wrap expression as actor source
-;   wisp:repl/helpers.bytes-to-string — host helper to convert list<u8> to string
-;   theater:simple/supervisor.spawn-with-wasm — spawn actor with inline WASM bytes
+;   wisp:compiler/compiler.compile-source — compile Wisp to WAT (WASM-to-WASM!)
+;   wisp:repl/helpers.wrap-expression — wrap expression as eval module
+;   wisp:assembler/runtime.wat-to-wasm — assemble WAT string to WASM bytes
+;   theater:simple/supervisor.spawn-and-wait — spawn actor and wait for result
 ;
 ; Exports:
 ;   theater:simple/actor.init — actor initialization
-;   theater:simple/message-server-client.handle-request — receives expressions
-;   theater:simple/supervisor-handlers.handle-child-exit — receives results
+;   theater:simple/message-server-client.handle-send — fire-and-forget (ignored)
+;   theater:simple/message-server-client.handle-request — compiles and spawns expression actors
 
 (import theater:simple/runtime log ((msg string)) s32)
 
-; Linked compiler (WASM-to-WASM call via Pack composition)
+; This is the WASM-to-WASM call to the linked compiler!
+; When we call compile-source, it goes directly to wisp-compiler.wasm
 (import wisp:compiler/compiler compile-source ((src string)) string)
 
-; Host functions
-(import wisp:assembler/runtime wat-to-wasm ((wat string)) (result (list u8) string))
-(import wisp:repl/helpers wrap-expression ((expr string)) string)
-(import wisp:repl/helpers bytes-to-string ((bytes (list u8))) string)
+; Host helper: wrap expression bytes as module source string
+; Takes (tuple request-id body-bytes), returns wrapped source string
+(import wisp:repl/helpers wrap-expression
+  ((params (tuple string (list u8))))
+  string)
 
-; Theater supervisor (spawn with inline WASM)
-(import theater:simple/supervisor spawn-with-wasm
-  ((manifest string) (init-bytes (option (list u8))) (wasm-bytes (list u8)))
-  (result string string))
+; Host function: assemble WAT string to WASM bytes
+; Returns option<list<u8>> - Some = success, None = error (logged on host)
+(import wisp:assembler/runtime wat-to-wasm
+  ((wat string))
+  (option (list u8)))
 
-; ============================================================
-; Actor Exports
-; ============================================================
+; Host function: spawn an actor with inline WASM and wait for its result
+; Takes (tuple tag wasm-bytes) where tag is ignored, returns the actor's result
+; (Using tuple because Wisp compiler supports tuple(string, list<u8>) encoding)
+; Returns option<list<u8>> - Some = actor result, None = error (logged on host)
+(import theater:simple/supervisor spawn-and-wait
+  ((params (tuple string (list u8))))
+  (option (list u8)))
 
 ; Initialize the REPL actor
 (export "theater:simple/actor.init"
@@ -43,8 +51,14 @@
     (result (tuple (option (list u8))) string)
     (begin
       (log "Spawn REPL actor initialized!")
-      (ok (tuple (option (list u8))) string
-          (tuple state)))))
+      ; Demo: call compile-source to prove WASM-to-WASM works
+      (log "Testing WASM-to-WASM call to compiler...")
+      (let (test-wat (compile-source "(export (fn test () s32 (i32.const 42)))"))
+        (begin
+          (log "Compiler returned WAT!")
+          (log test-wat)
+          (ok (tuple (option (list u8))) string
+              (tuple state)))))))
 
 ; Handle fire-and-forget messages (ignored)
 (export "theater:simple/message-server-client.handle-send"
@@ -55,63 +69,43 @@
       (ok (tuple (option (list u8))) string
           (tuple state)))))
 
-; Handle request-response messages
-; This is where we compile and spawn expression actors
+; Handle request-response messages — the full eval loop with actor spawning!
 (export "theater:simple/message-server-client.handle-request"
   (fn handle-request ((state (option (list u8))) (params (tuple string (list u8))))
     (result (tuple (option (list u8)) (tuple (option (list u8)))) string)
-    (let (request-body (tuple-get params 1))
-      (let (expr (bytes-to-string request-body))
+    (begin
+      (log "=== Full eval loop with actor spawning ===")
+
+      ; Step 1: Wrap expression as module source (host helper)
+      (log "Step 1: Wrapping expression...")
+      (let (source (wrap-expression params))
         (begin
-          (log (string-append "Evaluating: " expr))
-          ; Step 1: Wrap expression as actor source
-          (let (actor-source (wrap-expression expr))
+          (log "Wrapped source ready")
+
+          ; Step 2: Compile to WAT via WASM-to-WASM call!
+          (log "Step 2: Compiling via WASM-to-WASM...")
+          (let (wat (compile-source source))
             (begin
-              (log "Wrapped as actor source")
-              ; Step 2: Compile to WAT via linked compiler
-              (let (wat (compile-source actor-source))
-                (begin
-                  (log "Compiled to WAT")
-                  ; Step 3: Assemble to WASM via host function
-                  (match (wat-to-wasm wat)
-                    ((ok wasm-bytes)
-                      (begin
-                        (log "Assembled to WASM")
-                        ; Step 4: Spawn expression-actor
-                        ; For now, we just return success - full spawn needs manifest
-                        ; TODO: Actually call spawn-with-wasm once manifest handling is ready
-                        (ok (tuple (option (list u8)) (tuple (option (list u8)))) string
-                            (tuple state (tuple (some (list u8) wasm-bytes))))))
-                    ((err msg)
-                      (begin
-                        (log (string-append "Assembly error: " msg))
-                        (ok (tuple (option (list u8)) (tuple (option (list u8)))) string
-                            (tuple state (tuple (none (list u8)))))))))))))))))
+              (log "Compilation complete!")
 
-; Handle child actor exit - this is where we receive evaluation results
-(export "theater:simple/supervisor-handlers.handle-child-exit"
-  (fn handle-child-exit ((state (option (list u8))) (params (tuple string (option (list u8)))))
-    (result (tuple (option (list u8))) string)
-    (begin
-      (log "Child actor exited with result")
-      ; TODO: Extract result from params and route to waiting client
-      (ok (tuple (option (list u8))) string
-          (tuple state)))))
+              ; Step 3: Assemble WAT to WASM bytes
+              (log "Step 3: Assembling WAT to WASM...")
+              (let (wasm-opt (wat-to-wasm wat))
+                ; Use match for option pattern matching
+                (match wasm-opt
+                  ((some wasm-bytes)
+                    (begin
+                      (log "Assembly complete!")
 
-; Handle child actor error
-(export "theater:simple/supervisor-handlers.handle-child-error"
-  (fn handle-child-error ((state (option (list u8))) (params (tuple string (tuple string (option (list u8))))))
-    (result (tuple (option (list u8))) string)
-    (begin
-      (log "Child actor error")
-      (ok (tuple (option (list u8))) string
-          (tuple state)))))
-
-; Handle child actor external stop
-(export "theater:simple/supervisor-handlers.handle-child-external-stop"
-  (fn handle-child-external-stop ((state (option (list u8))) (params (tuple string)))
-    (result (tuple (option (list u8))) string)
-    (begin
-      (log "Child actor externally stopped")
-      (ok (tuple (option (list u8))) string
-          (tuple state)))))
+                      ; Step 4: Spawn expression-actor and wait for result
+                      (log "Step 4: Spawning expression-actor...")
+                      (let (result-bytes (spawn-and-wait (tuple "spawn" wasm-bytes)))
+                        (begin
+                          (log "=== Eval loop complete (via actor spawn) ===")
+                          (ok (tuple (option (list u8)) (tuple (option (list u8)))) string
+                              (tuple state (tuple result-bytes)))))))
+                  ((none)
+                    (begin
+                      (log "Assembly failed!")
+                      (err (tuple (option (list u8)) (tuple (option (list u8)))) string
+                          "Assembly failed"))))))))))))
