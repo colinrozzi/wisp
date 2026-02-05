@@ -24,6 +24,57 @@ use pack::compose::StaticComposer;
 // WASM runtime for eval-wasm
 use wasmtime::{Engine, Module, Store};
 
+/// Detect the return type of a Wisp expression based on its syntax.
+/// Returns "s32", "s64", "f32", or "f64".
+fn detect_expr_type(expr: &str) -> &'static str {
+    let expr = expr.trim();
+
+    // Check for explicit type cast as outermost expression
+    if expr.starts_with("(s64 ") || expr.starts_with("(s64\n") {
+        return "s64";
+    }
+    if expr.starts_with("(f32 ") || expr.starts_with("(f32\n") {
+        return "f32";
+    }
+    if expr.starts_with("(f64 ") || expr.starts_with("(f64\n") {
+        return "f64";
+    }
+    if expr.starts_with("(s32 ") || expr.starts_with("(s32\n") {
+        return "s32";
+    }
+
+    // Check for WASM instruction prefixes
+    if expr.starts_with("(i64.") {
+        return "s64";
+    }
+    if expr.starts_with("(f32.") {
+        return "f32";
+    }
+    if expr.starts_with("(f64.") {
+        return "f64";
+    }
+    if expr.starts_with("(i32.") {
+        return "s32";
+    }
+
+    // Check for numeric literals with type suffixes
+    // e.g., "42s64", "3.14f32"
+    if let Some(first_token) = expr.strip_prefix('(').and_then(|s| s.split_whitespace().next()) {
+        if first_token.ends_with("s64") || first_token.ends_with("i64") {
+            return "s64";
+        }
+        if first_token.ends_with("f32") {
+            return "f32";
+        }
+        if first_token.ends_with("f64") {
+            return "f64";
+        }
+    }
+
+    // Default to s32
+    "s32"
+}
+
 /// Handler for Wisp-specific host functions
 #[derive(Clone, Default)]
 pub struct WispHandler;
@@ -194,52 +245,95 @@ impl Handler for WispHandler {
                             }
                         };
 
-                        // Get the eval function
-                        let eval_func = match instance.get_typed_func::<(), i32>(&mut store, "eval") {
-                            Ok(f) => f,
-                            Err(e) => {
-                                info!("[EVAL-WASM] Could not find eval function: {}", e);
-                                return Value::Result {
-                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
-                                    err_type: ValueType::String,
-                                    value: Err(Box::new(Value::String(format!(
-                                        "Could not find eval function: {}",
-                                        e
-                                    )))),
-                                };
+                        // Type tags for the response
+                        const TYPE_S32: u8 = 0x01;
+                        const TYPE_S64: u8 = 0x02;
+                        const TYPE_F32: u8 = 0x03;
+                        const TYPE_F64: u8 = 0x04;
+
+                        // Try to get the eval function with different return types
+                        // The type is determined by what the WASM module exports
+
+                        // Helper to build the result
+                        let make_result = |type_tag: u8, bytes: Vec<u8>| {
+                            let mut result_bytes: Vec<Value> = vec![Value::U8(type_tag)];
+                            result_bytes.extend(bytes.into_iter().map(Value::U8));
+                            Value::Result {
+                                ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                err_type: ValueType::String,
+                                value: Ok(Box::new(Value::List {
+                                    elem_type: ValueType::U8,
+                                    items: result_bytes,
+                                })),
                             }
                         };
 
-                        // Call eval
-                        match eval_func.call(&mut store, ()) {
-                            Ok(result) => {
-                                info!("[EVAL-WASM] Result: {}", result);
-                                // Convert i32 to 4 bytes (little-endian)
-                                let result_bytes: Vec<Value> = result.to_le_bytes()
-                                    .into_iter()
-                                    .map(Value::U8)
-                                    .collect();
-                                Value::Result {
-                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
-                                    err_type: ValueType::String,
-                                    value: Ok(Box::new(Value::List {
-                                        elem_type: ValueType::U8,
-                                        items: result_bytes,
-                                    })),
-                                }
+                        let make_error = |msg: String| {
+                            Value::Result {
+                                ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                err_type: ValueType::String,
+                                value: Err(Box::new(Value::String(msg))),
                             }
-                            Err(e) => {
-                                info!("[EVAL-WASM] Execution error: {}", e);
-                                Value::Result {
-                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
-                                    err_type: ValueType::String,
-                                    value: Err(Box::new(Value::String(format!(
-                                        "Execution failed: {}",
-                                        e
-                                    )))),
+                        };
+
+                        // Try i32 first (most common)
+                        if let Ok(func) = instance.get_typed_func::<(), i32>(&mut store, "eval") {
+                            match func.call(&mut store, ()) {
+                                Ok(result) => {
+                                    info!("[EVAL-WASM] Result (i32): {}", result);
+                                    return make_result(TYPE_S32, result.to_le_bytes().to_vec());
+                                }
+                                Err(e) => {
+                                    info!("[EVAL-WASM] Execution error: {}", e);
+                                    return make_error(format!("Execution failed: {}", e));
                                 }
                             }
                         }
+
+                        // Try i64
+                        if let Ok(func) = instance.get_typed_func::<(), i64>(&mut store, "eval") {
+                            match func.call(&mut store, ()) {
+                                Ok(result) => {
+                                    info!("[EVAL-WASM] Result (i64): {}", result);
+                                    return make_result(TYPE_S64, result.to_le_bytes().to_vec());
+                                }
+                                Err(e) => {
+                                    info!("[EVAL-WASM] Execution error: {}", e);
+                                    return make_error(format!("Execution failed: {}", e));
+                                }
+                            }
+                        }
+
+                        // Try f32
+                        if let Ok(func) = instance.get_typed_func::<(), f32>(&mut store, "eval") {
+                            match func.call(&mut store, ()) {
+                                Ok(result) => {
+                                    info!("[EVAL-WASM] Result (f32): {}", result);
+                                    return make_result(TYPE_F32, result.to_le_bytes().to_vec());
+                                }
+                                Err(e) => {
+                                    info!("[EVAL-WASM] Execution error: {}", e);
+                                    return make_error(format!("Execution failed: {}", e));
+                                }
+                            }
+                        }
+
+                        // Try f64
+                        if let Ok(func) = instance.get_typed_func::<(), f64>(&mut store, "eval") {
+                            match func.call(&mut store, ()) {
+                                Ok(result) => {
+                                    info!("[EVAL-WASM] Result (f64): {}", result);
+                                    return make_result(TYPE_F64, result.to_le_bytes().to_vec());
+                                }
+                                Err(e) => {
+                                    info!("[EVAL-WASM] Execution error: {}", e);
+                                    return make_error(format!("Execution failed: {}", e));
+                                }
+                            }
+                        }
+
+                        // No matching eval function found
+                        make_error("Could not find eval function with supported return type (i32, i64, f32, f64)".to_string())
                     },
                 )?;
             ctx.mark_satisfied("wisp:assembler/runtime");
@@ -280,15 +374,17 @@ impl Handler for WispHandler {
                         let expr = String::from_utf8_lossy(&body_bytes).to_string();
                         info!("[WRAP] Expression: {}", expr);
 
-                        // Wrap expression as a simple eval function
-                        // The REPL will compile this and call eval() directly to get the i32 result
-                        // This avoids the self-hosted compiler's bug with u8 type annotations
+                        // Detect the return type from the expression
+                        let return_type = detect_expr_type(&expr);
+                        info!("[WRAP] Detected return type: {}", return_type);
+
+                        // Wrap expression as a simple eval function with the detected type
                         let source = format!(
                             r#"
-(export (fn eval () s32
+(export (fn eval () {}
   {}))
 "#,
-                            expr
+                            return_type, expr
                         );
                         info!("[WRAP] Wrapped source (eval function): {}", source.trim());
 

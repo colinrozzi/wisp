@@ -16,6 +16,7 @@
   (lparen)
   (rparen)
   (number s64)
+  (float-lit string)   ; Float literal stored as string (e.g., "3.14159")
   (symbol string)
   (str-lit string))
 
@@ -26,6 +27,7 @@
 (variant sexpr
   (sym string)
   (num s64)
+  (fnum string)  ; Float number stored as string for pass-through to WAT
   (str string)
   (lst (list sexpr)))
 
@@ -109,17 +111,44 @@
   (tok token)
   (new-pos s32))
 
-(fn parse-number-value ((src string) (pos s32) (len s32) (acc s64)) token-result
+; Find the end position of a number (integer or float)
+; Handles: digits, optional decimal point, more digits
+(fn find-number-end ((src string) (pos s32) (len s32) (seen-dot s32)) s32
   (if (i32.ge_s pos len)
-    (token-result (number acc) pos)
+    pos
     (let (c (string-ref src pos))
       (if (is-digit c)
-        (parse-number-value src (i32.add pos (i32.const 1)) len
-          (i64.add (i64.mul acc (i64.const 10)) (i64.extend_i32_s (digit-value c))))
-        (token-result (number acc) pos)))))
+        (find-number-end src (i32.add pos (i32.const 1)) len seen-dot)
+        (if (i32.and (i32.eq c (i32.const 46)) (i32.eq seen-dot (i32.const 0)))
+          (find-number-end src (i32.add pos (i32.const 1)) len (i32.const 1))
+          pos)))))
 
+; Check if substring contains a decimal point
+(fn has-decimal ((src string) (start s32) (end s32)) s32
+  (if (i32.ge_s start end)
+    (i32.const 0)
+    (if (i32.eq (string-ref src start) (i32.const 46))
+      (i32.const 1)
+      (has-decimal src (i32.add start (i32.const 1)) end))))
+
+; Parse integer part of a number string
+(fn parse-int-value ((src string) (pos s32) (end s32) (acc s64)) s64
+  (if (i32.ge_s pos end)
+    acc
+    (let (c (string-ref src pos))
+      (if (is-digit c)
+        (parse-int-value src (i32.add pos (i32.const 1)) end
+          (i64.add (i64.mul acc (i64.const 10)) (i64.extend_i32_s (digit-value c))))
+        acc))))
+
+; Read a number - returns either (number s64) or (float-lit string)
 (fn read-number ((src string) (pos s32) (len s32)) token-result
-  (parse-number-value src pos len (i64.const 0)))
+  (let (end (find-number-end src pos len (i32.const 0)))
+    (if (has-decimal src pos end)
+      ; Float: return as string for pass-through to WAT
+      (token-result (float-lit (substring src pos end)) end)
+      ; Integer: parse and return as s64
+      (token-result (number (parse-int-value src pos end (i64.const 0))) end))))
 
 (fn find-symbol-end ((src string) (pos s32) (len s32)) s32
   (if (i32.ge_s pos len)
@@ -168,6 +197,7 @@
                     (let (result (read-number src (i32.add pos (i32.const 1)) len))
                       (match (token-result.tok result)
                         ((number n) (token-result (number (i64.sub (i64.const 0) n)) (token-result.new-pos result)))
+                        ((float-lit f) (token-result (float-lit (string-append "-" f)) (token-result.new-pos result)))
                         ((lparen) result)
                         ((rparen) result)
                         ((symbol s) result)
@@ -218,6 +248,7 @@
     ((lparen) (i32.const 1))
     ((rparen) (i32.const 0))
     ((number n) (i32.const 0))
+    ((float-lit f) (i32.const 0))
     ((symbol s) (i32.const 0))
     ((str-lit s) (i32.const 0))))
 
@@ -226,6 +257,7 @@
     ((lparen) (i32.const 0))
     ((rparen) (i32.const 1))
     ((number n) (i32.const 0))
+    ((float-lit f) (i32.const 0))
     ((symbol s) (i32.const 0))
     ((str-lit s) (i32.const 0))))
 
@@ -234,6 +266,7 @@
     ((lparen) (sym "error-lparen"))
     ((rparen) (sym "error-rparen"))
     ((number n) (num n))
+    ((float-lit f) (fnum f))
     ((symbol s) (sym s))
     ((str-lit s) (str s))))
 
@@ -280,23 +313,26 @@
 ; ============================================================
 
 (fn is-sym ((e sexpr)) s32
-  (match e ((sym s) (i32.const 1)) ((num n) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
+  (match e ((sym s) (i32.const 1)) ((num n) (i32.const 0)) ((fnum f) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
 
 (fn is-num ((e sexpr)) s32
-  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 1)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
+  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 1)) ((fnum f) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
+
+(fn is-fnum ((e sexpr)) s32
+  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 0)) ((fnum f) (i32.const 1)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
 
 (fn is-lst ((e sexpr)) s32
-  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 1))))
+  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 0)) ((fnum f) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 1))))
 
 (fn is-str ((e sexpr)) s32
-  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 0)) ((str s) (i32.const 1)) ((lst l) (i32.const 0))))
+  (match e ((sym s) (i32.const 0)) ((num n) (i32.const 0)) ((fnum f) (i32.const 0)) ((str s) (i32.const 1)) ((lst l) (i32.const 0))))
 
 (fn get-sym ((e sexpr)) string
-  (match e ((sym s) s) ((num n) "") ((str s) "") ((lst l) "")))
+  (match e ((sym s) s) ((num n) "") ((fnum f) "") ((str s) "") ((lst l) "")))
 
 ; Return s32 truncated value for compatibility (match bug with i64 return types)
 (fn get-num ((e sexpr)) s32
-  (match e ((sym s) (i32.const 0)) ((num n) (i32.wrap_i64 n)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
+  (match e ((sym s) (i32.const 0)) ((num n) (i32.wrap_i64 n)) ((fnum f) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
 
 ; Return full s64 value using global variable workaround (match bug with i64 return types)
 ; The match stores the value in $__temp_i64, then we read it back
@@ -304,6 +340,7 @@
   (match e
     ((sym s) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
     ((num n) (begin (global.set $__temp_i64 n) (i32.const 1)))
+    ((fnum f) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
     ((str s) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
     ((lst l) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))))
 
@@ -312,11 +349,15 @@
     (get-num-i64-helper e)
     (global.get $__temp_i64)))
 
+; Get float number string
+(fn get-fnum ((e sexpr)) string
+  (match e ((sym s) "") ((num n) "") ((fnum f) f) ((str s) "") ((lst l) "")))
+
 (fn get-str ((e sexpr)) string
-  (match e ((sym s) "") ((num n) "") ((str s) s) ((lst l) "")))
+  (match e ((sym s) "") ((num n) "") ((fnum f) "") ((str s) s) ((lst l) "")))
 
 (fn get-lst ((e sexpr)) (list sexpr)
-  (match e ((sym s) (list-new sexpr)) ((num n) (list-new sexpr)) ((str s) (list-new sexpr)) ((lst l) l)))
+  (match e ((sym s) (list-new sexpr)) ((num n) (list-new sexpr)) ((fnum f) (list-new sexpr)) ((str s) (list-new sexpr)) ((lst l) l)))
 
 ; ============================================================
 ; Type Definition Collection
@@ -751,7 +792,10 @@
       (let (arg (list-get args (i32.const 0)))
         (if (is-num arg)
           (string-append "(" (string-append instr (string-append " " (string-append (i64-to-string (get-num-i64 arg)) ")"))))
-          (string-append "(" (string-append instr " (error: const expects number))"))))
+          (if (is-fnum arg)
+            ; Float literal - use string directly
+            (string-append "(" (string-append instr (string-append " " (string-append (get-fnum arg) ")"))))
+            (string-append "(" (string-append instr " (error: const expects number or float)")))))
       (let (compiled-args (compile-args args (i32.const 0) (list-len args) "" ctx))
         (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")"))))))))
 
@@ -814,6 +858,7 @@
 (fn compile-expr-sub ((expr sexpr) (binding-name string) (scrutinee-wat string) (ctx compile-ctx) (is-tail s32)) string
   (match expr
     ((num n) (compile-number n))
+    ((fnum f) (string-append "(f64.const " (string-append f ")")))  ; Default to f64 for bare float literals
     ((sym s)
       (if (string=? binding-name "")
         (compile-var s)
@@ -861,7 +906,10 @@
         (let (arg (list-get args (i32.const 0)))
           (if (is-num arg)
             (string-append "(" (string-append instr (string-append " " (string-append (i64-to-string (get-num-i64 arg)) ")"))))
-            (string-append "(" (string-append instr " (error: const expects number))"))))
+            (if (is-fnum arg)
+              ; Float literal - use string directly
+              (string-append "(" (string-append instr (string-append " " (string-append (get-fnum arg) ")"))))
+              (string-append "(" (string-append instr " (error: const expects number or float)")))))
         (let (compiled-args (compile-args-sub args (i32.const 0) (list-len args) "" binding-name scrutinee-wat ctx))
           (string-append "(" (string-append instr (string-append " " (string-append compiled-args ")")))))))))
 
@@ -929,6 +977,7 @@
 (fn compile-expr ((expr sexpr) (ctx compile-ctx) (is-tail s32)) string
   (match expr
     ((num n) (compile-number n))
+    ((fnum f) (string-append "(f64.const " (string-append f ")")))  ; Default to f64 for bare float literals
     ((sym s) (compile-var s))
     ((str s) (compile-string s))
     ((lst items) (compile-list items ctx is-tail))))

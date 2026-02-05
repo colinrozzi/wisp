@@ -293,19 +293,69 @@ type = "store"
         // Wait for the actual response from the actor
         match response_rx.await {
             Ok(response_bytes) => {
-                // Response is a 4-byte little-endian i32
-                if response_bytes.len() == 4 {
-                    let value = i32::from_le_bytes([
-                        response_bytes[0],
-                        response_bytes[1],
-                        response_bytes[2],
-                        response_bytes[3],
-                    ]);
-                    println!("{}", value);
+                // Response format: [type_tag, ...value_bytes]
+                // Type tags: 0x01=s32, 0x02=s64, 0x03=f32, 0x04=f64
+                if response_bytes.is_empty() {
+                    println!("(no result)");
                 } else {
-                    // For non-i32 responses, try as string
-                    let response = String::from_utf8_lossy(&response_bytes);
-                    println!("{}", response);
+                    let type_tag = response_bytes[0];
+                    let value_bytes = &response_bytes[1..];
+
+                    match type_tag {
+                        0x01 if value_bytes.len() >= 4 => {
+                            // s32 (i32)
+                            let value = i32::from_le_bytes([
+                                value_bytes[0],
+                                value_bytes[1],
+                                value_bytes[2],
+                                value_bytes[3],
+                            ]);
+                            println!("{}", value);
+                        }
+                        0x02 if value_bytes.len() >= 8 => {
+                            // s64 (i64)
+                            let value = i64::from_le_bytes([
+                                value_bytes[0],
+                                value_bytes[1],
+                                value_bytes[2],
+                                value_bytes[3],
+                                value_bytes[4],
+                                value_bytes[5],
+                                value_bytes[6],
+                                value_bytes[7],
+                            ]);
+                            println!("{}", value);
+                        }
+                        0x03 if value_bytes.len() >= 4 => {
+                            // f32
+                            let value = f32::from_le_bytes([
+                                value_bytes[0],
+                                value_bytes[1],
+                                value_bytes[2],
+                                value_bytes[3],
+                            ]);
+                            println!("{}", value);
+                        }
+                        0x04 if value_bytes.len() >= 8 => {
+                            // f64
+                            let value = f64::from_le_bytes([
+                                value_bytes[0],
+                                value_bytes[1],
+                                value_bytes[2],
+                                value_bytes[3],
+                                value_bytes[4],
+                                value_bytes[5],
+                                value_bytes[6],
+                                value_bytes[7],
+                            ]);
+                            println!("{}", value);
+                        }
+                        _ => {
+                            // Unknown format, try as string
+                            let response = String::from_utf8_lossy(&response_bytes);
+                            println!("{}", response);
+                        }
+                    }
                 }
             }
             Err(e) => {
