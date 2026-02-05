@@ -1,23 +1,23 @@
-; spawn-repl-actor.lisp — Theater actor with WASM-to-WASM compilation and actor spawning
+; spawn-repl-actor.lisp — Theater actor with WASM-to-WASM compilation and direct eval
 ;
-; This actor demonstrates the full eval loop with actor spawning:
+; This actor demonstrates the full eval loop:
 ; 1. Receives expression from user
-; 2. Wraps expression as module source (host helper)
+; 2. Wraps expression as eval module source (host helper)
 ; 3. Compiles source to WAT via WASM-to-WASM call to linked compiler!
 ; 4. Assembles WAT to WASM bytes (wat-to-wasm host function)
-; 5. Spawns expression-actor with the WASM bytes and waits for result
+; 5. Evaluates WASM directly and returns the i32 result (eval-wasm host function)
 ;
 ; Imports:
 ;   theater:simple/runtime.log — logging
 ;   wisp:compiler/compiler.compile-source — compile Wisp to WAT (WASM-to-WASM!)
 ;   wisp:repl/helpers.wrap-expression — wrap expression as eval module
 ;   wisp:assembler/runtime.wat-to-wasm — assemble WAT string to WASM bytes
-;   theater:simple/supervisor.spawn-and-wait — spawn actor and wait for result
+;   wisp:assembler/runtime.eval-wasm — evaluate WASM and call eval() export
 ;
 ; Exports:
 ;   theater:simple/actor.init — actor initialization
 ;   theater:simple/message-server-client.handle-send — fire-and-forget (ignored)
-;   theater:simple/message-server-client.handle-request — compiles and spawns expression actors
+;   theater:simple/message-server-client.handle-request — compiles and evaluates expressions
 
 (import theater:simple/runtime log ((msg string)) s32)
 
@@ -37,13 +37,11 @@
   ((wat string))
   (option (list u8)))
 
-; Host function: spawn an actor with inline WASM and wait for its result
-; Takes (tuple tag wasm-bytes) where tag is ignored, returns the actor's result
-; (Using tuple because Wisp compiler supports tuple(string, list<u8>) encoding)
-; Returns option<list<u8>> - Some = actor result, None = error (logged on host)
-(import theater:simple/supervisor spawn-and-wait
-  ((params (tuple string (list u8))))
-  (option (list u8)))
+; Host function: evaluate WASM bytes by calling the `eval` export
+; Returns result<list<u8>, string> - Ok = result bytes (4-byte i32), Err = error message
+(import wisp:assembler/runtime eval-wasm
+  ((wasm (list u8)))
+  (result (list u8) string))
 
 ; Initialize the REPL actor
 (export "theater:simple/actor.init"
@@ -69,12 +67,12 @@
       (ok (tuple (option (list u8))) string
           (tuple state)))))
 
-; Handle request-response messages — the full eval loop with actor spawning!
+; Handle request-response messages — the full eval loop with direct evaluation!
 (export "theater:simple/message-server-client.handle-request"
   (fn handle-request ((state (option (list u8))) (params (tuple string (list u8))))
     (result (tuple (option (list u8)) (tuple (option (list u8)))) string)
     (begin
-      (log "=== Full eval loop with actor spawning ===")
+      (log "=== Full eval loop with direct evaluation ===")
 
       ; Step 1: Wrap expression as module source (host helper)
       (log "Step 1: Wrapping expression...")
@@ -97,13 +95,23 @@
                     (begin
                       (log "Assembly complete!")
 
-                      ; Step 4: Spawn expression-actor and wait for result
-                      (log "Step 4: Spawning expression-actor...")
-                      (let (result-bytes (spawn-and-wait (tuple "spawn" wasm-bytes)))
-                        (begin
-                          (log "=== Eval loop complete (via actor spawn) ===")
-                          (ok (tuple (option (list u8)) (tuple (option (list u8)))) string
-                              (tuple state (tuple result-bytes)))))))
+                      ; Step 4: Evaluate WASM directly via host function
+                      (log "Step 4: Evaluating WASM...")
+                      (let (eval-result (eval-wasm wasm-bytes))
+                        (match eval-result
+                          ((ok result-bytes)
+                            (begin
+                              (log "=== Eval loop complete ===")
+                              ; Return success with result bytes as response
+                              ; State stays the same, response is the result
+                              (ok (tuple (option (list u8)) (tuple (option (list u8)))) string
+                                  (tuple state (tuple (some (list u8) result-bytes))))))
+                          ((err error-msg)
+                            (begin
+                              (log "Eval failed!")
+                              (log error-msg)
+                              (err (tuple (option (list u8)) (tuple (option (list u8)))) string
+                                  error-msg)))))))
                   ((none)
                     (begin
                       (log "Assembly failed!")

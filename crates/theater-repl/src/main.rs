@@ -44,7 +44,6 @@ use theater::config::actor_manifest::{RuntimeHostConfig, StoreHandlerConfig, Sup
 use theater::handler::HandlerRegistry;
 use theater::messages::{ActorMessage, ActorRequest, MessageCommand, TheaterCommand};
 use theater::theater_runtime::TheaterRuntime;
-use theater::TheaterId;
 use theater_handler_message_server::{MessageRouter, MessageServerHandler};
 use theater_handler_runtime::RuntimeHandler;
 use theater_handler_store::StoreHandler;
@@ -175,6 +174,8 @@ async fn run_theater_repl(actor_path: &PathBuf) -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Create inline manifest for the composed REPL actor
+    // Note: "wisp" handler is not a known type in Theater's manifest parser,
+    // but it's registered in the handler registry and will match imports.
     let manifest = r#"
 name = "composed-repl"
 version = "0.1.0"
@@ -192,9 +193,6 @@ type = "supervisor"
 
 [[handler]]
 type = "store"
-
-[[handler]]
-type = "wisp"
 "#;
 
     // Spawn the composed REPL actor with inline WASM bytes
@@ -229,6 +227,15 @@ type = "wisp"
             return Err(anyhow::anyhow!("Spawn channel closed"));
         }
     };
+
+    // HACK: Wait for actor to fully initialize and register with MessageRouter.
+    // Theater's SpawnActor returns success when the actor task is spawned, but
+    // before handlers (including MessageServerHandler) are started. This means
+    // the actor isn't registered with the MessageRouter yet.
+    //
+    // TODO(theater): SpawnActor should wait until actor is ready to receive messages.
+    // See: https://github.com/anthropics/theater/issues/XXX (file issue)
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     // REPL loop - send requests via MessageRouter
     let stdin = io::stdin();
@@ -286,8 +293,20 @@ type = "wisp"
         // Wait for the actual response from the actor
         match response_rx.await {
             Ok(response_bytes) => {
-                let response = String::from_utf8_lossy(&response_bytes);
-                println!("{}", response);
+                // Response is a 4-byte little-endian i32
+                if response_bytes.len() == 4 {
+                    let value = i32::from_le_bytes([
+                        response_bytes[0],
+                        response_bytes[1],
+                        response_bytes[2],
+                        response_bytes[3],
+                    ]);
+                    println!("{}", value);
+                } else {
+                    // For non-i32 responses, try as string
+                    let response = String::from_utf8_lossy(&response_bytes);
+                    println!("{}", response);
+                }
             }
             Err(e) => {
                 println!("error: No response from actor: {}", e);

@@ -797,6 +797,28 @@ fn type_needs_heap(ty: &Type) -> bool {
     }
 }
 
+/// Estimate the CGRF node size for an element type (used for list buffer allocation).
+/// Returns the approximate size in bytes of a single CGRF node for this type.
+fn cgrf_element_node_size(ty: &Type) -> usize {
+    match ty {
+        // Scalars: node header (8) + payload (4 or 8)
+        Type::S32 | Type::F32 | Type::U8 => 12,
+        Type::S64 | Type::F64 => 16,
+        // Strings: node header (8) + length (4) + average string data (~32)
+        Type::Str => 44,
+        // Lists: node header (8) + child indices (~16) + nested elements
+        Type::List(inner) => 24 + cgrf_element_node_size(inner),
+        // Options: node header (8) + presence (1) + optional child
+        Type::Option(inner) => 16 + cgrf_element_node_size(inner),
+        // Tuples: node header (8) + child indices
+        Type::Tuple(elems) => 8 + 4 * elems.len() + elems.iter().map(cgrf_element_node_size).sum::<usize>(),
+        // Records, variants, results: estimate conservatively
+        Type::Record(_) | Type::Variant(_) | Type::Result(_, _) => 64,
+        // Resources/borrows: just a handle
+        Type::Resource(_) | Type::Borrow(_) => 12,
+    }
+}
+
 /// Check if an expression uses heap allocation
 fn expr_uses_heap(expr: &Expr) -> bool {
     match expr {
@@ -8183,18 +8205,54 @@ fn generate_pack_wrapper(
     out.push_str("    local.set $value\n");
 
     // Allocate output buffer (guest-allocates ABI)
-    // Use a conservative size based on return type
-    let alloc_size = match &func.return_type {
-        Type::S32 | Type::F32 => 32, // 28 bytes needed
-        Type::S64 | Type::F64 => 40, // 32 bytes needed
-        Type::Str => 4096,           // Variable, allocate generously
-        Type::List(_) => 16384,      // Lists can be large
-        Type::Record(_) | Type::Variant(_) | Type::Option(_) | Type::Result(_, _) => 4096,
-        _ => 4096,
-    };
-    out.push_str(&format!("    i32.const {}\n", alloc_size));
-    out.push_str("    call $__alloc\n");
-    out.push_str("    local.set $out_ptr\n");
+    // For variable-size types, compute the exact size needed dynamically
+    match &func.return_type {
+        Type::S32 | Type::F32 => {
+            // Fixed size: header(16) + node(8) + payload(4) = 28, round up to 32
+            out.push_str("    i32.const 32\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $out_ptr\n");
+        }
+        Type::S64 | Type::F64 => {
+            // Fixed size: header(16) + node(8) + payload(8) = 32, round up to 40
+            out.push_str("    i32.const 40\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $out_ptr\n");
+        }
+        Type::Str => {
+            // Dynamic size: header(16) + node(8) + len_field(4) + string_data
+            // = 28 + string_length
+            out.push_str("    ;; Allocate exact size for string: 28 + string_length\n");
+            out.push_str("    local.get $value\n");
+            out.push_str("    i32.load\n"); // load string length
+            out.push_str("    i32.const 28\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $out_ptr\n");
+        }
+        Type::List(elem_ty) => {
+            // Dynamic size based on list length and element size
+            // CGRF list: header(16) + list_node(8 + 4 + 4*n) + n * element_nodes
+            // For simplicity, estimate element node size and multiply
+            let elem_node_size = cgrf_element_node_size(elem_ty);
+            out.push_str("    ;; Allocate size for list based on length\n");
+            out.push_str("    local.get $value\n");
+            out.push_str("    i32.load\n"); // load list length (first field)
+            out.push_str(&format!("    i32.const {}\n", elem_node_size + 4)); // per-element overhead
+            out.push_str("    i32.mul\n");
+            out.push_str("    i32.const 32\n"); // base overhead (header + list node header)
+            out.push_str("    i32.add\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $out_ptr\n");
+        }
+        _ => {
+            // For other types, use a generous fixed size
+            // TODO: compute dynamically for nested variable-size types
+            out.push_str("    i32.const 16384\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $out_ptr\n");
+        }
+    }
 
     // Encode result using recursive CGRF encoder
     out.push_str("    ;; Encode result value to CGRF (recursive encoder)\n");
@@ -8284,6 +8342,7 @@ fn generate_import_wrapper(
     out.push_str("    (local $out_ptr i32)\n");
     out.push_str("    (local $out_len i32)\n");
     out.push_str("    (local $status i32)\n");
+    out.push_str("    (local $result_slots i32)\n");
 
     // Check if we need extra locals for tuple encoding (must declare all locals upfront)
     if import.params.len() == 1 {
@@ -8329,14 +8388,51 @@ fn generate_import_wrapper(
         out.push_str("    (local $dec_list_node_offset i32)\n");
     }
 
-    // Use fixed buffer locations for import calls
-    // Import input buffer at 0x8000
-    // Result ptr/len slots at 0x9000 and 0x9004 (callee writes here)
-    let import_in_buf = 0x8000;
-    let result_ptr_slot = 0x9000;
-    let result_len_slot = 0x9004;
+    // Check if we need encoder locals for complex parameter types
+    let needs_complex_encode = import.params.iter().any(|p| {
+        matches!(
+            &p.ty,
+            Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Record(_) | Type::Variant(_)
+        )
+    });
+    if needs_complex_encode {
+        out.push_str("    (local $buf_cursor i32)\n");
+        out.push_str("    (local $node_idx i32)\n");
+        out.push_str("    (local $enc_root_idx i32)\n");
+        out.push_str("    (local $enc_header_start i32)\n");
+        out.push_str("    (local $enc_tmp i32)\n");
+        out.push_str("    (local $enc_tmp_i64 i64)\n");
+        out.push_str("    (local $enc_tmp_f32 f32)\n");
+        out.push_str("    (local $enc_tmp_f64 f64)\n");
+        out.push_str("    (local $enc_save_child i32)\n");
+        out.push_str("    (local $enc_save_root i32)\n");
+        out.push_str("    (local $enc_result_ptr i32)\n");
+        out.push_str("    (local $enc_tuple_header i32)\n");
+        out.push_str("    (local $enc_tuple_ci_pos i32)\n");
+        out.push_str("    (local $enc_list_header i32)\n");
+        out.push_str("    (local $enc_list_ci_pos i32)\n");
+        out.push_str("    (local $enc_list_i i32)\n");
+        out.push_str("    (local $enc_list_len i32)\n");
+        out.push_str("    (local $enc_list_data i32)\n");
+        out.push_str("    (local $enc_list_root_idx i32)\n");
+    }
 
-    out.push_str(&format!("    i32.const {}\n", import_in_buf));
+    // Allocate I/O buffers from heap (avoids collisions when modules are composed)
+    // Result ptr/len slots: 8 bytes (ptr at offset 0, len at offset 4)
+    out.push_str("    ;; Allocate result slots from heap (8 bytes)\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    call $__alloc\n");
+    out.push_str("    local.set $result_slots\n");
+
+    // Input buffer: allocate enough space for CGRF-encoded arguments
+    // Use larger buffer for complex types (tuples with options, nested lists, etc.)
+    let input_buf_size = if needs_complex_encode { 16384 } else { 4096 };
+    out.push_str(&format!(
+        "    ;; Allocate input buffer from heap ({} bytes)\n",
+        input_buf_size
+    ));
+    out.push_str(&format!("    i32.const {}\n", input_buf_size));
+    out.push_str("    call $__alloc\n");
     out.push_str("    local.set $in_buf\n");
 
     // Encode arguments to CGRF
@@ -9021,26 +9117,21 @@ fn generate_import_wrapper(
                     out.push_str("    i32.add\n");
                     out.push_str("    local.set $in_len\n");
                 } else {
-                    // Generic tuple encoding (not yet supported)
-                    out.push_str("    ;; WARNING: generic tuple encoding not yet supported\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    local.set $in_len\n");
+                    // Generic tuple encoding - use recursive encoder
+                    generate_import_generic_encode(out, &import.params[0], records, variants);
                 }
             } else {
-                // Tuple with unsupported field types
-                out.push_str("    ;; WARNING: tuple contains unsupported field types, passing empty\n");
-                out.push_str("    i32.const 0\n");
-                out.push_str("    local.set $in_len\n");
+                // Tuple with complex field types - use recursive encoder
+                generate_import_generic_encode(out, &import.params[0], records, variants);
             }
         } else {
-            // Non-tuple complex parameter
-            out.push_str("    ;; WARNING: unsupported single complex parameter type, passing empty\n");
-            out.push_str("    i32.const 0\n");
-            out.push_str("    local.set $in_len\n");
+            // Non-tuple complex parameter - use recursive encoder
+            generate_import_generic_encode(out, &import.params[0], records, variants);
         }
     } else {
-        // Unsupported argument types for import wrapper
-        out.push_str("    ;; WARNING: unsupported import argument types, passing empty\n");
+        // Multiple complex arguments - wrap in tuple and use recursive encoder
+        // For now, fallback to empty (should rarely happen)
+        out.push_str("    ;; WARNING: multiple complex import arguments not yet supported\n");
         out.push_str("    i32.const 0\n");
         out.push_str("    local.set $in_len\n");
     }
@@ -9049,16 +9140,20 @@ fn generate_import_wrapper(
     out.push_str("    ;; Call raw import with ptr/len slots\n");
     out.push_str("    local.get $in_buf\n");
     out.push_str("    local.get $in_len\n");
-    out.push_str(&format!("    i32.const {}\n", result_ptr_slot));
-    out.push_str(&format!("    i32.const {}\n", result_len_slot));
+    out.push_str("    local.get $result_slots\n"); // result_ptr slot
+    out.push_str("    local.get $result_slots\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n"); // result_len slot = result_slots + 4
     out.push_str(&format!("    call {}\n", raw_name));
     out.push_str("    local.set $status\n");
 
     // Read the result ptr and len from the slots
-    out.push_str(&format!("    i32.const {}\n", result_ptr_slot));
+    out.push_str("    local.get $result_slots\n");
     out.push_str("    i32.load\n");
     out.push_str("    local.set $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", result_len_slot));
+    out.push_str("    local.get $result_slots\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
     out.push_str("    i32.load\n");
     out.push_str("    local.set $out_len\n");
 
@@ -9113,6 +9208,70 @@ fn generate_import_wrapper(
     }
 
     out.push_str("  )\n");
+}
+
+/// Generate WAT to encode a single complex parameter to CGRF using the recursive encoder.
+/// Uses $in_buf as the output buffer and sets $in_len to the final encoded length.
+fn generate_import_generic_encode(
+    out: &mut String,
+    param: &Parameter,
+    records: &HashMap<String, RecordDef>,
+    variants: &HashMap<String, VariantDef>,
+) {
+    let param_name = &param.name;
+    let param_ty = &param.ty;
+
+    out.push_str(&format!(
+        "    ;; Generic CGRF encode for {:?} parameter\n",
+        param_ty
+    ));
+
+    // Set up encoding: use $in_buf as $out_ptr, cursor at 16 (after header)
+    out.push_str("    local.get $in_buf\n");
+    out.push_str("    local.set $out_ptr\n");
+    out.push_str("    i32.const 16\n");
+    out.push_str("    local.set $buf_cursor\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    local.set $node_idx\n");
+
+    // Encode the parameter value
+    let value_local = format!("${}", param_name);
+    generate_cgrf_encode_recursive(out, param_ty, &value_local, records, variants);
+
+    // Write CGRF header at offset 0
+    out.push_str("    ;; Write CGRF header\n");
+    // Magic
+    out.push_str("    local.get $in_buf\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+    out.push_str("    i32.store\n");
+    // Version
+    out.push_str("    local.get $in_buf\n");
+    out.push_str("    i32.const 4\n");
+    out.push_str("    i32.add\n");
+    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+    out.push_str("    i32.store16\n");
+    // Flags
+    out.push_str("    local.get $in_buf\n");
+    out.push_str("    i32.const 6\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    i32.const 0\n");
+    out.push_str("    i32.store16\n");
+    // Node count
+    out.push_str("    local.get $in_buf\n");
+    out.push_str("    i32.const 8\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $node_idx\n");
+    out.push_str("    i32.store\n");
+    // Root index
+    out.push_str("    local.get $in_buf\n");
+    out.push_str("    i32.const 12\n");
+    out.push_str("    i32.add\n");
+    out.push_str("    local.get $enc_root_idx\n");
+    out.push_str("    i32.store\n");
+
+    // Set in_len from buf_cursor
+    out.push_str("    local.get $buf_cursor\n");
+    out.push_str("    local.set $in_len\n");
 }
 
 // =============================================================================
@@ -9326,8 +9485,11 @@ fn generate_cgrf_encode_recursive(
             out.push_str("    local.get $node_idx\n");
             out.push_str("    local.set $enc_root_idx\n");
             generate_write_node_header(out, CGRF_STRING);
-            // Read string length
+            // Save string pointer (in case value_local is $enc_tmp which will be overwritten)
             out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    local.set $enc_result_ptr\n");
+            // Read string length
+            out.push_str("    local.get $enc_result_ptr\n");
             out.push_str("    i32.load\n");
             out.push_str("    local.set $enc_tmp\n");
             // Write length to payload
@@ -9336,13 +9498,13 @@ fn generate_cgrf_encode_recursive(
             out.push_str("    i32.add\n");
             out.push_str("    local.get $enc_tmp\n");
             out.push_str("    i32.store\n");
-            // Copy string data
+            // Copy string data (use saved pointer, not value_local which may have been overwritten)
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $buf_cursor\n");
             out.push_str("    i32.add\n");
             out.push_str("    i32.const 4\n");
             out.push_str("    i32.add\n"); // dest
-            out.push_str(&format!("    local.get {}\n", value_local));
+            out.push_str("    local.get $enc_result_ptr\n");
             out.push_str("    i32.const 4\n");
             out.push_str("    i32.add\n"); // src
             out.push_str("    local.get $enc_tmp\n"); // len

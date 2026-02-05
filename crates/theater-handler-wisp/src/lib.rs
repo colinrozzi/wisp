@@ -3,6 +3,7 @@
 //! Theater handler providing Wisp-specific host functions:
 //! - `wisp:assembler/runtime.wat-to-wasm` - Assemble WAT to WASM bytes
 //! - `wisp:repl/helpers.wrap-expression` - Wrap expression as eval module
+//! - `wisp:compose/packages.compose-packages` - Compose main + deps into single WASM
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,6 +17,12 @@ use theater::shutdown::ShutdownReceiver;
 
 // Pack integration
 use theater::pack_bridge::{Ctx, HostLinkerBuilder, LinkerError, Value, ValueType};
+
+// Pack composition
+use pack::compose::StaticComposer;
+
+// WASM runtime for eval-wasm
+use wasmtime::{Engine, Module, Store};
 
 /// Handler for Wisp-specific host functions
 #[derive(Clone, Default)]
@@ -43,6 +50,7 @@ impl Handler for WispHandler {
         Some(vec![
             "wisp:assembler/runtime".to_string(),
             "wisp:repl/helpers".to_string(),
+            "wisp:compose/packages".to_string(),
         ])
     }
 
@@ -118,6 +126,121 @@ impl Handler for WispHandler {
                             }
                         }
                     },
+                )?
+                // eval-wasm: func(wasm: list<u8>) -> result<list<u8>, string>
+                // Instantiate WASM module, call its `eval` export, return result as bytes
+                .func_typed(
+                    "eval-wasm",
+                    |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+                        let wasm_bytes: Vec<u8> = match input {
+                            Value::List { items, .. } => items
+                                .into_iter()
+                                .filter_map(|v| {
+                                    if let Value::U8(b) = v {
+                                        Some(b)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect(),
+                            _ => {
+                                return Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(
+                                        "Expected list<u8> for WASM bytes".to_string(),
+                                    ))),
+                                };
+                            }
+                        };
+
+                        info!("[EVAL-WASM] Instantiating {} bytes of WASM", wasm_bytes.len());
+
+                        // Create wasmtime engine and store
+                        let engine = match Engine::default() {
+                            engine => engine,
+                        };
+                        let mut store = Store::new(&engine, ());
+
+                        // Compile module
+                        let module = match Module::new(&engine, &wasm_bytes) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                info!("[EVAL-WASM] Module compilation error: {}", e);
+                                return Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(format!(
+                                        "Module compilation failed: {}",
+                                        e
+                                    )))),
+                                };
+                            }
+                        };
+
+                        // Instantiate module
+                        let instance = match wasmtime::Instance::new(&mut store, &module, &[]) {
+                            Ok(i) => i,
+                            Err(e) => {
+                                info!("[EVAL-WASM] Instantiation error: {}", e);
+                                return Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(format!(
+                                        "Instantiation failed: {}",
+                                        e
+                                    )))),
+                                };
+                            }
+                        };
+
+                        // Get the eval function
+                        let eval_func = match instance.get_typed_func::<(), i32>(&mut store, "eval") {
+                            Ok(f) => f,
+                            Err(e) => {
+                                info!("[EVAL-WASM] Could not find eval function: {}", e);
+                                return Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(format!(
+                                        "Could not find eval function: {}",
+                                        e
+                                    )))),
+                                };
+                            }
+                        };
+
+                        // Call eval
+                        match eval_func.call(&mut store, ()) {
+                            Ok(result) => {
+                                info!("[EVAL-WASM] Result: {}", result);
+                                // Convert i32 to 4 bytes (little-endian)
+                                let result_bytes: Vec<Value> = result.to_le_bytes()
+                                    .into_iter()
+                                    .map(Value::U8)
+                                    .collect();
+                                Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Ok(Box::new(Value::List {
+                                        elem_type: ValueType::U8,
+                                        items: result_bytes,
+                                    })),
+                                }
+                            }
+                            Err(e) => {
+                                info!("[EVAL-WASM] Execution error: {}", e);
+                                Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(format!(
+                                        "Execution failed: {}",
+                                        e
+                                    )))),
+                                }
+                            }
+                        }
+                    },
                 )?;
             ctx.mark_satisfied("wisp:assembler/runtime");
         }
@@ -157,14 +280,222 @@ impl Handler for WispHandler {
                         let expr = String::from_utf8_lossy(&body_bytes).to_string();
                         info!("[WRAP] Expression: {}", expr);
 
-                        // Wrap expression in a module with an eval function
-                        let source = format!(r#"(export (fn eval () s32 {}))"#, expr);
-                        info!("[WRAP] Wrapped source: {}", source);
+                        // Wrap expression as a simple eval function
+                        // The REPL will compile this and call eval() directly to get the i32 result
+                        // This avoids the self-hosted compiler's bug with u8 type annotations
+                        let source = format!(
+                            r#"
+(export (fn eval () s32
+  {}))
+"#,
+                            expr
+                        );
+                        info!("[WRAP] Wrapped source (eval function): {}", source.trim());
 
                         Value::String(source)
                     },
                 )?;
             ctx.mark_satisfied("wisp:repl/helpers");
+        }
+
+        // Setup wisp:compose/packages interface
+        if !ctx.is_satisfied("wisp:compose/packages") {
+            builder
+                .interface("wisp:compose/packages")?
+                // compose-packages: func(main: list<u8>, deps: list<tuple<string, list<u8>>>) -> result<list<u8>, string>
+                .func_typed(
+                    "compose-packages",
+                    |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
+                        // Input is tuple<list<u8>, list<tuple<string, list<u8>>>>
+                        // - main WASM bytes
+                        // - list of (interface-name, wasm-bytes) dependencies
+                        let (main_wasm, deps) = match &input {
+                            Value::Tuple(items) if items.len() >= 2 => {
+                                // Extract main WASM bytes
+                                let main_wasm: Vec<u8> = match &items[0] {
+                                    Value::List { items, .. } => items
+                                        .iter()
+                                        .filter_map(|v| {
+                                            if let Value::U8(b) = v {
+                                                Some(*b)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect(),
+                                    _ => {
+                                        return Value::Result {
+                                            ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                            err_type: ValueType::String,
+                                            value: Err(Box::new(Value::String(
+                                                "Expected list<u8> for main WASM".to_string(),
+                                            ))),
+                                        };
+                                    }
+                                };
+
+                                // Extract dependencies: list<tuple<string, list<u8>>>
+                                let deps: Vec<(String, Vec<u8>)> = match &items[1] {
+                                    Value::List { items, .. } => {
+                                        let mut result = Vec::new();
+                                        for item in items {
+                                            match item {
+                                                Value::Tuple(dep_items) if dep_items.len() >= 2 => {
+                                                    let interface = match &dep_items[0] {
+                                                        Value::String(s) => s.clone(),
+                                                        _ => continue,
+                                                    };
+                                                    let wasm: Vec<u8> = match &dep_items[1] {
+                                                        Value::List { items, .. } => items
+                                                            .iter()
+                                                            .filter_map(|v| {
+                                                                if let Value::U8(b) = v {
+                                                                    Some(*b)
+                                                                } else {
+                                                                    None
+                                                                }
+                                                            })
+                                                            .collect(),
+                                                        _ => continue,
+                                                    };
+                                                    result.push((interface, wasm));
+                                                }
+                                                _ => continue,
+                                            }
+                                        }
+                                        result
+                                    }
+                                    _ => {
+                                        return Value::Result {
+                                            ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                            err_type: ValueType::String,
+                                            value: Err(Box::new(Value::String(
+                                                "Expected list of deps".to_string(),
+                                            ))),
+                                        };
+                                    }
+                                };
+
+                                (main_wasm, deps)
+                            }
+                            _ => {
+                                return Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(
+                                        "Expected tuple<list<u8>, list<...>>".to_string(),
+                                    ))),
+                                };
+                            }
+                        };
+
+                        info!(
+                            "[COMPOSE] Composing main ({} bytes) with {} dependencies",
+                            main_wasm.len(),
+                            deps.len()
+                        );
+
+                        // If no dependencies, just return main as-is
+                        if deps.is_empty() {
+                            let bytes: Vec<Value> = main_wasm.into_iter().map(Value::U8).collect();
+                            return Value::Result {
+                                ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                err_type: ValueType::String,
+                                value: Ok(Box::new(Value::List {
+                                    elem_type: ValueType::U8,
+                                    items: bytes,
+                                })),
+                            };
+                        }
+
+                        // Use StaticComposer to compose packages
+                        let mut composer = StaticComposer::new();
+
+                        // Add main module
+                        composer = match composer.add_module("main", main_wasm) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                return Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(format!(
+                                        "Failed to add main module: {}",
+                                        e
+                                    )))),
+                                };
+                            }
+                        };
+
+                        // Add dependency modules
+                        for (idx, (interface, wasm)) in deps.iter().enumerate() {
+                            let dep_name = format!("dep{}", idx);
+                            info!("[COMPOSE] Adding dep '{}' for interface '{}'", dep_name, interface);
+
+                            composer = match composer.add_module(&dep_name, wasm.clone()) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    return Value::Result {
+                                        ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                        err_type: ValueType::String,
+                                        value: Err(Box::new(Value::String(format!(
+                                            "Failed to add dep module: {}",
+                                            e
+                                        )))),
+                                    };
+                                }
+                            };
+                        }
+
+                        // Auto-wire: matches imports to exports by function name
+                        composer = match composer.auto_wire() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                return Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(format!(
+                                        "Auto-wire failed: {}",
+                                        e
+                                    )))),
+                                };
+                            }
+                        };
+
+                        // Export main's exports
+                        composer = composer
+                            .export("memory", "main", "memory")
+                            .export("eval", "main", "eval");
+
+                        // Compose
+                        match composer.compose() {
+                            Ok(composed_wasm) => {
+                                info!("[COMPOSE] Success: {} bytes composed", composed_wasm.len());
+                                let bytes: Vec<Value> =
+                                    composed_wasm.into_iter().map(Value::U8).collect();
+                                Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Ok(Box::new(Value::List {
+                                        elem_type: ValueType::U8,
+                                        items: bytes,
+                                    })),
+                                }
+                            }
+                            Err(e) => {
+                                info!("[COMPOSE] Error: {}", e);
+                                Value::Result {
+                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                    err_type: ValueType::String,
+                                    value: Err(Box::new(Value::String(format!(
+                                        "Composition failed: {}",
+                                        e
+                                    )))),
+                                }
+                            }
+                        }
+                    },
+                )?;
+            ctx.mark_satisfied("wisp:compose/packages");
         }
 
         Ok(())

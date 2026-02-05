@@ -8,8 +8,14 @@ description = "Theater handler for Wisp-specific host functions (assembler, help
 # Theater core
 theater = { path = "/home/colin/work/theater/crates/theater" }
 
+# Pack for package composition
+pack = { path = "../../../pack" }
+
 # WAT to WASM assembly
 wat = "1.222"
+
+# WASM runtime for eval-wasm
+wasmtime = "29"
 
 # Async runtime
 tokio = { version = "1", features = ["sync"] }

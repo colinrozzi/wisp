@@ -3,7 +3,7 @@
   (import "wisp:compiler/compiler" "compile-source" (func $__raw_compile-source (param i32 i32 i32 i32) (result i32)))
   (import "wisp:repl/helpers" "wrap-expression" (func $__raw_wrap-expression (param i32 i32 i32 i32) (result i32)))
   (import "wisp:assembler/runtime" "wat-to-wasm" (func $__raw_wat-to-wasm (param i32 i32 i32 i32) (result i32)))
-  (import "theater:simple/supervisor" "spawn-and-wait" (func $__raw_spawn-and-wait (param i32 i32 i32 i32) (result i32)))
+  (import "wisp:assembler/runtime" "eval-wasm" (func $__raw_eval-wasm (param i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 16000 16000)
   (global $__heap_ptr (mut i32) (i32.const 49152))
   (global $enc_tuple_sp (mut i32) (i32.const 0xB000))
@@ -74,7 +74,14 @@
     (local $out_ptr i32)
     (local $out_len i32)
     (local $status i32)
-    i32.const 32768
+    (local $result_slots i32)
+    ;; Allocate result slots from heap (8 bytes)
+    i32.const 8
+    call $__alloc
+    local.set $result_slots
+    ;; Allocate input buffer from heap (4096 bytes)
+    i32.const 4096
+    call $__alloc
     local.set $in_buf
     ;; Write CGRF header for string argument
     local.get $in_buf
@@ -147,14 +154,18 @@
     ;; Call raw import with ptr/len slots
     local.get $in_buf
     local.get $in_len
-    i32.const 36864
-    i32.const 36868
+    local.get $result_slots
+    local.get $result_slots
+    i32.const 4
+    i32.add
     call $__raw_log
     local.set $status
-    i32.const 36864
+    local.get $result_slots
     i32.load
     local.set $out_ptr
-    i32.const 36868
+    local.get $result_slots
+    i32.const 4
+    i32.add
     i32.load
     local.set $out_len
     ;; Decode result from CGRF
@@ -169,6 +180,7 @@
     (local $out_ptr i32)
     (local $out_len i32)
     (local $status i32)
+    (local $result_slots i32)
     (local $in_ptr i32)
     (local $dec_node_offset i32)
     (local $dec_result i32)
@@ -186,7 +198,13 @@
     (local $dec_list_len i32)
     (local $dec_list_i i32)
     (local $dec_list_node_offset i32)
-    i32.const 32768
+    ;; Allocate result slots from heap (8 bytes)
+    i32.const 8
+    call $__alloc
+    local.set $result_slots
+    ;; Allocate input buffer from heap (4096 bytes)
+    i32.const 4096
+    call $__alloc
     local.set $in_buf
     ;; Write CGRF header for string argument
     local.get $in_buf
@@ -259,14 +277,18 @@
     ;; Call raw import with ptr/len slots
     local.get $in_buf
     local.get $in_len
-    i32.const 36864
-    i32.const 36868
+    local.get $result_slots
+    local.get $result_slots
+    i32.const 4
+    i32.add
     call $__raw_compile-source
     local.set $status
-    i32.const 36864
+    local.get $result_slots
     i32.load
     local.set $out_ptr
-    i32.const 36868
+    local.get $result_slots
+    i32.const 4
+    i32.add
     i32.load
     local.set $out_len
     ;; Decode result from CGRF
@@ -347,6 +369,7 @@
     (local $out_ptr i32)
     (local $out_len i32)
     (local $status i32)
+    (local $result_slots i32)
     (local $write_offset i32)
     (local $i i32)
     (local $field0_ptr i32)
@@ -370,7 +393,32 @@
     (local $dec_list_len i32)
     (local $dec_list_i i32)
     (local $dec_list_node_offset i32)
-    i32.const 32768
+    (local $buf_cursor i32)
+    (local $node_idx i32)
+    (local $enc_root_idx i32)
+    (local $enc_header_start i32)
+    (local $enc_tmp i32)
+    (local $enc_tmp_i64 i64)
+    (local $enc_tmp_f32 f32)
+    (local $enc_tmp_f64 f64)
+    (local $enc_save_child i32)
+    (local $enc_save_root i32)
+    (local $enc_result_ptr i32)
+    (local $enc_tuple_header i32)
+    (local $enc_tuple_ci_pos i32)
+    (local $enc_list_header i32)
+    (local $enc_list_ci_pos i32)
+    (local $enc_list_i i32)
+    (local $enc_list_len i32)
+    (local $enc_list_data i32)
+    (local $enc_list_root_idx i32)
+    ;; Allocate result slots from heap (8 bytes)
+    i32.const 8
+    call $__alloc
+    local.set $result_slots
+    ;; Allocate input buffer from heap (16384 bytes)
+    i32.const 16384
+    call $__alloc
     local.set $in_buf
     ;; Encode tuple(Str, List(U8)) parameter with 2 fields (with proper list encoding)
     ;; Extract field 0 from tuple
@@ -671,14 +719,18 @@
     ;; Call raw import with ptr/len slots
     local.get $in_buf
     local.get $in_len
-    i32.const 36864
-    i32.const 36868
+    local.get $result_slots
+    local.get $result_slots
+    i32.const 4
+    i32.add
     call $__raw_wrap-expression
     local.set $status
-    i32.const 36864
+    local.get $result_slots
     i32.load
     local.set $out_ptr
-    i32.const 36868
+    local.get $result_slots
+    i32.const 4
+    i32.add
     i32.load
     local.set $out_len
     ;; Decode result from CGRF
@@ -759,6 +811,7 @@
     (local $out_ptr i32)
     (local $out_len i32)
     (local $status i32)
+    (local $result_slots i32)
     (local $in_ptr i32)
     (local $dec_node_offset i32)
     (local $dec_result i32)
@@ -776,7 +829,13 @@
     (local $dec_list_len i32)
     (local $dec_list_i i32)
     (local $dec_list_node_offset i32)
-    i32.const 32768
+    ;; Allocate result slots from heap (8 bytes)
+    i32.const 8
+    call $__alloc
+    local.set $result_slots
+    ;; Allocate input buffer from heap (4096 bytes)
+    i32.const 4096
+    call $__alloc
     local.set $in_buf
     ;; Write CGRF header for string argument
     local.get $in_buf
@@ -849,14 +908,18 @@
     ;; Call raw import with ptr/len slots
     local.get $in_buf
     local.get $in_len
-    i32.const 36864
-    i32.const 36868
+    local.get $result_slots
+    local.get $result_slots
+    i32.const 4
+    i32.add
     call $__raw_wat-to-wasm
     local.set $status
-    i32.const 36864
+    local.get $result_slots
     i32.load
     local.set $out_ptr
-    i32.const 36868
+    local.get $result_slots
+    i32.const 4
+    i32.add
     i32.load
     local.set $out_len
     ;; Decode result from CGRF
@@ -1089,18 +1152,13 @@
     local.set $dec_result
     local.get $dec_result
   )
-  (func $spawn-and-wait (param $params i32) (result i32)
+  (func $eval-wasm (param $wasm i32) (result i32)
     (local $in_buf i32)
     (local $in_len i32)
     (local $out_ptr i32)
     (local $out_len i32)
     (local $status i32)
-    (local $write_offset i32)
-    (local $i i32)
-    (local $field0_ptr i32)
-    (local $field0_len i32)
-    (local $field1_ptr i32)
-    (local $field1_len i32)
+    (local $result_slots i32)
     (local $in_ptr i32)
     (local $dec_node_offset i32)
     (local $dec_result i32)
@@ -1118,28 +1176,221 @@
     (local $dec_list_len i32)
     (local $dec_list_i i32)
     (local $dec_list_node_offset i32)
-    i32.const 32768
+    (local $buf_cursor i32)
+    (local $node_idx i32)
+    (local $enc_root_idx i32)
+    (local $enc_header_start i32)
+    (local $enc_tmp i32)
+    (local $enc_tmp_i64 i64)
+    (local $enc_tmp_f32 f32)
+    (local $enc_tmp_f64 f64)
+    (local $enc_save_child i32)
+    (local $enc_save_root i32)
+    (local $enc_result_ptr i32)
+    (local $enc_tuple_header i32)
+    (local $enc_tuple_ci_pos i32)
+    (local $enc_list_header i32)
+    (local $enc_list_ci_pos i32)
+    (local $enc_list_i i32)
+    (local $enc_list_len i32)
+    (local $enc_list_data i32)
+    (local $enc_list_root_idx i32)
+    ;; Allocate result slots from heap (8 bytes)
+    i32.const 8
+    call $__alloc
+    local.set $result_slots
+    ;; Allocate input buffer from heap (16384 bytes)
+    i32.const 16384
+    call $__alloc
     local.set $in_buf
-    ;; Encode tuple(Str, List(U8)) parameter with 2 fields (with proper list encoding)
-    ;; Extract field 0 from tuple
-    local.get $params
+    ;; Generic CGRF encode for List(U8) parameter
+    local.get $in_buf
+    local.set $out_ptr
+    i32.const 16
+    local.set $buf_cursor
     i32.const 0
+    local.set $node_idx
+    ;; encode list
+    local.get $wasm
+    i32.load
+    local.set $enc_list_len
+    local.get $wasm
+    i32.const 8
     i32.add
     i32.load
-    local.set $field0_ptr
-    local.get $field0_ptr
-    i32.load
-    local.set $field0_len
-    ;; Extract field 1 from tuple
-    local.get $params
+    local.set $enc_list_data
+    local.get $node_idx
+    local.set $enc_root_idx
+    local.get $enc_root_idx
+    local.set $enc_list_root_idx
+    local.get $node_idx
+    i32.const 1
+    i32.add
+    local.set $node_idx
+    local.get $buf_cursor
+    local.set $enc_header_start
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 7
+    i32.store8
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 1
+    i32.add
+    i32.const 0
+    i32.store8
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 2
+    i32.add
+    i32.const 0
+    i32.store16
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
     i32.const 4
     i32.add
-    i32.load
-    local.set $field1_ptr
-    local.get $field1_ptr
-    i32.load
-    local.set $field1_len
-    ;; CGRF header (node_count and root_index patched later)
+    i32.const 0
+    i32.store
+    local.get $buf_cursor
+    i32.const 8
+    i32.add
+    local.set $buf_cursor
+    local.get $enc_header_start
+    local.set $enc_list_header
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 12
+    i32.store8
+    local.get $buf_cursor
+    i32.const 1
+    i32.add
+    local.set $buf_cursor
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    local.get $enc_list_len
+    i32.store
+    local.get $buf_cursor
+    i32.const 4
+    i32.add
+    local.set $enc_list_ci_pos
+    local.get $buf_cursor
+    i32.const 4
+    i32.add
+    local.get $enc_list_len
+    i32.const 4
+    i32.mul
+    i32.add
+    local.set $buf_cursor
+    i32.const 0
+    local.set $enc_list_i
+    block $list_break
+      loop $list_loop
+        local.get $enc_list_i
+        local.get $enc_list_len
+        i32.ge_u
+        br_if $list_break
+        local.get $enc_list_data
+        local.get $enc_list_i
+        i32.const 4
+        i32.mul
+        i32.add
+        i32.load
+        local.set $enc_tmp
+    ;; encode U8
+    local.get $node_idx
+    local.set $enc_root_idx
+    local.get $buf_cursor
+    local.set $enc_header_start
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 12
+    i32.store8
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 1
+    i32.add
+    i32.const 0
+    i32.store8
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 2
+    i32.add
+    i32.const 0
+    i32.store16
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    i32.const 4
+    i32.add
+    i32.const 0
+    i32.store
+    local.get $buf_cursor
+    i32.const 8
+    i32.add
+    local.set $buf_cursor
+    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    local.get $enc_tmp
+    i32.store8
+    local.get $buf_cursor
+    i32.const 1
+    i32.add
+    local.set $buf_cursor
+    local.get $out_ptr
+    local.get $enc_header_start
+    i32.add
+    i32.const 4
+    i32.add
+    local.get $buf_cursor
+    local.get $enc_header_start
+    i32.sub
+    i32.const 8
+    i32.sub
+    i32.store
+    local.get $node_idx
+    i32.const 1
+    i32.add
+    local.set $node_idx
+        local.get $out_ptr
+        local.get $enc_list_ci_pos
+        local.get $enc_list_i
+        i32.const 4
+        i32.mul
+        i32.add
+        i32.add
+        local.get $enc_root_idx
+        i32.store
+        local.get $enc_list_i
+        i32.const 1
+        i32.add
+        local.set $enc_list_i
+        br $list_loop
+      end
+    end
+    local.get $out_ptr
+    local.get $enc_list_header
+    i32.add
+    i32.const 4
+    i32.add
+    i32.const 5
+    local.get $enc_list_len
+    i32.const 4
+    i32.mul
+    i32.add
+    i32.store
+    local.get $enc_list_root_idx
+    local.set $enc_root_idx
+    ;; Write CGRF header
     local.get $in_buf
     i32.const 1179797315
     i32.store
@@ -1156,277 +1407,30 @@
     local.get $in_buf
     i32.const 8
     i32.add
-    local.get $field1_len
-    i32.const 3
-    i32.add
+    local.get $node_idx
     i32.store
     local.get $in_buf
     i32.const 12
     i32.add
-    local.get $field1_len
-    i32.const 2
-    i32.add
+    local.get $enc_root_idx
     i32.store
-    i32.const 16
-    local.set $write_offset
-    ;; Write U8 nodes for list elements
-    i32.const 0
-    local.set $i
-    (block $u8_done
-      (loop $u8_loop
-        local.get $i
-        local.get $field1_len
-        i32.ge_u
-        br_if $u8_done
-        ;; U8 node header
-        local.get $in_buf
-        local.get $write_offset
-        i32.add
-        i32.const 12
-        i32.store8
-        local.get $in_buf
-        local.get $write_offset
-        i32.add
-        i32.const 1
-        i32.add
-        i32.const 0
-        i32.store8
-        local.get $in_buf
-        local.get $write_offset
-        i32.add
-        i32.const 2
-        i32.add
-        i32.const 0
-        i32.store16
-        local.get $in_buf
-        local.get $write_offset
-        i32.add
-        i32.const 4
-        i32.add
-        i32.const 1
-        i32.store
-        local.get $in_buf
-        local.get $write_offset
-        i32.add
-        i32.const 8
-        i32.add
-        local.get $field1_ptr
-        i32.const 8
-        i32.add
-        i32.load
-        local.get $i
-        i32.const 4
-        i32.mul
-        i32.add
-        i32.load8_u
-        i32.store8
-        local.get $write_offset
-        i32.const 9
-        i32.add
-        local.set $write_offset
-        local.get $i
-        i32.const 1
-        i32.add
-        local.set $i
-        br $u8_loop
-      )
-    )
-    ;; Write list node
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 7
-    i32.store8
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 1
-    i32.add
-    i32.const 0
-    i32.store8
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 2
-    i32.add
-    i32.const 0
-    i32.store16
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 4
-    i32.add
-    local.get $field1_len
-    i32.const 4
-    i32.mul
-    i32.const 5
-    i32.add
-    i32.store
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 8
-    i32.add
-    i32.const 12
-    i32.store8
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 9
-    i32.add
-    local.get $field1_len
-    i32.store
-    i32.const 0
-    local.set $i
-    (block $idx_done
-      (loop $idx_loop
-        local.get $i
-        local.get $field1_len
-        i32.ge_u
-        br_if $idx_done
-        local.get $in_buf
-        local.get $write_offset
-        i32.add
-        i32.const 13
-        i32.add
-        local.get $i
-        i32.const 4
-        i32.mul
-        i32.add
-        local.get $i
-        i32.store
-        local.get $i
-        i32.const 1
-        i32.add
-        local.set $i
-        br $idx_loop
-      )
-    )
-    local.get $write_offset
-    i32.const 13
-    i32.add
-    local.get $field1_len
-    i32.const 4
-    i32.mul
-    i32.add
-    local.set $write_offset
-    ;; Write string node
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 6
-    i32.store8
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 1
-    i32.add
-    i32.const 0
-    i32.store8
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 2
-    i32.add
-    i32.const 0
-    i32.store16
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 4
-    i32.add
-    local.get $field0_len
-    i32.const 4
-    i32.add
-    i32.store
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 8
-    i32.add
-    local.get $field0_len
-    i32.store
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 12
-    i32.add
-    local.get $field0_ptr
-    i32.const 4
-    i32.add
-    local.get $field0_len
-    memory.copy
-    local.get $write_offset
-    i32.const 12
-    i32.add
-    local.get $field0_len
-    i32.add
-    local.set $write_offset
-    ;; Write tuple node (root)
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 11
-    i32.store8
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 1
-    i32.add
-    i32.const 0
-    i32.store8
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 2
-    i32.add
-    i32.const 0
-    i32.store16
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 4
-    i32.add
-    i32.const 12
-    i32.store
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 8
-    i32.add
-    i32.const 2
-    i32.store
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 12
-    i32.add
-    local.get $field1_len
-    i32.const 1
-    i32.add
-    i32.store
-    local.get $in_buf
-    local.get $write_offset
-    i32.add
-    i32.const 16
-    i32.add
-    local.get $field1_len
-    i32.store
-    local.get $write_offset
-    i32.const 20
-    i32.add
+    local.get $buf_cursor
     local.set $in_len
     ;; Call raw import with ptr/len slots
     local.get $in_buf
     local.get $in_len
-    i32.const 36864
-    i32.const 36868
-    call $__raw_spawn-and-wait
+    local.get $result_slots
+    local.get $result_slots
+    i32.const 4
+    i32.add
+    call $__raw_eval-wasm
     local.set $status
-    i32.const 36864
+    local.get $result_slots
     i32.load
     local.set $out_ptr
-    i32.const 36868
+    local.get $result_slots
+    i32.const 4
+    i32.add
     i32.load
     local.set $out_len
     ;; Decode result from CGRF
@@ -1470,30 +1474,39 @@
     )
     local.get $dec_scan_offset
     local.set $dec_node_offset
-    ;; decode option
+    ;; decode result
     global.get $__heap_ptr
-    local.set $dec_opt_ptr
+    local.set $dec_result
     global.get $__heap_ptr
     i32.const 8
     i32.add
     global.set $__heap_ptr
+    local.get $dec_result
+    local.set $dec_opt_ptr
     local.get $dec_node_offset
     local.set $dec_opt_node_offset
     local.get $in_ptr
     local.get $dec_node_offset
     i32.add
-    i32.const 10
+    i32.const 11
+    i32.add
+    i32.load
+    local.set $dec_tmp
+    local.get $dec_opt_ptr
+    local.get $dec_tmp
+    i32.store
+    local.get $in_ptr
+    local.get $dec_opt_node_offset
+    i32.add
+    i32.const 15
     i32.add
     i32.load8_u
     (if
       (then
-        local.get $dec_opt_ptr
-        i32.const 1
-        i32.store
         local.get $in_ptr
         local.get $dec_opt_node_offset
         i32.add
-        i32.const 11
+        i32.const 16
         i32.add
         i32.load
         local.set $dec_child_idx
@@ -1530,6 +1543,42 @@
     )
     local.get $dec_scan_offset
     local.set $dec_node_offset
+        local.get $dec_tmp
+        (if
+          (then
+            ;; err payload
+    ;; decode string
+    local.get $in_ptr
+    local.get $dec_node_offset
+    i32.add
+    i32.const 8
+    i32.add
+    i32.load
+    local.set $dec_tmp
+    global.get $__heap_ptr
+    local.set $dec_result
+    global.get $__heap_ptr
+    i32.const 4
+    i32.add
+    local.get $dec_tmp
+    i32.add
+    global.set $__heap_ptr
+    local.get $dec_result
+    local.get $dec_tmp
+    i32.store
+    local.get $dec_result
+    i32.const 4
+    i32.add
+    local.get $in_ptr
+    local.get $dec_node_offset
+    i32.add
+    i32.const 12
+    i32.add
+    local.get $dec_tmp
+    memory.copy
+          )
+          (else
+            ;; ok payload
     ;; decode list
     local.get $dec_node_offset
     local.set $dec_list_node_offset
@@ -1643,15 +1692,12 @@
     end
     local.get $dec_list_ptr
     local.set $dec_result
+          )
+        )
         local.get $dec_opt_ptr
         i32.const 4
         i32.add
         local.get $dec_result
-        i32.store
-      )
-      (else
-        local.get $dec_opt_ptr
-        i32.const 0
         i32.store
       )
     )
@@ -2679,14 +2725,16 @@
     (local i32)
     (local i32)
     (local i32)
+    (local i32)
+    (local i32)
     global.get $__heap_ptr
     local.set 2
     global.get $__heap_ptr
-    i32.const 46
+    i32.const 49
     i32.add
     global.set $__heap_ptr
     local.get 2
-    i32.const 42
+    i32.const 45
     i32.store
     local.get 2
     i32.const 4
@@ -2811,90 +2859,105 @@
     local.get 2
     i32.const 28
     i32.add
-    i32.const 97
+    i32.const 100
     i32.store8
     local.get 2
     i32.const 29
     i32.add
-    i32.const 99
+    i32.const 105
     i32.store8
     local.get 2
     i32.const 30
     i32.add
-    i32.const 116
+    i32.const 114
     i32.store8
     local.get 2
     i32.const 31
     i32.add
-    i32.const 111
+    i32.const 101
     i32.store8
     local.get 2
     i32.const 32
     i32.add
-    i32.const 114
+    i32.const 99
     i32.store8
     local.get 2
     i32.const 33
     i32.add
-    i32.const 32
+    i32.const 116
     i32.store8
     local.get 2
     i32.const 34
     i32.add
-    i32.const 115
+    i32.const 32
     i32.store8
     local.get 2
     i32.const 35
     i32.add
-    i32.const 112
+    i32.const 101
     i32.store8
     local.get 2
     i32.const 36
     i32.add
-    i32.const 97
+    i32.const 118
     i32.store8
     local.get 2
     i32.const 37
     i32.add
-    i32.const 119
+    i32.const 97
     i32.store8
     local.get 2
     i32.const 38
     i32.add
-    i32.const 110
+    i32.const 108
     i32.store8
     local.get 2
     i32.const 39
     i32.add
-    i32.const 105
+    i32.const 117
     i32.store8
     local.get 2
     i32.const 40
     i32.add
-    i32.const 110
+    i32.const 97
     i32.store8
     local.get 2
     i32.const 41
     i32.add
-    i32.const 103
+    i32.const 116
     i32.store8
     local.get 2
     i32.const 42
     i32.add
-    i32.const 32
+    i32.const 105
     i32.store8
     local.get 2
     i32.const 43
     i32.add
-    i32.const 61
+    i32.const 111
     i32.store8
     local.get 2
     i32.const 44
     i32.add
-    i32.const 61
+    i32.const 110
     i32.store8
     local.get 2
     i32.const 45
+    i32.add
+    i32.const 32
+    i32.store8
+    local.get 2
+    i32.const 46
+    i32.add
+    i32.const 61
+    i32.store8
+    local.get 2
+    i32.const 47
+    i32.add
+    i32.const 61
+    i32.store8
+    local.get 2
+    i32.const 48
     i32.add
     i32.const 61
     i32.store8
@@ -3793,11 +3856,11 @@
         global.get $__heap_ptr
         local.set 14
         global.get $__heap_ptr
-        i32.const 40
+        i32.const 30
         i32.add
         global.set $__heap_ptr
         local.get 14
-        i32.const 36
+        i32.const 26
         i32.store
         local.get 14
         i32.const 4
@@ -3842,12 +3905,12 @@
         local.get 14
         i32.const 12
         i32.add
-        i32.const 83
+        i32.const 69
         i32.store8
         local.get 14
         i32.const 13
         i32.add
-        i32.const 112
+        i32.const 118
         i32.store8
         local.get 14
         i32.const 14
@@ -3857,462 +3920,407 @@
         local.get 14
         i32.const 15
         i32.add
-        i32.const 119
+        i32.const 108
         i32.store8
         local.get 14
         i32.const 16
         i32.add
-        i32.const 110
+        i32.const 117
         i32.store8
         local.get 14
         i32.const 17
         i32.add
-        i32.const 105
+        i32.const 97
         i32.store8
         local.get 14
         i32.const 18
         i32.add
-        i32.const 110
+        i32.const 116
         i32.store8
         local.get 14
         i32.const 19
+        i32.add
+        i32.const 105
+        i32.store8
+        local.get 14
+        i32.const 20
+        i32.add
+        i32.const 110
+        i32.store8
+        local.get 14
+        i32.const 21
         i32.add
         i32.const 103
         i32.store8
         local.get 14
-        i32.const 20
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 14
-        i32.const 21
-        i32.add
-        i32.const 101
-        i32.store8
-        local.get 14
         i32.const 22
         i32.add
-        i32.const 120
+        i32.const 32
         i32.store8
         local.get 14
         i32.const 23
         i32.add
-        i32.const 112
+        i32.const 87
         i32.store8
         local.get 14
         i32.const 24
         i32.add
-        i32.const 114
+        i32.const 65
         i32.store8
         local.get 14
         i32.const 25
         i32.add
-        i32.const 101
+        i32.const 83
         i32.store8
         local.get 14
         i32.const 26
         i32.add
-        i32.const 115
+        i32.const 77
         i32.store8
         local.get 14
         i32.const 27
         i32.add
-        i32.const 115
+        i32.const 46
         i32.store8
         local.get 14
         i32.const 28
         i32.add
-        i32.const 105
+        i32.const 46
         i32.store8
         local.get 14
         i32.const 29
-        i32.add
-        i32.const 111
-        i32.store8
-        local.get 14
-        i32.const 30
-        i32.add
-        i32.const 110
-        i32.store8
-        local.get 14
-        i32.const 31
-        i32.add
-        i32.const 45
-        i32.store8
-        local.get 14
-        i32.const 32
-        i32.add
-        i32.const 97
-        i32.store8
-        local.get 14
-        i32.const 33
-        i32.add
-        i32.const 99
-        i32.store8
-        local.get 14
-        i32.const 34
-        i32.add
-        i32.const 116
-        i32.store8
-        local.get 14
-        i32.const 35
-        i32.add
-        i32.const 111
-        i32.store8
-        local.get 14
-        i32.const 36
-        i32.add
-        i32.const 114
-        i32.store8
-        local.get 14
-        i32.const 37
-        i32.add
-        i32.const 46
-        i32.store8
-        local.get 14
-        i32.const 38
-        i32.add
-        i32.const 46
-        i32.store8
-        local.get 14
-        i32.const 39
         i32.add
         i32.const 46
         i32.store8
         local.get 14
         call $log
         drop
-        global.get $__heap_ptr
+        local.get 12
+        call $eval-wasm
         local.set 15
-        global.get $__heap_ptr
-        i32.const 9
-        i32.add
-        global.set $__heap_ptr
-        local.get 15
-        i32.const 5
-        i32.store
-        local.get 15
-        i32.const 4
-        i32.add
-        i32.const 115
-        i32.store8
-        local.get 15
-        i32.const 5
-        i32.add
-        i32.const 112
-        i32.store8
-        local.get 15
-        i32.const 6
-        i32.add
-        i32.const 97
-        i32.store8
-        local.get 15
-        i32.const 7
-        i32.add
-        i32.const 119
-        i32.store8
-        local.get 15
-        i32.const 8
-        i32.add
-        i32.const 110
-        i32.store8
         local.get 15
         local.set 16
-        local.get 12
-        local.set 17
-        global.get $__heap_ptr
-        local.set 18
-        global.get $__heap_ptr
-        i32.const 8
-        i32.add
-        global.set $__heap_ptr
-        local.get 18
         local.get 16
-        i32.store
-        local.get 18
-        i32.const 4
-        i32.add
-        local.get 17
-        i32.store
-        local.get 18
-        call $spawn-and-wait
-        local.set 19
-        global.get $__heap_ptr
-        local.set 20
-        global.get $__heap_ptr
-        i32.const 48
-        i32.add
-        global.set $__heap_ptr
-        local.get 20
-        i32.const 44
-        i32.store
-        local.get 20
-        i32.const 4
-        i32.add
-        i32.const 61
-        i32.store8
-        local.get 20
-        i32.const 5
-        i32.add
-        i32.const 61
-        i32.store8
-        local.get 20
-        i32.const 6
-        i32.add
-        i32.const 61
-        i32.store8
-        local.get 20
-        i32.const 7
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 20
-        i32.const 8
-        i32.add
-        i32.const 69
-        i32.store8
-        local.get 20
-        i32.const 9
-        i32.add
-        i32.const 118
-        i32.store8
-        local.get 20
-        i32.const 10
-        i32.add
-        i32.const 97
-        i32.store8
-        local.get 20
-        i32.const 11
-        i32.add
-        i32.const 108
-        i32.store8
-        local.get 20
-        i32.const 12
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 20
-        i32.const 13
-        i32.add
-        i32.const 108
-        i32.store8
-        local.get 20
-        i32.const 14
-        i32.add
-        i32.const 111
-        i32.store8
-        local.get 20
-        i32.const 15
-        i32.add
-        i32.const 111
-        i32.store8
-        local.get 20
-        i32.const 16
-        i32.add
-        i32.const 112
-        i32.store8
-        local.get 20
-        i32.const 17
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 20
-        i32.const 18
-        i32.add
-        i32.const 99
-        i32.store8
-        local.get 20
-        i32.const 19
-        i32.add
-        i32.const 111
-        i32.store8
-        local.get 20
-        i32.const 20
-        i32.add
-        i32.const 109
-        i32.store8
-        local.get 20
-        i32.const 21
-        i32.add
-        i32.const 112
-        i32.store8
-        local.get 20
-        i32.const 22
-        i32.add
-        i32.const 108
-        i32.store8
-        local.get 20
-        i32.const 23
-        i32.add
-        i32.const 101
-        i32.store8
-        local.get 20
-        i32.const 24
-        i32.add
-        i32.const 116
-        i32.store8
-        local.get 20
-        i32.const 25
-        i32.add
-        i32.const 101
-        i32.store8
-        local.get 20
-        i32.const 26
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 20
-        i32.const 27
-        i32.add
-        i32.const 40
-        i32.store8
-        local.get 20
-        i32.const 28
-        i32.add
-        i32.const 118
-        i32.store8
-        local.get 20
-        i32.const 29
-        i32.add
-        i32.const 105
-        i32.store8
-        local.get 20
-        i32.const 30
-        i32.add
-        i32.const 97
-        i32.store8
-        local.get 20
-        i32.const 31
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 20
-        i32.const 32
-        i32.add
-        i32.const 97
-        i32.store8
-        local.get 20
-        i32.const 33
-        i32.add
-        i32.const 99
-        i32.store8
-        local.get 20
-        i32.const 34
-        i32.add
-        i32.const 116
-        i32.store8
-        local.get 20
-        i32.const 35
-        i32.add
-        i32.const 111
-        i32.store8
-        local.get 20
-        i32.const 36
-        i32.add
-        i32.const 114
-        i32.store8
-        local.get 20
-        i32.const 37
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 20
-        i32.const 38
-        i32.add
-        i32.const 115
-        i32.store8
-        local.get 20
-        i32.const 39
-        i32.add
-        i32.const 112
-        i32.store8
-        local.get 20
-        i32.const 40
-        i32.add
-        i32.const 97
-        i32.store8
-        local.get 20
-        i32.const 41
-        i32.add
-        i32.const 119
-        i32.store8
-        local.get 20
-        i32.const 42
-        i32.add
-        i32.const 110
-        i32.store8
-        local.get 20
-        i32.const 43
-        i32.add
-        i32.const 41
-        i32.store8
-        local.get 20
-        i32.const 44
-        i32.add
-        i32.const 32
-        i32.store8
-        local.get 20
-        i32.const 45
-        i32.add
-        i32.const 61
-        i32.store8
-        local.get 20
-        i32.const 46
-        i32.add
-        i32.const 61
-        i32.store8
-        local.get 20
-        i32.const 47
-        i32.add
-        i32.const 61
-        i32.store8
-        local.get 20
-        call $log
-        drop
-        global.get $__heap_ptr
-        local.set 21
-        global.get $__heap_ptr
-        i32.const 8
-        i32.add
-        global.set $__heap_ptr
-        local.get 21
+        i32.load
         i32.const 0
-        i32.store
-        local.get 21
-        i32.const 4
-        i32.add
-        local.get 0
-        local.set 22
-        local.get 19
-        local.set 23
-        global.get $__heap_ptr
-        local.set 24
-        global.get $__heap_ptr
-        i32.const 4
-        i32.add
-        global.set $__heap_ptr
-        local.get 24
-        local.get 23
-        i32.store
-        local.get 24
-        local.set 25
-        global.get $__heap_ptr
-        local.set 26
-        global.get $__heap_ptr
-        i32.const 8
-        i32.add
-        global.set $__heap_ptr
-        local.get 26
-        local.get 22
-        i32.store
-        local.get 26
-        i32.const 4
-        i32.add
-        local.get 25
-        i32.store
-        local.get 26
-        i32.store
-        local.get 21
+        i32.eq
+        (if (result i32)
+          (then
+            local.get 16
+            i32.const 4
+            i32.add
+            i32.load
+            local.set 17
+            global.get $__heap_ptr
+            local.set 18
+            global.get $__heap_ptr
+            i32.const 30
+            i32.add
+            global.set $__heap_ptr
+            local.get 18
+            i32.const 26
+            i32.store
+            local.get 18
+            i32.const 4
+            i32.add
+            i32.const 61
+            i32.store8
+            local.get 18
+            i32.const 5
+            i32.add
+            i32.const 61
+            i32.store8
+            local.get 18
+            i32.const 6
+            i32.add
+            i32.const 61
+            i32.store8
+            local.get 18
+            i32.const 7
+            i32.add
+            i32.const 32
+            i32.store8
+            local.get 18
+            i32.const 8
+            i32.add
+            i32.const 69
+            i32.store8
+            local.get 18
+            i32.const 9
+            i32.add
+            i32.const 118
+            i32.store8
+            local.get 18
+            i32.const 10
+            i32.add
+            i32.const 97
+            i32.store8
+            local.get 18
+            i32.const 11
+            i32.add
+            i32.const 108
+            i32.store8
+            local.get 18
+            i32.const 12
+            i32.add
+            i32.const 32
+            i32.store8
+            local.get 18
+            i32.const 13
+            i32.add
+            i32.const 108
+            i32.store8
+            local.get 18
+            i32.const 14
+            i32.add
+            i32.const 111
+            i32.store8
+            local.get 18
+            i32.const 15
+            i32.add
+            i32.const 111
+            i32.store8
+            local.get 18
+            i32.const 16
+            i32.add
+            i32.const 112
+            i32.store8
+            local.get 18
+            i32.const 17
+            i32.add
+            i32.const 32
+            i32.store8
+            local.get 18
+            i32.const 18
+            i32.add
+            i32.const 99
+            i32.store8
+            local.get 18
+            i32.const 19
+            i32.add
+            i32.const 111
+            i32.store8
+            local.get 18
+            i32.const 20
+            i32.add
+            i32.const 109
+            i32.store8
+            local.get 18
+            i32.const 21
+            i32.add
+            i32.const 112
+            i32.store8
+            local.get 18
+            i32.const 22
+            i32.add
+            i32.const 108
+            i32.store8
+            local.get 18
+            i32.const 23
+            i32.add
+            i32.const 101
+            i32.store8
+            local.get 18
+            i32.const 24
+            i32.add
+            i32.const 116
+            i32.store8
+            local.get 18
+            i32.const 25
+            i32.add
+            i32.const 101
+            i32.store8
+            local.get 18
+            i32.const 26
+            i32.add
+            i32.const 32
+            i32.store8
+            local.get 18
+            i32.const 27
+            i32.add
+            i32.const 61
+            i32.store8
+            local.get 18
+            i32.const 28
+            i32.add
+            i32.const 61
+            i32.store8
+            local.get 18
+            i32.const 29
+            i32.add
+            i32.const 61
+            i32.store8
+            local.get 18
+            call $log
+            drop
+            global.get $__heap_ptr
+            local.set 19
+            global.get $__heap_ptr
+            i32.const 8
+            i32.add
+            global.set $__heap_ptr
+            local.get 19
+            i32.const 0
+            i32.store
+            local.get 19
+            i32.const 4
+            i32.add
+            local.get 0
+            local.set 20
+            global.get $__heap_ptr
+            local.set 21
+            global.get $__heap_ptr
+            i32.const 8
+            i32.add
+            global.set $__heap_ptr
+            local.get 21
+            i32.const 1
+            i32.store
+            local.get 21
+            i32.const 4
+            i32.add
+            local.get 17
+            i32.store
+            local.get 21
+            local.set 22
+            global.get $__heap_ptr
+            local.set 23
+            global.get $__heap_ptr
+            i32.const 4
+            i32.add
+            global.set $__heap_ptr
+            local.get 23
+            local.get 22
+            i32.store
+            local.get 23
+            local.set 24
+            global.get $__heap_ptr
+            local.set 25
+            global.get $__heap_ptr
+            i32.const 8
+            i32.add
+            global.set $__heap_ptr
+            local.get 25
+            local.get 20
+            i32.store
+            local.get 25
+            i32.const 4
+            i32.add
+            local.get 24
+            i32.store
+            local.get 25
+            i32.store
+            local.get 19
+          )
+          (else
+        local.get 16
+        i32.load
+        i32.const 1
+        i32.eq
+        (if (result i32)
+          (then
+            local.get 16
+            i32.const 4
+            i32.add
+            i32.load
+            local.set 26
+            global.get $__heap_ptr
+            local.set 27
+            global.get $__heap_ptr
+            i32.const 16
+            i32.add
+            global.set $__heap_ptr
+            local.get 27
+            i32.const 12
+            i32.store
+            local.get 27
+            i32.const 4
+            i32.add
+            i32.const 69
+            i32.store8
+            local.get 27
+            i32.const 5
+            i32.add
+            i32.const 118
+            i32.store8
+            local.get 27
+            i32.const 6
+            i32.add
+            i32.const 97
+            i32.store8
+            local.get 27
+            i32.const 7
+            i32.add
+            i32.const 108
+            i32.store8
+            local.get 27
+            i32.const 8
+            i32.add
+            i32.const 32
+            i32.store8
+            local.get 27
+            i32.const 9
+            i32.add
+            i32.const 102
+            i32.store8
+            local.get 27
+            i32.const 10
+            i32.add
+            i32.const 97
+            i32.store8
+            local.get 27
+            i32.const 11
+            i32.add
+            i32.const 105
+            i32.store8
+            local.get 27
+            i32.const 12
+            i32.add
+            i32.const 108
+            i32.store8
+            local.get 27
+            i32.const 13
+            i32.add
+            i32.const 101
+            i32.store8
+            local.get 27
+            i32.const 14
+            i32.add
+            i32.const 100
+            i32.store8
+            local.get 27
+            i32.const 15
+            i32.add
+            i32.const 33
+            i32.store8
+            local.get 27
+            call $log
+            drop
+            local.get 26
+            call $log
+            drop
+            global.get $__heap_ptr
+            local.set 28
+            global.get $__heap_ptr
+            i32.const 8
+            i32.add
+            global.set $__heap_ptr
+            local.get 28
+            i32.const 1
+            i32.store
+            local.get 28
+            i32.const 4
+            i32.add
+            local.get 26
+            i32.store
+            local.get 28
+          )
+          (else
+            unreachable
+          )
+        )
+          )
+        )
       )
       (else
     local.get 11
@@ -4322,196 +4330,196 @@
     (if (result i32)
       (then
         global.get $__heap_ptr
-        local.set 27
+        local.set 29
         global.get $__heap_ptr
         i32.const 20
         i32.add
         global.set $__heap_ptr
-        local.get 27
+        local.get 29
         i32.const 16
         i32.store
-        local.get 27
+        local.get 29
         i32.const 4
         i32.add
         i32.const 65
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 5
         i32.add
         i32.const 115
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 6
         i32.add
         i32.const 115
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 7
         i32.add
         i32.const 101
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 8
         i32.add
         i32.const 109
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 9
         i32.add
         i32.const 98
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 10
         i32.add
         i32.const 108
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 11
         i32.add
         i32.const 121
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 12
         i32.add
         i32.const 32
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 13
         i32.add
         i32.const 102
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 14
         i32.add
         i32.const 97
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 15
         i32.add
         i32.const 105
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 16
         i32.add
         i32.const 108
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 17
         i32.add
         i32.const 101
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 18
         i32.add
         i32.const 100
         i32.store8
-        local.get 27
+        local.get 29
         i32.const 19
         i32.add
         i32.const 33
         i32.store8
-        local.get 27
+        local.get 29
         call $log
         drop
         global.get $__heap_ptr
-        local.set 28
+        local.set 30
         global.get $__heap_ptr
         i32.const 8
         i32.add
         global.set $__heap_ptr
-        local.get 28
+        local.get 30
         i32.const 1
         i32.store
-        local.get 28
+        local.get 30
         i32.const 4
         i32.add
         global.get $__heap_ptr
-        local.set 29
+        local.set 31
         global.get $__heap_ptr
         i32.const 19
         i32.add
         global.set $__heap_ptr
-        local.get 29
+        local.get 31
         i32.const 15
         i32.store
-        local.get 29
+        local.get 31
         i32.const 4
         i32.add
         i32.const 65
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 5
         i32.add
         i32.const 115
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 6
         i32.add
         i32.const 115
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 7
         i32.add
         i32.const 101
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 8
         i32.add
         i32.const 109
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 9
         i32.add
         i32.const 98
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 10
         i32.add
         i32.const 108
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 11
         i32.add
         i32.const 121
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 12
         i32.add
         i32.const 32
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 13
         i32.add
         i32.const 102
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 14
         i32.add
         i32.const 97
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 15
         i32.add
         i32.const 105
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 16
         i32.add
         i32.const 108
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 17
         i32.add
         i32.const 101
         i32.store8
-        local.get 29
+        local.get 31
         i32.const 18
         i32.add
         i32.const 100
         i32.store8
-        local.get 29
+        local.get 31
         i32.store
-        local.get 28
+        local.get 30
       )
       (else
         unreachable
@@ -4848,7 +4856,7 @@
     local.get $param_state
     call $init
     local.set $value
-    i32.const 4096
+    i32.const 16384
     call $__alloc
     local.set $out_ptr
     ;; Encode result value to CGRF (recursive encoder)
@@ -4905,6 +4913,8 @@
     i32.add
     local.set $buf_cursor
     local.get $enc_tmp
+    local.set $enc_result_ptr
+    local.get $enc_result_ptr
     i32.load
     local.set $enc_tmp
     local.get $out_ptr
@@ -4917,7 +4927,7 @@
     i32.add
     i32.const 4
     i32.add
-    local.get $enc_tmp
+    local.get $enc_result_ptr
     i32.const 4
     i32.add
     local.get $enc_tmp
@@ -6081,7 +6091,7 @@
     local.get $param_params
     call $handle-send
     local.set $value
-    i32.const 4096
+    i32.const 16384
     call $__alloc
     local.set $out_ptr
     ;; Encode result value to CGRF (recursive encoder)
@@ -6138,6 +6148,8 @@
     i32.add
     local.set $buf_cursor
     local.get $enc_tmp
+    local.set $enc_result_ptr
+    local.get $enc_result_ptr
     i32.load
     local.set $enc_tmp
     local.get $out_ptr
@@ -6150,7 +6162,7 @@
     i32.add
     i32.const 4
     i32.add
-    local.get $enc_tmp
+    local.get $enc_result_ptr
     i32.const 4
     i32.add
     local.get $enc_tmp
@@ -7389,7 +7401,7 @@
     local.get $param_params
     call $handle-request
     local.set $value
-    i32.const 4096
+    i32.const 16384
     call $__alloc
     local.set $out_ptr
     ;; Encode result value to CGRF (recursive encoder)
@@ -7446,6 +7458,8 @@
     i32.add
     local.set $buf_cursor
     local.get $enc_tmp
+    local.set $enc_result_ptr
+    local.get $enc_result_ptr
     i32.load
     local.set $enc_tmp
     local.get $out_ptr
@@ -7458,7 +7472,7 @@
     i32.add
     i32.const 4
     i32.add
-    local.get $enc_tmp
+    local.get $enc_result_ptr
     i32.const 4
     i32.add
     local.get $enc_tmp
