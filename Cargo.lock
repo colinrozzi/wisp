@@ -3257,10 +3257,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
- "wasmparser 0.219.2",
- "wasmtime 21.0.2",
- "wat",
 ]
 
 [[package]]

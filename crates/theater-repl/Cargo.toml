@@ -14,17 +14,8 @@ theater-handler-store = { path = "/home/colin/work/theater/crates/theater-handle
 # Wisp-specific handler
 theater-handler-wisp = { path = "../theater-handler-wisp" }
 
-# Pack for static composition (still needed for merging WASM modules)
+# Pack for static composition (merging WASM modules)
 pack = { path = "../../../pack" }
-
-# Wasmtime for expression actor execution (spawn-and-wait)
-wasmtime = "21.0"
-
-# WAT to WASM conversion
-wat = "1"
-
-# WASM validation
-wasmparser = "0.219"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -35,6 +26,3 @@ anyhow = "1.0"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# UUID for request IDs
-uuid = { version = "1", features = ["v4"] }
