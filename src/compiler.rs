@@ -7663,6 +7663,7 @@ const CGRF_RESULT: u8 = 0x14;
 /// Memory layout for Pack packages
 const INPUT_BUFFER_OFFSET: i32 = 0x0000;
 const OUTPUT_BUFFER_OFFSET: i32 = 0x4000;
+const METADATA_OFFSET: i32 = 0xA000; // Pack metadata segment (8KB reserved)
 const HEAP_START_OFFSET: i32 = 0xC000;
 
 /// Get the type tag byte for a type (for CGRF v2 encoding)
@@ -7757,6 +7758,281 @@ fn generate_write_type_tag(out: &mut String, ty: &Type, base_local: &str, offset
     }
 }
 
+// ============================================================================
+// CGRF Encoder for Pack Metadata
+// ============================================================================
+
+/// A CGRF node during encoding - stores payload bytes directly
+#[derive(Debug, Clone)]
+struct CgrfNode {
+    kind: u8,
+    payload: Vec<u8>,
+}
+
+/// Encoder for building CGRF-encoded metadata
+/// Matches Pack's CGRF v2 format exactly
+struct CgrfEncoder {
+    nodes: Vec<CgrfNode>,
+}
+
+impl CgrfEncoder {
+    fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    /// Add a string node, returns node index
+    /// Payload format: len:u32 + utf8_bytes
+    fn add_string(&mut self, s: &str) -> u32 {
+        let idx = self.nodes.len() as u32;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        payload.extend_from_slice(s.as_bytes());
+        self.nodes.push(CgrfNode { kind: CGRF_STRING, payload });
+        idx
+    }
+
+    /// Add a list node with given element type bytes and children indices
+    /// Payload format: elem_type:type_bytes + count:u32 + child_indices:u32*
+    fn add_list(&mut self, elem_type_bytes: Vec<u8>, children: Vec<u32>) -> u32 {
+        let idx = self.nodes.len() as u32;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&elem_type_bytes);
+        payload.extend_from_slice(&(children.len() as u32).to_le_bytes());
+        for child_idx in children {
+            payload.extend_from_slice(&child_idx.to_le_bytes());
+        }
+        self.nodes.push(CgrfNode { kind: CGRF_LIST, payload });
+        idx
+    }
+
+    /// Encode a named type (Record or Variant) for use in List element types
+    fn encode_named_type(tag: u8, name: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(tag);
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes
+    }
+
+    /// Add a record node with name and field (name, value_idx) pairs
+    /// Payload format: type_name_len:u32 + type_name:utf8 + field_count:u32 +
+    ///                 (field_name_len:u32 + field_name:utf8)* + child_indices:u32*
+    fn add_record(&mut self, name: &str, fields: Vec<(&str, u32)>) -> u32 {
+        let idx = self.nodes.len() as u32;
+        let mut payload = Vec::new();
+        // type_name_len + type_name
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name.as_bytes());
+        // field_count
+        payload.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        // field names first
+        for (fname, _) in &fields {
+            payload.extend_from_slice(&(fname.len() as u32).to_le_bytes());
+            payload.extend_from_slice(fname.as_bytes());
+        }
+        // then child indices
+        for (_, value_idx) in &fields {
+            payload.extend_from_slice(&value_idx.to_le_bytes());
+        }
+        self.nodes.push(CgrfNode { kind: CGRF_RECORD, payload });
+        idx
+    }
+
+    /// Add a variant node
+    /// Payload format: type_name_len:u32 + type_name:utf8 + case_name_len:u32 + case_name:utf8 +
+    ///                 tag:u32 + payload_count:u32 + child_indices:u32*
+    fn add_variant(&mut self, name: &str, case: &str, tag: u32, children: Vec<u32>) -> u32 {
+        let idx = self.nodes.len() as u32;
+        let mut payload = Vec::new();
+        // type_name_len + type_name
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name.as_bytes());
+        // case_name_len + case_name
+        payload.extend_from_slice(&(case.len() as u32).to_le_bytes());
+        payload.extend_from_slice(case.as_bytes());
+        // tag
+        payload.extend_from_slice(&tag.to_le_bytes());
+        // payload_count + child indices
+        payload.extend_from_slice(&(children.len() as u32).to_le_bytes());
+        for child_idx in children {
+            payload.extend_from_slice(&child_idx.to_le_bytes());
+        }
+        self.nodes.push(CgrfNode { kind: CGRF_VARIANT, payload });
+        idx
+    }
+
+    /// Encode all nodes to CGRF v2 bytes with the given root index
+    /// Format: Header (16 bytes) + Nodes (8 + payload_len each)
+    fn encode(&self, root: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // CGRF v2 Header (16 bytes):
+        // [MAGIC:u32][VERSION:u16][FLAGS:u16][NODE_COUNT:u32][ROOT_INDEX:u32]
+        bytes.extend_from_slice(&CGRF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&CGRF_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+        bytes.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&root.to_le_bytes());
+
+        // Nodes: each node has 8-byte header + payload
+        // [KIND:u8][FLAGS:u8][RESERVED:u16][PAYLOAD_LEN:u32][PAYLOAD...]
+        for node in &self.nodes {
+            bytes.push(node.kind);           // kind (1 byte)
+            bytes.push(0u8);                  // flags (1 byte)
+            bytes.extend_from_slice(&0u16.to_le_bytes()); // reserved (2 bytes)
+            bytes.extend_from_slice(&(node.payload.len() as u32).to_le_bytes()); // payload_len (4 bytes)
+            bytes.extend_from_slice(&node.payload); // payload
+        }
+
+        bytes
+    }
+}
+
+/// Map Wisp Type to CGRF type-desc variant tag
+/// These tags match the pack runtime's type descriptor format
+fn type_desc_tag(ty: &Type) -> u32 {
+    match ty {
+        Type::U8 => 1,       // u8
+        Type::S32 => 7,      // s32
+        Type::S64 => 8,      // s64
+        Type::F32 => 9,      // f32
+        Type::F64 => 10,     // f64
+        Type::Str => 12,     // string
+        Type::List(_) => 14, // list
+        Type::Option(_) => 15, // option
+        Type::Result(_, _) => 16, // result
+        Type::Record(_) => 17, // record
+        Type::Variant(_) => 18, // variant
+        Type::Tuple(_) => 19,  // tuple
+        Type::Resource(_) => 17, // treat as record
+        Type::Borrow(inner) => type_desc_tag(inner),
+    }
+}
+
+/// Build a type-desc variant node for a Type
+fn build_type_desc(encoder: &mut CgrfEncoder, ty: &Type) -> u32 {
+    let tag = type_desc_tag(ty);
+    let case_name = match ty {
+        Type::U8 => "u8",
+        Type::S32 => "s32",
+        Type::S64 => "s64",
+        Type::F32 => "f32",
+        Type::F64 => "f64",
+        Type::Str => "string",
+        Type::List(_) => "list",
+        Type::Option(_) => "option",
+        Type::Result(_, _) => "result",
+        Type::Record(_) => "record",
+        Type::Variant(_) => "variant",
+        Type::Tuple(_) => "tuple",
+        Type::Resource(_) => "record",
+        Type::Borrow(inner) => return build_type_desc(encoder, inner),
+    };
+
+    // Build payload for compound types
+    let payload = match ty {
+        Type::List(inner) => vec![build_type_desc(encoder, inner)],
+        Type::Option(inner) => vec![build_type_desc(encoder, inner)],
+        Type::Result(ok, err) => vec![
+            build_type_desc(encoder, ok),
+            build_type_desc(encoder, err),
+        ],
+        Type::Tuple(elems) => elems.iter().map(|e| build_type_desc(encoder, e)).collect(),
+        Type::Record(name) | Type::Variant(name) | Type::Resource(name) => {
+            vec![encoder.add_string(name)]
+        }
+        _ => vec![], // Simple types have no payload
+    };
+
+    encoder.add_variant("type-desc", case_name, tag, payload)
+}
+
+/// Build a param-sig record node
+fn build_param_sig(encoder: &mut CgrfEncoder, name: &str, ty: &Type) -> u32 {
+    let name_node = encoder.add_string(name);
+    let type_node = build_type_desc(encoder, ty);
+    encoder.add_record("param-sig", vec![
+        ("name", name_node),
+        ("type", type_node),
+    ])
+}
+
+/// Build a function-sig record node
+fn build_function_sig(
+    encoder: &mut CgrfEncoder,
+    interface: &str,
+    name: &str,
+    params: &[Parameter],
+    return_type: &Type,
+) -> u32 {
+    let interface_node = encoder.add_string(interface);
+    let name_node = encoder.add_string(name);
+
+    // Build params list
+    let param_nodes: Vec<u32> = params
+        .iter()
+        .map(|p| build_param_sig(encoder, &p.name, &p.ty))
+        .collect();
+    let params_list = encoder.add_list(
+        CgrfEncoder::encode_named_type(CGRF_RECORD, "param-sig"),
+        param_nodes,
+    );
+
+    // Build results list (single return type for now)
+    let result_node = build_type_desc(encoder, return_type);
+    let results_list = encoder.add_list(
+        CgrfEncoder::encode_named_type(CGRF_VARIANT, "type-desc"),
+        vec![result_node],
+    );
+
+    encoder.add_record("function-sig", vec![
+        ("interface", interface_node),
+        ("name", name_node),
+        ("params", params_list),
+        ("results", results_list),
+    ])
+}
+
+/// Encode PackageMetadata for a Program to CGRF bytes
+fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
+    let mut encoder = CgrfEncoder::new();
+
+    // Build imports list
+    let import_nodes: Vec<u32> = prog.imports.iter().map(|imp| {
+        // Use the module name as the interface
+        build_function_sig(&mut encoder, &imp.module, &imp.name, &imp.params, &imp.return_type)
+    }).collect();
+    let imports_list = encoder.add_list(
+        CgrfEncoder::encode_named_type(CGRF_RECORD, "function-sig"),
+        import_nodes,
+    );
+
+    // Build exports list
+    let export_nodes: Vec<u32> = prog.exports.iter().filter_map(|exp| {
+        let func = prog.functions.iter().find(|f| f.name == exp.func_name)?;
+        // Use a standard interface name for exports
+        Some(build_function_sig(
+            &mut encoder,
+            "exports",
+            &exp.export_name,
+            &func.params,
+            &func.return_type,
+        ))
+    }).collect();
+    let exports_list = encoder.add_list(
+        CgrfEncoder::encode_named_type(CGRF_RECORD, "function-sig"),
+        export_nodes,
+    );
+
+    // Build package-metadata record
+    let root = encoder.add_record("package-metadata", vec![
+        ("imports", imports_list),
+        ("exports", exports_list),
+    ]);
+
+    encoder.encode(root)
+}
+
 /// Generate WAT for a Pack-compatible package.
 ///
 /// This produces WASM with:
@@ -7789,6 +8065,33 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
         }
         out.push_str("\")\n");
     }
+
+    // Emit Pack metadata data segment
+    let metadata_bytes = encode_pack_metadata(prog);
+    let metadata_len = metadata_bytes.len();
+    out.push_str(&format!("  (data (i32.const {}) \"", METADATA_OFFSET));
+    for byte in &metadata_bytes {
+        out.push_str(&format!("\\{:02x}", byte));
+    }
+    out.push_str("\")\n");
+
+    // __pack_types function - returns pointer and length of CGRF-encoded metadata
+    // This enables the REPL import system to auto-detect function signatures
+    out.push_str(&format!(
+        r#"  (func (export "__pack_types") (param $out_ptr_ptr i32) (param $out_len_ptr i32) (result i32)
+    ;; Write metadata pointer to out_ptr_ptr
+    local.get $out_ptr_ptr
+    i32.const {}
+    i32.store
+    ;; Write metadata length to out_len_ptr
+    local.get $out_len_ptr
+    i32.const {}
+    i32.store
+    ;; Return 0 for success
+    i32.const 0)
+"#,
+        METADATA_OFFSET, metadata_len
+    ));
 
     // Heap pointer for allocations, starts after output buffer
     out.push_str(&format!(
