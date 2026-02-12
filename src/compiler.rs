@@ -4616,6 +4616,7 @@ fn parse_type_symbol(
         "f64" => Ok(Type::F64),
         "u8" => Ok(Type::U8),
         "string" => Ok(Type::Str),
+        "unit" => Ok(Type::Tuple(vec![])), // unit type is empty tuple
         // Check if this is a variant type name
         other if variant_names.contains(other) => Ok(Type::Variant(other.to_string())),
         // Check if this is a resource type name
@@ -4627,7 +4628,7 @@ fn parse_type_symbol(
 }
 
 fn is_type_symbol(sym: &str) -> bool {
-    matches!(sym, "s32" | "s64" | "f32" | "f64" | "u8" | "string")
+    matches!(sym, "s32" | "s64" | "f32" | "f64" | "u8" | "string" | "unit")
 }
 
 fn parse_expr(
@@ -5292,7 +5293,12 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         for param in &import.params {
             out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
         }
-        out.push_str(&format!("(result {})))\n", wat_type(&import.return_type)));
+        let result_clause = emit_wat_result(&import.return_type);
+        if result_clause.is_empty() {
+            out.push_str("))\n");
+        } else {
+            out.push_str(&format!("{})))\n", result_clause));
+        }
     }
 
     // Declare memory (500 pages = 32MB, allow growth up to 1000 pages = 64MB)
@@ -5384,7 +5390,12 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         for param in &func.params {
             out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
         }
-        out.push_str(&format!("(result {})\n", wat_type(&func.return_type)));
+        let result_clause = emit_wat_result(&func.return_type);
+        if result_clause.is_empty() {
+            out.push_str("\n");
+        } else {
+            out.push_str(&format!("{}\n", result_clause));
+        }
         for local in &env.locals {
             out.push_str(&format!("    (local {})\n", wat_type(local)));
         }
@@ -6988,6 +6999,11 @@ fn conversion_instr(from: &Type, to: &Type) -> Option<&'static str> {
     }
 }
 
+/// Check if a type is unit (empty tuple)
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(elems) if elems.is_empty())
+}
+
 fn wat_type(ty: &Type) -> &'static str {
     match ty {
         Type::S32 => "i32",
@@ -7005,6 +7021,15 @@ fn wat_type(ty: &Type) -> &'static str {
         | Type::Tuple(_) => "i32",
         // Resources are i32 handles
         Type::Resource(_) | Type::Borrow(_) => "i32",
+    }
+}
+
+/// Emit the (result ...) clause for a function, or nothing if unit type
+fn emit_wat_result(ty: &Type) -> String {
+    if is_unit_type(ty) {
+        String::new()
+    } else {
+        format!("(result {})", wat_type(ty))
     }
 }
 
@@ -7888,149 +7913,116 @@ impl CgrfEncoder {
     }
 }
 
-/// Map Wisp Type to CGRF type-desc variant tag
-/// These tags match the pack runtime's type descriptor format
-fn type_desc_tag(ty: &Type) -> u32 {
+/// Convert Wisp Type to Pack Type for metadata encoding
+fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
     match ty {
-        Type::U8 => 1,       // u8
-        Type::S32 => 7,      // s32
-        Type::S64 => 8,      // s64
-        Type::F32 => 9,      // f32
-        Type::F64 => 10,     // f64
-        Type::Str => 12,     // string
-        Type::List(_) => 14, // list
-        Type::Option(_) => 15, // option
-        Type::Result(_, _) => 16, // result
-        Type::Record(_) => 17, // record
-        Type::Variant(_) => 18, // variant
-        Type::Tuple(_) => 19,  // tuple
-        Type::Resource(_) => 17, // treat as record
-        Type::Borrow(inner) => type_desc_tag(inner),
+        Type::U8 => pack::types::Type::U8,
+        Type::S32 => pack::types::Type::S32,
+        Type::S64 => pack::types::Type::S64,
+        Type::F32 => pack::types::Type::F32,
+        Type::F64 => pack::types::Type::F64,
+        Type::Str => pack::types::Type::String,
+        Type::List(inner) => pack::types::Type::List(Box::new(wisp_type_to_pack_type(inner))),
+        Type::Option(inner) => pack::types::Type::Option(Box::new(wisp_type_to_pack_type(inner))),
+        Type::Result(ok, err) => pack::types::Type::Result {
+            ok: Box::new(wisp_type_to_pack_type(ok)),
+            err: Box::new(wisp_type_to_pack_type(err)),
+        },
+        Type::Tuple(elems) => pack::types::Type::Tuple(
+            elems.iter().map(wisp_type_to_pack_type).collect()
+        ),
+        Type::Record(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
+        Type::Variant(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
+        Type::Resource(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
+        Type::Borrow(inner) => wisp_type_to_pack_type(inner),
     }
 }
 
-/// Build a type-desc variant node for a Type
-fn build_type_desc(encoder: &mut CgrfEncoder, ty: &Type) -> u32 {
-    let tag = type_desc_tag(ty);
-    let case_name = match ty {
-        Type::U8 => "u8",
-        Type::S32 => "s32",
-        Type::S64 => "s64",
-        Type::F32 => "f32",
-        Type::F64 => "f64",
-        Type::Str => "string",
-        Type::List(_) => "list",
-        Type::Option(_) => "option",
-        Type::Result(_, _) => "result",
-        Type::Record(_) => "record",
-        Type::Variant(_) => "variant",
-        Type::Tuple(_) => "tuple",
-        Type::Resource(_) => "record",
-        Type::Borrow(inner) => return build_type_desc(encoder, inner),
-    };
-
-    // Build payload for compound types
-    let payload = match ty {
-        Type::List(inner) => vec![build_type_desc(encoder, inner)],
-        Type::Option(inner) => vec![build_type_desc(encoder, inner)],
-        Type::Result(ok, err) => vec![
-            build_type_desc(encoder, ok),
-            build_type_desc(encoder, err),
-        ],
-        Type::Tuple(elems) => elems.iter().map(|e| build_type_desc(encoder, e)).collect(),
-        Type::Record(name) | Type::Variant(name) | Type::Resource(name) => {
-            vec![encoder.add_string(name)]
-        }
-        _ => vec![], // Simple types have no payload
-    };
-
-    encoder.add_variant("type-desc", case_name, tag, payload)
-}
-
-/// Build a param-sig record node
-fn build_param_sig(encoder: &mut CgrfEncoder, name: &str, ty: &Type) -> u32 {
-    let name_node = encoder.add_string(name);
-    let type_node = build_type_desc(encoder, ty);
-    encoder.add_record("param-sig", vec![
-        ("name", name_node),
-        ("type", type_node),
-    ])
-}
-
-/// Build a function-sig record node
-fn build_function_sig(
-    encoder: &mut CgrfEncoder,
-    interface: &str,
-    name: &str,
-    params: &[Parameter],
-    return_type: &Type,
-) -> u32 {
-    let interface_node = encoder.add_string(interface);
-    let name_node = encoder.add_string(name);
-
-    // Build params list
-    let param_nodes: Vec<u32> = params
-        .iter()
-        .map(|p| build_param_sig(encoder, &p.name, &p.ty))
-        .collect();
-    let params_list = encoder.add_list(
-        CgrfEncoder::encode_named_type(CGRF_RECORD, "param-sig"),
-        param_nodes,
-    );
-
-    // Build results list (single return type for now)
-    let result_node = build_type_desc(encoder, return_type);
-    let results_list = encoder.add_list(
-        CgrfEncoder::encode_named_type(CGRF_VARIANT, "type-desc"),
-        vec![result_node],
-    );
-
-    encoder.add_record("function-sig", vec![
-        ("interface", interface_node),
-        ("name", name_node),
-        ("params", params_list),
-        ("results", results_list),
-    ])
-}
-
-/// Encode PackageMetadata for a Program to CGRF bytes
+/// Encode PackageMetadata for a Program to CGRF bytes with interface hashes.
+///
+/// This builds a Pack Arena from the Program and uses Pack's encode_metadata_with_hashes
+/// to generate CGRF bytes that include Merkle-tree interface hashes for O(1) compatibility
+/// checking at runtime.
 fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
-    let mut encoder = CgrfEncoder::new();
+    use pack::types::{Arena, Function, Param};
+    use std::collections::HashMap;
 
-    // Build imports list
-    let import_nodes: Vec<u32> = prog.imports.iter().map(|imp| {
-        // Use the module name as the interface
-        build_function_sig(&mut encoder, &imp.module, &imp.name, &imp.params, &imp.return_type)
-    }).collect();
-    let imports_list = encoder.add_list(
-        CgrfEncoder::encode_named_type(CGRF_RECORD, "function-sig"),
-        import_nodes,
-    );
+    let mut package = Arena::new("package");
 
-    // Build exports list
-    let export_nodes: Vec<u32> = prog.exports.iter().filter_map(|exp| {
-        let func = prog.functions.iter().find(|f| f.name == exp.func_name)?;
-        // Use a standard interface name for exports
-        Some(build_function_sig(
-            &mut encoder,
-            "exports",
-            &exp.export_name,
-            &func.params,
-            &func.return_type,
-        ))
-    }).collect();
-    let exports_list = encoder.add_list(
-        CgrfEncoder::encode_named_type(CGRF_RECORD, "function-sig"),
-        export_nodes,
-    );
+    // Build imports section - group by interface (module) name
+    let mut imports_section = Arena::new("imports");
+    let mut import_by_interface: HashMap<String, Vec<Function>> = HashMap::new();
 
-    // Build package-metadata record
-    let root = encoder.add_record("package-metadata", vec![
-        ("imports", imports_list),
-        ("exports", exports_list),
-    ]);
+    for imp in &prog.imports {
+        // For unit return type, use empty results vec (not vec![Type::Tuple(vec![])])
+        let results = if is_unit_type(&imp.return_type) {
+            vec![]
+        } else {
+            vec![wisp_type_to_pack_type(&imp.return_type)]
+        };
+        let func = Function::with_signature(
+            imp.name.clone(),
+            imp.params.iter().map(|p| {
+                Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty))
+            }).collect(),
+            results,
+        );
+        import_by_interface
+            .entry(imp.module.clone())
+            .or_default()
+            .push(func);
+    }
 
-    encoder.encode(root)
+    for (interface_name, funcs) in import_by_interface {
+        let mut interface_arena = Arena::new(interface_name);
+        for func in funcs {
+            interface_arena.add_function(func);
+        }
+        imports_section.add_child(interface_arena);
+    }
+
+    package.add_child(imports_section);
+
+    // Build exports section - group by interface name
+    let mut exports_section = Arena::new("exports");
+    let mut export_by_interface: HashMap<String, Vec<Function>> = HashMap::new();
+
+    for exp in &prog.exports {
+        if let Some(func) = prog.functions.iter().find(|f| f.name == exp.func_name) {
+            // For unit return type, use empty results vec
+            let results = if is_unit_type(&func.return_type) {
+                vec![]
+            } else {
+                vec![wisp_type_to_pack_type(&func.return_type)]
+            };
+            let pack_func = Function::with_signature(
+                exp.export_name.clone(),
+                func.params.iter().map(|p| {
+                    Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty))
+                }).collect(),
+                results,
+            );
+            // Use "exports" as the default interface for exports
+            export_by_interface
+                .entry("exports".to_string())
+                .or_default()
+                .push(pack_func);
+        }
+    }
+
+    for (interface_name, funcs) in export_by_interface {
+        let mut interface_arena = Arena::new(interface_name);
+        for func in funcs {
+            interface_arena.add_function(func);
+        }
+        exports_section.add_child(interface_arena);
+    }
+
+    package.add_child(exports_section);
+
+    // Use Pack's encoder which includes interface hashes
+    pack::metadata::encode_metadata_with_hashes(&package)
+        .expect("Failed to encode pack metadata with hashes")
 }
 
 /// Generate WAT for a Pack-compatible package.
@@ -8236,7 +8228,12 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
         for param in &func.params {
             out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
         }
-        out.push_str(&format!("(result {})\n", wat_type(&func.return_type)));
+        let result_clause = emit_wat_result(&func.return_type);
+        if result_clause.is_empty() {
+            out.push_str("\n");
+        } else {
+            out.push_str(&format!("{}\n", result_clause));
+        }
         for local in &env.locals {
             out.push_str(&format!("    (local {})\n", wat_type(local)));
         }
@@ -8505,7 +8502,10 @@ fn generate_pack_wrapper(
         out.push_str(&format!("    local.get $param_{}\n", param.name));
     }
     out.push_str(&format!("    call {}\n", internal_name));
-    out.push_str("    local.set $value\n");
+    // Only set $value if the function returns a non-unit type
+    if !is_unit_type(&func.return_type) {
+        out.push_str("    local.set $value\n");
+    }
 
     // Allocate output buffer (guest-allocates ABI)
     // For variable-size types, compute the exact size needed dynamically
@@ -8634,10 +8634,13 @@ fn generate_import_wrapper(
         out.push_str(&format!("(param ${} {}) ", param.name, wat_type(&param.ty)));
     }
 
-    // For now, imports that return "nothing" return s32 (0 for success)
-    // This matches Theater's log which returns unit
-    let result_type = wat_type(&import.return_type);
-    out.push_str(&format!("(result {})\n", result_type));
+    // Handle result type - unit (empty tuple) means no return value
+    let result_clause = emit_wat_result(&import.return_type);
+    if result_clause.is_empty() {
+        out.push_str("\n");
+    } else {
+        out.push_str(&format!("{}\n", result_clause));
+    }
 
     // Local variables for encoding (guest-allocates ABI)
     out.push_str("    (local $in_buf i32)\n");
@@ -9463,51 +9466,54 @@ fn generate_import_wrapper(
     // Decode result from CGRF output buffer
     // The result is a single CGRF node: header(16) + node_header(8) + payload
     // The scalar value is at $out_ptr + 24
-    out.push_str("    ;; Decode result from CGRF\n");
-    match &import.return_type {
-        Type::S32 => {
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str("    i32.const 24\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
+    // Unit type (empty tuple) has no return value
+    if !is_unit_type(&import.return_type) {
+        out.push_str("    ;; Decode result from CGRF\n");
+        match &import.return_type {
+            Type::S32 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+            }
+            Type::S64 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i64.load\n");
+            }
+            Type::F32 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    f32.load\n");
+            }
+            Type::F64 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    f64.load\n");
+            }
+            Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Str => {
+                // Use recursive decoder for complex types
+                // Set up $in_ptr to point to the output buffer (becomes input for decoding)
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    local.set $in_ptr\n");
+                // Read root index from header (offset 12) and find that node
+                out.push_str("    local.get $in_ptr\n");
+                out.push_str("    i32.const 12\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+                out.push_str("    local.set $dec_child_idx\n");
+                // Scan to find the root node
+                generate_dec_find_node_by_index(out);
+                // Decode the value recursively from the root node
+                generate_cgrf_decode_recursive(out, &import.return_type, records, variants);
+                // Result is in $dec_result
+                out.push_str("    local.get $dec_result\n");
+            }
+            _ => out.push_str("    i32.const 0\n"),
         }
-        Type::S64 => {
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str("    i32.const 24\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    i64.load\n");
-        }
-        Type::F32 => {
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str("    i32.const 24\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    f32.load\n");
-        }
-        Type::F64 => {
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str("    i32.const 24\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    f64.load\n");
-        }
-        Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Str => {
-            // Use recursive decoder for complex types
-            // Set up $in_ptr to point to the output buffer (becomes input for decoding)
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str("    local.set $in_ptr\n");
-            // Read root index from header (offset 12) and find that node
-            out.push_str("    local.get $in_ptr\n");
-            out.push_str("    i32.const 12\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    i32.load\n");
-            out.push_str("    local.set $dec_child_idx\n");
-            // Scan to find the root node
-            generate_dec_find_node_by_index(out);
-            // Decode the value recursively from the root node
-            generate_cgrf_decode_recursive(out, &import.return_type, records, variants);
-            // Result is in $dec_result
-            out.push_str("    local.get $dec_result\n");
-        }
-        _ => out.push_str("    i32.const 0\n"),
     }
 
     out.push_str("  )\n");

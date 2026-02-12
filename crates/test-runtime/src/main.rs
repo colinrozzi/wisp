@@ -1465,8 +1465,7 @@ fn is_compound_type(td: &pack::TypeDesc) -> bool {
             | pack::TypeDesc::List(_)
             | pack::TypeDesc::Option(_)
             | pack::TypeDesc::Result { .. }
-            | pack::TypeDesc::Record { .. }
-            | pack::TypeDesc::Variant { .. }
+            | pack::TypeDesc::Ref(_)
             | pack::TypeDesc::Tuple(_)
             | pack::TypeDesc::Value
     )
@@ -1585,6 +1584,7 @@ fn encode_string_data_segment(s: &str) -> String {
 /// Display a Pack TypeDesc as a human-readable string
 fn type_desc_display(td: &pack::TypeDesc) -> String {
     match td {
+        pack::TypeDesc::Unit => "()".to_string(),
         pack::TypeDesc::Bool => "bool".to_string(),
         pack::TypeDesc::U8 => "u8".to_string(),
         pack::TypeDesc::U16 => "u16".to_string(),
@@ -1598,7 +1598,6 @@ fn type_desc_display(td: &pack::TypeDesc) -> String {
         pack::TypeDesc::F64 => "f64".to_string(),
         pack::TypeDesc::Char => "char".to_string(),
         pack::TypeDesc::String => "string".to_string(),
-        pack::TypeDesc::Flags => "flags".to_string(),
         pack::TypeDesc::List(inner) => format!("list<{}>", type_desc_display(inner)),
         pack::TypeDesc::Option(inner) => format!("option<{}>", type_desc_display(inner)),
         pack::TypeDesc::Result { ok, err } => format!(
@@ -1606,8 +1605,7 @@ fn type_desc_display(td: &pack::TypeDesc) -> String {
             type_desc_display(ok),
             type_desc_display(err)
         ),
-        pack::TypeDesc::Record { name, .. } => name.clone(),
-        pack::TypeDesc::Variant { name, .. } => name.clone(),
+        pack::TypeDesc::Ref(path) => path.name().unwrap_or("unknown").to_string(),
         pack::TypeDesc::Tuple(elems) => {
             let inner: Vec<String> = elems.iter().map(|e| type_desc_display(e)).collect();
             format!("tuple<{}>", inner.join(", "))
@@ -1626,18 +1624,18 @@ fn type_desc_to_wasm(td: &pack::TypeDesc) -> WasmType {
         | pack::TypeDesc::U16
         | pack::TypeDesc::S8
         | pack::TypeDesc::S16
-        | pack::TypeDesc::Char
-        | pack::TypeDesc::Flags => WasmType::I32,
+        | pack::TypeDesc::Char => WasmType::I32,
         pack::TypeDesc::S64 | pack::TypeDesc::U64 => WasmType::I64,
         pack::TypeDesc::F32 => WasmType::F32,
         pack::TypeDesc::F64 => WasmType::F64,
+        // Unit has no runtime representation
+        pack::TypeDesc::Unit => WasmType::I32, // Should never be used at runtime
         // Compound types are all i32 pointers/handles at the WASM level
         pack::TypeDesc::String
         | pack::TypeDesc::List(_)
         | pack::TypeDesc::Option(_)
         | pack::TypeDesc::Result { .. }
-        | pack::TypeDesc::Record { .. }
-        | pack::TypeDesc::Variant { .. }
+        | pack::TypeDesc::Ref(_)
         | pack::TypeDesc::Tuple(_)
         | pack::TypeDesc::Value => WasmType::I32,
     }
@@ -1755,14 +1753,7 @@ fn cgrf_type_info(td: &pack::TypeDesc) -> CgrfTypeInfo {
             load_instr: "i32.load",
             is_dynamic: false,
         },
-        pack::TypeDesc::Flags => CgrfTypeInfo {
-            tag: 0x13,
-            payload_size: 4,
-            store_instr: "i32.store",
-            load_instr: "i32.load",
-            is_dynamic: false,
-        },
-        // For other compound types, fall back to S32 (pointer/handle)
+        // For other compound types (Ref, Flags, etc), fall back to S32 (pointer/handle)
         _ => CgrfTypeInfo {
             tag: 0x02,
             payload_size: 4,
@@ -2337,7 +2328,7 @@ fn load_interface(
                 let mut instance = loaded_packages.get(path).unwrap().lock().unwrap();
                 match instance.types() {
                     Ok(metadata) => {
-                        for func_sig in &metadata.exports {
+                        for func_sig in metadata.exports() {
                             let wasm_params: Vec<WasmType> = func_sig
                                 .params
                                 .iter()

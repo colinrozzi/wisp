@@ -6,6 +6,13 @@
 //! - `wisp:compose/packages.compose-packages` - Compose main + deps into single WASM
 //! - `wisp:filesystem/runtime.read-file` - Read file from filesystem
 //! - `wisp:imports/metadata.get-package-exports` - Get exports from a Pack package
+//!
+//! ## Interface Hashing
+//!
+//! This handler uses `InterfaceImpl` to declare its interfaces, enabling:
+//! - Compile-time type extraction from Rust closures
+//! - Automatic Merkle-tree hash computation for O(1) compatibility checking
+//! - Self-documenting interface declarations
 
 use std::fs;
 use std::future::Future;
@@ -20,7 +27,7 @@ use theater::handler::{Handler, HandlerContext, SharedActorInstance};
 use theater::shutdown::ShutdownReceiver;
 
 // Pack integration
-use theater::pack_bridge::{Ctx, HostLinkerBuilder, LinkerError, Value, ValueType};
+use theater::pack_bridge::{Ctx, HostLinkerBuilder, InterfaceImpl, LinkerError, TypeHash, Value, ValueType};
 
 // Pack composition and metadata
 use pack::compose::StaticComposer;
@@ -80,13 +87,97 @@ fn detect_expr_type(expr: &str) -> &'static str {
     "s32"
 }
 
-/// Handler for Wisp-specific host functions
+// ============================================================================
+// Interface Declarations
+// ============================================================================
+
+/// Build the interface declaration for `wisp:assembler/runtime`.
+///
+/// Functions:
+/// - `wat-to-wasm`: String -> Option<Vec<u8>>
+/// - `eval-wasm`: Vec<u8> -> Result<Vec<u8>, String>
+fn assembler_interface() -> InterfaceImpl {
+    InterfaceImpl::new("wisp:assembler/runtime")
+        .func("wat-to-wasm", |_: String| -> Option<Vec<u8>> { None })
+        .func("eval-wasm", |_: Vec<u8>| -> Result<Vec<u8>, String> { Err(String::new()) })
+}
+
+/// Build the interface declaration for `wisp:repl/helpers`.
+///
+/// Functions:
+/// - `wrap-expression`: (String, Vec<u8>) -> String
+/// - `parse-and-wrap`: (String, Vec<u8>) -> Result<String, String>
+fn helpers_interface() -> InterfaceImpl {
+    InterfaceImpl::new("wisp:repl/helpers")
+        .func("wrap-expression", |_: (String, Vec<u8>)| -> String { String::new() })
+        .func("parse-and-wrap", |_: (String, Vec<u8>)| -> Result<String, String> { Err(String::new()) })
+}
+
+/// Build the interface declaration for `wisp:compose/packages`.
+///
+/// Functions:
+/// - `compose-packages`: (Vec<u8>, (String, Vec<u8>)) -> Result<Vec<u8>, String>
+fn compose_interface() -> InterfaceImpl {
+    InterfaceImpl::new("wisp:compose/packages")
+        .func("compose-packages", |_: (Vec<u8>, (String, Vec<u8>))| -> Result<Vec<u8>, String> {
+            Err(String::new())
+        })
+}
+
+/// Build the interface declaration for `wisp:filesystem/runtime`.
+///
+/// Functions:
+/// - `read-file`: String -> Result<Vec<u8>, String>
+fn filesystem_interface() -> InterfaceImpl {
+    InterfaceImpl::new("wisp:filesystem/runtime")
+        .func("read-file", |_: String| -> Result<Vec<u8>, String> { Err(String::new()) })
+}
+
+/// Build the interface declaration for `wisp:imports/metadata`.
+///
+/// Functions:
+/// - `get-package-exports`: Vec<u8> -> Result<Vec<String>, String>
+fn metadata_interface() -> InterfaceImpl {
+    InterfaceImpl::new("wisp:imports/metadata")
+        .func("get-package-exports", |_: Vec<u8>| -> Result<Vec<String>, String> {
+            Err(String::new())
+        })
+}
+
+// ============================================================================
+// Handler Implementation
+// ============================================================================
+
+/// Handler for Wisp-specific host functions.
+///
+/// This handler provides host functions for:
+/// - WAT assembly and WASM evaluation
+/// - REPL expression wrapping
+/// - Package composition
+/// - File system access
+/// - Package metadata extraction
+///
+/// ## Interface Hashes
+///
+/// Each interface has a computed Merkle-tree hash based on its function signatures.
+/// Use `interface_hashes()` to get the hashes for compatibility checking.
 #[derive(Clone, Default)]
 pub struct WispHandler;
 
 impl WispHandler {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Get all interface declarations for this handler.
+    pub fn interfaces(&self) -> Vec<InterfaceImpl> {
+        vec![
+            assembler_interface(),
+            helpers_interface(),
+            compose_interface(),
+            filesystem_interface(),
+            metadata_interface(),
+        ]
     }
 }
 
@@ -103,17 +194,23 @@ impl Handler for WispHandler {
     }
 
     fn imports(&self) -> Option<Vec<String>> {
-        Some(vec![
-            "wisp:assembler/runtime".to_string(),
-            "wisp:repl/helpers".to_string(),
-            "wisp:compose/packages".to_string(),
-            "wisp:filesystem/runtime".to_string(),
-            "wisp:imports/metadata".to_string(),
-        ])
+        // Derive imports from interface declarations
+        Some(self.interfaces().iter().map(|i| i.name().to_string()).collect())
     }
 
     fn exports(&self) -> Option<Vec<String>> {
         None // No specific exports required
+    }
+
+    fn interface_hashes(&self) -> Vec<(String, TypeHash)> {
+        self.interfaces()
+            .iter()
+            .map(|i| (i.name().to_string(), i.hash()))
+            .collect()
+    }
+
+    fn supports_composite(&self) -> bool {
+        true
     }
 
     fn start(
@@ -139,9 +236,12 @@ impl Handler for WispHandler {
         info!("Setting up Wisp host functions");
 
         // Setup wisp:assembler/runtime interface
+        // Using interface_from_impl() to get both the builder and the interface hash
         if !ctx.is_satisfied("wisp:assembler/runtime") {
-            builder
-                .interface("wisp:assembler/runtime")?
+            let (mut iface, hash) = builder.interface_from_impl(&assembler_interface())?;
+            info!("Registering wisp:assembler/runtime with hash: {}", hash);
+
+            iface
                 // wat-to-wasm: func(wat: string) -> option<list<u8>>
                 .func_typed(
                     "wat-to-wasm",
@@ -529,7 +629,8 @@ impl Handler for WispHandler {
                             };
 
                             // Generate import declarations for exports matching the requested interface
-                            for sig in &metadata.exports {
+                            let exports = extract_exports_from_arena(&metadata);
+                            for sig in &exports {
                                 if sig.interface == *interface {
                                     let params = sig
                                         .params
@@ -995,8 +1096,8 @@ impl Handler for WispHandler {
                         };
 
                         // Convert exports to S-expression strings
-                        let export_strings: Vec<Value> = metadata
-                            .exports
+                        let exports = extract_exports_from_arena(&metadata);
+                        let export_strings: Vec<Value> = exports
                             .iter()
                             .map(|sig| {
                                 // Format params as ((name type) (name type))
@@ -1045,33 +1146,32 @@ impl Handler for WispHandler {
     }
 }
 
-/// Convert a Pack TypeDesc to a Wisp type string.
+/// Convert a Pack Type to a Wisp type string.
 fn type_desc_to_wisp(ty: &TypeDesc) -> String {
+    use pack::types::Type;
     match ty {
-        TypeDesc::Bool => "bool".to_string(),
-        TypeDesc::U8 => "u8".to_string(),
-        TypeDesc::U16 => "u16".to_string(),
-        TypeDesc::U32 => "u32".to_string(),
-        TypeDesc::U64 => "u64".to_string(),
-        TypeDesc::S8 => "s8".to_string(),
-        TypeDesc::S16 => "s16".to_string(),
-        TypeDesc::S32 => "s32".to_string(),
-        TypeDesc::S64 => "s64".to_string(),
-        TypeDesc::F32 => "f32".to_string(),
-        TypeDesc::F64 => "f64".to_string(),
-        TypeDesc::Char => "char".to_string(),
-        TypeDesc::String => "string".to_string(),
-        TypeDesc::Flags => "flags".to_string(),
-        TypeDesc::List(inner) => format!("(list {})", type_desc_to_wisp(inner)),
-        TypeDesc::Option(inner) => format!("(option {})", type_desc_to_wisp(inner)),
-        TypeDesc::Result { ok, err } => format!(
+        Type::Unit => "unit".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::U8 => "u8".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
+        Type::S8 => "s8".to_string(),
+        Type::S16 => "s16".to_string(),
+        Type::S32 => "s32".to_string(),
+        Type::S64 => "s64".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::Char => "char".to_string(),
+        Type::String => "string".to_string(),
+        Type::List(inner) => format!("(list {})", type_desc_to_wisp(inner)),
+        Type::Option(inner) => format!("(option {})", type_desc_to_wisp(inner)),
+        Type::Result { ok, err } => format!(
             "(result {} {})",
             type_desc_to_wisp(ok),
             type_desc_to_wisp(err)
         ),
-        TypeDesc::Record { name, .. } => name.clone(),
-        TypeDesc::Variant { name, .. } => name.clone(),
-        TypeDesc::Tuple(types) => {
+        Type::Tuple(types) => {
             let inner = types
                 .iter()
                 .map(type_desc_to_wisp)
@@ -1079,8 +1179,53 @@ fn type_desc_to_wisp(ty: &TypeDesc) -> String {
                 .join(" ");
             format!("(tuple {})", inner)
         }
-        TypeDesc::Value => "value".to_string(),
+        Type::Ref(path) => {
+            // Named type reference - use the type name
+            path.name().unwrap_or("unknown").to_string()
+        }
+        Type::Value => "value".to_string(),
     }
+}
+
+/// A function signature with its interface name.
+struct ExportedFunc {
+    interface: String,
+    name: String,
+    params: Vec<pack::types::Param>,
+    results: Vec<pack::types::Type>,
+}
+
+/// Extract exports from a Pack Arena metadata structure.
+///
+/// The Arena structure from `decode_metadata` is:
+/// ```text
+/// Arena("package")
+/// └── Arena("exports")
+///     ├── Arena("interface1") → functions
+///     └── Arena("interface2") → functions
+/// ```
+fn extract_exports_from_arena(arena: &pack::types::Arena) -> Vec<ExportedFunc> {
+    let mut result = Vec::new();
+
+    // Find the "exports" child arena
+    for child in &arena.children {
+        if child.name == "exports" {
+            // Each child of this arena is an interface
+            for interface_arena in &child.children {
+                let interface_name = &interface_arena.name;
+                for func in &interface_arena.functions {
+                    result.push(ExportedFunc {
+                        interface: interface_name.clone(),
+                        name: func.name.clone(),
+                        params: func.params.clone(),
+                        results: func.results.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// Parse input text for imports and extract the expression.
@@ -1282,5 +1427,68 @@ mod tests {
         let (interface, path) = result.unwrap();
         assert_eq!(interface, "colin:math/ops");
         assert_eq!(path, "examples/math.wasm");
+    }
+
+    #[test]
+    fn test_interface_hashes_returns_all_interfaces() {
+        let handler = WispHandler::new();
+        let hashes = handler.interface_hashes();
+
+        // Should have 5 interfaces
+        assert_eq!(hashes.len(), 5);
+
+        // Check all interface names are present
+        let names: Vec<&str> = hashes.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"wisp:assembler/runtime"));
+        assert!(names.contains(&"wisp:repl/helpers"));
+        assert!(names.contains(&"wisp:compose/packages"));
+        assert!(names.contains(&"wisp:filesystem/runtime"));
+        assert!(names.contains(&"wisp:imports/metadata"));
+    }
+
+    #[test]
+    fn test_interface_hashes_are_deterministic() {
+        let handler1 = WispHandler::new();
+        let handler2 = WispHandler::new();
+
+        let hashes1 = handler1.interface_hashes();
+        let hashes2 = handler2.interface_hashes();
+
+        // Same handler should produce same hashes
+        for (h1, h2) in hashes1.iter().zip(hashes2.iter()) {
+            assert_eq!(h1.0, h2.0, "Interface names should match");
+            assert_eq!(h1.1, h2.1, "Interface hashes should match");
+        }
+    }
+
+    #[test]
+    fn test_interface_hashes_differ_between_interfaces() {
+        let handler = WispHandler::new();
+        let hashes = handler.interface_hashes();
+
+        // Each interface should have a unique hash
+        let hash_values: Vec<_> = hashes.iter().map(|(_, h)| h).collect();
+        for (i, h1) in hash_values.iter().enumerate() {
+            for (j, h2) in hash_values.iter().enumerate() {
+                if i != j {
+                    assert_ne!(h1, h2, "Different interfaces should have different hashes");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_imports_derived_from_interfaces() {
+        use theater::handler::Handler;
+
+        let handler = WispHandler::new();
+        let imports = handler.imports().expect("Should have imports");
+        let interfaces = handler.interfaces();
+
+        // imports() should return the same names as interfaces()
+        assert_eq!(imports.len(), interfaces.len());
+        for iface in interfaces {
+            assert!(imports.contains(&iface.name().to_string()));
+        }
     }
 }
