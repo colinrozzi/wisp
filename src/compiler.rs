@@ -5621,8 +5621,8 @@ fn gen_expr(
                     expr, out, indent, env, signatures, globals, records, variants,
                     is_last && is_tail,
                 );
-                if !is_last {
-                    // Drop the value of non-final expressions
+                if !is_last && !is_unit_type(&last_ty) {
+                    // Drop the value of non-final expressions (only if they return a value)
                     out.push_str(&format!("{}drop\n", pad));
                 }
             }

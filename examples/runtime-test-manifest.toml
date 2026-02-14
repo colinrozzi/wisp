@@ -1,0 +1,8 @@
+name = "wisp-runtime-test"
+version = "0.1.0"
+package = "/home/colin/work/wisp/examples/runtime-test.wasm"
+description = "Test Wisp actor for Theater runtime handler"
+save_chain = true
+
+[[handler]]
+type = "runtime"
