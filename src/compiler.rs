@@ -295,6 +295,7 @@ impl CompileContext {
 pub struct CompileArtifacts {
     pub wat: PathBuf,
     pub wasm: PathBuf,
+    pub pact: PathBuf,
 }
 
 pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> {
@@ -331,6 +332,8 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     wat_path.set_extension("wat");
     let mut wasm_path = out_base.to_path_buf();
     wasm_path.set_extension("wasm");
+    let mut pact_path = out_base.to_path_buf();
+    pact_path.set_extension("pact");
 
     fs::write(&wat_path, &wat)
         .with_context(|| format!("failed to write {}", wat_path.display()))?;
@@ -340,9 +343,20 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     fs::write(&wasm_path, &wasm_bytes)
         .with_context(|| format!("failed to write {}", wasm_path.display()))?;
 
+    // Generate Pact interface definition
+    // Use source file name as interface name
+    let interface_name = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wisp");
+    let pact = generate_pact(&prog, interface_name);
+    fs::write(&pact_path, &pact)
+        .with_context(|| format!("failed to write {}", pact_path.display()))?;
+
     Ok(CompileArtifacts {
         wat: wat_path,
         wasm: wasm_path,
+        pact: pact_path,
     })
 }
 
@@ -7459,6 +7473,147 @@ fn generate_wit(prog: &Program) -> String {
         }
         out.push_str("}\n");
     }
+
+    out
+}
+
+/// Convert a Type to Pact syntax string.
+fn pact_type(ty: &Type) -> String {
+    match ty {
+        Type::S32 => "s32".to_string(),
+        Type::S64 => "s64".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::U8 => "u8".to_string(),
+        Type::Record(name) | Type::Variant(name) => name.clone(),
+        Type::Option(inner) => format!("option<{}>", pact_type(inner)),
+        Type::Result(ok, err) => format!("result<{}, {}>", pact_type(ok), pact_type(err)),
+        Type::List(inner) => format!("list<{}>", pact_type(inner)),
+        Type::Str => "string".to_string(),
+        Type::Resource(name) => name.clone(),
+        Type::Borrow(inner) => format!("borrow<{}>", pact_type(inner)),
+        Type::Tuple(elems) => {
+            let inner: Vec<String> = elems.iter().map(|t| pact_type(t)).collect();
+            format!("tuple<{}>", inner.join(", "))
+        }
+    }
+}
+
+/// Generate a Pact interface definition from the program.
+///
+/// Pact is Theater's interface definition language, replacing WIT.
+/// Unlike WIT's package/world structure, Pact uses a simpler interface model.
+pub fn generate_pact(prog: &Program, default_name: &str) -> String {
+    let mut out = String::new();
+
+    // Use world config name if available, otherwise use provided default (source file name)
+    let interface_name = if let Some(world_config) = &prog.world_config {
+        world_config.name.as_str()
+    } else {
+        default_name
+    };
+
+    out.push_str(&format!("interface {} {{\n", interface_name));
+
+    // Generate record type declarations
+    for record in &prog.records {
+        out.push_str(&format!("    record {} {{\n", record.name));
+        for field in &record.fields {
+            out.push_str(&format!("        {}: {},\n", field.name, pact_type(&field.ty)));
+        }
+        out.push_str("    }\n\n");
+    }
+
+    // Generate variant type declarations
+    for variant in &prog.variants {
+        out.push_str(&format!("    variant {} {{\n", variant.name));
+        for case in &variant.cases {
+            if case.payload.is_empty() {
+                out.push_str(&format!("        {},\n", case.name));
+            } else if case.payload.len() == 1 {
+                out.push_str(&format!(
+                    "        {}({}),\n",
+                    case.name,
+                    pact_type(&case.payload[0])
+                ));
+            } else {
+                let types: Vec<String> = case.payload.iter().map(pact_type).collect();
+                out.push_str(&format!(
+                    "        {}(tuple<{}>),\n",
+                    case.name,
+                    types.join(", ")
+                ));
+            }
+        }
+        out.push_str("    }\n\n");
+    }
+
+    // Generate imports block
+    let has_imports = if let Some(world_config) = &prog.world_config {
+        !world_config.external_imports.is_empty()
+    } else {
+        !prog.imports.is_empty()
+    };
+
+    if has_imports {
+        out.push_str("    imports {\n");
+
+        if let Some(world_config) = &prog.world_config {
+            // External imports (e.g., theater:simple/runtime)
+            for ext_import in &world_config.external_imports {
+                out.push_str(&format!("        {}\n", ext_import.to_wit_ref()));
+            }
+        } else {
+            // Group imports by module
+            let mut imports_by_module: BTreeMap<&str, Vec<&Import>> = BTreeMap::new();
+            for import in &prog.imports {
+                imports_by_module
+                    .entry(import.module.as_str())
+                    .or_default()
+                    .push(import);
+            }
+            for (module, _imports) in imports_by_module {
+                out.push_str(&format!("        {}\n", module));
+            }
+        }
+
+        out.push_str("    }\n\n");
+    }
+
+    // Generate exports block
+    let has_exports = if let Some(world_config) = &prog.world_config {
+        !world_config.external_exports.is_empty() || !prog.exports.is_empty()
+    } else {
+        !prog.exports.is_empty()
+    };
+
+    if has_exports {
+        out.push_str("    exports {\n");
+
+        // External exports (interface implementations)
+        if let Some(world_config) = &prog.world_config {
+            for ext_export in &world_config.external_exports {
+                out.push_str(&format!("        {}\n", ext_export.to_wit_ref()));
+            }
+        }
+
+        // Local function exports
+        for export in &prog.exports {
+            let func = find_function(prog, &export.func_name);
+            out.push_str(&format!("        {}: func(", export.export_name));
+            for (i, param) in func.params.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{}: {}", param.name, pact_type(&param.ty)));
+            }
+            out.push_str(&format!(") -> {}\n", pact_type(&func.return_type)));
+        }
+
+        out.push_str("    }\n");
+    }
+
+    out.push_str("}\n");
 
     out
 }

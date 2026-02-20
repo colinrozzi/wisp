@@ -124,6 +124,7 @@ fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("Wrote:");
     println!("  {}", artifacts.wat.display());
     println!("  {}", artifacts.wasm.display());
+    println!("  {}", artifacts.pact.display());
 }
 
 fn run_package(package_path: &Path, func: &str, args: &[String], deps: &[String]) -> Result<()> {
