@@ -2187,6 +2187,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "pack-abi",
  "serde",
  "serde_json",
  "sha2",
@@ -2201,6 +2202,7 @@ name = "pack-abi"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.14.5",
+ "serde",
  "sha2",
 ]
 

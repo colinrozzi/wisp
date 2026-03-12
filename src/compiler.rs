@@ -5618,13 +5618,19 @@ fn gen_expr(
             let value_ty = gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
-            let idx = env.declare_local(value_ty);
-            out.push_str(&format!("{}local.set {}\n", pad, idx));
-            env.push_binding(name.clone(), idx);
+            // Only save to local if value type is not unit (unit leaves nothing on stack)
+            let has_binding = !is_unit_type(&value_ty);
+            if has_binding {
+                let idx = env.declare_local(value_ty);
+                out.push_str(&format!("{}local.set {}\n", pad, idx));
+                env.push_binding(name.clone(), idx);
+            }
             let body_ty = gen_expr(
                 body, out, indent, env, signatures, globals, records, variants, is_tail,
             );
-            env.pop_binding();
+            if has_binding {
+                env.pop_binding();
+            }
             body_ty
         }
         Expr::Begin { exprs } => {
