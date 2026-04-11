@@ -8,9 +8,14 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    pack = {
+      url = "github:colinrozzi/pack";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, pack }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -33,61 +38,40 @@
         ];
 
         nativeBuildInputs = with pkgs; [
-          rustToolchain
           pkg-config
+          rustToolchain
         ];
 
-      in
-      {
+      in {
         devShells.default = pkgs.mkShell {
-          inherit buildInputs;
+          inherit buildInputs nativeBuildInputs;
 
           packages = with pkgs; [
             rustToolchain
             pkg-config
-
-            # Dev tools
-            cargo-watch
-            cargo-expand
-
-            # WASM tools
+            openssl
             wasmtime
           ];
 
-          RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
-          RUST_BACKTRACE = "1";
-
           shellHook = ''
-            echo "Wisp development environment"
-            echo "Rust: $(rustc --version)"
-            echo ""
-            echo "Commands:"
+            echo "wisp development environment"
             echo "  cargo build --release     Build wisp compiler"
             echo "  cargo run -- compile X    Compile a .wisp file"
             echo "  cargo test                Run tests"
           '';
         };
 
-        # For nix build, we need to handle the pack dependency
-        # This creates a derivation that builds wisp with pack included
         packages.default = let
-          # Read pack from the expected location relative to wisp
-          packSrc = builtins.path {
-            path = ../pack;
-            name = "pack-src";
-          };
-
           combinedSrc = pkgs.runCommand "wisp-combined-src" {} ''
             mkdir -p $out
             cp -r ${./.}/. $out/
             chmod -R u+w $out
 
-            # Put pack inside wisp directory
+            # Put pack as sibling so ../pack paths resolve
+            cp -rL ${pack} $out/../pack || true
+            # Also put it inside for Cargo git dep override
             mkdir -p $out/pack
-            cp -r ${packSrc}/. $out/pack/
-
-            # Patch Cargo.toml to use local pack
-            ${pkgs.gnused}/bin/sed -i 's|path = "../pack"|path = "./pack"|g' $out/Cargo.toml
+            cp -rL ${pack}/. $out/pack/
           '';
         in pkgs.rustPlatform.buildRustPackage {
           pname = "wisp";

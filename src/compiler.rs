@@ -608,6 +608,14 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// Create string from bytes: (string-from-bytes bytes) -> string
+    StringFromBytes {
+        bytes: Box<Expr>,
+    },
+    /// Convert string to bytes: (string-to-bytes string) -> list<u8>
+    StringToBytes {
+        string: Box<Expr>,
+    },
     /// Construct a tuple: (tuple e1 e2 ...)
     TupleConstruct {
         values: Vec<Expr>,
@@ -862,7 +870,7 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::ListLen { list } => expr_uses_heap(list),
         Expr::StringLen { string } => expr_uses_heap(string),
         Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
-        Expr::Substring { .. } | Expr::StringAppend { .. } => true, // allocate new strings
+        Expr::Substring { .. } | Expr::StringAppend { .. } | Expr::StringFromBytes { .. } | Expr::StringToBytes { .. } => true, // allocate new strings/lists
         Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
         Expr::TupleConstruct { .. } => true,
     }
@@ -1495,7 +1503,10 @@ fn check_expr(
             }
             for (arg, expected_ty) in args.iter().zip(instr_info.params.iter()) {
                 let ty = check_expr(arg, env, signatures, globals, records, variants)?;
-                if ty != *expected_ty {
+                // Allow u8 -> s32 coercion since u8 is stored as i32
+                let types_compatible = ty == *expected_ty
+                    || (*expected_ty == Type::S32 && ty == Type::U8);
+                if !types_compatible {
                     bail!(
                         "argument type mismatch in '{}': expected {:?}, got {:?}",
                         name,
@@ -1834,7 +1845,10 @@ fn check_expr(
                 _ => bail!("list-push expects a list, got {:?}", list_ty),
             };
             let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
-            if value_ty != elem_type {
+            // Allow s32 -> u8 coercion since u8 is stored as i32 internally
+            let types_compatible = value_ty == elem_type
+                || (elem_type == Type::U8 && value_ty == Type::S32);
+            if !types_compatible {
                 bail!(
                     "list-push value type mismatch: expected {:?}, got {:?}",
                     elem_type,
@@ -1916,6 +1930,20 @@ fn check_expr(
                 bail!("string=? expects strings, got {:?}", right_ty);
             }
             Ok(Type::S32)
+        }
+        Expr::StringFromBytes { bytes } => {
+            let bytes_ty = check_expr(bytes, env, signatures, globals, records, variants)?;
+            match &bytes_ty {
+                Type::List(elem) if **elem == Type::U8 => Ok(Type::Str),
+                _ => bail!("string-from-bytes expects list<u8>, got {:?}", bytes_ty),
+            }
+        }
+        Expr::StringToBytes { string } => {
+            let str_ty = check_expr(string, env, signatures, globals, records, variants)?;
+            if str_ty != Type::Str {
+                bail!("string-to-bytes expects string, got {:?}", str_ty);
+            }
+            Ok(Type::List(Box::new(Type::U8)))
         }
     }
 }
@@ -2819,10 +2847,10 @@ fn expand_all_macros(forms: Vec<SExpr>, macros: &CollectedMacros) -> Vec<SExpr> 
         .into_iter()
         .filter(|form| {
             // Filter out defmacro and define-syntax forms (they're already collected)
-            if let SExpr::List(items, _) = form
-                && let Some(SExpr::Sym(sym, _)) = items.first()
-            {
-                return sym != "defmacro" && sym != "define-syntax";
+            if let SExpr::List(items, _) = form {
+                if let Some(SExpr::Sym(sym, _)) = items.first() {
+                    return sym != "defmacro" && sym != "define-syntax";
+                }
             }
             true
         })
@@ -5146,6 +5174,32 @@ fn parse_expr(
                         right: Box::new(right),
                     })
                 }
+                SExpr::Sym(sym, _sym_span) if sym == "string-from-bytes" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-from-bytes' expression",
+                            list_span,
+                            "expected: (string-from-bytes bytes)",
+                        ));
+                    }
+                    let bytes = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringFromBytes {
+                        bytes: Box::new(bytes),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string-to-bytes" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-to-bytes' expression",
+                            list_span,
+                            "expected: (string-to-bytes string)",
+                        ));
+                    }
+                    let string = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringToBytes {
+                        string: Box::new(string),
+                    })
+                }
                 _ => {
                     if let SExpr::Sym(sym, sym_span) = op {
                         // Check if this is a WASM instruction
@@ -6921,6 +6975,106 @@ fn gen_expr(
             out.push_str(&format!("{}end ;; string-eq outer\n", pad));
             Type::S32
         }
+        // String: from-bytes - create string from list<u8>
+        Expr::StringFromBytes { bytes } => {
+            // Evaluate bytes list pointer
+            let bytes_local = env.declare_local(Type::S32);
+            gen_expr(
+                bytes, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, bytes_local));
+
+            // Get length from list (list layout: [4 bytes len][data])
+            let len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, bytes_local));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, len_local));
+
+            // Allocate new string: 4 bytes for length + len bytes for data
+            let new_ptr_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
+
+            // Bump heap pointer
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store length in new string
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Copy bytes from list to string
+            // dst: new_ptr + 4
+            // src: bytes_local + 4
+            // len: len_local
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, bytes_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}memory.copy\n", pad));
+
+            // Return new string pointer
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            Type::Str
+        }
+        // String: to-bytes - convert string to list<u8>
+        Expr::StringToBytes { string } => {
+            // Evaluate string pointer
+            let str_local = env.declare_local(Type::S32);
+            gen_expr(
+                string, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, str_local));
+
+            // Get length from string (string layout: [4 bytes len][data])
+            let len_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, str_local));
+            out.push_str(&format!("{}i32.load\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, len_local));
+
+            // Allocate new list: 4 bytes for length + len bytes for data
+            let new_ptr_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
+
+            // Bump heap pointer
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+
+            // Store length in new list
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}i32.store\n", pad));
+
+            // Copy bytes from string to list
+            // dst: new_ptr + 4
+            // src: str_local + 4
+            // len: len_local
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, str_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}memory.copy\n", pad));
+
+            // Return new list pointer
+            out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            Type::List(Box::new(Type::U8))
+        }
     }
 }
 
@@ -8085,10 +8239,19 @@ fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
         Type::Str => pack::types::Type::String,
         Type::List(inner) => pack::types::Type::List(Box::new(wisp_type_to_pack_type(inner))),
         Type::Option(inner) => pack::types::Type::Option(Box::new(wisp_type_to_pack_type(inner))),
-        Type::Result(ok, err) => pack::types::Type::Result {
-            ok: Box::new(wisp_type_to_pack_type(ok)),
-            err: Box::new(wisp_type_to_pack_type(err)),
-        },
+        Type::Result(ok, err) => {
+            // Pack's pact parser maps result<_, E> to Result { ok: Bool, err: E }
+            // For compatibility, we convert unit (empty tuple) ok type to Bool
+            let ok_type = if is_unit_type(ok) {
+                pack::types::Type::Bool
+            } else {
+                wisp_type_to_pack_type(ok)
+            };
+            pack::types::Type::Result {
+                ok: Box::new(ok_type),
+                err: Box::new(wisp_type_to_pack_type(err)),
+            }
+        }
         Type::Tuple(elems) => pack::types::Type::Tuple(
             elems.iter().map(wisp_type_to_pack_type).collect()
         ),
@@ -8856,12 +9019,14 @@ fn generate_import_wrapper(
     }
 
     // Check if we need encoder locals for complex parameter types
+    // Also need encoder locals when we have multiple params (including strings) since they
+    // get wrapped in a tuple using the recursive encoder
     let needs_complex_encode = import.params.iter().any(|p| {
         matches!(
             &p.ty,
-            Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Record(_) | Type::Variant(_)
+            Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Record(_) | Type::Variant(_) | Type::Str
         )
-    });
+    }) || import.params.len() > 1;
     if needs_complex_encode {
         out.push_str("    (local $buf_cursor i32)\n");
         out.push_str("    (local $node_idx i32)\n");
@@ -9025,27 +9190,35 @@ fn generate_import_wrapper(
         out.push_str("    i32.const 0\n");
         out.push_str("    i32.store\n");
         // Tuple node with 0 children
+        // Node format: [kind:1][flags:1][reserved:2][payload_len:4][payload...]
+        // Tuple payload: [element_count:4][child_indices:4*N]
+        // For empty tuple: payload = [0:u32], payload_len = 4
         out.push_str("    local.get $in_buf\n");
         out.push_str("    i32.const 16\n");
         out.push_str("    i32.add\n");
-        out.push_str("    i32.const 8\n"); // kind = Tuple
+        out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE)); // kind = Tuple (0x0B)
         out.push_str("    i32.store8\n");
         out.push_str("    local.get $in_buf\n");
         out.push_str("    i32.const 17\n");
         out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.const 0\n"); // flags
         out.push_str("    i32.store8\n");
         out.push_str("    local.get $in_buf\n");
         out.push_str("    i32.const 18\n");
         out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.const 0\n"); // reserved
         out.push_str("    i32.store16\n");
         out.push_str("    local.get $in_buf\n");
         out.push_str("    i32.const 20\n");
         out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n"); // payload_len = 0
+        out.push_str("    i32.const 4\n"); // payload_len = 4 (for element_count field)
         out.push_str("    i32.store\n");
-        out.push_str("    i32.const 24\n"); // total length
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 24\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n"); // element_count = 0
+        out.push_str("    i32.store\n");
+        out.push_str("    i32.const 28\n"); // total length: 16 header + 8 node header + 4 payload
         out.push_str("    local.set $in_len\n");
     } else if import.params.len() == 1 && matches!(import.params[0].ty, Type::S32) {
         // Single s32 argument — encode as CGRF S32 node
@@ -9596,10 +9769,141 @@ fn generate_import_wrapper(
             generate_import_generic_encode(out, &import.params[0], records, variants);
         }
     } else {
-        // Multiple complex arguments - wrap in tuple and use recursive encoder
-        // For now, fallback to empty (should rarely happen)
-        out.push_str("    ;; WARNING: multiple complex import arguments not yet supported\n");
+        // Multiple complex arguments - wrap in a CGRF tuple
+        // Each param is already a local pointing to its value.
+        // We need to:
+        // 1. Encode each param as a child node
+        // 2. Create a tuple node referencing all children
+        let n = import.params.len();
+        out.push_str(&format!(
+            "    ;; Encode {} complex arguments as CGRF tuple\n",
+            n
+        ));
+
+        // Set up encoding: use $in_buf as $out_ptr, cursor at 16 (after header)
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    local.set $out_ptr\n");
+        out.push_str("    i32.const 16\n");
+        out.push_str("    local.set $buf_cursor\n");
         out.push_str("    i32.const 0\n");
+        out.push_str("    local.set $node_idx\n");
+
+        // Write tuple node header first (will patch later)
+        // Reserve space for: header(8) + child_count(4) + N*child_idx(4*N)
+        let tuple_payload_len = 4 + 4 * n;
+        out.push_str("    ;; Write tuple node header (placeholder)\n");
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    local.set $enc_tuple_header\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE as i32));
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 1\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store8\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 2\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        // payload_len - will be patched later but set placeholder
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", tuple_payload_len));
+        out.push_str("    i32.store\n");
+        // child_count
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", n));
+        out.push_str("    i32.store\n");
+        // Save position of child_indices array
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.set $enc_tuple_ci_pos\n");
+
+        // Save tuple's node index
+        out.push_str("    local.get $node_idx\n");
+        out.push_str("    local.set $enc_save_root\n");
+        // Increment node_idx
+        out.push_str("    local.get $node_idx\n");
+        out.push_str("    i32.const 1\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.set $node_idx\n");
+        // Advance cursor past tuple node header + payload
+        out.push_str("    local.get $buf_cursor\n");
+        out.push_str(&format!("    i32.const {}\n", 8 + tuple_payload_len));
+        out.push_str("    i32.add\n");
+        out.push_str("    local.set $buf_cursor\n");
+
+        // Encode each param as a child and store its index
+        for (i, param) in import.params.iter().enumerate() {
+            out.push_str(&format!("    ;; Encode param {} ({})\n", i, param.name));
+            let param_local = format!("${}", param.name);
+            generate_cgrf_encode_recursive(out, &param.ty, &param_local, records, variants);
+
+            // Write child's node index to child_indices[i]
+            out.push_str("    local.get $out_ptr\n");
+            out.push_str("    local.get $enc_tuple_ci_pos\n");
+            out.push_str("    i32.add\n");
+            if i > 0 {
+                out.push_str(&format!("    i32.const {}\n", i * 4));
+                out.push_str("    i32.add\n");
+            }
+            out.push_str("    local.get $enc_root_idx\n");
+            out.push_str("    i32.store\n");
+        }
+
+        // Set root index to tuple's node index
+        out.push_str("    local.get $enc_save_root\n");
+        out.push_str("    local.set $enc_root_idx\n");
+
+        // Write CGRF header
+        out.push_str("    ;; Write CGRF header\n");
+        // Magic
+        out.push_str("    local.get $in_buf\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
+        out.push_str("    i32.store\n");
+        // Version
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n");
+        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
+        out.push_str("    i32.store16\n");
+        // Flags
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 6\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("    i32.store16\n");
+        // Node count
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 8\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $node_idx\n");
+        out.push_str("    i32.store\n");
+        // Root index (the tuple)
+        out.push_str("    local.get $in_buf\n");
+        out.push_str("    i32.const 12\n");
+        out.push_str("    i32.add\n");
+        out.push_str("    local.get $enc_root_idx\n");
+        out.push_str("    i32.store\n");
+
+        // Set in_len from buf_cursor
+        out.push_str("    local.get $buf_cursor\n");
         out.push_str("    local.set $in_len\n");
     }
 
@@ -13873,7 +14177,7 @@ fn generate_decode_variant_at_offset(
 fn generate_decode_result_at_offset(
     out: &mut String,
     ok_ty: &Type,
-    _err_ty: &Type,
+    err_ty: &Type,
     param_name: &str,
 ) {
     out.push_str("    ;; Decode result at $child_offset\n");
@@ -13891,12 +14195,19 @@ fn generate_decode_result_at_offset(
     out.push_str("    i32.add\n");
     out.push_str("    global.set $__heap_ptr\n");
 
-    // Result is encoded like a variant: [tag: u32, has_payload: u8, child_index: u32]
-    // Read tag from result node (at child_offset + 8)
+    // Result v2 format: [ok_type:type_tag*, err_type:type_tag*, tag:u32, has_payload:u8, child_index:u32]
+    // Calculate offsets based on type tag sizes
+    let ok_type_size = type_tag_size(ok_ty);
+    let err_type_size = type_tag_size(err_ty);
+    let tag_offset = 8 + ok_type_size + err_type_size;
+    let has_payload_offset = tag_offset + 4;
+    let child_index_offset = has_payload_offset + 1;
+
+    // Read tag from result node
     out.push_str("    local.get $in_ptr\n");
     out.push_str("    local.get $child_offset\n");
     out.push_str("    i32.add\n");
-    out.push_str("    i32.const 8\n");
+    out.push_str(&format!("    i32.const {}\n", tag_offset));
     out.push_str("    i32.add\n");
     out.push_str("    i32.load\n");
     out.push_str("    local.set $field_val\n");
@@ -13906,11 +14217,11 @@ fn generate_decode_result_at_offset(
     out.push_str("    local.get $field_val\n");
     out.push_str("    i32.store\n");
 
-    // Read child_index (at child_offset + 13)
+    // Read child_index
     out.push_str("    local.get $in_ptr\n");
     out.push_str("    local.get $child_offset\n");
     out.push_str("    i32.add\n");
-    out.push_str("    i32.const 13\n");
+    out.push_str(&format!("    i32.const {}\n", child_index_offset));
     out.push_str("    i32.add\n");
     out.push_str("    i32.load\n");
     out.push_str("    local.set $child_idx\n");

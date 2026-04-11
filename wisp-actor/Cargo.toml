@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Composite guest library for Theater integration
-composite-guest = { path = "../../composite/crates/composite-guest" }
+composite-guest = { git = "https://github.com/colinrozzi/composite.git" }
 
 # Memory allocator for no_std
 dlmalloc = { version = "0.2", features = ["global"] }

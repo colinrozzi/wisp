@@ -1,5 +1,8 @@
 /target
 result
+
+# Local cargo overrides (dev-only)
+.cargo/config.toml
 wisp-actor/target
 
 # Compiled examples (can be regenerated)

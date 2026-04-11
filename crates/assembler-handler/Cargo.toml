@@ -8,8 +8,8 @@ edition = "2021"
 wat = "1.242.0"
 
 # Core theater dependencies
-theater = { path = "../../../theater/crates/theater" }
-val-serde = { path = "../../../theater/crates/val-serde" }
+theater = { git = "https://github.com/colinrozzi/theater.git" }
+val-serde = { git = "https://github.com/colinrozzi/theater.git" }
 
 # WebAssembly runtime
 wasmtime = { version = "31.0", features = ["component-model", "async"] }

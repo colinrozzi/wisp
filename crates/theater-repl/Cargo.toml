@@ -5,17 +5,17 @@ edition = "2021"
 
 [dependencies]
 # Theater runtime
-theater = { path = "/home/colin/work/theater/crates/theater" }
-theater-handler-runtime = { path = "/home/colin/work/theater/crates/theater-handler-runtime" }
-theater-handler-supervisor = { path = "/home/colin/work/theater/crates/theater-handler-supervisor" }
-theater-handler-message-server = { path = "/home/colin/work/theater/crates/theater-handler-message-server" }
-theater-handler-store = { path = "/home/colin/work/theater/crates/theater-handler-store" }
+theater = { git = "https://github.com/colinrozzi/theater.git" }
+theater-handler-runtime = { git = "https://github.com/colinrozzi/theater.git" }
+theater-handler-supervisor = { git = "https://github.com/colinrozzi/theater.git" }
+theater-handler-message-server = { git = "https://github.com/colinrozzi/theater.git" }
+theater-handler-store = { git = "https://github.com/colinrozzi/theater.git" }
 
 # Wisp-specific handler
 theater-handler-wisp = { path = "../theater-handler-wisp" }
 
 # Pack for static composition (merging WASM modules)
-pack = { path = "../../../pack" }
+pack = { git = "https://github.com/colinrozzi/pack.git" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
