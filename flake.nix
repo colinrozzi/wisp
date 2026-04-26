@@ -92,5 +92,59 @@
         };
 
         packages.wisp = self.packages.${system}.default;
+
+          packages.update-pack = pkgs.writeShellScriptBin "update-pack" ''
+            set -e
+            VERSION="''${1:?Usage: nix run .#update-pack <version> (e.g. v0.2.1)}"
+
+            echo "Updating pack to $VERSION..."
+
+            # Update all Cargo.toml files
+            find . -name "Cargo.toml" -not -path "*/target/*" \
+              -exec ${pkgs.gnused}/bin/sed -i \
+                "s|colinrozzi/pack\.git\", tag = \"[^\"]*\"|colinrozzi/pack.git\", tag = \"$VERSION\"|g" {} \;
+            echo "  Updated Cargo.toml files"
+
+            # Update flake.nix URL
+            ${pkgs.python3}/bin/python3 -c "
+import re, sys
+with open('flake.nix', 'r') as f:
+    content = f.read()
+content = re.sub(
+    r'(url = \"github:colinrozzi/pack)/[^\"]*',
+    r'\1/' + sys.argv[1],
+    content,
+    count=1
+)
+with open('flake.nix', 'w') as f:
+    f.write(content)
+            " "$VERSION"
+            echo "  Updated flake.nix"
+
+            # Update flake lock
+            nix flake update pack
+            echo "  Updated flake.lock"
+
+            echo ""
+            echo "Pack updated to $VERSION. Changes:"
+            git diff --stat
+          '';
+
+          packages.update-theater = pkgs.writeShellScriptBin "update-theater" ''
+            set -e
+            VERSION="''${1:?Usage: nix run .#update-theater <version> (e.g. v0.3.1)}"
+
+            echo "Updating theater to $VERSION..."
+
+            # Update all Cargo.toml files
+            find . -name "Cargo.toml" -not -path "*/target/*" \
+              -exec ${pkgs.gnused}/bin/sed -i \
+                "s|colinrozzi/theater\.git\", tag = \"[^\"]*\"|colinrozzi/theater.git\", tag = \"$VERSION\"|g" {} \;
+            echo "  Updated Cargo.toml files"
+
+            echo ""
+            echo "Theater updated to $VERSION. Changes:"
+            git diff --stat
+          '';
       });
 }
