@@ -10,7 +10,7 @@
     };
 
     pack = {
-      url = "github:colinrozzi/pack";
+      url = "github:colinrozzi/pack/v0.2.0";
       flake = false;
     };
   };

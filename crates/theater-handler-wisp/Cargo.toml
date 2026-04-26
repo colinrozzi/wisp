@@ -6,10 +6,10 @@ description = "Theater handler for Wisp-specific host functions (assembler, help
 
 [dependencies]
 # Theater core
-theater = { git = "https://github.com/colinrozzi/theater.git" }
+theater = { git = "https://github.com/colinrozzi/theater.git", tag = "v0.3.0" }
 
 # Pack for package composition
-pack = { git = "https://github.com/colinrozzi/pack.git" }
+pack = { git = "https://github.com/colinrozzi/pack.git", tag = "v0.2.0" }
 
 # WAT to WASM assembly
 wat = "1.222"

@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "pack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3113,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "theater"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3155,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "theater-chain"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -3178,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-message-server"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-runtime"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3207,7 +3207,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-store"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3222,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-supervisor"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",

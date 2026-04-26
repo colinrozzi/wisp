@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-theater = { git = "https://github.com/colinrozzi/theater.git" }
-pack = { git = "https://github.com/colinrozzi/pack.git" }
+theater = { git = "https://github.com/colinrozzi/theater.git", tag = "v0.3.0" }
+pack = { git = "https://github.com/colinrozzi/pack.git", tag = "v0.2.0" }
 wat = "1.242.0"
 wasmtime = { version = "31.0", features = ["async"] }
 tokio = { version = "1", features = ["full"] }
