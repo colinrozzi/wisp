@@ -96,8 +96,14 @@ return-type dispatch.
 
 A likely staging:
 
-- [ ] Thread an optional expected type through expression elaboration (bidirectional).
-- [ ] Return-type dispatch for nullary/return-typed trait methods (`zero`, `empty`, …).
+- [x] Thread an optional expected type through expression elaboration (bidirectional).
+      *Done 2026-08-10* — `walk` in the generics pre-pass carries `expected`, seeded
+      from return position, `if`/`let` tails, ascription/cast, and sibling arguments.
+- [x] Return-type dispatch for nullary/return-typed trait methods (`zero`, `empty`, …).
+      *Done 2026-08-10* — the expected type is a resolution source for trait methods
+      whose type parameter is only in the return. See
+      [changes/GENERICS-AND-TRAITS.md](../changes/GENERICS-AND-TRAITS.md) and
+      `tests/fixtures/return_dispatch.lisp`.
 - [ ] Literals adopt the expected type.
 - [ ] Metavariables + postponement, only where a case genuinely needs them.
 - [ ] Type-aware macros / elaborators (Design C): macros that may query the expected

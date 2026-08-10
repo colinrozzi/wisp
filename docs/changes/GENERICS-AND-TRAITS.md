@@ -201,14 +201,48 @@ generic type-parameter binding). This picks the right instance even when the typ
 parameter is not the first argument and a competing instance exists.
 Fixtures: `tests/fixtures/inference_nested.lisp`, `tests/fixtures/inference_dispatch.lisp`.
 
+### Return-type dispatch (top-down, first slice — 2026-08-10)
+
+`walk` now threads an **expected type** downward (`expected: Option<String>`), the
+top-down half of bidirectional checking. It is a fourth resolution source for a trait
+method, after the two argument-based ones and before the generic-body fallback: if no
+argument fixes the type, the expected type from context does. This resolves methods
+whose type parameter is only in the **return** (e.g. `zero : T`), which no argument can
+decide.
+
+The expected type is seeded from four places:
+
+- **Return position** — a `fn` body is expected at the declared return type
+  (`process_fn_form`, and `specialize` for a monomorphized copy).
+- **`if` / `let` tails** — both `if` branches and a `let` body inherit the expected
+  type of the whole form; a `let` value uses its own `: type` annotation.
+- **Ascription / cast** — `(e : s32)` and `(s32 e)` push `s32` into `e`.
+- **Sibling argument** — a resolved call expects each argument at its parameter type
+  (via a new `fn_params` table over instance methods, plain fns, exported fns, and
+  monomorphized copies). So `(+ x (one))` gives `(one)` the type of `x`, and
+  `(+ (one) (one))` in an `s32` function resolves both.
+
+A generic whose result *is* its type parameter also takes its type argument from the
+expected type when no argument determines it.
+
+Fixture: `tests/fixtures/return_dispatch.lisp` — return position, ascription, sibling
+argument, both-constants, and `if` branches, each picking the right instruction
+(`Zero--zero--s32` vs `Zero--zero--f64`, etc.). When no context exists (e.g. `(zero)`
+as a raw `i32.add` argument) the error is clear: "cannot resolve trait method 'zero':
+no instance matches the argument types or the expected type".
+
+See [proposals/ELABORATION.md](../proposals/ELABORATION.md) for the wider arc this
+seeds (typed constants, `fold`/`sum` over a monoid, decode-into-expected-type, and the
+road to type-aware macros).
+
 ### Known limits (next steps)
 
-- **Return-type dispatch not handled** (e.g. `zero : T`). This needs the *expected*
-  type to flow **down** from context (bidirectional / top-down), a different mechanism
-  from the current bottom-up inference. Left for a future elaboration pass — see the
-  vision doc [proposals/ELABORATION.md](../proposals/ELABORATION.md) for what it
-  unlocks (typed constants, generic algorithms, decode-into-expected-type) and how it
-  seeds the type-aware macro system.
+- **Expected type does not yet flow through raw wasm instruction arguments** (e.g.
+  `(i32.add (zero) ...)`); only trait-method and generic call arguments, `if`/`let`
+  tails, ascription, and return position carry it. Widening this is the natural next
+  step.
+- **Generic return-type inference is shallow** — it fires only when the generic's
+  return *is* the bare type parameter, not when it is nested (e.g. `(list T)`).
 - **No cross-argument structural unification** (e.g. param `(list T)` vs arg
   `(list s32)` to solve `T`); inference matches a type parameter only where a parameter
   type *is* the bare type parameter.

@@ -3897,6 +3897,7 @@ struct Lowering<'a> {
     method_to_trait: HashMap<String, String>,
     method_dispatch: HashMap<String, usize>, // method -> param index carrying the type param
     monofn_returns: HashMap<String, String>, // fn name -> scalar return type string
+    fn_params: HashMap<String, Vec<Option<String>>>, // concrete fn name -> per-param type strings
     instances: HashMap<(String, String), HashMap<String, String>>, // (trait,type)->method->fn
     worklist: Vec<(String, String)>,
     emitted: HashSet<(String, String)>,
@@ -3997,6 +3998,11 @@ fn head_sym(items: &[SExpr]) -> Option<&str> {
 /// True when an SExpr is the bare `:` symbol used for type annotations.
 fn is_colon(e: &SExpr) -> bool {
     matches!(e, SExpr::Sym(s, _) if s == ":")
+}
+
+/// True for the built-in scalar type names.
+fn is_scalar_name(s: &str) -> bool {
+    matches!(s, "s32" | "s64" | "f32" | "f64" | "u8")
 }
 
 /// Structural view of a `fn` form. Tolerates an optional `:` before the return
@@ -4107,19 +4113,37 @@ impl<'a> Lowering<'a> {
     }
 
     /// Rewrite a body: resolve trait methods (when `mrc` is set) and generic calls.
+    ///
+    /// `expected` is the type this expression is used at, flowing *down* from
+    /// context (a return annotation, an ascription, an `if`/`let` tail, or a
+    /// sibling argument). It supplies the missing type for return-type dispatch
+    /// (methods like `zero : T` whose type parameter is only in the return).
     fn walk(
         &mut self,
         e: &SExpr,
         env: &[(String, String)],
         mrc: Option<&MethodCtx>,
+        expected: Option<String>,
     ) -> Result<SExpr> {
         match e {
             SExpr::List(items, span) => {
+                // Colon ascription `(expr : type)`: steer the expected type into `expr`.
+                if items.len() == 3
+                    && is_colon(&items[1])
+                    && let Some(t) = type_expr_string(&items[2])
+                {
+                    let inner = self.walk(&items[0], env, mrc, Some(t))?;
+                    return Ok(SExpr::List(
+                        vec![inner, items[1].clone(), items[2].clone()],
+                        span.clone(),
+                    ));
+                }
+
                 if let Some(head) = head_sym(items) {
                     // Trait-method call: resolve to a concrete instance function.
                     // Works anywhere, not only inside a generic body — the dispatch
-                    // type comes from the arguments (or, inside a generic, from the
-                    // type-parameter binding).
+                    // type comes from the arguments, the expected type, or (inside a
+                    // generic) the type-parameter binding.
                     if let Some(trait_name) = self.method_to_trait.get(head).cloned() {
                         let mut concrete: Option<String> = None;
                         // 1. Signature-driven: dispatch on the argument that carries the
@@ -4148,7 +4172,17 @@ impl<'a> Lowering<'a> {
                                 }
                             }
                         }
-                        // 3. Fall back to the type-parameter binding inside a generic body.
+                        // 3. Return-type dispatch: the expected type from context.
+                        if concrete.is_none()
+                            && let Some(exp) = expected.as_deref()
+                            && self
+                                .instances
+                                .get(&(trait_name.clone(), exp.to_string()))
+                                .is_some_and(|m| m.contains_key(head))
+                        {
+                            concrete = Some(exp.to_string());
+                        }
+                        // 4. Fall back to the type-parameter binding inside a generic body.
                         if concrete.is_none()
                             && let Some(mc) = mrc
                             && mc.constraints.contains(&trait_name)
@@ -4158,7 +4192,7 @@ impl<'a> Lowering<'a> {
                         let concrete = concrete.ok_or_else(|| {
                             self.ctx.error(
                                 format!(
-                                    "cannot resolve trait method '{}': no instance matches the argument types",
+                                    "cannot resolve trait method '{}': no instance matches the argument types or the expected type",
                                     head
                                 ),
                                 span,
@@ -4178,43 +4212,117 @@ impl<'a> Lowering<'a> {
                                     span,
                                 )
                             })?;
+                        // Each argument is expected at the instance method's param type.
+                        let arg_exp = self.fn_params.get(&fname).cloned().unwrap_or_default();
                         let mut new_items = Vec::with_capacity(items.len());
                         new_items.push(SExpr::Sym(fname, items[0].span().clone()));
-                        for a in &items[1..] {
-                            new_items.push(self.walk(a, env, mrc)?);
+                        for (i, a) in items[1..].iter().enumerate() {
+                            let exp = arg_exp.get(i).cloned().flatten();
+                            new_items.push(self.walk(a, env, mrc, exp)?);
                         }
                         return Ok(SExpr::List(new_items, span.clone()));
                     }
 
                     // Generic function call?
                     if let Some(genfn) = self.generics.get(head).cloned() {
-                        let concrete =
-                            self.infer_type_arg(&genfn, &items[1..], env)
-                                .ok_or_else(|| {
-                                    self.ctx.error(
+                        let concrete = match self.infer_type_arg(&genfn, &items[1..], env) {
+                            Some(c) => c,
+                            None => {
+                                // Return-type inference: a generic whose result *is* the
+                                // type parameter takes its type argument from the context.
+                                if let Some(exp) = expected.as_deref()
+                                    && matches!(&genfn.ret, SExpr::Sym(s, _) if *s == genfn.tparam)
+                                {
+                                    exp.to_string()
+                                } else {
+                                    return Err(self.ctx.error(
                                         format!(
                                             "cannot infer type argument for generic '{}'",
                                             genfn.name
                                         ),
                                         span,
-                                    )
-                                })?;
+                                    ));
+                                }
+                            }
+                        };
                         self.worklist.push((genfn.name.clone(), concrete.clone()));
+                        let gptypes = param_type_strings(&genfn.params);
                         let mut new_items = Vec::with_capacity(items.len());
                         new_items.push(SExpr::Sym(
                             specialized_fn_name(&genfn.name, &concrete),
                             items[0].span().clone(),
                         ));
-                        for a in &items[1..] {
-                            new_items.push(self.walk(a, env, mrc)?);
+                        for (i, a) in items[1..].iter().enumerate() {
+                            // A parameter typed as the type parameter is expected at the
+                            // concrete type; other parameters carry their own type.
+                            let exp = gptypes.get(i).cloned().flatten().map(|s| {
+                                if s == genfn.tparam {
+                                    concrete.clone()
+                                } else {
+                                    s
+                                }
+                            });
+                            new_items.push(self.walk(a, env, mrc, exp)?);
                         }
                         return Ok(SExpr::List(new_items, span.clone()));
                     }
+
+                    // Forms that carry the expected type into their tail positions.
+                    match head {
+                        "if" if items.len() == 4 => {
+                            let c = self.walk(&items[1], env, mrc, None)?;
+                            let t = self.walk(&items[2], env, mrc, expected.clone())?;
+                            let f = self.walk(&items[3], env, mrc, expected)?;
+                            return Ok(SExpr::List(vec![items[0].clone(), c, t, f], span.clone()));
+                        }
+                        "let" if items.len() == 3 => {
+                            // (let (name value) body) or (let (name : type value) body)
+                            if let SExpr::List(bind, bspan) = &items[1] {
+                                let (val_idx, val_exp) = if bind.len() == 4 && is_colon(&bind[1]) {
+                                    (3, type_expr_string(&bind[2]))
+                                } else if bind.len() == 2 {
+                                    (1, None)
+                                } else {
+                                    (usize::MAX, None)
+                                };
+                                if val_idx != usize::MAX {
+                                    let bound_ty = val_exp
+                                        .clone()
+                                        .or_else(|| self.infer_type(&bind[val_idx], env));
+                                    let new_val = self.walk(&bind[val_idx], env, mrc, val_exp)?;
+                                    let mut new_bind = bind.clone();
+                                    new_bind[val_idx] = new_val;
+                                    // The body may reference the bound name; record its type.
+                                    let mut body_env = env.to_vec();
+                                    if let (Some(SExpr::Sym(n, _)), Some(bt)) =
+                                        (bind.first(), bound_ty)
+                                    {
+                                        body_env.push((n.clone(), bt));
+                                    }
+                                    let body = self.walk(&items[2], &body_env, mrc, expected)?;
+                                    return Ok(SExpr::List(
+                                        vec![
+                                            items[0].clone(),
+                                            SExpr::List(new_bind, bspan.clone()),
+                                            body,
+                                        ],
+                                        span.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                        s if is_scalar_name(s) && items.len() == 2 => {
+                            // scalar cast / ascription `(type expr)`
+                            let x = self.walk(&items[1], env, mrc, Some(s.to_string()))?;
+                            return Ok(SExpr::List(vec![items[0].clone(), x], span.clone()));
+                        }
+                        _ => {}
+                    }
                 }
-                // Plain list: recurse into every element.
+                // Plain list: recurse into every element (no expected type).
                 let mut new_items = Vec::with_capacity(items.len());
                 for i in items {
-                    new_items.push(self.walk(i, env, mrc)?);
+                    new_items.push(self.walk(i, env, mrc, None)?);
                 }
                 Ok(SExpr::List(new_items, span.clone()))
             }
@@ -4232,11 +4340,17 @@ impl<'a> Lowering<'a> {
         let params = subst_type(&genfn.params, &genfn.tparam, concrete);
         let ret = subst_type(&genfn.ret, &genfn.tparam, concrete);
         let env = param_env(&params);
+        self.fn_params.insert(
+            specialized_fn_name(gen_name, concrete),
+            param_type_strings(&params),
+        );
         let mc = MethodCtx {
             constraints: genfn.constraints.clone(),
             concrete: concrete.to_string(),
         };
-        let body = self.walk(&genfn.body, &env, Some(&mc))?;
+        // The body is in return position, so it is expected at the return type.
+        let ret_exp = type_expr_string(&ret);
+        let body = self.walk(&genfn.body, &env, Some(&mc), ret_exp)?;
         let span = genfn.body.span().clone();
         Ok(SExpr::List(
             vec![
@@ -4256,7 +4370,9 @@ impl<'a> Lowering<'a> {
         let shape =
             fn_shape(items).ok_or_else(|| self.ctx.error("malformed function definition", span))?;
         let env = param_env(shape.params);
-        let new_body = self.walk(shape.body, &env, None)?;
+        // The body is in return position, so it is expected at the return type.
+        let ret_exp = type_expr_string(shape.ret);
+        let new_body = self.walk(shape.body, &env, None, ret_exp)?;
         let mut new_items = items.to_vec();
         if let Some(last) = new_items.last_mut() {
             *last = new_body;
@@ -4297,6 +4413,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
         method_to_trait: HashMap::new(),
         method_dispatch: HashMap::new(),
         monofn_returns: HashMap::new(),
+        fn_params: HashMap::new(),
         instances: HashMap::new(),
         worklist: Vec::new(),
         emitted: HashSet::new(),
@@ -4451,6 +4568,8 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                     if let Some(rt) = type_expr_string(shape.ret) {
                         low.monofn_returns.insert(fname.clone(), rt);
                     }
+                    low.fn_params
+                        .insert(fname.clone(), param_type_strings(shape.params));
                     let mut new_mi = mi.clone();
                     new_mi[1] = SExpr::Sym(fname.clone(), mi[1].span().clone());
                     instance_fns.push(SExpr::List(new_mi, span.clone()));
@@ -4520,11 +4639,31 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                         },
                     );
                 } else {
+                    low.fn_params
+                        .insert(name.clone(), param_type_strings(shape.params));
                     if let Some(rt) = type_expr_string(shape.ret) {
                         low.monofn_returns.insert(name, rt);
                     }
                     retained.push(form.clone());
                 }
+            }
+            Some("export") => {
+                // Record the signature of an inner (fn ...) so calls to it propagate
+                // types, then retain the export unchanged for Pass 2.
+                for it in &items[1..] {
+                    if let SExpr::List(inner, _) = it
+                        && head_sym(inner) == Some("fn")
+                        && let Some(shape) = fn_shape(inner)
+                        && let SExpr::Sym(n, _) = shape.name
+                    {
+                        low.fn_params
+                            .insert(n.clone(), param_type_strings(shape.params));
+                        if let Some(rt) = type_expr_string(shape.ret) {
+                            low.monofn_returns.insert(n.clone(), rt);
+                        }
+                    }
+                }
+                retained.push(form.clone());
             }
             _ => retained.push(form.clone()),
         }
