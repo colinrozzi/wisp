@@ -4343,6 +4343,32 @@ impl<'a> Lowering<'a> {
                 }
                 Ok(SExpr::List(new_items, span.clone()))
             }
+            // A default integer literal (there is no `s32` suffix, so `ty == S32`
+            // is always a default) adopts the expected type: it widens to `s64`, or
+            // promotes to a float. An explicit suffix (`s64`, `f32`, `f64`) is left
+            // untouched, as is a literal with no expected type.
+            SExpr::Int {
+                value,
+                ty: Type::S32,
+                span,
+            } if expected.is_some() => Ok(match expected.as_deref().unwrap() {
+                "s64" => SExpr::Int {
+                    value: *value,
+                    ty: Type::S64,
+                    span: span.clone(),
+                },
+                "f32" => SExpr::Float {
+                    value: *value as f64,
+                    ty: Type::F32,
+                    span: span.clone(),
+                },
+                "f64" => SExpr::Float {
+                    value: *value as f64,
+                    ty: Type::F64,
+                    span: span.clone(),
+                },
+                _ => e.clone(),
+            }),
             other => Ok(other.clone()),
         }
     }

@@ -239,6 +239,26 @@ See [proposals/ELABORATION.md](../proposals/ELABORATION.md) for the wider arc th
 seeds (typed constants, `fold`/`sum` over a monoid, decode-into-expected-type, and the
 road to type-aware macros).
 
+### Literals adopt the expected type (2026-08-10)
+
+The same expected type retypes a **default integer literal**. There is no `s32`
+suffix, so an integer literal whose type is `s32` is *provably* a default and safe to
+change; an explicit `s64`/`f32`/`f64` suffix is left untouched. When an expected type
+reaches such a literal it adopts it: `s64` widens the integer, and `f32`/`f64` promote
+it to a float. So these now compile that previously did not:
+
+- `(fn f () : s64 5)` — the body literal takes the return type.
+- `(i64.add 1 2)`, `(f32.add 1 2)` — literals take the operand type.
+- `(5 : s64)` — ascription retypes the literal.
+- `(let (big : s64 100) ...)` — the value takes the binding type.
+- `(+ x 1)` with `x : f64` — dispatch fixes the type on `x`, then the sibling `1`
+  adopts `f64`.
+
+Float literals are **not** adopted: a default `f64` and an explicit `3.14f64` are
+indistinguishable from the type alone, so respecting the suffix wins. Use integer
+literals (which promote) or a `f32`/`f64` suffix where a specific float width is needed.
+Fixture: `tests/fixtures/literal_adoption.lisp`.
+
 ### Known limits (next steps)
 
 - **Generic return-type inference is shallow** — it fires only when the generic's
@@ -248,6 +268,8 @@ road to type-aware macros).
   type *is* the bare type parameter.
 - **Single type parameter per generic/trait**; no multi-param traits, no superclasses.
 - Colon `let`/ascription are scalar-only.
+- **Float literals do not adopt the expected type** (the default-vs-explicit `f64`
+  ambiguity). Integer literals promote to floats, so this is rarely felt.
 - **Standard library** (`-`, `*`, `<`, `=`, comparisons, more numeric types) — planned
   as a separate session/project.
 - **Name mangling** uses `Trait--method--type` and `gen--type` (readable, `-` is a
