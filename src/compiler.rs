@@ -321,6 +321,9 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     let macros = collect_macros(&forms);
     let expanded_forms = expand_all_macros(forms, &macros);
 
+    // Lower traits / instances / generics to plain monomorphic forms.
+    let expanded_forms = expand_generics(expanded_forms, &ctx)?;
+
     let prog = parse_program(expanded_forms, &ctx)?;
     let signatures = collect_signatures(&prog)?;
     type_check(&prog, &signatures, &ctx)?;
@@ -833,7 +836,9 @@ fn cgrf_element_node_size(ty: &Type) -> usize {
         // Options: node header (8) + presence (1) + optional child
         Type::Option(inner) => 16 + cgrf_element_node_size(inner),
         // Tuples: node header (8) + child indices
-        Type::Tuple(elems) => 8 + 4 * elems.len() + elems.iter().map(cgrf_element_node_size).sum::<usize>(),
+        Type::Tuple(elems) => {
+            8 + 4 * elems.len() + elems.iter().map(cgrf_element_node_size).sum::<usize>()
+        }
         // Records, variants, results: estimate conservatively
         Type::Record(_) | Type::Variant(_) | Type::Result(_, _) => 64,
         // Resources/borrows: just a handle
@@ -857,7 +862,7 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::Begin { exprs } => exprs.iter().any(expr_uses_heap),
         Expr::WasmInstr { args, .. } => args.iter().any(expr_uses_heap),
         Expr::GlobalSet { value, .. } => expr_uses_heap(value),
-        Expr::RecordConstruct { fields, .. } => true, // records need heap
+        Expr::RecordConstruct { .. } => true, // records need heap
         Expr::RecordAccess { expr, .. } => expr_uses_heap(expr),
         Expr::VariantConstruct { .. } => true, // variants need heap
         Expr::Match { expr, cases } => {
@@ -870,7 +875,10 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::ListLen { list } => expr_uses_heap(list),
         Expr::StringLen { string } => expr_uses_heap(string),
         Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
-        Expr::Substring { .. } | Expr::StringAppend { .. } | Expr::StringFromBytes { .. } | Expr::StringToBytes { .. } => true, // allocate new strings/lists
+        Expr::Substring { .. }
+        | Expr::StringAppend { .. }
+        | Expr::StringFromBytes { .. }
+        | Expr::StringToBytes { .. } => true, // allocate new strings/lists
         Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
         Expr::TupleConstruct { .. } => true,
     }
@@ -1504,8 +1512,8 @@ fn check_expr(
             for (arg, expected_ty) in args.iter().zip(instr_info.params.iter()) {
                 let ty = check_expr(arg, env, signatures, globals, records, variants)?;
                 // Allow u8 -> s32 coercion since u8 is stored as i32
-                let types_compatible = ty == *expected_ty
-                    || (*expected_ty == Type::S32 && ty == Type::U8);
+                let types_compatible =
+                    ty == *expected_ty || (*expected_ty == Type::S32 && ty == Type::U8);
                 if !types_compatible {
                     bail!(
                         "argument type mismatch in '{}': expected {:?}, got {:?}",
@@ -1846,8 +1854,8 @@ fn check_expr(
             };
             let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
             // Allow s32 -> u8 coercion since u8 is stored as i32 internally
-            let types_compatible = value_ty == elem_type
-                || (elem_type == Type::U8 && value_ty == Type::S32);
+            let types_compatible =
+                value_ty == elem_type || (elem_type == Type::U8 && value_ty == Type::S32);
             if !types_compatible {
                 bail!(
                     "list-push value type mismatch: expected {:?}, got {:?}",
@@ -2847,10 +2855,10 @@ fn expand_all_macros(forms: Vec<SExpr>, macros: &CollectedMacros) -> Vec<SExpr> 
         .into_iter()
         .filter(|form| {
             // Filter out defmacro and define-syntax forms (they're already collected)
-            if let SExpr::List(items, _) = form {
-                if let Some(SExpr::Sym(sym, _)) = items.first() {
-                    return sym != "defmacro" && sym != "define-syntax";
-                }
+            if let SExpr::List(items, _) = form
+                && let Some(SExpr::Sym(sym, _)) = items.first()
+            {
+                return sym != "defmacro" && sym != "define-syntax";
             }
             true
         })
@@ -3019,6 +3027,7 @@ fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
 /// Substitute pattern variables in a syntax template
 /// Pattern variables bound in the environment are replaced with their values
 /// Other symbols get the macro scope added for hygiene
+#[allow(clippy::only_used_in_recursion)]
 fn substitute_pattern_vars_in_syntax(
     sexpr: &SExpr,
     env: &HashMap<String, CompileTimeValue>,
@@ -3329,7 +3338,7 @@ fn eval_quasisyntax(
                 other => eval_quasisyntax(other, env, span, macro_scope),
             }
         }
-        SExpr::UnsyntaxSplice(inner, _) => {
+        SExpr::UnsyntaxSplice(_inner, _) => {
             // #,@ should only appear inside lists
             panic!("Unsyntax-splice (#,@) can only appear inside a list");
         }
@@ -3403,6 +3412,7 @@ fn match_pattern(
     }
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn match_pattern_impl(
     pattern: &Pattern,
     input: &SExpr,
@@ -3680,6 +3690,7 @@ fn add_scope_to_sexpr(sexpr: &SExpr, scope: ScopeId) -> SExpr {
 
 // Evaluate quasiquoted template with substitutions
 // macro_scope: Optional scope to add to template-introduced identifiers (for hygiene)
+#[allow(clippy::only_used_in_recursion)]
 fn eval_quasiquote(
     template: &SExpr,
     subs: &HashMap<String, SExpr>,
@@ -3796,6 +3807,752 @@ fn add_scope_to_span(span: &Span, scope: Option<ScopeId>) -> Span {
     }
 }
 
+// ===========================================================================
+// Generics + traits pre-pass (monomorphization / dictionary erasure)
+//
+// Lowers `trait`, `instance`, and generic `fn` (those with a `where` clause)
+// into plain monomorphic `fn` forms. Runs after macro expansion and before
+// `parse_program`, so the rest of the typed pipeline is untouched.
+//   - Each instance method becomes a concrete top-level fn.
+//   - Each use of a generic fn at a concrete type is specialized to a copy.
+//   - Inside a copy, trait-method calls resolve to the concrete instance fn.
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+struct GenericFnDef {
+    name: String,
+    tparam: String,
+    constraints: Vec<String>, // trait names constraining tparam
+    params: SExpr,            // ((name type) ...) with tparam still symbolic
+    ret: SExpr,               // return type expr with tparam still symbolic
+    body: SExpr,
+}
+
+/// A trait method's declared signature (the type parameter is still symbolic).
+#[derive(Debug, Clone)]
+struct TraitMethodSig {
+    name: String,
+    params: SExpr,
+    ret: SExpr,
+}
+
+/// A declared trait: its type parameter and its method signatures.
+#[derive(Debug, Clone)]
+struct TraitDef {
+    tparam: String,
+    methods: Vec<TraitMethodSig>,
+}
+
+/// Parse a bodyless trait method signature: `(fn name params [:] ret)`.
+fn parse_method_sig(mi: &[SExpr]) -> Option<TraitMethodSig> {
+    let name = match mi.get(1)? {
+        SExpr::Sym(s, _) => s.clone(),
+        _ => return None,
+    };
+    let params = mi.get(2)?.clone();
+    let mut idx = 3;
+    if mi.get(idx).is_some_and(is_colon) {
+        idx += 1;
+    }
+    let ret = mi.get(idx)?.clone();
+    if idx != mi.len() - 1 {
+        return None; // a trait method has no body
+    }
+    Some(TraitMethodSig { name, params, ret })
+}
+
+/// Structural equality of two type expressions, ignoring spans.
+fn type_expr_eq(a: &SExpr, b: &SExpr) -> bool {
+    match (a, b) {
+        (SExpr::Sym(x, _), SExpr::Sym(y, _)) => x == y,
+        (SExpr::List(xs, _), SExpr::List(ys, _)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(p, q)| type_expr_eq(p, q))
+        }
+        _ => false,
+    }
+}
+
+/// The type expr of each parameter in a param list (colon or bare form).
+fn param_type_exprs(params: &SExpr) -> Vec<&SExpr> {
+    let mut out = Vec::new();
+    if let SExpr::List(items, _) = params {
+        for p in items {
+            if let Some((_, ty)) = param_name_and_type(p) {
+                out.push(ty);
+            }
+        }
+    }
+    out
+}
+
+/// Context for resolving trait-method calls inside a specialized body.
+struct MethodCtx {
+    constraints: Vec<String>,
+    concrete: String,
+}
+
+struct Lowering<'a> {
+    ctx: &'a CompileContext,
+    generics: HashMap<String, GenericFnDef>,
+    method_to_trait: HashMap<String, String>,
+    method_dispatch: HashMap<String, usize>, // method -> param index carrying the type param
+    monofn_returns: HashMap<String, String>, // fn name -> scalar return type string
+    instances: HashMap<(String, String), HashMap<String, String>>, // (trait,type)->method->fn
+    worklist: Vec<(String, String)>,
+    emitted: HashSet<(String, String)>,
+}
+
+/// The scalar type name for a type-expr that is a bare symbol (e.g. `s32`).
+fn type_expr_string(e: &SExpr) -> Option<String> {
+    match e {
+        SExpr::Sym(s, _) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Map a literal's attached `Type` to its surface name.
+fn scalar_type_name(ty: &Type) -> Option<String> {
+    Some(
+        match ty {
+            Type::S32 => "s32",
+            Type::S64 => "s64",
+            Type::F32 => "f32",
+            Type::F64 => "f64",
+            Type::U8 => "u8",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Substitute a type parameter symbol with a concrete type throughout a type expr.
+fn subst_type(e: &SExpr, tparam: &str, concrete: &str) -> SExpr {
+    match e {
+        SExpr::Sym(s, span) if s == tparam => SExpr::Sym(concrete.to_string(), span.clone()),
+        SExpr::List(items, span) => SExpr::List(
+            items
+                .iter()
+                .map(|i| subst_type(i, tparam, concrete))
+                .collect(),
+            span.clone(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Extract the name symbol and type expr from one param, for either
+/// `(name type)` or `(name : type)`.
+fn param_name_and_type(p: &SExpr) -> Option<(&str, &SExpr)> {
+    if let SExpr::List(pp, _) = p {
+        let name = match pp.first() {
+            Some(SExpr::Sym(n, _)) => n.as_str(),
+            _ => return None,
+        };
+        let ty = match pp.len() {
+            2 => &pp[1],
+            3 if matches!(&pp[1], SExpr::Sym(s, _) if s == ":") => &pp[2],
+            _ => return None,
+        };
+        return Some((name, ty));
+    }
+    None
+}
+
+/// Build a name->type-string environment from a param list SExpr.
+fn param_env(params: &SExpr) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let SExpr::List(items, _) = params {
+        for p in items {
+            if let Some((n, ty)) = param_name_and_type(p)
+                && let Some(ts) = type_expr_string(ty)
+            {
+                env.push((n.to_string(), ts));
+            }
+        }
+    }
+    env
+}
+
+/// Per-parameter declared type strings (None where the type is not a bare symbol).
+fn param_type_strings(params: &SExpr) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    if let SExpr::List(items, _) = params {
+        for p in items {
+            match param_name_and_type(p) {
+                Some((_, ty)) => out.push(type_expr_string(ty)),
+                None => out.push(None),
+            }
+        }
+    }
+    out
+}
+
+fn head_sym(items: &[SExpr]) -> Option<&str> {
+    match items.first() {
+        Some(SExpr::Sym(s, _)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// True when an SExpr is the bare `:` symbol used for type annotations.
+fn is_colon(e: &SExpr) -> bool {
+    matches!(e, SExpr::Sym(s, _) if s == ":")
+}
+
+/// Structural view of a `fn` form. Tolerates an optional `:` before the return
+/// type and an optional `(where ...)` clause:
+///   (fn name (params) [:] ret [(where ...)] body)
+struct FnShape<'a> {
+    name: &'a SExpr,
+    params: &'a SExpr,
+    ret: &'a SExpr,
+    where_clause: Option<&'a SExpr>,
+    body: &'a SExpr,
+}
+
+fn fn_shape(items: &[SExpr]) -> Option<FnShape<'_>> {
+    // items[0] == "fn" is checked by the caller.
+    let name = items.get(1)?;
+    let params = items.get(2)?;
+    let mut idx = 3;
+    if items.get(idx).is_some_and(is_colon) {
+        idx += 1;
+    }
+    let ret = items.get(idx)?;
+    idx += 1;
+    let where_clause = if idx + 1 < items.len()
+        && matches!(items.get(idx), Some(SExpr::List(w, _)) if head_sym(w) == Some("where"))
+    {
+        let w = items.get(idx);
+        idx += 1;
+        w
+    } else {
+        None
+    };
+    let body = items.get(idx)?;
+    if idx != items.len() - 1 {
+        return None; // trailing junk after the body
+    }
+    Some(FnShape {
+        name,
+        params,
+        ret,
+        where_clause,
+        body,
+    })
+}
+
+fn sanitize_method(m: &str) -> String {
+    m.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c.to_string()
+            } else {
+                format!("c{}", c as u32)
+            }
+        })
+        .collect()
+}
+
+fn instance_fn_name(trait_name: &str, ty: &str, method: &str) -> String {
+    format!("{}--{}--{}", trait_name, sanitize_method(method), ty)
+}
+
+fn specialized_fn_name(gen_name: &str, ty: &str) -> String {
+    format!("{}--{}", gen_name, ty)
+}
+
+impl<'a> Lowering<'a> {
+    /// Infer the surface type name of an expression (literals, params, known calls).
+    fn infer_type(&self, e: &SExpr, env: &[(String, String)]) -> Option<String> {
+        match e {
+            SExpr::Int { ty, .. } => scalar_type_name(ty),
+            SExpr::Float { ty, .. } => scalar_type_name(ty),
+            SExpr::Sym(name, _) => env.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone()),
+            SExpr::List(items, _) => {
+                let head = head_sym(items)?;
+                if let Some(info) = lookup_wasm_instr(head) {
+                    return scalar_type_name(&info.result);
+                }
+                // A call to a generic function: its result type is the return type
+                // with the type parameter replaced by the inferred type argument.
+                if let Some(genfn) = self.generics.get(head) {
+                    let concrete = self.infer_type_arg(genfn, &items[1..], env)?;
+                    let ret = subst_type(&genfn.ret, &genfn.tparam, &concrete);
+                    return type_expr_string(&ret);
+                }
+                self.monofn_returns.get(head).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// Which concrete type does a generic call resolve to?
+    fn infer_type_arg(
+        &self,
+        genfn: &GenericFnDef,
+        args: &[SExpr],
+        env: &[(String, String)],
+    ) -> Option<String> {
+        let ptypes = param_type_strings(&genfn.params);
+        for (i, pt) in ptypes.iter().enumerate() {
+            if pt.as_deref() == Some(genfn.tparam.as_str())
+                && let Some(a) = args.get(i)
+                && let Some(t) = self.infer_type(a, env)
+            {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Rewrite a body: resolve trait methods (when `mrc` is set) and generic calls.
+    fn walk(
+        &mut self,
+        e: &SExpr,
+        env: &[(String, String)],
+        mrc: Option<&MethodCtx>,
+    ) -> Result<SExpr> {
+        match e {
+            SExpr::List(items, span) => {
+                if let Some(head) = head_sym(items) {
+                    // Trait-method call: resolve to a concrete instance function.
+                    // Works anywhere, not only inside a generic body — the dispatch
+                    // type comes from the arguments (or, inside a generic, from the
+                    // type-parameter binding).
+                    if let Some(trait_name) = self.method_to_trait.get(head).cloned() {
+                        let mut concrete: Option<String> = None;
+                        // 1. Signature-driven: dispatch on the argument that carries the
+                        //    trait's type parameter.
+                        if let Some(&di) = self.method_dispatch.get(head)
+                            && let Some(a) = items.get(1 + di)
+                            && let Some(t) = self.infer_type(a, env)
+                            && self
+                                .instances
+                                .get(&(trait_name.clone(), t.clone()))
+                                .is_some_and(|m| m.contains_key(head))
+                        {
+                            concrete = Some(t);
+                        }
+                        // 2. Otherwise, any argument whose inferred type has an instance.
+                        if concrete.is_none() {
+                            for a in &items[1..] {
+                                if let Some(t) = self.infer_type(a, env)
+                                    && self
+                                        .instances
+                                        .get(&(trait_name.clone(), t.clone()))
+                                        .is_some_and(|m| m.contains_key(head))
+                                {
+                                    concrete = Some(t);
+                                    break;
+                                }
+                            }
+                        }
+                        // 3. Fall back to the type-parameter binding inside a generic body.
+                        if concrete.is_none()
+                            && let Some(mc) = mrc
+                            && mc.constraints.contains(&trait_name)
+                        {
+                            concrete = Some(mc.concrete.clone());
+                        }
+                        let concrete = concrete.ok_or_else(|| {
+                            self.ctx.error(
+                                format!(
+                                    "cannot resolve trait method '{}': no instance matches the argument types",
+                                    head
+                                ),
+                                span,
+                            )
+                        })?;
+                        let fname = self
+                            .instances
+                            .get(&(trait_name.clone(), concrete.clone()))
+                            .and_then(|m| m.get(head))
+                            .cloned()
+                            .ok_or_else(|| {
+                                self.ctx.error(
+                                    format!(
+                                        "no instance of trait '{}' for type '{}' (method '{}')",
+                                        trait_name, concrete, head
+                                    ),
+                                    span,
+                                )
+                            })?;
+                        let mut new_items = Vec::with_capacity(items.len());
+                        new_items.push(SExpr::Sym(fname, items[0].span().clone()));
+                        for a in &items[1..] {
+                            new_items.push(self.walk(a, env, mrc)?);
+                        }
+                        return Ok(SExpr::List(new_items, span.clone()));
+                    }
+
+                    // Generic function call?
+                    if let Some(genfn) = self.generics.get(head).cloned() {
+                        let concrete =
+                            self.infer_type_arg(&genfn, &items[1..], env)
+                                .ok_or_else(|| {
+                                    self.ctx.error(
+                                        format!(
+                                            "cannot infer type argument for generic '{}'",
+                                            genfn.name
+                                        ),
+                                        span,
+                                    )
+                                })?;
+                        self.worklist.push((genfn.name.clone(), concrete.clone()));
+                        let mut new_items = Vec::with_capacity(items.len());
+                        new_items.push(SExpr::Sym(
+                            specialized_fn_name(&genfn.name, &concrete),
+                            items[0].span().clone(),
+                        ));
+                        for a in &items[1..] {
+                            new_items.push(self.walk(a, env, mrc)?);
+                        }
+                        return Ok(SExpr::List(new_items, span.clone()));
+                    }
+                }
+                // Plain list: recurse into every element.
+                let mut new_items = Vec::with_capacity(items.len());
+                for i in items {
+                    new_items.push(self.walk(i, env, mrc)?);
+                }
+                Ok(SExpr::List(new_items, span.clone()))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Produce the specialized `fn` form for one (generic, concrete-type) pair.
+    fn specialize(&mut self, gen_name: &str, concrete: &str) -> Result<SExpr> {
+        let genfn = self
+            .generics
+            .get(gen_name)
+            .cloned()
+            .expect("generic exists");
+        let params = subst_type(&genfn.params, &genfn.tparam, concrete);
+        let ret = subst_type(&genfn.ret, &genfn.tparam, concrete);
+        let env = param_env(&params);
+        let mc = MethodCtx {
+            constraints: genfn.constraints.clone(),
+            concrete: concrete.to_string(),
+        };
+        let body = self.walk(&genfn.body, &env, Some(&mc))?;
+        let span = genfn.body.span().clone();
+        Ok(SExpr::List(
+            vec![
+                SExpr::Sym("fn".to_string(), span.clone()),
+                SExpr::Sym(specialized_fn_name(gen_name, concrete), span.clone()),
+                params,
+                ret,
+                body,
+            ],
+            span,
+        ))
+    }
+
+    /// Rewrite the body of a retained `fn` form (generic calls -> specialized names).
+    /// The body is always the last element, whatever the annotation shape.
+    fn process_fn_form(&mut self, items: &[SExpr], span: &Span) -> Result<SExpr> {
+        let shape =
+            fn_shape(items).ok_or_else(|| self.ctx.error("malformed function definition", span))?;
+        let env = param_env(shape.params);
+        let new_body = self.walk(shape.body, &env, None)?;
+        let mut new_items = items.to_vec();
+        if let Some(last) = new_items.last_mut() {
+            *last = new_body;
+        }
+        Ok(SExpr::List(new_items, span.clone()))
+    }
+
+    /// Rewrite any `fn` bodies reachable from a retained top-level form.
+    fn process_form(&mut self, form: &SExpr) -> Result<SExpr> {
+        if let SExpr::List(items, span) = form {
+            match head_sym(items) {
+                Some("fn") => return self.process_fn_form(items, span),
+                Some("export") => {
+                    // Rewrite an inner (fn ...) if present, leaving the wrapper shape intact.
+                    let mut new_items = Vec::with_capacity(items.len());
+                    for it in items {
+                        match it {
+                            SExpr::List(inner, ispan) if head_sym(inner) == Some("fn") => {
+                                new_items.push(self.process_fn_form(inner, ispan)?);
+                            }
+                            other => new_items.push(other.clone()),
+                        }
+                    }
+                    return Ok(SExpr::List(new_items, span.clone()));
+                }
+                _ => {}
+            }
+        }
+        Ok(form.clone())
+    }
+}
+
+/// Lower traits/instances/generics to plain monomorphic forms.
+fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>> {
+    let mut low = Lowering {
+        ctx,
+        generics: HashMap::new(),
+        method_to_trait: HashMap::new(),
+        method_dispatch: HashMap::new(),
+        monofn_returns: HashMap::new(),
+        instances: HashMap::new(),
+        worklist: Vec::new(),
+        emitted: HashSet::new(),
+    };
+
+    let mut retained: Vec<SExpr> = Vec::new();
+    let mut instance_fns: Vec<SExpr> = Vec::new();
+
+    // Pass 0: collect trait declarations (name, type parameter, method signatures)
+    // so instances and `where` clauses can be checked regardless of source order.
+    let mut traits: HashMap<String, TraitDef> = HashMap::new();
+    let mut seen_instances: HashSet<(String, String)> = HashSet::new();
+    for form in &forms {
+        let (items, span) = match form {
+            SExpr::List(items, span) if !items.is_empty() => (items, span),
+            _ => continue,
+        };
+        if head_sym(items) != Some("trait") {
+            continue;
+        }
+        let (name, tparam) = match items.get(1) {
+            Some(SExpr::List(head, _)) if head.len() == 2 => match (&head[0], &head[1]) {
+                (SExpr::Sym(n, _), SExpr::Sym(t, _)) => (n.clone(), t.clone()),
+                _ => return Err(ctx.error("trait head must be (Name TypeParam)", span)),
+            },
+            _ => return Err(ctx.error("trait expects (trait (Name T) methods...)", span)),
+        };
+        let mut methods = Vec::new();
+        for m in &items[2..] {
+            let mi = match m {
+                SExpr::List(mi, _) if head_sym(mi) == Some("fn") => mi,
+                _ => return Err(ctx.error("trait method must be (fn name params : ret)", span)),
+            };
+            let sig = parse_method_sig(mi)
+                .ok_or_else(|| ctx.error("malformed trait method signature", span))?;
+            low.method_to_trait.insert(sig.name.clone(), name.clone());
+            // Record which parameter carries the trait's type parameter, for dispatch.
+            let ptypes = param_type_exprs(&sig.params);
+            if let Some(di) = ptypes
+                .iter()
+                .position(|t| matches!(t, SExpr::Sym(s, _) if *s == tparam))
+            {
+                low.method_dispatch.insert(sig.name.clone(), di);
+            }
+            methods.push(sig);
+        }
+        if traits
+            .insert(name.clone(), TraitDef { tparam, methods })
+            .is_some()
+        {
+            return Err(ctx.error(format!("duplicate trait '{}'", name), span));
+        }
+    }
+
+    // Pass 1: classify every top-level form.
+    for form in &forms {
+        let (items, span) = match form {
+            SExpr::List(items, span) if !items.is_empty() => (items, span),
+            _ => {
+                retained.push(form.clone());
+                continue;
+            }
+        };
+        match head_sym(items) {
+            Some("trait") => {} // collected in Pass 0
+            Some("instance") => {
+                // (instance (Trait Type) (fn method params [:] ret body) ...)
+                let (trait_name, ty) = match items.get(1) {
+                    Some(SExpr::List(head, _)) if head.len() == 2 => {
+                        let tn = match &head[0] {
+                            SExpr::Sym(s, _) => s.clone(),
+                            _ => return Err(ctx.error("instance trait must be a symbol", span)),
+                        };
+                        let ty = type_expr_string(&head[1]).ok_or_else(|| {
+                            ctx.error("instance type must be a bare type name", span)
+                        })?;
+                        (tn, ty)
+                    }
+                    _ => {
+                        return Err(ctx.error("instance expects (instance (Trait Type) ...)", span));
+                    }
+                };
+                let trait_def = traits.get(&trait_name).ok_or_else(|| {
+                    ctx.error(format!("unknown trait '{}' in instance", trait_name), span)
+                })?;
+                if !seen_instances.insert((trait_name.clone(), ty.clone())) {
+                    return Err(ctx.error(
+                        format!("duplicate instance for ({} {})", trait_name, ty),
+                        span,
+                    ));
+                }
+                let mut provided: HashSet<String> = HashSet::new();
+                for m in &items[2..] {
+                    let mi = match m {
+                        SExpr::List(mi, _) if head_sym(mi) == Some("fn") => mi,
+                        _ => return Err(ctx.error("instance method must be (fn ...)", span)),
+                    };
+                    let shape =
+                        fn_shape(mi).ok_or_else(|| ctx.error("malformed instance method", span))?;
+                    let method = match shape.name {
+                        SExpr::Sym(s, _) => s.clone(),
+                        _ => return Err(ctx.error("method name must be a symbol", span)),
+                    };
+                    // The method must be declared by the trait.
+                    let tsig = trait_def
+                        .methods
+                        .iter()
+                        .find(|s| s.name == method)
+                        .ok_or_else(|| {
+                            ctx.error(
+                                format!("trait '{}' has no method '{}'", trait_name, method),
+                                span,
+                            )
+                        })?;
+                    // Its signature must match the trait's, with the type parameter
+                    // substituted by this instance's type.
+                    let want_params = subst_type(&tsig.params, &trait_def.tparam, &ty);
+                    let want_ret = subst_type(&tsig.ret, &trait_def.tparam, &ty);
+                    let want_pt = param_type_exprs(&want_params);
+                    let got_pt = param_type_exprs(shape.params);
+                    if want_pt.len() != got_pt.len()
+                        || !want_pt.iter().zip(&got_pt).all(|(a, b)| type_expr_eq(a, b))
+                    {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) method '{}' has parameter types that do not match trait '{}'",
+                                trait_name, ty, method, trait_name
+                            ),
+                            span,
+                        ));
+                    }
+                    if !type_expr_eq(&want_ret, shape.ret) {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) method '{}' has a return type that does not match trait '{}'",
+                                trait_name, ty, method, trait_name
+                            ),
+                            span,
+                        ));
+                    }
+                    if !provided.insert(method.clone()) {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) defines method '{}' more than once",
+                                trait_name, ty, method
+                            ),
+                            span,
+                        ));
+                    }
+                    let fname = instance_fn_name(&trait_name, &ty, &method);
+                    // Emit the instance method as a plain concrete fn (same shape, renamed).
+                    if let Some(rt) = type_expr_string(shape.ret) {
+                        low.monofn_returns.insert(fname.clone(), rt);
+                    }
+                    let mut new_mi = mi.clone();
+                    new_mi[1] = SExpr::Sym(fname.clone(), mi[1].span().clone());
+                    instance_fns.push(SExpr::List(new_mi, span.clone()));
+                    low.instances
+                        .entry((trait_name.clone(), ty.clone()))
+                        .or_default()
+                        .insert(method, fname);
+                }
+                // Every trait method must be implemented.
+                for s in &trait_def.methods {
+                    if !provided.contains(&s.name) {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) is missing method '{}'",
+                                trait_name, ty, s.name
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+            Some("fn") => {
+                let shape = fn_shape(items)
+                    .ok_or_else(|| ctx.error("malformed function definition", span))?;
+                let name = match shape.name {
+                    SExpr::Sym(s, _) => s.clone(),
+                    _ => return Err(ctx.error("function name must be a symbol", span)),
+                };
+                if let Some(where_form) = shape.where_clause {
+                    // Generic function.
+                    let where_items = match where_form {
+                        SExpr::List(w, _) => w,
+                        _ => unreachable!(),
+                    };
+                    let mut constraints = Vec::new();
+                    let mut tparam = None;
+                    for c in &where_items[1..] {
+                        if let SExpr::List(cc, _) = c
+                            && cc.len() == 2
+                            && let (SExpr::Sym(tn, _), SExpr::Sym(tp, _)) = (&cc[0], &cc[1])
+                        {
+                            constraints.push(tn.clone());
+                            tparam = Some(tp.clone());
+                        } else {
+                            return Err(ctx.error("constraint must be (Trait TypeParam)", span));
+                        }
+                    }
+                    let tparam = tparam.ok_or_else(|| {
+                        ctx.error("generic fn needs at least one constraint", span)
+                    })?;
+                    for tn in &constraints {
+                        if !traits.contains_key(tn) {
+                            return Err(
+                                ctx.error(format!("unknown trait '{}' in where clause", tn), span)
+                            );
+                        }
+                    }
+                    low.generics.insert(
+                        name.clone(),
+                        GenericFnDef {
+                            name,
+                            tparam,
+                            constraints,
+                            params: shape.params.clone(),
+                            ret: shape.ret.clone(),
+                            body: shape.body.clone(),
+                        },
+                    );
+                } else {
+                    if let Some(rt) = type_expr_string(shape.ret) {
+                        low.monofn_returns.insert(name, rt);
+                    }
+                    retained.push(form.clone());
+                }
+            }
+            _ => retained.push(form.clone()),
+        }
+    }
+
+    // Pass 2: rewrite retained + instance fn bodies (seeds the worklist).
+    let mut output: Vec<SExpr> = Vec::new();
+    for form in &retained {
+        let rewritten = low.process_form(form)?;
+        output.push(rewritten);
+    }
+    for form in &instance_fns {
+        let rewritten = low.process_form(form)?;
+        output.push(rewritten);
+    }
+
+    // Pass 3: drain the worklist, emitting one specialized copy per (generic, type).
+    while let Some((g, t)) = low.worklist.pop() {
+        if !low.emitted.insert((g.clone(), t.clone())) {
+            continue;
+        }
+        let fn_form = low.specialize(&g, &t)?;
+        output.push(fn_form);
+    }
+
+    Ok(output)
+}
+
 fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut pending = Vec::new();
     let mut defined = HashSet::new();
@@ -3822,36 +4579,27 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
             }
             match &items[0] {
                 SExpr::Sym(sym, _) if sym == "record" => {
-                    if items.len() >= 2 {
-                        if let SExpr::Sym(name, _) = &items[1] {
-                            if !record_names.insert(name.clone()) {
-                                return Err(
-                                    ctx.error(format!("duplicate record type '{}'", name), span)
-                                );
-                            }
-                        }
+                    if items.len() >= 2
+                        && let SExpr::Sym(name, _) = &items[1]
+                        && !record_names.insert(name.clone())
+                    {
+                        return Err(ctx.error(format!("duplicate record type '{}'", name), span));
                     }
                 }
                 SExpr::Sym(sym, _) if sym == "variant" => {
-                    if items.len() >= 2 {
-                        if let SExpr::Sym(name, _) = &items[1] {
-                            if !variant_names.insert(name.clone()) {
-                                return Err(
-                                    ctx.error(format!("duplicate variant type '{}'", name), span)
-                                );
-                            }
-                        }
+                    if items.len() >= 2
+                        && let SExpr::Sym(name, _) = &items[1]
+                        && !variant_names.insert(name.clone())
+                    {
+                        return Err(ctx.error(format!("duplicate variant type '{}'", name), span));
                     }
                 }
                 SExpr::Sym(sym, _) if sym == "resource" => {
-                    if items.len() >= 2 {
-                        if let SExpr::Sym(name, _) = &items[1] {
-                            if !resource_names.insert(name.clone()) {
-                                return Err(
-                                    ctx.error(format!("duplicate resource type '{}'", name), span)
-                                );
-                            }
-                        }
+                    if items.len() >= 2
+                        && let SExpr::Sym(name, _) = &items[1]
+                        && !resource_names.insert(name.clone())
+                    {
+                        return Err(ctx.error(format!("duplicate resource type '{}'", name), span));
                     }
                 }
                 _ => {}
@@ -4250,28 +4998,35 @@ fn parse_fn_form(
         SExpr::List(items, span) => (items, span),
         other => return Err(ctx.error("function definition must be a list", other.span())),
     };
-    if items.len() != 5 {
-        return Err(ctx.error_with_note(
+    match items.first() {
+        Some(SExpr::Sym(s, _)) if s == "fn" => {}
+        _ => return Err(ctx.error("function definition must start with 'fn'", &span)),
+    }
+    let shape = fn_shape(&items).ok_or_else(|| {
+        ctx.error_with_note(
             "invalid function definition",
             &span,
-            "expected: (fn name ((param type) ...) return-type body)",
+            "expected: (fn name ((param : type) ...) [:] return-type body)",
+        )
+    })?;
+    if shape.where_clause.is_some() {
+        return Err(ctx.error(
+            "generic functions (with a `where` clause) are not valid here",
+            &span,
         ));
     }
-    match &items[0] {
-        SExpr::Sym(s, _) if s == "fn" => {}
-        other => return Err(ctx.error("function definition must start with 'fn'", other.span())),
-    }
-    let name = match &items[1] {
+    let name = match shape.name {
         SExpr::Sym(name, _) => name.clone(),
         other => return Err(ctx.error("function name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[2], variant_names, resource_names, ctx)?;
-    let return_type = parse_type_expr(&items[3], variant_names, resource_names, ctx)?;
+    let params = parse_typed_params(shape.params, variant_names, resource_names, ctx)?;
+    let return_type = parse_type_expr(shape.ret, variant_names, resource_names, ctx)?;
+    let body = shape.body.clone();
     Ok(PendingFunction {
         name,
         params,
         return_type,
-        body: items[4].clone(),
+        body,
         span,
     })
 }
@@ -4283,13 +5038,18 @@ fn parse_import_form(
     ctx: &CompileContext,
 ) -> Result<Import> {
     let span = items[0].span().clone();
-    if items.len() != 5 {
-        return Err(ctx.error_with_note(
-            "invalid import declaration",
-            &span,
-            "expected: (import module name ((param type) ...) return-type)",
-        ));
-    }
+    // (import module name (params) [:] return-type)
+    let ret_idx = match items.len() {
+        5 => 4,
+        6 if is_colon(&items[4]) => 5,
+        _ => {
+            return Err(ctx.error_with_note(
+                "invalid import declaration",
+                &span,
+                "expected: (import module name ((param : type) ...) [:] return-type)",
+            ));
+        }
+    };
 
     let module = match &items[1] {
         SExpr::Sym(s, _) => s.clone(),
@@ -4300,7 +5060,7 @@ fn parse_import_form(
         other => return Err(ctx.error("import name must be a symbol", other.span())),
     };
     let params = parse_typed_params(&items[3], variant_names, resource_names, ctx)?;
-    let return_type = parse_type_expr(&items[4], variant_names, resource_names, ctx)?;
+    let return_type = parse_type_expr(&items[ret_idx], variant_names, resource_names, ctx)?;
 
     Ok(Import {
         module,
@@ -4318,13 +5078,20 @@ fn parse_global_form(
     ctx: &CompileContext,
 ) -> Result<Global> {
     let span = items[0].span().clone();
-    if items.len() != 5 {
-        return Err(ctx.error_with_note(
-            "invalid global declaration",
-            &span,
-            "expected: (global $name type mutability init-value)",
-        ));
-    }
+    // (global $name [:] type mutability init-value)
+    let type_idx = match items.len() {
+        5 => 2,
+        6 if is_colon(&items[2]) => 3,
+        _ => {
+            return Err(ctx.error_with_note(
+                "invalid global declaration",
+                &span,
+                "expected: (global $name [:] type mutability init-value)",
+            ));
+        }
+    };
+    let mut_idx = type_idx + 1;
+    let init_idx = type_idx + 2;
 
     let name = match &items[1] {
         SExpr::Sym(s, sym_span) => {
@@ -4342,9 +5109,9 @@ fn parse_global_form(
         }
     };
 
-    let ty = parse_type_expr(&items[2], variant_names, resource_names, ctx)?;
+    let ty = parse_type_expr(&items[type_idx], variant_names, resource_names, ctx)?;
 
-    let mutable = match &items[3] {
+    let mutable = match &items[mut_idx] {
         SExpr::Sym(s, sym_span) => match s.as_str() {
             "mut" => true,
             "const" => false,
@@ -4359,7 +5126,7 @@ fn parse_global_form(
         other => return Err(ctx.error("mutability must be 'mut' or 'const'", other.span())),
     };
 
-    let init_value = match &items[4] {
+    let init_value = match &items[init_idx] {
         SExpr::Int { value, .. } => *value,
         other => {
             return Err(ctx.error(
@@ -4532,13 +5299,18 @@ fn parse_typed_params(
             for p in params {
                 match p {
                     SExpr::List(parts, param_span) => {
-                        if parts.len() != 2 {
-                            return Err(ctx.error_with_note(
-                                "invalid parameter",
-                                param_span,
-                                "expected: (name type)",
-                            ));
-                        }
+                        // Accept both `(name type)` and `(name : type)`.
+                        let type_expr = match parts.len() {
+                            2 => &parts[1],
+                            3 if matches!(&parts[1], SExpr::Sym(s, _) if s == ":") => &parts[2],
+                            _ => {
+                                return Err(ctx.error_with_note(
+                                    "invalid parameter",
+                                    param_span,
+                                    "expected: (name type) or (name : type)",
+                                ));
+                            }
+                        };
                         let (name, scopes) = match &parts[0] {
                             SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                             other => {
@@ -4547,7 +5319,7 @@ fn parse_typed_params(
                                 );
                             }
                         };
-                        let ty = parse_type_expr(&parts[1], variant_names, resource_names, ctx)?;
+                        let ty = parse_type_expr(type_expr, variant_names, resource_names, ctx)?;
                         result.push(Parameter { name, ty, scopes });
                     }
                     other => {
@@ -4670,7 +5442,10 @@ fn parse_type_symbol(
 }
 
 fn is_type_symbol(sym: &str) -> bool {
-    matches!(sym, "s32" | "s64" | "f32" | "f64" | "u8" | "string" | "unit")
+    matches!(
+        sym,
+        "s32" | "s64" | "f32" | "f64" | "u8" | "string" | "unit"
+    )
 }
 
 fn parse_expr(
@@ -4722,6 +5497,25 @@ fn parse_expr(
         SExpr::List(items, list_span) => {
             if items.is_empty() {
                 return Err(ctx.error("empty list is not a valid expression", list_span));
+            }
+            // Ascription in colon form: (expr : type), mirroring the head form (type expr).
+            if items.len() == 3
+                && is_colon(&items[1])
+                && let SExpr::Sym(tsym, _) = &items[2]
+                && is_type_symbol(tsym)
+            {
+                let ty = match tsym.as_str() {
+                    "s32" => Type::S32,
+                    "s64" => Type::S64,
+                    "f32" => Type::F32,
+                    "f64" => Type::F64,
+                    _ => unreachable!(),
+                };
+                let inner = parse_expr(&items[0], vars, functions, records, variants, ctx)?;
+                return Ok(Expr::Ascribe {
+                    expr: Box::new(inner),
+                    ty,
+                });
             }
             // Create variant name set for type parsing
             let variant_names: HashSet<String> = variants.keys().cloned().collect();
@@ -4826,18 +5620,41 @@ fn parse_expr(
                             return Err(ctx.error_with_note(
                                 "let binding must be a list",
                                 other.span(),
-                                "expected: (name value)",
+                                "expected: (name value) or (name : type value)",
                             ));
                         }
                     };
-                    if binding.len() != 2 {
-                        return Err(ctx.error_with_note(
-                            "invalid let binding",
-                            items[1].span(),
-                            "expected: (name value)",
-                        ));
-                    }
-                    let (name, name_scopes) = match &binding[0] {
+                    // Accept `(name value)` and `(name : type value)`.
+                    let (name_sexpr, value_sexpr, annotation) = match binding.len() {
+                        2 => (&binding[0], &binding[1], None),
+                        4 if is_colon(&binding[1]) => {
+                            let ty = match &binding[2] {
+                                SExpr::Sym(t, _) if is_type_symbol(t) => match t.as_str() {
+                                    "s32" => Type::S32,
+                                    "s64" => Type::S64,
+                                    "f32" => Type::F32,
+                                    "f64" => Type::F64,
+                                    _ => unreachable!(),
+                                },
+                                other => {
+                                    return Err(ctx.error_with_note(
+                                        "let type annotation must be a scalar type",
+                                        other.span(),
+                                        "e.g. (name : s32 value)",
+                                    ));
+                                }
+                            };
+                            (&binding[0], &binding[3], Some(ty))
+                        }
+                        _ => {
+                            return Err(ctx.error_with_note(
+                                "invalid let binding",
+                                items[1].span(),
+                                "expected: (name value) or (name : type value)",
+                            ));
+                        }
+                    };
+                    let (name, name_scopes) = match name_sexpr {
                         SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                         other => {
                             return Err(
@@ -4845,8 +5662,15 @@ fn parse_expr(
                             );
                         }
                     };
-                    let value_expr =
-                        parse_expr(&binding[1], vars, functions, records, variants, ctx)?;
+                    let mut value_expr =
+                        parse_expr(value_sexpr, vars, functions, records, variants, ctx)?;
+                    // A colon annotation ascribes the value to the declared type.
+                    if let Some(ty) = annotation {
+                        value_expr = Expr::Ascribe {
+                            expr: Box::new(value_expr),
+                            ty,
+                        };
+                    }
                     // Create a new binding with the name and its scopes for hygienic resolution
                     let new_binding = Binding::new(name, name_scopes);
                     let mangled_name = new_binding.mangled_name();
@@ -5692,7 +6516,14 @@ fn gen_expr(
             for (i, expr) in exprs.iter().enumerate() {
                 let is_last = i == exprs.len() - 1;
                 last_ty = gen_expr(
-                    expr, out, indent, env, signatures, globals, records, variants,
+                    expr,
+                    out,
+                    indent,
+                    env,
+                    signatures,
+                    globals,
+                    records,
+                    variants,
                     is_last && is_tail,
                 );
                 if !is_last && !is_unit_type(&last_ty) {
@@ -7679,7 +8510,11 @@ pub fn generate_pact(prog: &Program, default_name: &str) -> String {
     for record in &prog.records {
         out.push_str(&format!("    record {} {{\n", record.name));
         for field in &record.fields {
-            out.push_str(&format!("        {}: {},\n", field.name, pact_type(&field.ty)));
+            out.push_str(&format!(
+                "        {}: {},\n",
+                field.name,
+                pact_type(&field.ty)
+            ));
         }
         out.push_str("    }\n\n");
     }
@@ -8127,7 +8962,10 @@ impl CgrfEncoder {
         let mut payload = Vec::new();
         payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
         payload.extend_from_slice(s.as_bytes());
-        self.nodes.push(CgrfNode { kind: CGRF_STRING, payload });
+        self.nodes.push(CgrfNode {
+            kind: CGRF_STRING,
+            payload,
+        });
         idx
     }
 
@@ -8141,7 +8979,10 @@ impl CgrfEncoder {
         for child_idx in children {
             payload.extend_from_slice(&child_idx.to_le_bytes());
         }
-        self.nodes.push(CgrfNode { kind: CGRF_LIST, payload });
+        self.nodes.push(CgrfNode {
+            kind: CGRF_LIST,
+            payload,
+        });
         idx
     }
 
@@ -8174,7 +9015,10 @@ impl CgrfEncoder {
         for (_, value_idx) in &fields {
             payload.extend_from_slice(&value_idx.to_le_bytes());
         }
-        self.nodes.push(CgrfNode { kind: CGRF_RECORD, payload });
+        self.nodes.push(CgrfNode {
+            kind: CGRF_RECORD,
+            payload,
+        });
         idx
     }
 
@@ -8197,7 +9041,10 @@ impl CgrfEncoder {
         for child_idx in children {
             payload.extend_from_slice(&child_idx.to_le_bytes());
         }
-        self.nodes.push(CgrfNode { kind: CGRF_VARIANT, payload });
+        self.nodes.push(CgrfNode {
+            kind: CGRF_VARIANT,
+            payload,
+        });
         idx
     }
 
@@ -8217,8 +9064,8 @@ impl CgrfEncoder {
         // Nodes: each node has 8-byte header + payload
         // [KIND:u8][FLAGS:u8][RESERVED:u16][PAYLOAD_LEN:u32][PAYLOAD...]
         for node in &self.nodes {
-            bytes.push(node.kind);           // kind (1 byte)
-            bytes.push(0u8);                  // flags (1 byte)
+            bytes.push(node.kind); // kind (1 byte)
+            bytes.push(0u8); // flags (1 byte)
             bytes.extend_from_slice(&0u16.to_le_bytes()); // reserved (2 bytes)
             bytes.extend_from_slice(&(node.payload.len() as u32).to_le_bytes()); // payload_len (4 bytes)
             bytes.extend_from_slice(&node.payload); // payload
@@ -8252,9 +9099,9 @@ fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
                 err: Box::new(wisp_type_to_pack_type(err)),
             }
         }
-        Type::Tuple(elems) => pack::types::Type::Tuple(
-            elems.iter().map(wisp_type_to_pack_type).collect()
-        ),
+        Type::Tuple(elems) => {
+            pack::types::Type::Tuple(elems.iter().map(wisp_type_to_pack_type).collect())
+        }
         Type::Record(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
         Type::Variant(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
         Type::Resource(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
@@ -8286,9 +9133,10 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
         };
         let func = Function::with_signature(
             imp.name.clone(),
-            imp.params.iter().map(|p| {
-                Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty))
-            }).collect(),
+            imp.params
+                .iter()
+                .map(|p| Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty)))
+                .collect(),
             results,
         );
         import_by_interface
@@ -8321,9 +9169,10 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
             };
             let pack_func = Function::with_signature(
                 exp.export_name.clone(),
-                func.params.iter().map(|p| {
-                    Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty))
-                }).collect(),
+                func.params
+                    .iter()
+                    .map(|p| Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty)))
+                    .collect(),
                 results,
             );
             // Use "exports" as the default interface for exports
@@ -8568,7 +9417,13 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
     // Generate Pack wrappers for exported functions
     for export in &prog.exports {
         let func = find_function(prog, &export.func_name);
-        generate_pack_wrapper(&mut out, func, &export.export_name, &records_map, &variants_map);
+        generate_pack_wrapper(
+            &mut out,
+            func,
+            &export.export_name,
+            &records_map,
+            &variants_map,
+        );
     }
 
     out.push_str(")\n");
@@ -8791,7 +9646,13 @@ fn generate_pack_wrapper(
                 out.push_str(&format!("    local.set $param_{}\n", param.name));
             } else {
                 generate_cgrf_decode_param(
-                    out, &param.ty, &param.name, 0, false, records, variants,
+                    out,
+                    &param.ty,
+                    &param.name,
+                    0,
+                    false,
+                    records,
+                    variants,
                 );
             }
         } else {
@@ -9024,7 +9885,13 @@ fn generate_import_wrapper(
     let needs_complex_encode = import.params.iter().any(|p| {
         matches!(
             &p.ty,
-            Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Record(_) | Type::Variant(_) | Type::Str
+            Type::Tuple(_)
+                | Type::Option(_)
+                | Type::List(_)
+                | Type::Result(_, _)
+                | Type::Record(_)
+                | Type::Variant(_)
+                | Type::Str
         )
     }) || import.params.len() > 1;
     if needs_complex_encode {
@@ -11050,10 +11917,7 @@ fn generate_cgrf_decode_recursive(
             out.push_str("        local.get $in_ptr\n");
             out.push_str("        local.get $dec_list_node_offset\n");
             out.push_str("        i32.add\n");
-            out.push_str(&format!(
-                "        i32.const {}\n",
-                child_indices_offset
-            ));
+            out.push_str(&format!("        i32.const {}\n", child_indices_offset));
             out.push_str("        i32.add\n");
             out.push_str("        local.get $dec_list_i\n");
             out.push_str("        i32.const 4\n");
@@ -11119,10 +11983,7 @@ fn generate_cgrf_decode_recursive(
                 out.push_str("    local.get $in_ptr\n");
                 out.push_str("    local.get $dec_tuple_node_offset\n");
                 out.push_str("    i32.add\n");
-                out.push_str(&format!(
-                    "    i32.const {}\n",
-                    child_indices_offset + i * 4
-                ));
+                out.push_str(&format!("    i32.const {}\n", child_indices_offset + i * 4));
                 out.push_str("    i32.add\n");
                 out.push_str("    i32.load\n");
                 out.push_str("    local.set $dec_child_idx\n");
@@ -11243,10 +12104,7 @@ fn generate_cgrf_decode_recursive(
             out.push_str("    local.set $dec_result\n");
         }
         _ => {
-            out.push_str(&format!(
-                "    ;; TODO: recursive decode for {:?}\n",
-                ty
-            ));
+            out.push_str(&format!("    ;; TODO: recursive decode for {:?}\n", ty));
             out.push_str("    i32.const 0\n");
             out.push_str("    local.set $dec_result\n");
         }
@@ -14507,10 +15365,7 @@ fn generate_cgrf_decode_tuple_param(
                         out.push_str("    local.set $dec_node_offset\n");
                         generate_cgrf_decode_recursive(out, param_ty, records, variants);
                         out.push_str("    local.get $dec_result\n");
-                        out.push_str(&format!(
-                            "    local.set $param_{}\n",
-                            param_name
-                        ));
+                        out.push_str(&format!("    local.set $param_{}\n", param_name));
                     }
                     _ => unreachable!(),
                 }
