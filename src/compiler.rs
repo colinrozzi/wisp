@@ -4316,6 +4316,23 @@ impl<'a> Lowering<'a> {
                             let x = self.walk(&items[1], env, mrc, Some(s.to_string()))?;
                             return Ok(SExpr::List(vec![items[0].clone(), x], span.clone()));
                         }
+                        s if lookup_wasm_instr(s).is_some() => {
+                            // A raw wasm instruction expects each argument at its
+                            // operand type (e.g. `i32.add` wants two `s32`s).
+                            let ptypes: Vec<Option<String>> = lookup_wasm_instr(s)
+                                .unwrap()
+                                .params
+                                .iter()
+                                .map(scalar_type_name)
+                                .collect();
+                            let mut new_items = Vec::with_capacity(items.len());
+                            new_items.push(items[0].clone());
+                            for (i, a) in items[1..].iter().enumerate() {
+                                let exp = ptypes.get(i).cloned().flatten();
+                                new_items.push(self.walk(a, env, mrc, exp)?);
+                            }
+                            return Ok(SExpr::List(new_items, span.clone()));
+                        }
                         _ => {}
                     }
                 }

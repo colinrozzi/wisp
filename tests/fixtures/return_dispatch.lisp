@@ -46,3 +46,7 @@
 
 ; 5. Through an if: both branches inherit the expected type.
 (export (fn pick ((c : s32)) : s32 (if c (zero) (one))))
+
+; 6. Through a raw wasm instruction: the operand type flows into the argument.
+(export (fn wadd () : s32 (i32.add (zero) (i32.const 1))))
+(export (fn wmul () : f64 (f64.mul (one) (f64.const 2.0))))

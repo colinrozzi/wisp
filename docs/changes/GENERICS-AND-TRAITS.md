@@ -221,15 +221,19 @@ The expected type is seeded from four places:
   (via a new `fn_params` table over instance methods, plain fns, exported fns, and
   monomorphized copies). So `(+ x (one))` gives `(one)` the type of `x`, and
   `(+ (one) (one))` in an `s32` function resolves both.
+- **Raw wasm instruction** — an instruction expects each argument at its operand type
+  (from `lookup_wasm_instr`), so `(i32.add (zero) ...)` gives `(zero)` type `s32` and
+  `(f64.mul (one) ...)` gives `(one)` type `f64`.
 
 A generic whose result *is* its type parameter also takes its type argument from the
 expected type when no argument determines it.
 
 Fixture: `tests/fixtures/return_dispatch.lisp` — return position, ascription, sibling
-argument, both-constants, and `if` branches, each picking the right instruction
-(`Zero--zero--s32` vs `Zero--zero--f64`, etc.). When no context exists (e.g. `(zero)`
-as a raw `i32.add` argument) the error is clear: "cannot resolve trait method 'zero':
-no instance matches the argument types or the expected type".
+argument, both-constants, `if` branches, and raw wasm-instruction arguments, each
+picking the right instruction (`Zero--zero--s32` vs `Zero--zero--f64`, etc.). When no
+context exists at all (a truly unconstrained `(zero)`), the error is clear: "cannot
+resolve trait method 'zero': no instance matches the argument types or the expected
+type".
 
 See [proposals/ELABORATION.md](../proposals/ELABORATION.md) for the wider arc this
 seeds (typed constants, `fold`/`sum` over a monoid, decode-into-expected-type, and the
@@ -237,10 +241,6 @@ road to type-aware macros).
 
 ### Known limits (next steps)
 
-- **Expected type does not yet flow through raw wasm instruction arguments** (e.g.
-  `(i32.add (zero) ...)`); only trait-method and generic call arguments, `if`/`let`
-  tails, ascription, and return position carry it. Widening this is the natural next
-  step.
 - **Generic return-type inference is shallow** — it fires only when the generic's
   return *is* the bare type parameter, not when it is nested (e.g. `(list T)`).
 - **No cross-argument structural unification** (e.g. param `(list T)` vs arg
