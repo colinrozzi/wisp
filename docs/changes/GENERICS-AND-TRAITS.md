@@ -259,13 +259,32 @@ indistinguishable from the type alone, so respecting the suffix wins. Use intege
 literals (which promote) or a `f32`/`f64` suffix where a specific float width is needed.
 Fixture: `tests/fixtures/literal_adoption.lisp`.
 
+### Structural unification: generics over `(list T)` (2026-08-12)
+
+Call-site type-argument inference is now **structural**. `infer_type_arg` unifies each
+parameter's type *pattern* against the argument's inferred type via `unify_tparam`: a
+bare `T` binds to the whole argument type, and a nested pattern like `(list T)` binds
+`T` to the aligned sub-type (so `(list T)` against `(list s32)` gives `T = s32`). This
+generalizes to `(option T)`, `(tuple T …)`, and other shapes.
+
+To carry compound types through the pre-pass, inferred types are now **canonical
+strings** (`s32`, `(list s32)`, …): `canonical_type` builds them, `type_str_to_expr`
+parses them back, `param_env`/`param_type_strings` record them, and `infer_type` knows
+the list builtins (`list-new`, `list-get`, `list-push`, `list-len`). `subst_type`
+already recursed, so the emit side was ready.
+
+This unlocked real generic algorithms over lists. A recursive `sum` over `(list T)`
+(indexing with `list-len`/`list-get`) monomorphizes at `s32` and `f64`, with `+`
+dispatching per element type and `(zero)` return-dispatching for the base case. Tests:
+`tests/generics.rs` (`test_generic_list_sum_s32`/`_f64`, `test_generic_over_list_*`).
+
 ### Known limits (next steps)
 
-- **Generic return-type inference is shallow** — it fires only when the generic's
-  return *is* the bare type parameter, not when it is nested (e.g. `(list T)`).
-- **No cross-argument structural unification** (e.g. param `(list T)` vs arg
-  `(list s32)` to solve `T`); inference matches a type parameter only where a parameter
-  type *is* the bare type parameter.
+- **Generic return-type inference is shallow** — inferring the type argument from an
+  *expected* type fires only when the return *is* the bare type parameter, not a nested
+  `(list T)` from an expected `(list s32)`. (Argument-side nesting *is* handled.)
+- **`T` binding to a compound type** works via `subst_type` but is only lightly
+  exercised; the tested cases bind `T` to scalars.
 - **Single type parameter per generic/trait**; no multi-param traits, no superclasses.
 - Colon `let`/ascription are scalar-only.
 - **Float literals do not adopt the expected type** (the default-vs-explicit `f64`

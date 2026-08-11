@@ -4030,10 +4030,68 @@ fn scalar_type_name(ty: &Type) -> Option<String> {
     )
 }
 
+/// A canonical string for a concrete type expr, supporting nesting:
+/// `s32`, `(list s32)`, `(option (list s32))`, `(tuple s32 f64)`, ...
+fn canonical_type(e: &SExpr) -> Option<String> {
+    match e {
+        SExpr::Sym(s, _) => Some(s.clone()),
+        SExpr::List(items, _) => {
+            let parts = items
+                .iter()
+                .map(canonical_type)
+                .collect::<Option<Vec<_>>>()?;
+            Some(format!("({})", parts.join(" ")))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a canonical type string (e.g. `(list s32)`) back into a type expr.
+fn type_str_to_expr(s: &str) -> Option<SExpr> {
+    let toks = tokenize(s);
+    if toks.is_empty() {
+        return None;
+    }
+    let (e, _) = parse_sexpr(&toks, 0);
+    Some(e)
+}
+
+/// The element type of a canonical list type string, e.g. `(list s32)` -> `s32`.
+fn list_elem_type(s: &str) -> Option<String> {
+    match type_str_to_expr(s)? {
+        SExpr::List(items, _) if items.len() == 2 && head_sym(&items) == Some("list") => {
+            canonical_type(&items[1])
+        }
+        _ => None,
+    }
+}
+
+/// Structurally unify a parameter type pattern (with `tparam` still symbolic)
+/// against a concrete type expr, returning the canonical type `tparam` binds to.
+/// e.g. pattern `(list T)` vs concrete `(list s32)` yields `Some("s32")`.
+fn unify_tparam(pat: &SExpr, concrete: &SExpr, tparam: &str) -> Option<String> {
+    match (pat, concrete) {
+        (SExpr::Sym(s, _), _) if s == tparam => canonical_type(concrete),
+        (SExpr::List(ps, _), SExpr::List(cs, _)) if ps.len() == cs.len() => ps
+            .iter()
+            .zip(cs)
+            .find_map(|(p, c)| unify_tparam(p, c, tparam)),
+        _ => None,
+    }
+}
+
 /// Substitute a type parameter symbol with a concrete type throughout a type expr.
+/// The concrete type may itself be compound (e.g. `(list s32)`).
 fn subst_type(e: &SExpr, tparam: &str, concrete: &str) -> SExpr {
     match e {
-        SExpr::Sym(s, span) if s == tparam => SExpr::Sym(concrete.to_string(), span.clone()),
+        SExpr::Sym(s, span) if s == tparam => {
+            if concrete.contains('(') {
+                type_str_to_expr(concrete)
+                    .unwrap_or_else(|| SExpr::Sym(concrete.to_string(), span.clone()))
+            } else {
+                SExpr::Sym(concrete.to_string(), span.clone())
+            }
+        }
         SExpr::List(items, span) => SExpr::List(
             items
                 .iter()
@@ -4063,13 +4121,14 @@ fn param_name_and_type(p: &SExpr) -> Option<(&str, &SExpr)> {
     None
 }
 
-/// Build a name->type-string environment from a param list SExpr.
+/// Build a name->canonical-type environment from a param list SExpr. Compound
+/// types (e.g. `(list s32)`) are included, so structural inference can use them.
 fn param_env(params: &SExpr) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if let SExpr::List(items, _) = params {
         for p in items {
             if let Some((n, ty)) = param_name_and_type(p)
-                && let Some(ts) = type_expr_string(ty)
+                && let Some(ts) = canonical_type(ty)
             {
                 env.push((n.to_string(), ts));
             }
@@ -4078,13 +4137,13 @@ fn param_env(params: &SExpr) -> Vec<(String, String)> {
     env
 }
 
-/// Per-parameter declared type strings (None where the type is not a bare symbol).
+/// Per-parameter declared canonical type strings (None where absent).
 fn param_type_strings(params: &SExpr) -> Vec<Option<String>> {
     let mut out = Vec::new();
     if let SExpr::List(items, _) = params {
         for p in items {
             match param_name_and_type(p) {
-                Some((_, ty)) => out.push(type_expr_string(ty)),
+                Some((_, ty)) => out.push(canonical_type(ty)),
                 None => out.push(None),
             }
         }
@@ -4184,12 +4243,25 @@ impl<'a> Lowering<'a> {
                 if let Some(info) = lookup_wasm_instr(head) {
                     return scalar_type_name(&info.result);
                 }
+                // Built-in list/string operations with a known result type.
+                match head {
+                    "list-new" => {
+                        return Some(format!("(list {})", canonical_type(items.get(1)?)?));
+                    }
+                    "list-len" | "string-len" | "string-ref" => return Some("s32".to_string()),
+                    "list-push" => return self.infer_type(items.get(1)?, env),
+                    "list-get" => {
+                        let lt = self.infer_type(items.get(1)?, env)?;
+                        return list_elem_type(&lt);
+                    }
+                    _ => {}
+                }
                 // A call to a generic function: its result type is the return type
                 // with the type parameter replaced by the inferred type argument.
                 if let Some(genfn) = self.generics.get(head) {
                     let concrete = self.infer_type_arg(genfn, &items[1..], env)?;
                     let ret = subst_type(&genfn.ret, &genfn.tparam, &concrete);
-                    return type_expr_string(&ret);
+                    return canonical_type(&ret);
                 }
                 self.monofn_returns.get(head).cloned()
             }
@@ -4197,20 +4269,23 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Which concrete type does a generic call resolve to?
+    /// Which concrete type does a generic call resolve to? Each parameter's type
+    /// pattern is structurally unified against the argument's inferred type, so a
+    /// bare `T` binds directly and a nested `(list T)` binds `T` to the element type.
     fn infer_type_arg(
         &self,
         genfn: &GenericFnDef,
         args: &[SExpr],
         env: &[(String, String)],
     ) -> Option<String> {
-        let ptypes = param_type_strings(&genfn.params);
-        for (i, pt) in ptypes.iter().enumerate() {
-            if pt.as_deref() == Some(genfn.tparam.as_str())
-                && let Some(a) = args.get(i)
-                && let Some(t) = self.infer_type(a, env)
+        let ptypes = param_type_exprs(&genfn.params);
+        for (i, pexpr) in ptypes.iter().enumerate() {
+            if let Some(a) = args.get(i)
+                && let Some(concrete_str) = self.infer_type(a, env)
+                && let Some(concrete_expr) = type_str_to_expr(&concrete_str)
+                && let Some(binding) = unify_tparam(pexpr, &concrete_expr, &genfn.tparam)
             {
-                return Some(t);
+                return Some(binding);
             }
         }
         None
@@ -4528,7 +4603,7 @@ impl<'a> Lowering<'a> {
             fn_shape(items).ok_or_else(|| self.ctx.error("malformed function definition", span))?;
         let env = param_env(shape.params);
         // The body is in return position, so it is expected at the return type.
-        let ret_exp = type_expr_string(shape.ret);
+        let ret_exp = canonical_type(shape.ret);
         let new_body = self.walk(shape.body, &env, None, ret_exp)?;
         let mut new_items = items.to_vec();
         if let Some(last) = new_items.last_mut() {
@@ -4724,7 +4799,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                     }
                     let fname = instance_fn_name(&trait_name, &ty, &method);
                     // Emit the instance method as a plain concrete fn (same shape, renamed).
-                    if let Some(rt) = type_expr_string(shape.ret) {
+                    if let Some(rt) = canonical_type(shape.ret) {
                         low.monofn_returns.insert(fname.clone(), rt);
                     }
                     low.fn_params
@@ -4802,7 +4877,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                 } else {
                     low.fn_params
                         .insert(name.clone(), param_type_strings(shape.params));
-                    if let Some(rt) = type_expr_string(shape.ret) {
+                    if let Some(rt) = canonical_type(shape.ret) {
                         low.monofn_returns.insert(name, rt);
                     }
                     retained.push(form.clone());
@@ -4819,7 +4894,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                     {
                         low.fn_params
                             .insert(n.clone(), param_type_strings(shape.params));
-                        if let Some(rt) = type_expr_string(shape.ret) {
+                        if let Some(rt) = canonical_type(shape.ret) {
                             low.monofn_returns.insert(n.clone(), rt);
                         }
                     }

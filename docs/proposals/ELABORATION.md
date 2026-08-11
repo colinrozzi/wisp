@@ -127,18 +127,34 @@ than build the heavy machinery next, for two reasons:
    generic functions over lists, no `fold`/`sum`/`empty` to exercise nested inference.
    Building the solver now would be solving a problem we cannot feel.
 
-The two concrete gaps we already know of, to build *when real code demands them*:
+The two concrete gaps we identified, to build *when real code demands them*:
 
-- **Structural unification** — solve a type parameter from a nested shape, e.g. `T` in
-  `(list T)` from an expected `(list s32)`, or from an argument's shape. Bounded; *not*
-  the full metavariable machinery. Today `infer_type_arg` and the return-type-from-
-  expected path match only a **bare** type parameter.
-- **Postponement** — infer a `let` value from its later use, e.g.
-  `(let (x (zero)) (+ x 1.0))`. This one genuinely needs stuck-and-retry.
+- **Structural unification** — ✅ **built 2026-08-12.** `infer_type_arg` now unifies a
+  parameter's type pattern against the argument's inferred type: a bare `T` binds
+  directly, and a nested `(list T)` (or `(option T)`, `(tuple T …)`, etc.) binds `T` to
+  the aligned sub-type. This is a bounded structural match, *not* the full metavariable
+  machinery. It unlocked generic algorithms over lists — e.g. a recursive `sum` over
+  `(list T)` monomorphizing at `s32` and `f64` (see GENERICS-AND-TRAITS.md). Details
+  below.
+- **Postponement** — still open. Infer a `let` value from its *later* use, e.g.
+  `(let (x (zero)) (+ x 1.0))`. This one genuinely needs stuck-and-retry, and no real
+  program has demanded it yet — so it stays paused until one does.
 
-Next work: the **standard library** (see METAPROGRAMMING/TYPE-SYSTEM and the change
-doc). Real generic code will show which of the above is actually needed, and we build
-that — against real cases, not guesses.
+### Structural unification (2026-08-12)
+
+The pre-pass now carries a **canonical type string** that supports nesting
+(`s32`, `(list s32)`, `(option (list s32))`). `canonical_type` produces it,
+`type_str_to_expr` parses it back, and `unify_tparam(pattern, concrete, T)` walks a
+parameter pattern against a concrete type expr to find what `T` binds to. `param_env`
+and `infer_type` were widened to record and produce compound types (`list-new`,
+`list-get`, `list-push`, `list-len`), and `subst_type` already recursed, so the emit
+side needed nothing. Bounded on purpose: a single type parameter, and `T` binding to a
+compound type is supported by `subst_type` but the motivating cases bind `T` to
+scalars.
+
+Next work: still the **standard library** growth and list/string algorithms. Real
+generic code keeps showing which machinery is actually needed — postponement has not
+been needed yet.
 
 ## One-line summary
 

@@ -199,6 +199,75 @@ fn test_literal_ascription_s64() {
     assert_eq!(compile_and_run(src), 1);
 }
 
+// === Structural unification: generics over (list T) ==========================
+
+/// A generic `sum` over `(list T)`, recursing by index. `T` is solved by unifying
+/// the parameter shape `(list T)` against the argument's `(list s32)` / `(list f64)`.
+const SUM_DEFS: &str = r#"
+(fn sum-go ((xs : (list T)) (i : s32) (acc : T)) : T
+  (where (Add T) (Zero T))
+  (if (i32.lt_s i (list-len xs))
+      (sum-go xs (i32.add i (i32.const 1)) (+ acc (list-get xs i)))
+      acc))
+
+(fn sum ((xs : (list T))) : T
+  (where (Add T) (Zero T))
+  (sum-go xs (i32.const 0) (zero)))
+"#;
+
+#[test]
+fn test_generic_list_sum_s32() {
+    let src = with_preamble(&format!(
+        "{}
+(export (fn test-func () s32
+  (let (xs (list-push (list-push (list-push (list-new s32)
+             (i32.const 10)) (i32.const 20)) (i32.const 12)))
+    (sum xs))))",
+        SUM_DEFS
+    ));
+    assert_eq!(compile_and_run(&src), 42);
+}
+
+#[test]
+fn test_generic_list_sum_f64() {
+    // The same `sum` monomorphizes at f64; T is solved from (list f64).
+    let src = with_preamble(&format!(
+        "{}
+(export (fn test-func () s32
+  (let (xs (list-push (list-push (list-new f64) (f64.const 1.5)) (f64.const 2.0)))
+    (if (f64.eq (sum xs) (f64.const 3.5)) (i32.const 1) (i32.const 0)))))",
+        SUM_DEFS
+    ));
+    assert_eq!(compile_and_run(&src), 1);
+}
+
+#[test]
+fn test_generic_over_list_return_element() {
+    // `first` takes (list T) and returns T: T is used in both the parameter shape
+    // and the return, and (zero) return-dispatches for the empty case.
+    let src = with_preamble(
+        "(fn first ((xs : (list T))) : T
+           (where (Zero T))
+           (if (i32.lt_s (list-len xs) (i32.const 1)) (zero) (list-get xs (i32.const 0))))
+(export (fn test-func () s32
+  (let (xs (list-push (list-new s32) (i32.const 42)))
+    (first xs))))",
+    );
+    assert_eq!(compile_and_run(&src), 42);
+}
+
+#[test]
+fn test_generic_over_list_empty_uses_zero() {
+    // An empty list falls to the (zero) branch, return-dispatched to s32.
+    let src = with_preamble(
+        "(fn first ((xs : (list T))) : T
+           (where (Zero T))
+           (if (i32.lt_s (list-len xs) (i32.const 1)) (zero) (list-get xs (i32.const 0))))
+(export (fn test-func () s32 (first (list-new s32))))",
+    );
+    assert_eq!(compile_and_run(&src), 0);
+}
+
 // === Trait checker: bad programs must be rejected with a clear message =======
 
 fn compile_error(source: &str) -> String {
