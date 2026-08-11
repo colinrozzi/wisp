@@ -114,6 +114,32 @@ A likely staging:
 - [ ] Type-aware macros / elaborators (Design C): macros that may query the expected
       type — the unified metaprogramming mechanism envisioned in METAPROGRAMMING.md.
 
+## Deliberate pause (2026-08-11)
+
+The top-down half is done (the three boxes above). We **stop here on purpose** rather
+than build the heavy machinery next, for two reasons:
+
+1. **It is a different weight class.** Metavariables + postponement turn the single-pass
+   `walk` into a constraint solver with type holes and a retry queue — the exact
+   machinery monomorphization was meant to let us avoid. The rule has been to add it
+   *only where a case genuinely needs it*.
+2. **The cases barely exist yet.** Without a standard library there are almost no
+   generic functions over lists, no `fold`/`sum`/`empty` to exercise nested inference.
+   Building the solver now would be solving a problem we cannot feel.
+
+The two concrete gaps we already know of, to build *when real code demands them*:
+
+- **Structural unification** — solve a type parameter from a nested shape, e.g. `T` in
+  `(list T)` from an expected `(list s32)`, or from an argument's shape. Bounded; *not*
+  the full metavariable machinery. Today `infer_type_arg` and the return-type-from-
+  expected path match only a **bare** type parameter.
+- **Postponement** — infer a `let` value from its later use, e.g.
+  `(let (x (zero)) (+ x 1.0))`. This one genuinely needs stuck-and-retry.
+
+Next work: the **standard library** (see METAPROGRAMMING/TYPE-SYSTEM and the change
+doc). Real generic code will show which of the above is actually needed, and we build
+that — against real cases, not guesses.
+
 ## One-line summary
 
 Return-type dispatch gives typed constants and real generic algorithms today, and it
