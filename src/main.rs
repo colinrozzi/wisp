@@ -20,14 +20,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compile an S-expression source file to WAT/WASM artifacts.
+    /// Compile an S-expression source file to a `.wasm` package.
     Compile {
         /// Path to the input Lisp file.
         #[arg(value_name = "SOURCE")]
         source: PathBuf,
-        /// Basename for the generated artifacts (defaults to source stem).
+        /// Basename for the artifacts (defaults to `<dir>/compiled/<stem>`).
         #[arg(value_name = "OUT_STEM")]
         out: Option<String>,
+        /// Also write the readable `.wat` disassembly.
+        #[arg(long = "emit-wat")]
+        emit_wat: bool,
+        /// Also write the `.pact` text interface (already embedded in the wasm).
+        #[arg(long = "emit-pact")]
+        emit_pact: bool,
     },
     /// Run a function exported from a compiled WebAssembly package (component model).
     Run {
@@ -68,7 +74,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Compile { source, out } => run_compile(&source, out.as_deref())?,
+        Command::Compile {
+            source,
+            out,
+            emit_wat,
+            emit_pact,
+        } => run_compile(
+            &source,
+            out.as_deref(),
+            compiler::EmitOptions {
+                wat: emit_wat,
+                pact: emit_pact,
+            },
+        )?,
         Command::Run {
             package,
             func,
@@ -87,10 +105,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_compile(source: &Path, out: Option<&str>) -> Result<()> {
+fn run_compile(source: &Path, out: Option<&str>, emit: compiler::EmitOptions) -> Result<()> {
     let out_base = derive_out_base(source, out)?;
 
-    let artifacts = compiler::compile(source, &out_base)?;
+    let artifacts = compiler::compile(source, &out_base, emit)?;
     print_artifacts(&artifacts);
     Ok(())
 }
@@ -102,29 +120,29 @@ fn derive_out_base(source: &Path, out: Option<&str>) -> Result<PathBuf> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     match out {
-        Some(raw) => {
-            let candidate = PathBuf::from(raw);
-            if candidate.parent().is_none() {
-                Ok(parent.join(candidate))
-            } else {
-                Ok(candidate)
-            }
-        }
+        // An explicit out-stem is used verbatim (relative to CWD) — the escape hatch.
+        Some(raw) => Ok(PathBuf::from(raw)),
+        // By default, artifacts go in a `compiled/` subfolder next to the source,
+        // so source directories stay clean (Racket-style `compiled/`).
         None => {
             let stem = source
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .with_context(|| format!("{} has no valid file stem", source.display()))?;
-            Ok(parent.join(stem))
+            Ok(parent.join("compiled").join(stem))
         }
     }
 }
 
 fn print_artifacts(artifacts: &CompileArtifacts) {
     println!("Wrote:");
-    println!("  {}", artifacts.wat.display());
     println!("  {}", artifacts.wasm.display());
-    println!("  {}", artifacts.pact.display());
+    if let Some(wat) = &artifacts.wat {
+        println!("  {}", wat.display());
+    }
+    if let Some(pact) = &artifacts.pact {
+        println!("  {}", pact.display());
+    }
 }
 
 fn run_package(package_path: &Path, func: &str, args: &[String], deps: &[String]) -> Result<()> {

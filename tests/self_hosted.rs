@@ -104,7 +104,8 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
     let out_base = temp_dir.join(format!("test_selfhost_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
-    compiler::compile(&source_path, &out_base).expect("failed to compile");
+    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        .expect("failed to compile");
 
     let wasm_path = out_base.with_extension("wasm");
     let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read wasm");
@@ -207,7 +208,8 @@ fn compile_and_call_string(source: &str, func_name: &str) -> String {
     let out_base = temp_dir.join(format!("test_selfhost_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
-    compiler::compile(&source_path, &out_base).expect("failed to compile");
+    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        .expect("failed to compile");
 
     let wasm_path = out_base.with_extension("wasm");
     let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read wasm");
@@ -278,7 +280,8 @@ fn test_self_hosted_compiles() {
     let out_base = temp_dir.join(format!("test_selfhost_compile_{}", test_id));
 
     std::fs::write(&source_path, &source).expect("failed to write temp source");
-    compiler::compile(&source_path, &out_base).expect("self-hosted compiler failed to compile");
+    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        .expect("self-hosted compiler failed to compile");
 
     // Verify output files exist
     assert!(out_base.with_extension("wasm").exists());

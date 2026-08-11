@@ -62,9 +62,11 @@ The project uses a two-tier documentation system:
 
 ### Build and Run
 ```bash
-# Compile a Lisp source file to WAT/WASM/WIT
+# Compile a Lisp source file to a .wasm package (written to <dir>/compiled/<stem>.wasm)
 cargo run -- compile <source.lisp> [out-stem]
-# Example: cargo run -- compile examples/prog.lisp examples/prog
+# Example: cargo run -- compile examples/prog.lisp    # -> examples/compiled/prog.wasm
+# Also write the readable views (off by default; both are derivable from the wasm):
+cargo run -- compile <source.lisp> --emit-wat --emit-pact
 
 # Run an exported function from a compiled component
 cargo run -- run <component.wasm> <function-name> <args...>
@@ -233,7 +235,18 @@ Future: Golden tests that diff generated WAT/WIT against expected snapshots.
 
 ## Output Files
 
-For input `examples/prog.lisp` with out-stem `examples/prog`:
-- `examples/prog.wat` - WebAssembly text format (module with imports, functions, exports)
-- `examples/prog.wasm` - WebAssembly component binary (encoded with embedded WIT)
-- `examples/prog.wit` - WIT world declaration (package example:wisp with imports/exports)
+By default, compiling `examples/prog.lisp` writes just one file, in a `compiled/`
+subfolder next to the source (Racket-style), so source directories stay clean:
+- `examples/compiled/prog.wasm` - the Pack package. It embeds the interface metadata
+  (CGRF), so it is the one true artifact.
+
+The other two are optional, human-readable **views** of information the wasm already
+holds; nothing consumes them, so they are off by default:
+- `--emit-wat` -> `examples/compiled/prog.wat` - readable WAT disassembly (the wasm is
+  built from this; any wasm tool regenerates it).
+- `--emit-pact` -> `examples/compiled/prog.pact` - text interface (also embedded in the
+  wasm as CGRF metadata).
+
+An explicit out-stem (`compile prog.lisp path/name`) is used verbatim (relative to the
+current directory), bypassing the `compiled/` default. The output directory is created
+if missing. `compiled/` is gitignored.

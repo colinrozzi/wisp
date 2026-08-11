@@ -293,9 +293,19 @@ impl CompileContext {
 
 #[derive(Debug)]
 pub struct CompileArtifacts {
-    pub wat: PathBuf,
     pub wasm: PathBuf,
-    pub pact: PathBuf,
+    /// Written only when requested (`--emit-wat`); a readable disassembly of the wasm.
+    pub wat: Option<PathBuf>,
+    /// Written only when requested (`--emit-pact`); a text view of the interface that
+    /// is also embedded in the wasm.
+    pub pact: Option<PathBuf>,
+}
+
+/// Which optional, human-readable views to write alongside the `.wasm`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmitOptions {
+    pub wat: bool,
+    pub pact: bool,
 }
 
 /// Splice `(include "path")` top-level forms in place, reading each referenced
@@ -362,7 +372,7 @@ fn expand_includes(
     Ok(out)
 }
 
-pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> {
+pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result<CompileArtifacts> {
     let src = fs::read_to_string(source_path)
         .with_context(|| format!("failed to read source file {}", source_path.display()))?;
 
@@ -403,37 +413,53 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     let signatures = collect_signatures(&prog)?;
     type_check(&prog, &signatures, &ctx)?;
 
-    // Generate Pack-compatible WAT (raw module with Pack/Graph ABI)
+    // Generate Pack-compatible WAT (raw module with Pack/Graph ABI). This text is
+    // always produced because the wasm is built from it, but it is only *written*
+    // when requested — it is a readable disassembly the wasm can regenerate.
     let wat = generate_wat_pack(&prog, &signatures);
 
-    let mut wat_path = out_base.to_path_buf();
-    wat_path.set_extension("wat");
+    // Ensure the output directory (e.g. `compiled/`) exists.
+    if let Some(dir) = out_base.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create output directory {}", dir.display()))?;
+    }
+
     let mut wasm_path = out_base.to_path_buf();
     wasm_path.set_extension("wasm");
-    let mut pact_path = out_base.to_path_buf();
-    pact_path.set_extension("pact");
 
-    fs::write(&wat_path, &wat)
-        .with_context(|| format!("failed to write {}", wat_path.display()))?;
-
-    // Convert WAT to raw WASM module (not a component)
+    // The wasm is the one true artifact; it also embeds the interface metadata.
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
     fs::write(&wasm_path, &wasm_bytes)
         .with_context(|| format!("failed to write {}", wasm_path.display()))?;
 
-    // Generate Pact interface definition
-    // Use source file name as interface name
-    let interface_name = source_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("wisp");
-    let pact = generate_pact(&prog, interface_name);
-    fs::write(&pact_path, &pact)
-        .with_context(|| format!("failed to write {}", pact_path.display()))?;
+    // Optional view: the readable WAT disassembly.
+    let wat_path = if emit.wat {
+        let mut p = out_base.to_path_buf();
+        p.set_extension("wat");
+        fs::write(&p, &wat).with_context(|| format!("failed to write {}", p.display()))?;
+        Some(p)
+    } else {
+        None
+    };
+
+    // Optional view: the text interface (also embedded in the wasm as CGRF metadata).
+    let pact_path = if emit.pact {
+        let interface_name = source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("wisp");
+        let pact = generate_pact(&prog, interface_name);
+        let mut p = out_base.to_path_buf();
+        p.set_extension("pact");
+        fs::write(&p, &pact).with_context(|| format!("failed to write {}", p.display()))?;
+        Some(p)
+    } else {
+        None
+    };
 
     Ok(CompileArtifacts {
-        wat: wat_path,
         wasm: wasm_path,
+        wat: wat_path,
         pact: pact_path,
     })
 }

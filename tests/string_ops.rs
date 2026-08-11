@@ -14,7 +14,8 @@ fn compile_and_run(source: &str) -> i32 {
     std::fs::write(&source_path, source).expect("failed to write temp source");
 
     // Compile
-    compiler::compile(&source_path, &out_base).expect("failed to compile");
+    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        .expect("failed to compile");
 
     // Read the WASM file
     let wasm_path = out_base.with_extension("wasm");

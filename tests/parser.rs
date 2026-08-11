@@ -11,7 +11,8 @@ fn compile_and_run(source: &str) -> i32 {
     let out_base = temp_dir.join(format!("test_parser_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
-    compiler::compile(&source_path, &out_base).expect("failed to compile");
+    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        .expect("failed to compile");
 
     let wasm_path = out_base.with_extension("wasm");
     let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read wasm");
