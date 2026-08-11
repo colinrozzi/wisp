@@ -214,16 +214,22 @@ Comments: `; comment to end of line`
 
 ## Testing
 
-Currently no automated tests. Test fixtures in `tests/fixtures/`:
-- `s64_factorial.lisp` - recursive factorial with s64
-- `f64_math.lisp` - f64 arithmetic and typed casts
+Automated integration tests live in `tests/*.rs` (run with `cargo test -p wisp`):
+`tokenizer`, `parser`, `pattern_match`, `codegen`, `string_ops`, and `self_hosted`.
+Each compiles Wisp source to a `.wasm`, runs it under wasmtime, and checks the result.
+159 tests pass; 2 self-hosted bootstrap tests are `#[ignore]`d (they recurse past
+memory limits on a 42 KB file).
 
-Manual testing workflow:
-1. Compile fixture: `cargo run -- compile tests/fixtures/foo.lisp tests/fixtures/foo`
-2. Run exports: `cargo run -- run tests/fixtures/foo.wasm function-name args...`
-3. Verify output matches expected behavior
+- **Output ABI**: an exported function is called as `(in_ptr, in_len, out_ptr_ptr,
+  out_len_ptr)`. The callee allocates the output buffer and writes its address into
+  the `out_ptr_ptr` slot and the length into the `out_len_ptr` slot. The result is
+  CGRF-encoded: after reading the pointer, an s32 payload sits at `+24` (16-byte CGRF
+  header + 8-byte node header); a string has its length at `+24` and bytes at `+28`.
+- **Big stack**: the self-hosted compiler recurses deeply (the tokenizer recurses per
+  character), so `self_hosted` tests run their body on a 1 GiB thread via
+  `run_big_stack` rather than the default 2 MiB test stack.
 
-Future: Golden tests that diff generated WAT/WIT against expected snapshots.
+Test fixtures also live in `tests/fixtures/` for manual `cargo run -- compile` checks.
 
 ## Coding Style
 

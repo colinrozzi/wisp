@@ -97,7 +97,28 @@ fn write_cgrf_string(
     offset - ptr as usize
 }
 
+/// Run `f` on a thread with a large stack. The self-hosted compiler running inside
+/// wasm recurses deeply (the tokenizer recurses once per input character), which
+/// consumes host stack during `func.call`, so the default 2 MiB test stack overflows.
+fn run_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        match std::thread::Builder::new()
+            .stack_size(1 << 30) // 1 GiB
+            .spawn_scoped(s, f)
+            .expect("failed to spawn big-stack thread")
+            .join()
+        {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    })
+}
+
 fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) -> String {
+    run_big_stack(|| compile_and_call_with_string_arg_inner(source, func_name, input))
+}
+
+fn compile_and_call_with_string_arg_inner(source: &str, func_name: &str, input: &str) -> String {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
     let source_path = temp_dir.join(format!("test_selfhost_{}.lisp", test_id));
@@ -161,9 +182,9 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
     // With 4MB of memory (64 pages), we have addresses 0x0-0x3FFFFF
     // Put output near the top: 0x200000 (2MB offset), leaving 2MB for output
     let in_ptr: i32 = 0x1000;
-    let input_size = (28 + input.len()) as i32; // CGRF header + string bytes
-    let out_ptr: i32 = 0x200000; // 2MB offset
-    let out_cap: i32 = 0x1F0000; // ~2MB capacity
+    // Scratch slots for the returned pointer/length, in the reserved low region.
+    let out_ptr_ptr: i32 = 0x800;
+    let out_len_ptr: i32 = 0x804;
 
     // Write input string in CGRF format
     let in_len = write_cgrf_string(&memory, &mut store, in_ptr, input) as i32;
@@ -180,12 +201,19 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
         &[
             wasmtime::Val::I32(in_ptr),
             wasmtime::Val::I32(in_len),
-            wasmtime::Val::I32(out_ptr),
-            wasmtime::Val::I32(out_cap),
+            wasmtime::Val::I32(out_ptr_ptr),
+            wasmtime::Val::I32(out_len_ptr),
         ],
         &mut results,
     )
     .expect("call failed");
+
+    // The callee allocated the output buffer; read its pointer from the slot.
+    let mut ptr_buf = [0u8; 4];
+    memory
+        .read(&store, out_ptr_ptr as usize, &mut ptr_buf)
+        .expect("failed to read output pointer");
+    let out_ptr = i32::from_le_bytes(ptr_buf);
 
     // CGRF string format: offset 24 = string length, offset 28 = string bytes (inline)
     let mut len_buf = [0u8; 4];
@@ -202,6 +230,10 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
 }
 
 fn compile_and_call_string(source: &str, func_name: &str) -> String {
+    run_big_stack(|| compile_and_call_string_inner(source, func_name))
+}
+
+fn compile_and_call_string_inner(source: &str, func_name: &str) -> String {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
     let source_path = temp_dir.join(format!("test_selfhost_{}.lisp", test_id));
@@ -234,8 +266,9 @@ fn compile_and_call_string(source: &str, func_name: &str) -> String {
 
     let in_ptr: i32 = 0x1000;
     let in_len: i32 = 0;
-    let out_ptr: i32 = 0x2000;
-    let out_cap: i32 = 4096;
+    // Scratch slots for the returned pointer/length, in the reserved low region.
+    let out_ptr_ptr: i32 = 0x800;
+    let out_len_ptr: i32 = 0x804;
 
     let mut results = [wasmtime::Val::I32(0)];
     func.call(
@@ -243,12 +276,19 @@ fn compile_and_call_string(source: &str, func_name: &str) -> String {
         &[
             wasmtime::Val::I32(in_ptr),
             wasmtime::Val::I32(in_len),
-            wasmtime::Val::I32(out_ptr),
-            wasmtime::Val::I32(out_cap),
+            wasmtime::Val::I32(out_ptr_ptr),
+            wasmtime::Val::I32(out_len_ptr),
         ],
         &mut results,
     )
     .expect("call failed");
+
+    // The callee allocated the output buffer; read its pointer from the slot.
+    let mut ptr_buf = [0u8; 4];
+    memory
+        .read(&store, out_ptr_ptr as usize, &mut ptr_buf)
+        .expect("failed to read output pointer");
+    let out_ptr = i32::from_le_bytes(ptr_buf);
 
     // CGRF string format: offset 24 = string length, offset 28 = string bytes (inline)
     let mut len_buf = [0u8; 4];
@@ -272,20 +312,30 @@ fn get_compiler_source() -> String {
 
 #[test]
 fn test_self_hosted_compiles() {
-    // Just verify the compiler can be compiled
-    let source = get_compiler_source();
-    let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_selfhost_compile_{}.lisp", test_id));
-    let out_base = temp_dir.join(format!("test_selfhost_compile_{}", test_id));
+    run_big_stack(|| {
+        // Just verify the compiler can be compiled
+        let source = get_compiler_source();
+        let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let temp_dir = std::env::temp_dir();
+        let source_path = temp_dir.join(format!("test_selfhost_compile_{}.lisp", test_id));
+        let out_base = temp_dir.join(format!("test_selfhost_compile_{}", test_id));
 
-    std::fs::write(&source_path, &source).expect("failed to write temp source");
-    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        std::fs::write(&source_path, &source).expect("failed to write temp source");
+        // Emit the wat too, since this test asserts both artifacts are produced.
+        compiler::compile(
+            &source_path,
+            &out_base,
+            compiler::EmitOptions {
+                wat: true,
+                pact: false,
+            },
+        )
         .expect("self-hosted compiler failed to compile");
 
-    // Verify output files exist
-    assert!(out_base.with_extension("wasm").exists());
-    assert!(out_base.with_extension("wat").exists());
+        // Verify output files exist
+        assert!(out_base.with_extension("wasm").exists());
+        assert!(out_base.with_extension("wat").exists());
+    });
 }
 
 #[test]
@@ -677,8 +727,9 @@ fn test_bootstrap_v2_compiles_factorial() {
     let test_program = "(fn add-one ((x s32)) s32 (i32.add x (i32.const 1)))";
 
     let in_ptr: i32 = 0x1000;
-    let out_ptr: i32 = 0x200000;
-    let out_cap: i32 = 0x100000;
+    // Scratch slots for the returned pointer/length, in the reserved low region.
+    let out_ptr_ptr: i32 = 0x800;
+    let out_len_ptr: i32 = 0x804;
 
     // Write input in CGRF format
     let in_len = write_cgrf_string(&memory, &mut store, in_ptr, test_program) as i32;
@@ -691,12 +742,19 @@ fn test_bootstrap_v2_compiles_factorial() {
         &[
             wasmtime::Val::I32(in_ptr),
             wasmtime::Val::I32(in_len),
-            wasmtime::Val::I32(out_ptr),
-            wasmtime::Val::I32(out_cap),
+            wasmtime::Val::I32(out_ptr_ptr),
+            wasmtime::Val::I32(out_len_ptr),
         ],
         &mut results,
     )
     .expect("v2 compiler call failed");
+
+    // The callee allocated the output buffer; read its pointer from the slot.
+    let mut ptr_buf = [0u8; 4];
+    memory
+        .read(&store, out_ptr_ptr as usize, &mut ptr_buf)
+        .expect("failed to read output pointer");
+    let out_ptr = i32::from_le_bytes(ptr_buf);
 
     // Read the result
     let mut len_buf = [0u8; 4];
