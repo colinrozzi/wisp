@@ -298,6 +298,70 @@ pub struct CompileArtifacts {
     pub pact: PathBuf,
 }
 
+/// Splice `(include "path")` top-level forms in place, reading each referenced
+/// file relative to the including file's directory. Runs before macro/generic
+/// expansion, so included traits, macros, and functions are all visible. A file
+/// is included at most once (keyed by canonical path), which also breaks cycles.
+fn expand_includes(
+    forms: Vec<SExpr>,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    ctx: &CompileContext,
+) -> Result<Vec<SExpr>> {
+    let mut out = Vec::new();
+    for form in forms {
+        let is_include = matches!(&form,
+            SExpr::List(items, _) if head_sym(items) == Some("include"));
+        if !is_include {
+            out.push(form);
+            continue;
+        }
+        let (items, span) = match &form {
+            SExpr::List(items, span) => (items, span),
+            _ => unreachable!(),
+        };
+        let rel = match items.get(1) {
+            Some(SExpr::Str(s, _)) if items.len() == 2 => s,
+            _ => {
+                return Err(ctx.error(
+                    "include expects a string path: (include \"file.lisp\")",
+                    span,
+                ));
+            }
+        };
+        let path = base_dir.join(rel);
+        let canon = path.canonicalize().map_err(|e| {
+            ctx.error(
+                format!("include: cannot open '{}': {}", path.display(), e),
+                span,
+            )
+        })?;
+        if !visited.insert(canon.clone()) {
+            continue; // already included
+        }
+        let inc_src = fs::read_to_string(&canon).map_err(|e| {
+            ctx.error(
+                format!("include: cannot read '{}': {}", canon.display(), e),
+                span,
+            )
+        })?;
+        let toks = tokenize(&inc_src);
+        let mut inc_forms = Vec::new();
+        let mut pos = 0;
+        while pos < toks.len() {
+            let (s, next) = parse_sexpr(&toks, pos);
+            inc_forms.push(s);
+            pos = next;
+        }
+        let inc_dir = canon
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| base_dir.to_path_buf());
+        out.extend(expand_includes(inc_forms, &inc_dir, visited, ctx)?);
+    }
+    Ok(out)
+}
+
 pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> {
     let src = fs::read_to_string(source_path)
         .with_context(|| format!("failed to read source file {}", source_path.display()))?;
@@ -316,6 +380,17 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
     if forms.is_empty() {
         bail!("no function definitions found in source");
     }
+
+    // Splice any `(include "...")` files before macro/generic expansion.
+    let base_dir = source_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut visited = HashSet::new();
+    if let Ok(c) = source_path.canonicalize() {
+        visited.insert(c);
+    }
+    let forms = expand_includes(forms, &base_dir, &mut visited, &ctx)?;
 
     // Collect macro definitions (both defmacro and define-syntax) and expand macros
     let macros = collect_macros(&forms);
@@ -3899,6 +3974,9 @@ struct Lowering<'a> {
     monofn_returns: HashMap<String, String>, // fn name -> scalar return type string
     fn_params: HashMap<String, Vec<Option<String>>>, // concrete fn name -> per-param type strings
     instances: HashMap<(String, String), HashMap<String, String>>, // (trait,type)->method->fn
+    instance_defs: HashMap<String, SExpr>,   // instance fn name -> its (renamed) fn form
+    used_instances: HashSet<String>,         // instance fn names actually referenced
+    instance_worklist: Vec<String>,          // instance fns awaiting emission
     worklist: Vec<(String, String)>,
     emitted: HashSet<(String, String)>,
 }
@@ -4212,6 +4290,9 @@ impl<'a> Lowering<'a> {
                                     span,
                                 )
                             })?;
+                        // Mark this instance for emission (instances are emitted on
+                        // demand, so an unused stdlib costs nothing).
+                        self.mark_instance(&fname);
                         // Each argument is expected at the instance method's param type.
                         let arg_exp = self.fn_params.get(&fname).cloned().unwrap_or_default();
                         let mut new_items = Vec::with_capacity(items.len());
@@ -4373,6 +4454,13 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Record that an instance method is used, queuing it for emission once.
+    fn mark_instance(&mut self, fname: &str) {
+        if self.used_instances.insert(fname.to_string()) {
+            self.instance_worklist.push(fname.to_string());
+        }
+    }
+
     /// Produce the specialized `fn` form for one (generic, concrete-type) pair.
     fn specialize(&mut self, gen_name: &str, concrete: &str) -> Result<SExpr> {
         let genfn = self
@@ -4458,12 +4546,14 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
         monofn_returns: HashMap::new(),
         fn_params: HashMap::new(),
         instances: HashMap::new(),
+        instance_defs: HashMap::new(),
+        used_instances: HashSet::new(),
+        instance_worklist: Vec::new(),
         worklist: Vec::new(),
         emitted: HashSet::new(),
     };
 
     let mut retained: Vec<SExpr> = Vec::new();
-    let mut instance_fns: Vec<SExpr> = Vec::new();
 
     // Pass 0: collect trait declarations (name, type parameter, method signatures)
     // so instances and `where` clauses can be checked regardless of source order.
@@ -4615,7 +4705,9 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                         .insert(fname.clone(), param_type_strings(shape.params));
                     let mut new_mi = mi.clone();
                     new_mi[1] = SExpr::Sym(fname.clone(), mi[1].span().clone());
-                    instance_fns.push(SExpr::List(new_mi, span.clone()));
+                    // Store the instance fn; it is emitted only if it is referenced.
+                    low.instance_defs
+                        .insert(fname.clone(), SExpr::List(new_mi, span.clone()));
                     low.instances
                         .entry((trait_name.clone(), ty.clone()))
                         .or_default()
@@ -4712,24 +4804,32 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
         }
     }
 
-    // Pass 2: rewrite retained + instance fn bodies (seeds the worklist).
+    // Pass 2: rewrite retained forms. This marks the instances they use and seeds
+    // the generic worklist.
     let mut output: Vec<SExpr> = Vec::new();
     for form in &retained {
         let rewritten = low.process_form(form)?;
         output.push(rewritten);
     }
-    for form in &instance_fns {
-        let rewritten = low.process_form(form)?;
-        output.push(rewritten);
-    }
 
-    // Pass 3: drain the worklist, emitting one specialized copy per (generic, type).
-    while let Some((g, t)) = low.worklist.pop() {
-        if !low.emitted.insert((g.clone(), t.clone())) {
-            continue;
+    // Pass 3: drain both worklists, emitting one copy per specialized generic and
+    // one copy per referenced instance. Each emitted body may reference further
+    // generics or instances, so we loop until both are empty. Unused instances
+    // (e.g. most of an included stdlib) are never emitted.
+    loop {
+        if let Some((g, t)) = low.worklist.pop() {
+            if low.emitted.insert((g.clone(), t.clone())) {
+                let fn_form = low.specialize(&g, &t)?;
+                output.push(fn_form);
+            }
+        } else if let Some(fname) = low.instance_worklist.pop() {
+            if let Some(SExpr::List(items, span)) = low.instance_defs.get(&fname).cloned() {
+                let rewritten = low.process_fn_form(&items, &span)?;
+                output.push(rewritten);
+            }
+        } else {
+            break;
         }
-        let fn_form = low.specialize(&g, &t)?;
-        output.push(fn_form);
     }
 
     Ok(output)

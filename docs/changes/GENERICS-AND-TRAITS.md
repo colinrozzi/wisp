@@ -270,8 +270,10 @@ Fixture: `tests/fixtures/literal_adoption.lisp`.
 - Colon `let`/ascription are scalar-only.
 - **Float literals do not adopt the expected type** (the default-vs-explicit `f64`
   ambiguity). Integer literals promote to floats, so this is rarely felt.
-- **Standard library** (`-`, `*`, `<`, `=`, comparisons, more numeric types) — planned
-  as a separate session/project.
+- **Standard library** — a first minimal slice exists (`+ - * /`, `<`/`>`, `=`,
+  `zero`/`one` for the scalar types), reachable via `(include "std/num.lisp")`.
+  Instances are emitted on demand, so an unused stdlib costs nothing. See
+  [STDLIB.md](STDLIB.md).
 - **Name mangling** uses `Trait--method--type` and `gen--type` (readable, `-` is a
   legal symbol char here). Dictionaries are fully erased — no runtime cost.
 

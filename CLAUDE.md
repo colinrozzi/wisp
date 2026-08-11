@@ -207,6 +207,7 @@ Exports: `(export name)` or `(export (fn ...))`
 Conditionals: `(if cond then else)` - condition must be s32 (0=false, 1=true)
 Let bindings: `(let (name value) body)` - introduces lexically scoped local
 Type casts: `(s32 expr)`, `(s64 expr)`, `(f32 expr)`, `(f64 expr)`
+Includes: `(include "path.lisp")` - splice another file's forms (path relative to this file); pulls in the stdlib, e.g. `(include "std/num.lisp")`
 Comments: `; comment to end of line`
 
 ## Testing
