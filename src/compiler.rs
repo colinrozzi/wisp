@@ -4580,9 +4580,13 @@ impl<'a> Lowering<'a> {
             constraints: genfn.constraints.clone(),
             concrete: concrete.to_string(),
         };
+        // Substitute the type parameter inside the body too, so type positions like
+        // `(list-new T)` become concrete (`(list-new s32)`). Type parameters are
+        // uppercase by convention and never name a value, so this is safe.
+        let concrete_body = subst_type(&genfn.body, &genfn.tparam, concrete);
         // The body is in return position, so it is expected at the return type.
-        let ret_exp = type_expr_string(&ret);
-        let body = self.walk(&genfn.body, &env, Some(&mc), ret_exp)?;
+        let ret_exp = canonical_type(&ret);
+        let body = self.walk(&concrete_body, &env, Some(&mc), ret_exp)?;
         let span = genfn.body.span().clone();
         Ok(SExpr::List(
             vec![
@@ -4843,18 +4847,28 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                     let mut constraints = Vec::new();
                     let mut tparam = None;
                     for c in &where_items[1..] {
-                        if let SExpr::List(cc, _) = c
+                        // A bare type parameter with no constraint: (where T).
+                        if let SExpr::Sym(tp, _) = c {
+                            tparam = Some(tp.clone());
+                        } else if let SExpr::List(cc, _) = c
                             && cc.len() == 2
                             && let (SExpr::Sym(tn, _), SExpr::Sym(tp, _)) = (&cc[0], &cc[1])
                         {
+                            // A trait bound: (Trait T).
                             constraints.push(tn.clone());
                             tparam = Some(tp.clone());
                         } else {
-                            return Err(ctx.error("constraint must be (Trait TypeParam)", span));
+                            return Err(ctx.error(
+                                "where clause entry must be a type parameter or (Trait TypeParam)",
+                                span,
+                            ));
                         }
                     }
                     let tparam = tparam.ok_or_else(|| {
-                        ctx.error("generic fn needs at least one constraint", span)
+                        ctx.error(
+                            "generic fn needs a type parameter in its where clause",
+                            span,
+                        )
                     })?;
                     for tn in &constraints {
                         if !traits.contains_key(tn) {

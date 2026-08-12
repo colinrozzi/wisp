@@ -71,10 +71,33 @@ instruction:
   `Add` trait)
 - `clamp-sign` → `Ord--c60--s32` (`i32.lt_s`), `Zero`/`One`/`Sub` at `s32`
 
+## `std/list.lisp` — generic algorithms over `(list T)` (2026-08-13)
+
+Built on structural unification (see GENERICS-AND-TRAITS.md), a second stdlib module
+provides generic list functions, monomorphized per element type when used:
+
+- `length` — fully parametric (`(where T)`, no constraint).
+- `sum` — `(where (Add T) (Zero T))`.
+- `contains` — membership by `(where (Eq T))`.
+- `reverse` — parametric; builds a new list.
+
+They recurse by index (`list-len` + `list-get`); Wisp lists have no nil/cons pattern
+matching. `std/list.lisp` starts with `(include "num.lisp")` for the numeric traits;
+the include-once rule makes a double include of `num.lisp` harmless. Tests:
+`tests/list.rs` (length, sum at s32 and f64, contains present/absent, reverse).
+
+Two small compiler enablers landed with this:
+
+- **Unconstrained generics** — a bare `(where T)` declares a type parameter with no
+  trait bound, so `length`/`reverse` need no fake constraint.
+- **Body substitution** — `specialize` now substitutes the type parameter inside the
+  body too, so a type position like `(list-new T)` becomes `(list-new s32)`.
+
 ## Known limits / next steps
 
-- **Scalars only** — no list/string operations yet; those are where structural
-  unification and postponement will first be needed (see ELABORATION.md).
+- **No `map`/`filter` with arbitrary functions** — Wisp has no first-class functions
+  yet, so higher-order list ops need either function values or a macro. Present list
+  ops apply fixed operations (via trait methods) instead.
 - **No `include` path search** — the path is resolved only relative to the including
   file. No standard search root (e.g. a `WISP_PATH`) yet, so programs outside the repo
   reference `std/num.lisp` by a relative path.
