@@ -302,10 +302,30 @@ substitutes each function parameter's name with its argument, and drops the func
 parameters. This unlocked `fold`/`map`/`filter` in `std/list.lisp` (`sum` is now
 `(fold + (zero) xs)`). Tests: `tests/generics.rs` (`test_hof_*`), `tests/list.rs`.
 
-Limits: single type parameter, so `map` is `T -> T` (a type-changing `map : (list T) ->
-(list U)` needs a second type parameter). Function arguments must be statically known
-names — no dynamic function values (that would need `funcref`/`call_indirect`, a
-different mechanism).
+Function arguments must be statically known names — no dynamic function values (that
+would need `funcref`/`call_indirect`, a different mechanism).
+
+### Multiple type parameters (2026-08-14)
+
+Templates may now declare several type parameters: `(where T U)`, or
+`(where (Ord T) (Convert T U))`. Each is bound independently by structural
+unification, and the specialization is keyed on all of them
+(`second--f64--s32`, `map--to-f--s32--f64`). A **function argument's signature** also
+drives inference: for a function parameter `(f : (-> T U))`, the actual function's
+`(-> arg... ret)` type (from its recorded parameter and return types) is unified against
+the pattern, so `U` can come from the function's *return* type. This delivers the
+type-changing `map : (list T) -> (list U)` — `T` from the list, `U` from the mapping
+function. Test: `tests/generics.rs::test_type_changing_map`, `test_multi_param_from_values`.
+
+Mechanically, `GenericFnDef.tparam` became `tparams: Vec<String>`, `constraints`
+became `(trait, type-parameter)` pairs, `SpecKey`/`MethodCtx` carry a list of
+`(type-parameter, concrete)` bindings, and `unify_tparam`/`subst_type` gained
+multi-parameter forms (`unify_types`/`subst_types`).
+
+Limits: a type-changing `map` needs its function argument to be a **monomorphic**
+function (so its signature is concrete); a generic function argument would need to be
+specialized at the inferred `T` first (not done). Multi-parameter *traits* (e.g.
+`(trait (Convert T U) ...)`) are still single-parameter — deferred.
 
 ### Known limits (next steps)
 

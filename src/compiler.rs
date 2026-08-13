@@ -3922,20 +3922,20 @@ fn add_scope_to_span(span: &Span, scope: Option<ScopeId>) -> Span {
 #[derive(Debug, Clone)]
 struct GenericFnDef {
     name: String,
-    tparam: String,           // type parameter, or "" if the template has none
-    constraints: Vec<String>, // trait names constraining tparam
-    func_params: Vec<usize>,  // argument positions of function-typed parameters
-    params: SExpr,            // ((name type) ...) with tparam still symbolic
-    ret: SExpr,               // return type expr with tparam still symbolic
+    tparams: Vec<String>,               // type parameters (declaration order)
+    constraints: Vec<(String, String)>, // (trait, type parameter it constrains)
+    func_params: Vec<usize>,            // argument positions of function-typed parameters
+    params: SExpr,                      // ((name type) ...) with type params still symbolic
+    ret: SExpr,                         // return type expr with type params still symbolic
     body: SExpr,
 }
 
-/// One monomorphization request: a template specialized at a concrete type (may be
-/// "" for none) and a list of function-name arguments (one per function parameter).
+/// One monomorphization request: a template specialized at concrete types (one binding
+/// per type parameter, in declaration order) and function-name arguments.
 #[derive(Debug, Clone)]
 struct SpecKey {
     name: String,
-    concrete: String,
+    bindings: Vec<(String, String)>, // (type parameter, concrete type)
     func_args: Vec<String>,
 }
 
@@ -3970,15 +3970,15 @@ fn param_name_at(params: &SExpr, idx: usize) -> Option<String> {
 
 /// The mangled name of a specialized template: base, then each function argument,
 /// then the concrete type (if any). e.g. `map--double--s32`, `apply-twice--inc`.
-fn template_fn_name(base: &str, func_args: &[String], concrete: &str) -> String {
+fn template_fn_name(base: &str, func_args: &[String], concretes: &[String]) -> String {
     let mut s = base.to_string();
     for fa in func_args {
         s.push_str("--");
         s.push_str(&sanitize_method(fa));
     }
-    if !concrete.is_empty() {
+    for c in concretes {
         s.push_str("--");
-        s.push_str(concrete);
+        s.push_str(c);
     }
     s
 }
@@ -4042,8 +4042,8 @@ fn param_type_exprs(params: &SExpr) -> Vec<&SExpr> {
 
 /// Context for resolving trait-method calls inside a specialized body.
 struct MethodCtx {
-    constraints: Vec<String>,
-    concrete: String,
+    constraints: Vec<(String, String)>, // (trait, type parameter it constrains)
+    bindings: Vec<(String, String)>,    // (type parameter, concrete type)
 }
 
 struct Lowering<'a> {
@@ -4120,18 +4120,34 @@ fn list_elem_type(s: &str) -> Option<String> {
     }
 }
 
-/// Structurally unify a parameter type pattern (with `tparam` still symbolic)
-/// against a concrete type expr, returning the canonical type `tparam` binds to.
-/// e.g. pattern `(list T)` vs concrete `(list s32)` yields `Some("s32")`.
-fn unify_tparam(pat: &SExpr, concrete: &SExpr, tparam: &str) -> Option<String> {
+/// Structurally unify a parameter type pattern against a concrete type expr,
+/// accumulating a binding for each of `tparams` it can determine (first wins).
+/// e.g. pattern `(-> T U)` vs concrete `(-> s32 f64)` binds `T=s32`, `U=f64`.
+fn unify_types(pat: &SExpr, concrete: &SExpr, tparams: &[String], out: &mut Vec<(String, String)>) {
     match (pat, concrete) {
-        (SExpr::Sym(s, _), _) if s == tparam => canonical_type(concrete),
-        (SExpr::List(ps, _), SExpr::List(cs, _)) if ps.len() == cs.len() => ps
-            .iter()
-            .zip(cs)
-            .find_map(|(p, c)| unify_tparam(p, c, tparam)),
-        _ => None,
+        (SExpr::Sym(s, _), _) if tparams.iter().any(|t| t == s) => {
+            if !out.iter().any(|(k, _)| k == s)
+                && let Some(c) = canonical_type(concrete)
+            {
+                out.push((s.clone(), c));
+            }
+        }
+        (SExpr::List(ps, _), SExpr::List(cs, _)) if ps.len() == cs.len() => {
+            for (p, c) in ps.iter().zip(cs) {
+                unify_types(p, c, tparams, out);
+            }
+        }
+        _ => {}
     }
+}
+
+/// Apply every `(type parameter, concrete)` substitution to a type expr.
+fn subst_types(e: &SExpr, bindings: &[(String, String)]) -> SExpr {
+    let mut out = e.clone();
+    for (tp, concrete) in bindings {
+        out = subst_type(&out, tp, concrete);
+    }
+    out
 }
 
 /// Substitute a type parameter symbol with a concrete type throughout a type expr.
@@ -4307,15 +4323,11 @@ impl<'a> Lowering<'a> {
                     _ => {}
                 }
                 // A call to a template (generic and/or higher-order): its result type
-                // is the return type with the type parameter (if any) replaced by the
-                // inferred type argument. Function arguments do not affect the return.
+                // is the return type with the type parameters replaced by the inferred
+                // type arguments. Function arguments do not affect the return.
                 if let Some(genfn) = self.generics.get(head) {
-                    let concrete = if genfn.tparam.is_empty() {
-                        String::new()
-                    } else {
-                        self.infer_type_arg(genfn, &items[1..], env)?
-                    };
-                    let ret = subst_type(&genfn.ret, &genfn.tparam, &concrete);
+                    let bindings = self.infer_bindings(genfn, &items[1..], env);
+                    let ret = subst_types(&genfn.ret, &bindings);
                     return canonical_type(&ret);
                 }
                 self.monofn_returns.get(head).cloned()
@@ -4324,26 +4336,56 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Which concrete type does a generic call resolve to? Each parameter's type
-    /// pattern is structurally unified against the argument's inferred type, so a
-    /// bare `T` binds directly and a nested `(list T)` binds `T` to the element type.
-    fn infer_type_arg(
+    /// The signature of a known monomorphic function as a `(-> arg... ret)` type expr,
+    /// used to unify a function parameter's declared type against the actual function.
+    fn func_signature_expr(&self, fname: &str) -> Option<SExpr> {
+        let params = self.fn_params.get(fname)?;
+        let ret = self.monofn_returns.get(fname)?;
+        let mut parts = vec!["->".to_string()];
+        for p in params {
+            parts.push(p.clone()?);
+        }
+        parts.push(ret.clone());
+        type_str_to_expr(&format!("({})", parts.join(" ")))
+    }
+
+    /// Infer a concrete binding for each type parameter of a template call. A value
+    /// parameter's type pattern is unified against the argument's inferred type; a
+    /// function parameter's `(-> ...)` is unified against the function argument's
+    /// signature. Bindings are returned in type-parameter declaration order.
+    fn infer_bindings(
         &self,
         genfn: &GenericFnDef,
         args: &[SExpr],
         env: &[(String, String)],
-    ) -> Option<String> {
+    ) -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = Vec::new();
         let ptypes = param_type_exprs(&genfn.params);
         for (i, pexpr) in ptypes.iter().enumerate() {
-            if let Some(a) = args.get(i)
-                && let Some(concrete_str) = self.infer_type(a, env)
-                && let Some(concrete_expr) = type_str_to_expr(&concrete_str)
-                && let Some(binding) = unify_tparam(pexpr, &concrete_expr, &genfn.tparam)
+            let Some(a) = args.get(i) else { continue };
+            if genfn.func_params.contains(&i) {
+                if let SExpr::Sym(fname, _) = a
+                    && let Some(sig) = self.func_signature_expr(fname)
+                {
+                    unify_types(pexpr, &sig, &genfn.tparams, &mut found);
+                }
+            } else if let Some(cstr) = self.infer_type(a, env)
+                && let Some(cexpr) = type_str_to_expr(&cstr)
             {
-                return Some(binding);
+                unify_types(pexpr, &cexpr, &genfn.tparams, &mut found);
             }
         }
-        None
+        // Return in declaration order, keeping only parameters that got a binding.
+        genfn
+            .tparams
+            .iter()
+            .filter_map(|tp| {
+                found
+                    .iter()
+                    .find(|(k, _)| k == tp)
+                    .map(|(_, c)| (tp.clone(), c.clone()))
+            })
+            .collect()
     }
 
     /// Rewrite a body: resolve trait methods (when `mrc` is set) and generic calls.
@@ -4416,12 +4458,15 @@ impl<'a> Lowering<'a> {
                         {
                             concrete = Some(exp.to_string());
                         }
-                        // 4. Fall back to the type-parameter binding inside a generic body.
+                        // 4. Fall back to the binding of the type parameter this trait
+                        //    constrains, inside a generic body.
                         if concrete.is_none()
                             && let Some(mc) = mrc
-                            && mc.constraints.contains(&trait_name)
+                            && let Some((_, tp)) =
+                                mc.constraints.iter().find(|(tn, _)| *tn == trait_name)
+                            && let Some((_, c)) = mc.bindings.iter().find(|(k, _)| k == tp)
                         {
-                            concrete = Some(mc.concrete.clone());
+                            concrete = Some(c.clone());
                         }
                         let concrete = concrete.ok_or_else(|| {
                             self.ctx.error(
@@ -4480,37 +4525,34 @@ impl<'a> Lowering<'a> {
                                 }
                             }
                         }
-                        // Infer the type argument from the value arguments, if any.
-                        let concrete = if genfn.tparam.is_empty() {
-                            String::new()
-                        } else {
-                            match self.infer_type_arg(&genfn, args, env) {
-                                Some(c) => c,
-                                None => {
-                                    // A template whose result *is* the type parameter
-                                    // takes its type argument from the expected type.
-                                    if let Some(exp) = expected.as_deref()
-                                        && matches!(&genfn.ret, SExpr::Sym(s, _) if *s == genfn.tparam)
-                                    {
-                                        exp.to_string()
-                                    } else {
-                                        return Err(self.ctx.error(
-                                            format!(
-                                                "cannot infer type argument for generic '{}'",
-                                                genfn.name
-                                            ),
-                                            span,
-                                        ));
-                                    }
-                                }
-                            }
-                        };
+                        // Infer a binding for each type parameter from the arguments.
+                        let mut bindings = self.infer_bindings(&genfn, args, env);
+                        // A single-type-parameter template whose result *is* that
+                        // parameter takes its argument from the expected type.
+                        if bindings.len() < genfn.tparams.len()
+                            && genfn.tparams.len() == 1
+                            && let Some(exp) = expected.as_deref()
+                            && matches!(&genfn.ret, SExpr::Sym(s, _) if *s == genfn.tparams[0])
+                        {
+                            bindings = vec![(genfn.tparams[0].clone(), exp.to_string())];
+                        }
+                        if bindings.len() < genfn.tparams.len() {
+                            return Err(self.ctx.error(
+                                format!(
+                                    "cannot infer type argument(s) for generic '{}'",
+                                    genfn.name
+                                ),
+                                span,
+                            ));
+                        }
+                        let concretes: Vec<String> =
+                            bindings.iter().map(|(_, c)| c.clone()).collect();
                         self.worklist.push(SpecKey {
                             name: genfn.name.clone(),
-                            concrete: concrete.clone(),
+                            bindings: bindings.clone(),
                             func_args: func_args.clone(),
                         });
-                        let mname = template_fn_name(&genfn.name, &func_args, &concrete);
+                        let mname = template_fn_name(&genfn.name, &func_args, &concretes);
                         let gptypes = param_type_strings(&genfn.params);
                         let mut new_items = Vec::with_capacity(items.len());
                         new_items.push(SExpr::Sym(mname, items[0].span().clone()));
@@ -4519,14 +4561,14 @@ impl<'a> Lowering<'a> {
                             if genfn.func_params.contains(&i) {
                                 continue;
                             }
-                            // A parameter typed as the type parameter is expected at the
-                            // concrete type; other parameters carry their own type.
+                            // A parameter typed as a bare type parameter is expected at
+                            // that parameter's concrete binding.
                             let exp = gptypes.get(i).cloned().flatten().map(|s| {
-                                if s == genfn.tparam {
-                                    concrete.clone()
-                                } else {
-                                    s
-                                }
+                                bindings
+                                    .iter()
+                                    .find(|(tp, _)| *tp == s)
+                                    .map(|(_, c)| c.clone())
+                                    .unwrap_or(s)
                             });
                             new_items.push(self.walk(a, env, mrc, exp)?);
                         }
@@ -4656,15 +4698,15 @@ impl<'a> Lowering<'a> {
             .get(&key.name)
             .cloned()
             .expect("generic exists");
-        let concrete = key.concrete.as_str();
-        let mname = template_fn_name(&key.name, &key.func_args, concrete);
+        let concretes: Vec<String> = key.bindings.iter().map(|(_, c)| c.clone()).collect();
+        let mname = template_fn_name(&key.name, &key.func_args, &concretes);
 
-        // 1. Substitute the type parameter throughout params, return, and body. Type
+        // 1. Substitute the type parameters throughout params, return, and body. Type
         //    positions like `(list-new T)` become concrete; safe because a type
         //    parameter is uppercase by convention and never names a value.
-        let mut params = subst_type(&genfn.params, &genfn.tparam, concrete);
-        let ret = subst_type(&genfn.ret, &genfn.tparam, concrete);
-        let mut body = subst_type(&genfn.body, &genfn.tparam, concrete);
+        let mut params = subst_types(&genfn.params, &key.bindings);
+        let ret = subst_types(&genfn.ret, &key.bindings);
+        let mut body = subst_types(&genfn.body, &key.bindings);
 
         // 2. Substitute each function parameter's name with its function argument, so
         //    `(f x)` becomes `(double x)`. Reuses `subst_type` (a bare symbol swap).
@@ -4692,7 +4734,7 @@ impl<'a> Lowering<'a> {
             .insert(mname.clone(), param_type_strings(&params));
         let mc = MethodCtx {
             constraints: genfn.constraints.clone(),
-            concrete: concrete.to_string(),
+            bindings: key.bindings.clone(),
         };
         // The body is in return position, so it is expected at the return type.
         let ret_exp = canonical_type(&ret);
@@ -4953,20 +4995,25 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                 let func_params = func_param_indices(shape.params);
                 let is_template = shape.where_clause.is_some() || !func_params.is_empty();
                 if is_template {
-                    let mut constraints = Vec::new();
-                    let mut tparam = String::new();
+                    let mut constraints: Vec<(String, String)> = Vec::new();
+                    let mut tparams: Vec<String> = Vec::new();
+                    let note_tparam = |tp: &str, list: &mut Vec<String>| {
+                        if !list.iter().any(|t| t == tp) {
+                            list.push(tp.to_string());
+                        }
+                    };
                     if let Some(SExpr::List(where_items, _)) = shape.where_clause {
                         for c in &where_items[1..] {
                             // A bare type parameter with no constraint: (where T).
                             if let SExpr::Sym(tp, _) = c {
-                                tparam = tp.clone();
+                                note_tparam(tp, &mut tparams);
                             } else if let SExpr::List(cc, _) = c
                                 && cc.len() == 2
                                 && let (SExpr::Sym(tn, _), SExpr::Sym(tp, _)) = (&cc[0], &cc[1])
                             {
                                 // A trait bound: (Trait T).
-                                constraints.push(tn.clone());
-                                tparam = tp.clone();
+                                constraints.push((tn.clone(), tp.clone()));
+                                note_tparam(tp, &mut tparams);
                             } else {
                                 return Err(ctx.error(
                                     "where clause entry must be a type parameter or (Trait TypeParam)",
@@ -4974,14 +5021,14 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                                 ));
                             }
                         }
-                        if tparam.is_empty() {
+                        if tparams.is_empty() {
                             return Err(ctx.error(
                                 "generic fn needs a type parameter in its where clause",
                                 span,
                             ));
                         }
                     }
-                    for tn in &constraints {
+                    for (tn, _) in &constraints {
                         if !traits.contains_key(tn) {
                             return Err(
                                 ctx.error(format!("unknown trait '{}' in where clause", tn), span)
@@ -4992,7 +5039,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                         name.clone(),
                         GenericFnDef {
                             name,
-                            tparam,
+                            tparams,
                             constraints,
                             func_params,
                             params: shape.params.clone(),
@@ -5045,7 +5092,8 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
     // (e.g. most of an included stdlib) are never emitted.
     loop {
         if let Some(key) = low.worklist.pop() {
-            let mname = template_fn_name(&key.name, &key.func_args, &key.concrete);
+            let concretes: Vec<String> = key.bindings.iter().map(|(_, c)| c.clone()).collect();
+            let mname = template_fn_name(&key.name, &key.func_args, &concretes);
             if low.emitted.insert(mname) {
                 let fn_form = low.specialize(&key)?;
                 output.push(fn_form);

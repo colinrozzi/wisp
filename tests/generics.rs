@@ -346,6 +346,37 @@ fn test_hof_map_f64() {
     assert_eq!(compile_and_run(&src), 1);
 }
 
+// === Multiple type parameters ================================================
+
+#[test]
+fn test_multi_param_from_values() {
+    // Two type parameters, each inferred from a value argument.
+    let src = "(fn second ((a : T) (b : U)) : U (where T U) b)
+(export (fn test-func () s32 (second (f64.const 1.0) (i32.const 42))))";
+    assert_eq!(compile_and_run(src), 42);
+}
+
+#[test]
+fn test_type_changing_map() {
+    // map : (list T) -> (list U). T is solved from the list; U from the function
+    // argument's return type. Here s32 -> f64.
+    let src = "(fn map-go ((f : (-> T U)) (xs : (list T)) (i : s32) (acc : (list U))) : (list U)
+  (where T U)
+  (if (i32.lt_s i (list-len xs))
+      (map-go f xs (i32.add i (i32.const 1)) (list-push acc (f (list-get xs i))))
+      acc))
+(fn map ((f : (-> T U)) (xs : (list T))) : (list U)
+  (where T U)
+  (map-go f xs (i32.const 0) (list-new U)))
+(fn to-f ((n : s32)) : f64 (f64.convert_i32_s n))
+(fn build () : (list s32)
+  (list-push (list-push (list-new s32) (i32.const 10)) (i32.const 20)))
+(export (fn test-func () s32
+  (if (f64.eq (list-get (map to-f (build)) (i32.const 1)) (f64.const 20.0))
+    (i32.const 1) (i32.const 0))))";
+    assert_eq!(compile_and_run(src), 1);
+}
+
 #[test]
 fn test_hof_fold_with_trait_method() {
     // fold can take a trait method (+) as its function argument; (zero) is the seed.
