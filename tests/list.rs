@@ -162,3 +162,44 @@ fn test_list_reverse_last_element() {
         10
     );
 }
+
+#[test]
+fn test_list_fold() {
+    // fold (+) 0 [10,20,30] = 60 (this is how sum is defined).
+    assert_eq!(
+        compile_and_run(&with_list(
+            "(export (fn test-func () s32 (fold + (zero) (build))))"
+        )),
+        60
+    );
+}
+
+#[test]
+fn test_list_map() {
+    // map double [10,20,30] = [20,40,60]; first element is 20.
+    let src = with_list(
+        "(fn dbl ((n : s32)) : s32 (i32.add n n))
+(export (fn test-func () s32 (list-get (map dbl (build)) (i32.const 0))))",
+    );
+    assert_eq!(compile_and_run(&src), 20);
+}
+
+#[test]
+fn test_list_filter() {
+    // filter (> 15) [10,20,30] = [20,30]; its length is 2.
+    let src = with_list(
+        "(fn is-big ((n : s32)) : s32 (i32.gt_s n (i32.const 15)))
+(export (fn test-func () s32 (length (filter is-big (build)))))",
+    );
+    assert_eq!(compile_and_run(&src), 2);
+}
+
+#[test]
+fn test_list_filter_first_kept() {
+    // filter (> 15) [10,20,30] = [20,30]; first kept element is 20.
+    let src = with_list(
+        "(fn is-big ((n : s32)) : s32 (i32.gt_s n (i32.const 15)))
+(export (fn test-func () s32 (list-get (filter is-big (build)) (i32.const 0))))",
+    );
+    assert_eq!(compile_and_run(&src), 20);
+}

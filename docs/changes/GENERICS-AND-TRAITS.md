@@ -278,6 +278,35 @@ This unlocked real generic algorithms over lists. A recursive `sum` over `(list 
 dispatching per element type and `(zero)` return-dispatching for the base case. Tests:
 `tests/generics.rs` (`test_generic_list_sum_s32`/`_f64`, `test_generic_over_list_*`).
 
+### Higher-order functions via monomorphization (2026-08-13)
+
+Functions can take other functions as arguments, resolved entirely at compile time —
+the same defunctionalization the type system already uses. A parameter typed
+`(-> arg... ret)` is a **function parameter**; its argument at the call site is a
+function *name*, not a runtime value.
+
+`(map inc xs)` specializes `map` for `inc` **and** the element type: it emits
+`map--inc--s32` with the function parameter dropped from the signature and every `(f …)`
+in the body replaced by `(inc …)`. There are no runtime function values, no table, no
+closures — just another monomorphization dimension. The function argument may itself be
+generic (`(map double xs)`) or a trait method (`(fold + (zero) xs)`); it resolves inside
+the specialized, monomorphic copy.
+
+Mechanically: `GenericFnDef` gained `func_params` (the argument positions of function
+parameters) and its type parameter became optional (`""` = none, so a purely
+higher-order function needs no `where`). A template is now anything with a `where`
+clause *or* a function parameter. The specialization key (`SpecKey`) carries the type
+argument and the list of function-name arguments; the mangled name encodes both
+(`map--inc--s32`, `apply-twice--inc`). `specialize` substitutes the type parameter,
+substitutes each function parameter's name with its argument, and drops the function
+parameters. This unlocked `fold`/`map`/`filter` in `std/list.lisp` (`sum` is now
+`(fold + (zero) xs)`). Tests: `tests/generics.rs` (`test_hof_*`), `tests/list.rs`.
+
+Limits: single type parameter, so `map` is `T -> T` (a type-changing `map : (list T) ->
+(list U)` needs a second type parameter). Function arguments must be statically known
+names — no dynamic function values (that would need `funcref`/`call_indirect`, a
+different mechanism).
+
 ### Known limits (next steps)
 
 - **Generic return-type inference is shallow** — inferring the type argument from an

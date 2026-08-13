@@ -195,6 +195,8 @@ Key: Separate *what* to import (interface) from *where* (source).
 ## Language Features
 
 Functions: `(fn name ((param type) ...) return-type body)`
+Generics: a `fn` with a `(where (Trait T) ...)` clause is a template, monomorphized per concrete type. A bare `(where T)` declares an unconstrained type parameter.
+Higher-order functions: a parameter typed `(-> arg... ret)` is a function parameter. The argument is a function *name*, resolved at compile time — `(map f xs)` specializes to `map--f--T` with `f` inlined (defunctionalization; no runtime function values or closures).
 Imports: `(import module func ((param type) ...) return-type)`
 Exports: `(export name)` or `(export (fn ...))`
 **Macros:** `(defmacro name (params...) template)` - define syntactic abstractions

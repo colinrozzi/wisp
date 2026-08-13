@@ -77,9 +77,14 @@ Built on structural unification (see GENERICS-AND-TRAITS.md), a second stdlib mo
 provides generic list functions, monomorphized per element type when used:
 
 - `length` — fully parametric (`(where T)`, no constraint).
-- `sum` — `(where (Add T) (Zero T))`.
+- `fold` / `map` / `filter` — higher-order; take a function argument.
+- `sum` — `(where (Add T) (Zero T))`, defined as `(fold + (zero) xs)`.
 - `contains` — membership by `(where (Eq T))`.
 - `reverse` — parametric; builds a new list.
+
+The higher-order functions are **compile-time specialized**: `(map f xs)` monomorphizes
+`map` for that specific `f` and element type, inlining `f` — no runtime function values.
+So `sum` really is `fold` plus `+`/`zero`, with zero indirection after specialization.
 
 They recurse by index (`list-len` + `list-get`); Wisp lists have no nil/cons pattern
 matching. `std/list.lisp` starts with `(include "num.lisp")` for the numeric traits;

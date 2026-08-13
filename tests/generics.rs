@@ -268,6 +268,96 @@ fn test_generic_over_list_empty_uses_zero() {
     assert_eq!(compile_and_run(&src), 0);
 }
 
+// === Higher-order functions via monomorphization =============================
+
+/// map/fold over `(list T)` taking a function argument, plus an `inc` helper and a
+/// list builder. Function arguments are compile-time; `(map f xs)` specializes to
+/// `map--f--T` with `f` inlined.
+const HOF_DEFS: &str = r#"
+(fn inc ((n : s32)) : s32 (i32.add n (i32.const 1)))
+
+(fn build () : (list s32)
+  (list-push (list-push (list-new s32) (i32.const 10)) (i32.const 20)))
+
+(fn map-go ((f : (-> T T)) (xs : (list T)) (i : s32) (acc : (list T))) : (list T)
+  (where T)
+  (if (i32.lt_s i (list-len xs))
+      (map-go f xs (i32.add i (i32.const 1)) (list-push acc (f (list-get xs i))))
+      acc))
+(fn map ((f : (-> T T)) (xs : (list T))) : (list T)
+  (where T)
+  (map-go f xs (i32.const 0) (list-new T)))
+
+(fn fold-go ((f : (-> T T T)) (xs : (list T)) (i : s32) (acc : T)) : T
+  (where T)
+  (if (i32.lt_s i (list-len xs))
+      (fold-go f xs (i32.add i (i32.const 1)) (f acc (list-get xs i)))
+      acc))
+(fn fold ((f : (-> T T T)) (init : T) (xs : (list T))) : T
+  (where T)
+  (fold-go f xs (i32.const 0) init))
+"#;
+
+fn with_hof(body: &str) -> String {
+    format!("{}\n{}\n{}", PREAMBLE, HOF_DEFS, body)
+}
+
+#[test]
+fn test_hof_apply_twice() {
+    // A monomorphic higher-order function; `f` is a compile-time argument.
+    let src = "(fn inc ((n : s32)) : s32 (i32.add n (i32.const 1)))
+(fn apply-twice ((f : (-> s32 s32)) (x : s32)) : s32 (f (f x)))
+(export (fn test-func () s32 (apply-twice inc (i32.const 40))))";
+    assert_eq!(compile_and_run(src), 42);
+}
+
+#[test]
+fn test_hof_map_inc_first() {
+    // map inc [10,20] = [11,21]; first element is 11.
+    let src = with_hof("(export (fn test-func () s32 (list-get (map inc (build)) (i32.const 0))))");
+    assert_eq!(compile_and_run(&src), 11);
+}
+
+#[test]
+fn test_hof_map_inc_last() {
+    let src = with_hof("(export (fn test-func () s32 (list-get (map inc (build)) (i32.const 1))))");
+    assert_eq!(compile_and_run(&src), 21);
+}
+
+#[test]
+fn test_hof_map_generic_function_argument() {
+    // The function argument may itself be generic: `double` is a generic fn.
+    // map double [10,20] = [20,40]; first element is 20.
+    let src =
+        with_hof("(export (fn test-func () s32 (list-get (map double (build)) (i32.const 0))))");
+    assert_eq!(compile_and_run(&src), 20);
+}
+
+#[test]
+fn test_hof_map_f64() {
+    // The same map monomorphizes at f64 with a f64 function argument.
+    let src = with_hof(
+        "(fn inc-f ((x : f64)) : f64 (f64.add x (f64.const 1.0)))
+(export (fn test-func () s32
+  (let (xs (list-push (list-new f64) (f64.const 41.0)))
+    (if (f64.eq (list-get (map inc-f xs) (i32.const 0)) (f64.const 42.0))
+      (i32.const 1) (i32.const 0)))))",
+    );
+    assert_eq!(compile_and_run(&src), 1);
+}
+
+#[test]
+fn test_hof_fold_with_trait_method() {
+    // fold can take a trait method (+) as its function argument; (zero) is the seed.
+    let src = with_hof(
+        "(fn build3 () : (list s32)
+  (list-push (list-push (list-push (list-new s32)
+    (i32.const 10)) (i32.const 20)) (i32.const 30)))
+(export (fn test-func () s32 (fold + (zero) (build3))))",
+    );
+    assert_eq!(compile_and_run(&src), 60);
+}
+
 // === Trait checker: bad programs must be rejected with a clear message =======
 
 fn compile_error(source: &str) -> String {

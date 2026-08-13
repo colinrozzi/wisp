@@ -16,17 +16,49 @@
   (where T)
   (list-len xs))
 
-; --- sum: Add + Zero ---------------------------------------------------------
+; --- higher-order: fold, map, filter ----------------------------------------
+; Function arguments are compile-time: (fold f init xs) specializes fold for that
+; specific f, inlining it. No runtime function values, no closures.
 
-(fn sum-go ((xs : (list T)) (i : s32) (acc : T)) : T
-  (where (Add T) (Zero T))
+; fold: reduce with a binary function and a seed.
+(fn fold-go ((f : (-> T T T)) (xs : (list T)) (i : s32) (acc : T)) : T
+  (where T)
   (if (i32.lt_s i (list-len xs))
-      (sum-go xs (i32.add i (i32.const 1)) (+ acc (list-get xs i)))
+      (fold-go f xs (i32.add i (i32.const 1)) (f acc (list-get xs i)))
       acc))
+
+(fn fold ((f : (-> T T T)) (init : T) (xs : (list T))) : T
+  (where T)
+  (fold-go f xs (i32.const 0) init))
+
+; map: apply a function to each element (same element type).
+(fn map-go ((f : (-> T T)) (xs : (list T)) (i : s32) (acc : (list T))) : (list T)
+  (where T)
+  (if (i32.lt_s i (list-len xs))
+      (map-go f xs (i32.add i (i32.const 1)) (list-push acc (f (list-get xs i))))
+      acc))
+
+(fn map ((f : (-> T T)) (xs : (list T))) : (list T)
+  (where T)
+  (map-go f xs (i32.const 0) (list-new T)))
+
+; filter: keep the elements a predicate accepts (predicate returns s32: 1 = keep).
+(fn filter-go ((p : (-> T s32)) (xs : (list T)) (i : s32) (acc : (list T))) : (list T)
+  (where T)
+  (if (i32.lt_s i (list-len xs))
+      (filter-go p xs (i32.add i (i32.const 1))
+        (if (p (list-get xs i)) (list-push acc (list-get xs i)) acc))
+      acc))
+
+(fn filter ((p : (-> T s32)) (xs : (list T))) : (list T)
+  (where T)
+  (filter-go p xs (i32.const 0) (list-new T)))
+
+; --- sum: Add + Zero, expressed with fold ------------------------------------
 
 (fn sum ((xs : (list T))) : T
   (where (Add T) (Zero T))
-  (sum-go xs (i32.const 0) (zero)))
+  (fold + (zero) xs))
 
 ; --- contains: membership by Eq ----------------------------------------------
 
