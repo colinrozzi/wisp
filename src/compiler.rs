@@ -3991,10 +3991,10 @@ struct TraitMethodSig {
     ret: SExpr,
 }
 
-/// A declared trait: its type parameter and its method signatures.
+/// A declared trait: its type parameters and its method signatures.
 #[derive(Debug, Clone)]
 struct TraitDef {
-    tparam: String,
+    tparams: Vec<String>,
     methods: Vec<TraitMethodSig>,
 }
 
@@ -4049,11 +4049,11 @@ struct MethodCtx {
 struct Lowering<'a> {
     ctx: &'a CompileContext,
     generics: HashMap<String, GenericFnDef>,
+    traits: HashMap<String, TraitDef>, // trait name -> declaration (type params + sigs)
     method_to_trait: HashMap<String, String>,
-    method_dispatch: HashMap<String, usize>, // method -> param index carrying the type param
     monofn_returns: HashMap<String, String>, // fn name -> scalar return type string
     fn_params: HashMap<String, Vec<Option<String>>>, // concrete fn name -> per-param type strings
-    instances: HashMap<(String, String), HashMap<String, String>>, // (trait,type)->method->fn
+    instances: HashMap<(String, String), HashMap<String, String>>, // (trait, type-key)->method->fn
     instance_defs: HashMap<String, SExpr>,   // instance fn name -> its (renamed) fn form
     used_instances: HashSet<String>,         // instance fn names actually referenced
     instance_worklist: Vec<String>,          // instance fns awaiting emission
@@ -4293,8 +4293,18 @@ fn sanitize_method(m: &str) -> String {
         .collect()
 }
 
-fn instance_fn_name(trait_name: &str, ty: &str, method: &str) -> String {
-    format!("{}--{}--{}", trait_name, sanitize_method(method), ty)
+fn instance_fn_name(trait_name: &str, types: &[String], method: &str) -> String {
+    format!(
+        "{}--{}--{}",
+        trait_name,
+        sanitize_method(method),
+        types.join("--")
+    )
+}
+
+/// The internal map key for an instance: the trait's type arguments, joined.
+fn instance_key(types: &[String]) -> String {
+    types.join(",")
 }
 
 impl<'a> Lowering<'a> {
@@ -4388,6 +4398,68 @@ impl<'a> Lowering<'a> {
             .collect()
     }
 
+    /// Resolve which concrete types a trait-method call uses, one per trait type
+    /// parameter (in declaration order). Bindings come from the argument types, the
+    /// expected type (return-position dispatch), and the enclosing generic's bindings.
+    /// Returns None if any type parameter is left unbound.
+    fn resolve_trait_types(
+        &self,
+        trait_name: &str,
+        method: &str,
+        args: &[SExpr],
+        env: &[(String, String)],
+        expected: Option<&str>,
+        mrc: Option<&MethodCtx>,
+    ) -> Option<Vec<String>> {
+        let tdef = self.traits.get(trait_name)?;
+        let sig = tdef.methods.iter().find(|m| m.name == method)?;
+        let mut bindings: Vec<(String, String)> = Vec::new();
+
+        // From the argument types.
+        for (i, pexpr) in param_type_exprs(&sig.params).iter().enumerate() {
+            if let Some(a) = args.get(i)
+                && let Some(cs) = self.infer_type(a, env)
+                && let Some(ce) = type_str_to_expr(&cs)
+            {
+                unify_types(pexpr, &ce, &tdef.tparams, &mut bindings);
+            }
+        }
+        // From the expected type, against the return type (return-position dispatch).
+        if let Some(exp) = expected
+            && let Some(ee) = type_str_to_expr(exp)
+        {
+            unify_types(&sig.ret, &ee, &tdef.tparams, &mut bindings);
+        }
+        // From the enclosing generic body: a `(where (Trait G) ...)` constraint maps
+        // the generic's type parameter `G` to this (single-parameter) trait's own type
+        // parameter, so we can use `G`'s binding when arguments don't fix it.
+        if let Some(mc) = mrc
+            && tdef.tparams.len() == 1
+            && !bindings.iter().any(|(k, _)| k == &tdef.tparams[0])
+        {
+            for (tn, gtp) in &mc.constraints {
+                if tn == trait_name
+                    && let Some((_, gc)) = mc.bindings.iter().find(|(k, _)| k == gtp)
+                {
+                    bindings.push((tdef.tparams[0].clone(), gc.clone()));
+                    break;
+                }
+            }
+        }
+
+        let types: Vec<String> = tdef
+            .tparams
+            .iter()
+            .filter_map(|tp| {
+                bindings
+                    .iter()
+                    .find(|(k, _)| k == tp)
+                    .map(|(_, c)| c.clone())
+            })
+            .collect();
+        (types.len() == tdef.tparams.len()).then_some(types)
+    }
+
     /// Rewrite a body: resolve trait methods (when `mrc` is set) and generic calls.
     ///
     /// `expected` is the type this expression is used at, flowing *down* from
@@ -4421,72 +4493,36 @@ impl<'a> Lowering<'a> {
                     // type comes from the arguments, the expected type, or (inside a
                     // generic) the type-parameter binding.
                     if let Some(trait_name) = self.method_to_trait.get(head).cloned() {
-                        let mut concrete: Option<String> = None;
-                        // 1. Signature-driven: dispatch on the argument that carries the
-                        //    trait's type parameter.
-                        if let Some(&di) = self.method_dispatch.get(head)
-                            && let Some(a) = items.get(1 + di)
-                            && let Some(t) = self.infer_type(a, env)
-                            && self
-                                .instances
-                                .get(&(trait_name.clone(), t.clone()))
-                                .is_some_and(|m| m.contains_key(head))
-                        {
-                            concrete = Some(t);
-                        }
-                        // 2. Otherwise, any argument whose inferred type has an instance.
-                        if concrete.is_none() {
-                            for a in &items[1..] {
-                                if let Some(t) = self.infer_type(a, env)
-                                    && self
-                                        .instances
-                                        .get(&(trait_name.clone(), t.clone()))
-                                        .is_some_and(|m| m.contains_key(head))
-                                {
-                                    concrete = Some(t);
-                                    break;
-                                }
-                            }
-                        }
-                        // 3. Return-type dispatch: the expected type from context.
-                        if concrete.is_none()
-                            && let Some(exp) = expected.as_deref()
-                            && self
-                                .instances
-                                .get(&(trait_name.clone(), exp.to_string()))
-                                .is_some_and(|m| m.contains_key(head))
-                        {
-                            concrete = Some(exp.to_string());
-                        }
-                        // 4. Fall back to the binding of the type parameter this trait
-                        //    constrains, inside a generic body.
-                        if concrete.is_none()
-                            && let Some(mc) = mrc
-                            && let Some((_, tp)) =
-                                mc.constraints.iter().find(|(tn, _)| *tn == trait_name)
-                            && let Some((_, c)) = mc.bindings.iter().find(|(k, _)| k == tp)
-                        {
-                            concrete = Some(c.clone());
-                        }
-                        let concrete = concrete.ok_or_else(|| {
-                            self.ctx.error(
-                                format!(
-                                    "cannot resolve trait method '{}': no instance matches the argument types or the expected type",
-                                    head
-                                ),
-                                span,
+                        // Bind the trait's type parameters from the argument types, the
+                        // expected type, and (inside a generic) the enclosing bindings.
+                        let types = self
+                            .resolve_trait_types(
+                                &trait_name,
+                                head,
+                                &items[1..],
+                                env,
+                                expected.as_deref(),
+                                mrc,
                             )
-                        })?;
+                            .ok_or_else(|| {
+                                self.ctx.error(
+                                    format!(
+                                        "cannot resolve trait method '{}': no instance matches the argument types or the expected type",
+                                        head
+                                    ),
+                                    span,
+                                )
+                            })?;
                         let fname = self
                             .instances
-                            .get(&(trait_name.clone(), concrete.clone()))
+                            .get(&(trait_name.clone(), instance_key(&types)))
                             .and_then(|m| m.get(head))
                             .cloned()
                             .ok_or_else(|| {
                                 self.ctx.error(
                                     format!(
-                                        "no instance of trait '{}' for type '{}' (method '{}')",
-                                        trait_name, concrete, head
+                                        "no instance of trait '{}' for {:?} (method '{}')",
+                                        trait_name, types, head
                                     ),
                                     span,
                                 )
@@ -4527,14 +4563,24 @@ impl<'a> Lowering<'a> {
                         }
                         // Infer a binding for each type parameter from the arguments.
                         let mut bindings = self.infer_bindings(&genfn, args, env);
-                        // A single-type-parameter template whose result *is* that
-                        // parameter takes its argument from the expected type.
+                        // Any parameter still unbound (e.g. one appearing only in the
+                        // return type) is taken from the expected type, by unifying the
+                        // return type against it.
                         if bindings.len() < genfn.tparams.len()
-                            && genfn.tparams.len() == 1
                             && let Some(exp) = expected.as_deref()
-                            && matches!(&genfn.ret, SExpr::Sym(s, _) if *s == genfn.tparams[0])
+                            && let Some(ee) = type_str_to_expr(exp)
                         {
-                            bindings = vec![(genfn.tparams[0].clone(), exp.to_string())];
+                            unify_types(&genfn.ret, &ee, &genfn.tparams, &mut bindings);
+                            bindings = genfn
+                                .tparams
+                                .iter()
+                                .filter_map(|tp| {
+                                    bindings
+                                        .iter()
+                                        .find(|(k, _)| k == tp)
+                                        .map(|(_, c)| (tp.clone(), c.clone()))
+                                })
+                                .collect();
                         }
                         if bindings.len() < genfn.tparams.len() {
                             return Err(self.ctx.error(
@@ -4798,8 +4844,8 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
     let mut low = Lowering {
         ctx,
         generics: HashMap::new(),
+        traits: HashMap::new(),
         method_to_trait: HashMap::new(),
-        method_dispatch: HashMap::new(),
         monofn_returns: HashMap::new(),
         fn_params: HashMap::new(),
         instances: HashMap::new(),
@@ -4824,12 +4870,23 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
         if head_sym(items) != Some("trait") {
             continue;
         }
-        let (name, tparam) = match items.get(1) {
-            Some(SExpr::List(head, _)) if head.len() == 2 => match (&head[0], &head[1]) {
-                (SExpr::Sym(n, _), SExpr::Sym(t, _)) => (n.clone(), t.clone()),
-                _ => return Err(ctx.error("trait head must be (Name TypeParam)", span)),
-            },
-            _ => return Err(ctx.error("trait expects (trait (Name T) methods...)", span)),
+        // (trait (Name T U ...) methods...)
+        let (name, tparams) = match items.get(1) {
+            Some(SExpr::List(head, _)) if head.len() >= 2 => {
+                let name = match &head[0] {
+                    SExpr::Sym(n, _) => n.clone(),
+                    _ => return Err(ctx.error("trait name must be a symbol", span)),
+                };
+                let mut tparams = Vec::new();
+                for t in &head[1..] {
+                    match t {
+                        SExpr::Sym(tp, _) => tparams.push(tp.clone()),
+                        _ => return Err(ctx.error("trait type parameter must be a symbol", span)),
+                    }
+                }
+                (name, tparams)
+            }
+            _ => return Err(ctx.error("trait expects (trait (Name T ...) methods...)", span)),
         };
         let mut methods = Vec::new();
         for m in &items[2..] {
@@ -4840,23 +4897,17 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
             let sig = parse_method_sig(mi)
                 .ok_or_else(|| ctx.error("malformed trait method signature", span))?;
             low.method_to_trait.insert(sig.name.clone(), name.clone());
-            // Record which parameter carries the trait's type parameter, for dispatch.
-            let ptypes = param_type_exprs(&sig.params);
-            if let Some(di) = ptypes
-                .iter()
-                .position(|t| matches!(t, SExpr::Sym(s, _) if *s == tparam))
-            {
-                low.method_dispatch.insert(sig.name.clone(), di);
-            }
             methods.push(sig);
         }
         if traits
-            .insert(name.clone(), TraitDef { tparam, methods })
+            .insert(name.clone(), TraitDef { tparams, methods })
             .is_some()
         {
             return Err(ctx.error(format!("duplicate trait '{}'", name), span));
         }
     }
+    // Make the trait declarations available during body rewriting (Pass 2/3).
+    low.traits = traits.clone();
 
     // Pass 1: classify every top-level form.
     for form in &forms {
@@ -4870,28 +4921,55 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
         match head_sym(items) {
             Some("trait") => {} // collected in Pass 0
             Some("instance") => {
-                // (instance (Trait Type) (fn method params [:] ret body) ...)
-                let (trait_name, ty) = match items.get(1) {
-                    Some(SExpr::List(head, _)) if head.len() == 2 => {
+                // (instance (Trait Type ...) (fn method params [:] ret body) ...)
+                let (trait_name, types) = match items.get(1) {
+                    Some(SExpr::List(head, _)) if head.len() >= 2 => {
                         let tn = match &head[0] {
                             SExpr::Sym(s, _) => s.clone(),
                             _ => return Err(ctx.error("instance trait must be a symbol", span)),
                         };
-                        let ty = type_expr_string(&head[1]).ok_or_else(|| {
-                            ctx.error("instance type must be a bare type name", span)
-                        })?;
-                        (tn, ty)
+                        let mut types = Vec::new();
+                        for t in &head[1..] {
+                            types.push(canonical_type(t).ok_or_else(|| {
+                                ctx.error("instance type must be a type name", span)
+                            })?);
+                        }
+                        (tn, types)
                     }
                     _ => {
-                        return Err(ctx.error("instance expects (instance (Trait Type) ...)", span));
+                        return Err(
+                            ctx.error("instance expects (instance (Trait Type ...) ...)", span)
+                        );
                     }
                 };
                 let trait_def = traits.get(&trait_name).ok_or_else(|| {
                     ctx.error(format!("unknown trait '{}' in instance", trait_name), span)
                 })?;
-                if !seen_instances.insert((trait_name.clone(), ty.clone())) {
+                if trait_def.tparams.len() != types.len() {
                     return Err(ctx.error(
-                        format!("duplicate instance for ({} {})", trait_name, ty),
+                        format!(
+                            "instance of '{}' has {} type argument(s) but the trait declares {}",
+                            trait_name,
+                            types.len(),
+                            trait_def.tparams.len()
+                        ),
+                        span,
+                    ));
+                }
+                // (type parameter -> instance type) bindings for substitution.
+                let tbindings: Vec<(String, String)> = trait_def
+                    .tparams
+                    .iter()
+                    .cloned()
+                    .zip(types.iter().cloned())
+                    .collect();
+                if !seen_instances.insert((trait_name.clone(), instance_key(&types))) {
+                    return Err(ctx.error(
+                        format!(
+                            "duplicate instance for ({} {})",
+                            trait_name,
+                            types.join(" ")
+                        ),
                         span,
                     ));
                 }
@@ -4918,10 +4996,10 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                                 span,
                             )
                         })?;
-                    // Its signature must match the trait's, with the type parameter
-                    // substituted by this instance's type.
-                    let want_params = subst_type(&tsig.params, &trait_def.tparam, &ty);
-                    let want_ret = subst_type(&tsig.ret, &trait_def.tparam, &ty);
+                    // Its signature must match the trait's, with the type parameters
+                    // substituted by this instance's types.
+                    let want_params = subst_types(&tsig.params, &tbindings);
+                    let want_ret = subst_types(&tsig.ret, &tbindings);
                     let want_pt = param_type_exprs(&want_params);
                     let got_pt = param_type_exprs(shape.params);
                     if want_pt.len() != got_pt.len()
@@ -4930,7 +5008,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                         return Err(ctx.error(
                             format!(
                                 "instance ({} {}) method '{}' has parameter types that do not match trait '{}'",
-                                trait_name, ty, method, trait_name
+                                trait_name, types.join(" "), method, trait_name
                             ),
                             span,
                         ));
@@ -4939,7 +5017,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                         return Err(ctx.error(
                             format!(
                                 "instance ({} {}) method '{}' has a return type that does not match trait '{}'",
-                                trait_name, ty, method, trait_name
+                                trait_name, types.join(" "), method, trait_name
                             ),
                             span,
                         ));
@@ -4948,12 +5026,14 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                         return Err(ctx.error(
                             format!(
                                 "instance ({} {}) defines method '{}' more than once",
-                                trait_name, ty, method
+                                trait_name,
+                                types.join(" "),
+                                method
                             ),
                             span,
                         ));
                     }
-                    let fname = instance_fn_name(&trait_name, &ty, &method);
+                    let fname = instance_fn_name(&trait_name, &types, &method);
                     // Emit the instance method as a plain concrete fn (same shape, renamed).
                     if let Some(rt) = canonical_type(shape.ret) {
                         low.monofn_returns.insert(fname.clone(), rt);
@@ -4966,7 +5046,7 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                     low.instance_defs
                         .insert(fname.clone(), SExpr::List(new_mi, span.clone()));
                     low.instances
-                        .entry((trait_name.clone(), ty.clone()))
+                        .entry((trait_name.clone(), instance_key(&types)))
                         .or_default()
                         .insert(method, fname);
                 }
@@ -4976,7 +5056,9 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                         return Err(ctx.error(
                             format!(
                                 "instance ({} {}) is missing method '{}'",
-                                trait_name, ty, s.name
+                                trait_name,
+                                types.join(" "),
+                                s.name
                             ),
                             span,
                         ));
@@ -5008,15 +5090,24 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                             if let SExpr::Sym(tp, _) = c {
                                 note_tparam(tp, &mut tparams);
                             } else if let SExpr::List(cc, _) = c
-                                && cc.len() == 2
-                                && let (SExpr::Sym(tn, _), SExpr::Sym(tp, _)) = (&cc[0], &cc[1])
+                                && cc.len() >= 2
+                                && let SExpr::Sym(tn, _) = &cc[0]
+                                && cc[1..].iter().all(|x| matches!(x, SExpr::Sym(..)))
                             {
-                                // A trait bound: (Trait T).
-                                constraints.push((tn.clone(), tp.clone()));
-                                note_tparam(tp, &mut tparams);
+                                // A trait bound: (Trait T ...). All named type
+                                // parameters are declared; the constraint is recorded
+                                // against the first (used for single-parameter dispatch).
+                                for x in &cc[1..] {
+                                    if let SExpr::Sym(tp, _) = x {
+                                        note_tparam(tp, &mut tparams);
+                                    }
+                                }
+                                if let SExpr::Sym(tp, _) = &cc[1] {
+                                    constraints.push((tn.clone(), tp.clone()));
+                                }
                             } else {
                                 return Err(ctx.error(
-                                    "where clause entry must be a type parameter or (Trait TypeParam)",
+                                    "where clause entry must be a type parameter or (Trait TypeParam ...)",
                                     span,
                                 ));
                             }

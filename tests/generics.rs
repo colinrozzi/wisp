@@ -377,6 +377,76 @@ fn test_type_changing_map() {
     assert_eq!(compile_and_run(src), 1);
 }
 
+// === Multi-parameter traits ==================================================
+
+/// A two-parameter conversion trait with two instances that share the input type,
+/// so the *expected* type must choose between them.
+const CONVERT_DEFS: &str = r#"
+(trait (Convert T U) (fn convert ((x : T)) : U))
+(instance (Convert s32 f64) (fn convert ((x : s32)) : f64 (f64.convert_i32_s x)))
+(instance (Convert s32 s64) (fn convert ((x : s32)) : s64 (i64.extend_i32_s x)))
+"#;
+
+#[test]
+fn test_multi_trait_convert_to_f64() {
+    // (convert 42) resolves to Convert s32 f64 because the context expects f64.
+    let src = format!(
+        "{}
+(export (fn test-func () s32
+  (if (f64.eq (convert (i32.const 42)) (f64.const 42.0)) (i32.const 1) (i32.const 0))))",
+        CONVERT_DEFS
+    );
+    assert_eq!(compile_and_run(&src), 1);
+}
+
+#[test]
+fn test_multi_trait_convert_to_s64() {
+    // The same call resolves to Convert s32 s64 in an s64 context.
+    let src = format!(
+        "{}
+(export (fn test-func () s32
+  (if (i64.eq (convert (i32.const 42)) (i64.const 42)) (i32.const 1) (i32.const 0))))",
+        CONVERT_DEFS
+    );
+    assert_eq!(compile_and_run(&src), 1);
+}
+
+#[test]
+fn test_multi_trait_convert_ascription() {
+    // An ascription supplies the output type directly.
+    let src = format!(
+        "{}
+(export (fn test-func () s32 (i64.eq ((convert (i32.const 7)) : s64) (i64.const 7))))",
+        CONVERT_DEFS
+    );
+    assert_eq!(compile_and_run(&src), 1);
+}
+
+#[test]
+fn test_multi_trait_ambiguous_is_rejected() {
+    // With no expected type, U cannot be chosen between the two instances.
+    let src = format!(
+        "{}
+(export (fn test-func () s32 (let (x (convert (i32.const 1))) (i32.const 0))))",
+        CONVERT_DEFS
+    );
+    let err = compile_error(&src);
+    assert!(err.contains("cannot resolve trait method"), "got: {err}");
+}
+
+#[test]
+fn test_generic_constrained_by_multi_trait() {
+    // A generic over (T, U) constrained by a multi-parameter trait.
+    let src = format!(
+        "{}
+(fn widen ((x : T)) : U (where (Convert T U)) (convert x))
+(export (fn test-func () s32
+  (if (f64.eq (widen (i32.const 42)) (f64.const 42.0)) (i32.const 1) (i32.const 0))))",
+        CONVERT_DEFS
+    );
+    assert_eq!(compile_and_run(&src), 1);
+}
+
 #[test]
 fn test_hof_fold_with_trait_method() {
     // fold can take a trait method (+) as its function argument; (zero) is the seed.

@@ -324,8 +324,30 @@ multi-parameter forms (`unify_types`/`subst_types`).
 
 Limits: a type-changing `map` needs its function argument to be a **monomorphic**
 function (so its signature is concrete); a generic function argument would need to be
-specialized at the inferred `T` first (not done). Multi-parameter *traits* (e.g.
-`(trait (Convert T U) ...)`) are still single-parameter — deferred.
+specialized at the inferred `T` first (not done).
+
+### Multi-parameter traits (2026-08-14)
+
+Traits may declare several type parameters, e.g. a conversion:
+
+```lisp
+(trait (Convert T U) (fn convert ((x : T)) : U))
+(instance (Convert s32 f64) (fn convert ((x : s32)) : f64 (f64.convert_i32_s x)))
+(instance (Convert s32 s64) (fn convert ((x : s32)) : s64 (i64.extend_i32_s x)))
+```
+
+Method resolution was unified into `resolve_trait_types`, which binds *each* of a
+trait's type parameters from three sources — the argument types, the **expected** type
+(unified against the method's return type), and the enclosing generic's bindings — then
+looks the instance up by the full type tuple. So `(convert 42)` resolves to
+`Convert s32 f64` in an f64 context and `Convert s32 s64` in an s64 context; with no
+context it is correctly rejected as ambiguous. A generic may be constrained by a
+multi-parameter trait: `(fn widen ((x : T)) : U (where (Convert T U)) (convert x))`.
+
+`TraitDef.tparam` became `tparams`; instances are keyed by the type tuple
+(`Convert--convert--s32--f64`); the old per-method dispatch-index table was removed in
+favour of full structural resolution. Tests: `tests/generics.rs::test_multi_trait_*`,
+`test_generic_constrained_by_multi_trait`.
 
 ### Known limits (next steps)
 
