@@ -406,6 +406,9 @@ pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result
     let macros = collect_macros(&forms);
     let expanded_forms = expand_all_macros(forms, &macros);
 
+    // Compile-time deriving: `(derive Trait Type)` -> a generated trait instance.
+    let expanded_forms = expand_derives(expanded_forms, &ctx)?;
+
     // Lower traits / instances / generics to plain monomorphic forms.
     let expanded_forms = expand_generics(expanded_forms, &ctx)?;
 
@@ -4840,6 +4843,144 @@ impl<'a> Lowering<'a> {
 }
 
 /// Lower traits/instances/generics to plain monomorphic forms.
+/// The primitive equality instruction for a scalar type, or None if not scalar.
+fn scalar_eq_instr(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "s32" | "u8" => "i32.eq",
+        "s64" => "i64.eq",
+        "f32" => "f32.eq",
+        "f64" => "f64.eq",
+        _ => return None,
+    })
+}
+
+/// Generate an `(instance (Eq Type) ...)` that compares a record field by field.
+fn derive_eq_record(
+    trait_name: &str,
+    type_name: &str,
+    fields: &[(String, String)],
+    span: &Span,
+    ctx: &CompileContext,
+) -> Result<SExpr> {
+    let sym = |s: &str| SExpr::Sym(s.to_string(), span.clone());
+    let list = |v: Vec<SExpr>| SExpr::List(v, span.clone());
+
+    // One comparison per field: (<eq> (Type.field a) (Type.field b)).
+    let mut cmps = Vec::new();
+    for (fname, fty) in fields {
+        let eq = scalar_eq_instr(fty).ok_or_else(|| {
+            ctx.error(
+                format!(
+                    "cannot derive Eq for '{}': field '{}' has non-scalar type '{}'",
+                    type_name, fname, fty
+                ),
+                span,
+            )
+        })?;
+        let accessor = format!("{}.{}", type_name, fname);
+        cmps.push(list(vec![
+            sym(eq),
+            list(vec![sym(&accessor), sym("a")]),
+            list(vec![sym(&accessor), sym("b")]),
+        ]));
+    }
+    // Combine with i32.and (an empty record is always equal).
+    let body = cmps
+        .into_iter()
+        .reduce(|acc, c| list(vec![sym("i32.and"), acc, c]))
+        .unwrap_or_else(|| SExpr::Int {
+            value: 1,
+            ty: Type::S32,
+            span: span.clone(),
+        });
+
+    let param = |n: &str| list(vec![sym(n), sym(":"), sym(type_name)]);
+    let method = list(vec![
+        sym("fn"),
+        sym("="),
+        list(vec![param("a"), param("b")]),
+        sym(":"),
+        sym("s32"),
+        body,
+    ]);
+    Ok(list(vec![
+        sym("instance"),
+        list(vec![sym(trait_name), sym(type_name)]),
+        method,
+    ]))
+}
+
+/// Compile-time deriving: `(derive Trait Type)` inspects Type's definition and emits a
+/// trait instance. Runs after macro expansion and before the generics pre-pass, so the
+/// generated instance flows through the normal trait pipeline. This is the first
+/// "type-aware macro": it reflects on a type's structure to generate code.
+fn expand_derives(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>> {
+    // Collect record shapes: name -> [(field, canonical type)].
+    let mut records: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for form in &forms {
+        if let SExpr::List(items, _) = form
+            && head_sym(items) == Some("record")
+            && let Some(SExpr::Sym(name, _)) = items.get(1)
+        {
+            let mut fields = Vec::new();
+            for f in &items[2..] {
+                if let SExpr::List(fd, _) = f
+                    && let Some(SExpr::Sym(fname, _)) = fd.first()
+                    && let Some(fty) = fd.get(1).and_then(canonical_type)
+                {
+                    fields.push((fname.clone(), fty));
+                }
+            }
+            records.insert(name.clone(), fields);
+        }
+    }
+
+    let mut out = Vec::new();
+    for form in forms {
+        let is_derive = matches!(&form, SExpr::List(items, _) if head_sym(items) == Some("derive"));
+        if !is_derive {
+            out.push(form);
+            continue;
+        }
+        let (items, span) = match &form {
+            SExpr::List(i, s) => (i, s),
+            _ => unreachable!(),
+        };
+        let trait_name = match items.get(1) {
+            Some(SExpr::Sym(s, _)) => s.clone(),
+            _ => return Err(ctx.error("derive expects (derive Trait Type)", span)),
+        };
+        let type_name = match items.get(2) {
+            Some(SExpr::Sym(s, _)) => s.clone(),
+            _ => return Err(ctx.error("derive expects (derive Trait Type)", span)),
+        };
+        match trait_name.as_str() {
+            "Eq" => {
+                let fields = records.get(&type_name).ok_or_else(|| {
+                    ctx.error(
+                        format!(
+                            "cannot derive Eq for '{}': not a record (variant deriving is not yet supported)",
+                            type_name
+                        ),
+                        span,
+                    )
+                })?;
+                out.push(derive_eq_record(
+                    &trait_name,
+                    &type_name,
+                    fields,
+                    span,
+                    ctx,
+                )?);
+            }
+            other => {
+                return Err(ctx.error(format!("cannot derive '{}' (supported: Eq)", other), span));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>> {
     let mut low = Lowering {
         ctx,

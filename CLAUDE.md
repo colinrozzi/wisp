@@ -200,6 +200,7 @@ Higher-order functions: a parameter typed `(-> arg... ret)` is a function parame
 Imports: `(import module func ((param type) ...) return-type)`
 Exports: `(export name)` or `(export (fn ...))`
 **Traits/instances:** `(trait (Name T ...) (fn method (params) : ret) ...)` declares an interface over one or more type parameters; `(instance (Name Type ...) (fn method ... body) ...)` implements it. Methods resolve at compile time (monomorphized); the expected type disambiguates return-typed methods.
+**Deriving:** `(derive Trait Type)` reflects on a record's fields to generate a trait instance at compile time (e.g. `(derive Eq point)`). The first type-aware macro; per-trait generators, `Eq` supported. See docs/changes/DERIVING.md.
 **Macros:** `(defmacro name (params...) template)` - define syntactic abstractions
 **Quasiquote:** `` `expr `` - quote template, `,expr` - unquote, `,@expr` - splice
 **Globals:** `(global $name type mut|const init-value)` - module-level mutable/immutable state
