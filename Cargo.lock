@@ -2184,6 +2184,7 @@ dependencies = [
 [[package]]
 name = "pack"
 version = "0.2.0"
+source = "git+https://github.com/colinrozzi/pack.git?tag=v0.2.0#2e141a093ed43a5b6dd7a28541c56b33a66ecc9c"
 dependencies = [
  "anyhow",
  "clap",
@@ -2200,6 +2201,37 @@ dependencies = [
 [[package]]
 name = "pack-abi"
 version = "0.1.0"
+source = "git+https://github.com/colinrozzi/pack.git?tag=v0.2.0#2e141a093ed43a5b6dd7a28541c56b33a66ecc9c"
+dependencies = [
+ "hashbrown 0.14.5",
+ "serde",
+ "sha2",
+]
+
+[[package]]
+name = "packr"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a492ddbfd29808526bc26a4b5f6d872cdaca65e02473562ce14e5d4138a336"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "packr-abi",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "wasmparser 0.219.2",
+ "wasmtime 27.0.0",
+]
+
+[[package]]
+name = "packr-abi"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60b480c91d6f4b89705f3957f05850d0a2be9fcf44a59d926cf496cff66a0155"
 dependencies = [
  "hashbrown 0.14.5",
  "serde",
@@ -3113,9 +3145,10 @@ dependencies = [
 
 [[package]]
 name = "theater"
-version = "0.3.0"
+version = "0.3.29"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "axum-server",
  "base64 0.21.7",
@@ -3129,8 +3162,8 @@ dependencies = [
  "lazy_static",
  "libc",
  "md5",
- "pack",
- "pack-abi",
+ "packr",
+ "packr-abi",
  "pin-utils",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
@@ -3140,6 +3173,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "theater-chain",
  "thiserror 1.0.69",
  "tokio",
@@ -3155,15 +3189,17 @@ dependencies = [
 
 [[package]]
 name = "theater-chain"
-version = "0.3.0"
+version = "0.3.11"
 dependencies = [
  "base64 0.21.7",
  "bytes",
  "chrono",
+ "console",
  "futures",
  "hex",
  "lazy_static",
  "md5",
+ "packr",
  "pin-utils",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
@@ -3178,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-message-server"
-version = "0.3.0"
+version = "0.3.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3193,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-runtime"
-version = "0.3.0"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3207,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-store"
-version = "0.3.0"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3222,7 +3258,7 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-supervisor"
-version = "0.3.0"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "chrono",

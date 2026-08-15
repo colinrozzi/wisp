@@ -27,16 +27,21 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use pack::compose::StaticComposer;
 use tracing::{error, info};
 
 // Theater integration
-use theater::config::actor_manifest::{RuntimeHostConfig, StoreHandlerConfig, SupervisorHostConfig};
+use theater::config::actor_manifest::{
+    ManifestConfig, RuntimeHostConfig, StoreHandlerConfig, SupervisorHostConfig,
+};
 use theater::handler::HandlerRegistry;
 use theater::messages::{ActorMessage, ActorRequest, MessageCommand, TheaterCommand};
+use theater::pack_bridge::Value;
 use theater::theater_runtime::TheaterRuntime;
+use theater::utils::ResourceCache;
 use theater_handler_message_server::{MessageRouter, MessageServerHandler};
 use theater_handler_runtime::RuntimeHandler;
 use theater_handler_store::StoreHandler;
@@ -108,7 +113,11 @@ async fn run_theater_repl(actor_path: &PathBuf) -> Result<()> {
             "compile-source",
         )
         // Export all the actor interfaces from repl
-        .export("theater:simple/actor.init", "repl", "theater:simple/actor.init")
+        .export(
+            "theater:simple/actor.init",
+            "repl",
+            "theater:simple/actor.init",
+        )
         .export(
             "theater:simple/message-server-client.handle-send",
             "repl",
@@ -131,9 +140,15 @@ async fn run_theater_repl(actor_path: &PathBuf) -> Result<()> {
     let message_router = MessageRouter::new();
     let handler_registry = create_handler_registry(theater_tx.clone(), message_router.clone());
 
-    let mut runtime = TheaterRuntime::new(theater_tx.clone(), theater_rx, None, handler_registry)
-        .await
-        .context("Failed to create Theater runtime")?;
+    let mut runtime = TheaterRuntime::new(
+        theater_tx.clone(),
+        theater_rx,
+        None,
+        handler_registry,
+        Arc::new(ResourceCache::new()),
+    )
+    .await
+    .context("Failed to create Theater runtime")?;
 
     // Start the runtime in a background task
     let runtime_handle = tokio::spawn(async move {
@@ -169,13 +184,16 @@ type = "store"
     info!("Spawning REPL actor...");
     let (response_tx, response_rx) = oneshot::channel();
 
+    let manifest_config =
+        ManifestConfig::from_str(manifest).context("Failed to parse REPL manifest")?;
+
     theater_tx
         .send(TheaterCommand::SpawnActor {
-            manifest_path: manifest.to_string(),
-            wasm_bytes: Some(composed_wasm),
-            init_bytes: None,
+            wasm_bytes: composed_wasm,
+            name: Some("composed-repl".to_string()),
+            manifest: Some(manifest_config),
+            init_state: Value::Tuple(vec![]),
             response_tx,
-            parent_id: None,
             supervisor_tx: None,
             subscription_tx: None,
         })
@@ -344,10 +362,17 @@ fn create_handler_registry(
 
     // Runtime handler - provides actor runtime information and control
     let runtime_config = RuntimeHostConfig {};
-    registry.register(RuntimeHandler::new(runtime_config, theater_tx.clone(), None));
+    registry.register(RuntimeHandler::new(
+        runtime_config,
+        theater_tx.clone(),
+        None,
+    ));
 
     // Store handler - provides key-value storage for actors
-    let store_config = StoreHandlerConfig {};
+    let store_config = StoreHandlerConfig {
+        base_path: None,
+        store_id: None,
+    };
     registry.register(StoreHandler::new(store_config, None));
 
     // Supervisor handler - allows actors to spawn and manage child actors

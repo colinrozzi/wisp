@@ -21,13 +21,14 @@ use std::pin::Pin;
 
 use tracing::info;
 
-use theater::actor::handle::ActorHandle;
 use theater::actor::store::ActorStore;
-use theater::handler::{Handler, HandlerContext, SharedActorInstance};
+use theater::handler::{Handler, HandlerContext, HandlerEventReceiver};
 use theater::shutdown::ShutdownReceiver;
 
 // Pack integration
-use theater::pack_bridge::{Ctx, HostLinkerBuilder, InterfaceImpl, LinkerError, TypeHash, Value, ValueType};
+use theater::pack_bridge::{
+    Ctx, HostLinkerBuilder, InterfaceImpl, LinkerError, TypeHash, Value, ValueType,
+};
 
 // Pack composition and metadata
 use pack::compose::StaticComposer;
@@ -71,7 +72,10 @@ fn detect_expr_type(expr: &str) -> &'static str {
 
     // Check for numeric literals with type suffixes
     // e.g., "42s64", "3.14f32"
-    if let Some(first_token) = expr.strip_prefix('(').and_then(|s| s.split_whitespace().next()) {
+    if let Some(first_token) = expr
+        .strip_prefix('(')
+        .and_then(|s| s.split_whitespace().next())
+    {
         if first_token.ends_with("s64") || first_token.ends_with("i64") {
             return "s64";
         }
@@ -99,7 +103,9 @@ fn detect_expr_type(expr: &str) -> &'static str {
 fn assembler_interface() -> InterfaceImpl {
     InterfaceImpl::new("wisp:assembler/runtime")
         .func("wat-to-wasm", |_: String| -> Option<Vec<u8>> { None })
-        .func("eval-wasm", |_: Vec<u8>| -> Result<Vec<u8>, String> { Err(String::new()) })
+        .func("eval-wasm", |_: Vec<u8>| -> Result<Vec<u8>, String> {
+            Err(String::new())
+        })
 }
 
 /// Build the interface declaration for `wisp:repl/helpers`.
@@ -109,8 +115,13 @@ fn assembler_interface() -> InterfaceImpl {
 /// - `parse-and-wrap`: (String, Vec<u8>) -> Result<String, String>
 fn helpers_interface() -> InterfaceImpl {
     InterfaceImpl::new("wisp:repl/helpers")
-        .func("wrap-expression", |_: (String, Vec<u8>)| -> String { String::new() })
-        .func("parse-and-wrap", |_: (String, Vec<u8>)| -> Result<String, String> { Err(String::new()) })
+        .func("wrap-expression", |_: (String, Vec<u8>)| -> String {
+            String::new()
+        })
+        .func(
+            "parse-and-wrap",
+            |_: (String, Vec<u8>)| -> Result<String, String> { Err(String::new()) },
+        )
 }
 
 /// Build the interface declaration for `wisp:compose/packages`.
@@ -118,10 +129,10 @@ fn helpers_interface() -> InterfaceImpl {
 /// Functions:
 /// - `compose-packages`: (Vec<u8>, (String, Vec<u8>)) -> Result<Vec<u8>, String>
 fn compose_interface() -> InterfaceImpl {
-    InterfaceImpl::new("wisp:compose/packages")
-        .func("compose-packages", |_: (Vec<u8>, (String, Vec<u8>))| -> Result<Vec<u8>, String> {
-            Err(String::new())
-        })
+    InterfaceImpl::new("wisp:compose/packages").func(
+        "compose-packages",
+        |_: (Vec<u8>, (String, Vec<u8>))| -> Result<Vec<u8>, String> { Err(String::new()) },
+    )
 }
 
 /// Build the interface declaration for `wisp:filesystem/runtime`.
@@ -130,7 +141,9 @@ fn compose_interface() -> InterfaceImpl {
 /// - `read-file`: String -> Result<Vec<u8>, String>
 fn filesystem_interface() -> InterfaceImpl {
     InterfaceImpl::new("wisp:filesystem/runtime")
-        .func("read-file", |_: String| -> Result<Vec<u8>, String> { Err(String::new()) })
+        .func("read-file", |_: String| -> Result<Vec<u8>, String> {
+            Err(String::new())
+        })
 }
 
 /// Build the interface declaration for `wisp:imports/metadata`.
@@ -138,10 +151,10 @@ fn filesystem_interface() -> InterfaceImpl {
 /// Functions:
 /// - `get-package-exports`: Vec<u8> -> Result<Vec<String>, String>
 fn metadata_interface() -> InterfaceImpl {
-    InterfaceImpl::new("wisp:imports/metadata")
-        .func("get-package-exports", |_: Vec<u8>| -> Result<Vec<String>, String> {
-            Err(String::new())
-        })
+    InterfaceImpl::new("wisp:imports/metadata").func(
+        "get-package-exports",
+        |_: Vec<u8>| -> Result<Vec<String>, String> { Err(String::new()) },
+    )
 }
 
 // ============================================================================
@@ -195,7 +208,12 @@ impl Handler for WispHandler {
 
     fn imports(&self) -> Option<Vec<String>> {
         // Derive imports from interface declarations
-        Some(self.interfaces().iter().map(|i| i.name().to_string()).collect())
+        Some(
+            self.interfaces()
+                .iter()
+                .map(|i| i.name().to_string())
+                .collect(),
+        )
     }
 
     fn exports(&self) -> Option<Vec<String>> {
@@ -213,11 +231,13 @@ impl Handler for WispHandler {
         true
     }
 
-    fn start(
+    // The Handler trait replaced `start` with a synchronous `init` plus an async `run`.
+    // This handler only needs the long-running loop, so it overrides `run` (init stays
+    // the default no-op) and waits for shutdown.
+    fn run(
         &mut self,
-        _actor_handle: ActorHandle,
-        _actor_instance: SharedActorInstance,
         shutdown_receiver: ShutdownReceiver,
+        _event_rx: HandlerEventReceiver,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
         info!("Starting Wisp handler");
 
@@ -455,28 +475,29 @@ impl Handler for WispHandler {
                     "wrap-expression",
                     |_ctx: &mut Ctx<'_, ActorStore>, input: Value| {
                         // Input is tuple<string, list<u8>> - (request-id, body-bytes)
-                        let body_bytes: Vec<u8> = match &input {
-                            Value::Tuple(items) if items.len() >= 2 => match &items[1] {
-                                Value::List { items, .. } => items
-                                    .iter()
-                                    .filter_map(|v| {
-                                        if let Value::U8(b) = v {
-                                            Some(*b)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect(),
+                        let body_bytes: Vec<u8> =
+                            match &input {
+                                Value::Tuple(items) if items.len() >= 2 => match &items[1] {
+                                    Value::List { items, .. } => items
+                                        .iter()
+                                        .filter_map(|v| {
+                                            if let Value::U8(b) = v {
+                                                Some(*b)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect(),
+                                    _ => {
+                                        info!("[WRAP] Expected list<u8> as second tuple element");
+                                        return Value::String(String::new());
+                                    }
+                                },
                                 _ => {
-                                    info!("[WRAP] Expected list<u8> as second tuple element");
+                                    info!("[WRAP] Expected tuple with request-id and body");
                                     return Value::String(String::new());
                                 }
-                            },
-                            _ => {
-                                info!("[WRAP] Expected tuple with request-id and body");
-                                return Value::String(String::new());
-                            }
-                        };
+                            };
 
                         let expr = String::from_utf8_lossy(&body_bytes).to_string();
                         info!("[WRAP] Expression: {}", expr);
@@ -510,16 +531,18 @@ impl Handler for WispHandler {
                         // Extract body bytes from input
                         let body_bytes: Vec<u8> = match &input {
                             Value::Tuple(items) if items.len() >= 2 => match &items[1] {
-                                Value::List { items, .. } => items
-                                    .iter()
-                                    .filter_map(|v| {
-                                        if let Value::U8(b) = v {
-                                            Some(*b)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect(),
+                                Value::List { items, .. } => {
+                                    items
+                                        .iter()
+                                        .filter_map(|v| {
+                                            if let Value::U8(b) = v {
+                                                Some(*b)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect()
+                                }
                                 _ => {
                                     return Value::Result {
                                         ok_type: ok_type.clone(),
@@ -552,7 +575,10 @@ impl Handler for WispHandler {
                         let mut import_declarations = String::new();
 
                         for (interface, path) in &imports {
-                            info!("[PARSE-AND-WRAP] Processing import: {} from {}", interface, path);
+                            info!(
+                                "[PARSE-AND-WRAP] Processing import: {} from {}",
+                                interface, path
+                            );
 
                             // Read the WASM file
                             let resolved_path = if Path::new(path).is_absolute() {
@@ -587,7 +613,11 @@ impl Handler for WispHandler {
                                 }
                             };
 
-                            info!("[PARSE-AND-WRAP] Loaded {} bytes from {}", wasm_bytes.len(), resolved_path);
+                            info!(
+                                "[PARSE-AND-WRAP] Loaded {} bytes from {}",
+                                wasm_bytes.len(),
+                                resolved_path
+                            );
 
                             // Get export metadata
                             let runtime = Runtime::new();
@@ -635,7 +665,9 @@ impl Handler for WispHandler {
                                     let params = sig
                                         .params
                                         .iter()
-                                        .map(|p| format!("({} {})", p.name, type_desc_to_wisp(&p.ty)))
+                                        .map(|p| {
+                                            format!("({} {})", p.name, type_desc_to_wisp(&p.ty))
+                                        })
                                         .collect::<Vec<_>>()
                                         .join(" ");
 
@@ -741,10 +773,13 @@ impl Handler for WispHandler {
                                                 .collect(),
                                             _ => {
                                                 return Value::Result {
-                                                    ok_type: ValueType::List(Box::new(ValueType::U8)),
+                                                    ok_type: ValueType::List(Box::new(
+                                                        ValueType::U8,
+                                                    )),
                                                     err_type: ValueType::String,
                                                     value: Err(Box::new(Value::String(
-                                                        "Expected list<u8> in params tuple".to_string(),
+                                                        "Expected list<u8> in params tuple"
+                                                            .to_string(),
                                                     ))),
                                                 };
                                             }
@@ -766,7 +801,8 @@ impl Handler for WispHandler {
                                             ok_type: ValueType::List(Box::new(ValueType::U8)),
                                             err_type: ValueType::String,
                                             value: Err(Box::new(Value::String(
-                                                "Expected tuple or list<u8> for original input".to_string(),
+                                                "Expected tuple or list<u8> for original input"
+                                                    .to_string(),
                                             ))),
                                         };
                                     }
@@ -843,7 +879,12 @@ impl Handler for WispHandler {
                                 }
                             };
 
-                            info!("[COMPOSE] Loaded {} bytes from {} for interface {}", wasm_bytes.len(), resolved_path, interface);
+                            info!(
+                                "[COMPOSE] Loaded {} bytes from {} for interface {}",
+                                wasm_bytes.len(),
+                                resolved_path,
+                                interface
+                            );
                             deps.push((interface.clone(), wasm_bytes));
                         }
 
@@ -868,7 +909,10 @@ impl Handler for WispHandler {
                         // Add dependency modules
                         for (idx, (interface, wasm)) in deps.iter().enumerate() {
                             let dep_name = format!("dep{}", idx);
-                            info!("[COMPOSE] Adding dep '{}' for interface '{}'", dep_name, interface);
+                            info!(
+                                "[COMPOSE] Adding dep '{}' for interface '{}'",
+                                dep_name, interface
+                            );
 
                             composer = match composer.add_module(&dep_name, wasm.clone()) {
                                 Ok(c) => c,
@@ -981,7 +1025,11 @@ impl Handler for WispHandler {
 
                         match fs::read(&resolved_path) {
                             Ok(bytes) => {
-                                info!("[READ-FILE] Success: {} bytes from {}", bytes.len(), resolved_path);
+                                info!(
+                                    "[READ-FILE] Success: {} bytes from {}",
+                                    bytes.len(),
+                                    resolved_path
+                                );
                                 let values: Vec<Value> = bytes.into_iter().map(Value::U8).collect();
                                 Value::Result {
                                     ok_type: ValueType::List(Box::new(ValueType::U8)),
@@ -1022,13 +1070,7 @@ impl Handler for WispHandler {
                         let wasm_bytes: Vec<u8> = match input {
                             Value::List { items, .. } => items
                                 .into_iter()
-                                .filter_map(|v| {
-                                    if let Value::U8(b) = v {
-                                        Some(b)
-                                    } else {
-                                        None
-                                    }
-                                })
+                                .filter_map(|v| if let Value::U8(b) = v { Some(b) } else { None })
                                 .collect(),
                             _ => {
                                 return Value::Result {
@@ -1124,10 +1166,7 @@ impl Handler for WispHandler {
                             })
                             .collect();
 
-                        info!(
-                            "[GET-EXPORTS] Found {} exports",
-                            export_strings.len()
-                        );
+                        info!("[GET-EXPORTS] Found {} exports", export_strings.len());
 
                         Value::Result {
                             ok_type: ValueType::List(Box::new(ValueType::String)),

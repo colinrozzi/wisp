@@ -131,7 +131,7 @@ fn eval_expr(expr: &str, state: &ReplState, runtime: &Runtime) -> anyhow::Result
 
     // Call eval with no arguments (empty tuple)
     let input = PackValue::Tuple(vec![]);
-    let output = instance.call_with_value("eval", &input, 0)?;
+    let output = instance.call_with_value("eval", &input)?;
 
     // Convert Pack Value to our Value
     pack_to_repl_value(&output)
