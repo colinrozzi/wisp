@@ -16,7 +16,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock as SyncRwLock;
+use tokio::sync::RwLock as SyncRwLock;
 
 use anyhow::{Context, Result};
 use theater::actor::handle::ActorHandle;
@@ -28,7 +28,10 @@ use theater::pack_bridge::{AsyncRuntime, Ctx, PackInstance, Value};
 use theater::ValueType;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{
+    Config, Engine, Global, GlobalType, Instance, Linker, Memory, MemoryType, Module, Mutability,
+    Store, Val, ValType,
+};
 
 // Pack runtime for loading imported packages
 use pack::Runtime as PackRuntime;
@@ -96,13 +99,16 @@ async fn main() -> Result<()> {
     let (operation_tx, _operation_rx) = mpsc::channel(10);
     let (info_tx, _info_rx) = mpsc::channel(10);
     let (control_tx, _control_rx) = mpsc::channel(10);
-    let chain = Arc::new(SyncRwLock::new(StateChain::new(
-        actor_id.clone(),
-        theater_tx.clone(),
-    )));
+    let chain = Arc::new(SyncRwLock::new(StateChain::new(actor_id.clone())));
     let actor_handle = ActorHandle::new(operation_tx, info_tx, control_tx);
 
-    let actor_store = ActorStore::new(actor_id.clone(), theater_tx.clone(), actor_handle, chain);
+    let actor_store = ActorStore::new(
+        actor_id.clone(),
+        theater_tx.clone(),
+        actor_handle,
+        chain,
+        Value::Tuple(vec![]),
+    );
 
     let mut instance =
         PackInstance::new("wisp-test", &wasm_bytes, &runtime, actor_store, |builder| {
@@ -356,25 +362,28 @@ fn create_actor_store() -> ActorStore {
     let (operation_tx, _) = mpsc::channel(10);
     let (info_tx, _) = mpsc::channel(10);
     let (control_tx, _) = mpsc::channel(10);
-    let chain = Arc::new(SyncRwLock::new(StateChain::new(
-        actor_id.clone(),
-        theater_tx.clone(),
-    )));
+    let chain = Arc::new(SyncRwLock::new(StateChain::new(actor_id.clone())));
     let actor_handle = ActorHandle::new(operation_tx, info_tx, control_tx);
 
-    ActorStore::new(actor_id, theater_tx, actor_handle, chain)
+    ActorStore::new(
+        actor_id,
+        theater_tx,
+        actor_handle,
+        chain,
+        Value::Tuple(vec![]),
+    )
 }
 
 /// Build an Option<List<U8>> value from an Option<Vec<u8>>.
 fn state_to_value(state: &Option<Vec<u8>>) -> Value {
     Value::Option {
         inner_type: ValueType::List(Box::new(ValueType::U8)),
-        value: state
-            .as_ref()
-            .map(|bytes| Box::new(Value::List {
+        value: state.as_ref().map(|bytes| {
+            Box::new(Value::List {
                 elem_type: ValueType::U8,
                 items: bytes.iter().copied().map(Value::U8).collect(),
-            })),
+            })
+        }),
     }
 }
 
@@ -395,24 +404,30 @@ fn bytes_to_value(bytes: &[u8]) -> Value {
 /// Returns (new_state, extra_values) on Ok, or the error string on Err.
 fn decode_actor_result(value: &Value) -> Result<(Option<Vec<u8>>, Vec<Value>)> {
     match value {
-        Value::Result { value: Ok(inner), .. } => {
+        Value::Result {
+            value: Ok(inner), ..
+        } => {
             // inner is a Tuple
             match inner.as_ref() {
                 Value::Tuple(fields) => {
                     // First field is the new state: Option<List<U8>>
                     let new_state = match fields.first() {
-                        Some(Value::Option { value: Some(list_val), .. }) => {
-                            match list_val.as_ref() {
-                                Value::List { items, .. } => {
-                                    let bytes: Vec<u8> = items.iter().map(|v| match v {
+                        Some(Value::Option {
+                            value: Some(list_val),
+                            ..
+                        }) => match list_val.as_ref() {
+                            Value::List { items, .. } => {
+                                let bytes: Vec<u8> = items
+                                    .iter()
+                                    .map(|v| match v {
                                         Value::U8(b) => *b,
                                         _ => 0,
-                                    }).collect();
-                                    Some(bytes)
-                                }
-                                _ => None,
+                                    })
+                                    .collect();
+                                Some(bytes)
                             }
-                        }
+                            _ => None,
+                        },
                         Some(Value::Option { value: None, .. }) => None,
                         _ => None,
                     };
@@ -422,7 +437,9 @@ fn decode_actor_result(value: &Value) -> Result<(Option<Vec<u8>>, Vec<Value>)> {
                 other => anyhow::bail!("Expected tuple in Ok result, got: {:?}", other),
             }
         }
-        Value::Result { value: Err(inner), .. } => {
+        Value::Result {
+            value: Err(inner), ..
+        } => {
             anyhow::bail!("Actor returned error: {:?}", inner)
         }
         other => anyhow::bail!("Expected Result value, got: {:?}", other),
@@ -442,14 +459,14 @@ fn format_state(state: &Option<Vec<u8>>) -> String {
 /// Loads a messaging actor WASM and calls init, handle-send, and handle-request
 /// in sequence, threading state between calls and recording events to the chain.
 async fn run_test_messaging(wasm_path: &str) -> Result<()> {
-    use theater::events::{ChainEventData, ChainEventPayload};
     use theater::events::wasm::WasmEventData;
+    use theater::events::{ChainEventData, ChainEventPayload};
 
     println!("=== Messaging Actor Test ===");
     println!();
 
-    let wasm_bytes = std::fs::read(wasm_path)
-        .with_context(|| format!("Failed to read {}", wasm_path))?;
+    let wasm_bytes =
+        std::fs::read(wasm_path).with_context(|| format!("Failed to read {}", wasm_path))?;
     info!("Loaded {} bytes from {}", wasm_bytes.len(), wasm_path);
 
     let runtime = AsyncRuntime::new();
@@ -482,13 +499,18 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     let init_func = "theater:simple/actor.init";
 
     // Record WasmCall event
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
-            function_name: init_func.to_string(),
-            params: vec![],
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+                function_name: init_func.to_string(),
+                params: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     let init_state: Option<Vec<u8>> = None;
     let init_input = Value::Tuple(vec![state_to_value(&init_state), Value::Tuple(vec![])]);
@@ -497,13 +519,19 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     let (state, _) = decode_actor_result(&init_result)?;
 
     // Record WasmResult event
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
-            function_name: init_func.to_string(),
-            result: (None, vec![]),
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+                function_name: init_func.to_string(),
+                state: Value::Tuple(vec![]),
+                response: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     println!("  init returned Ok, state: {}", format_state(&state));
     println!();
@@ -514,13 +542,18 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     let send_func = "theater:simple/message-server-client.handle-send";
 
     // Record WasmCall event
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
-            function_name: send_func.to_string(),
-            params: vec![],
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+                function_name: send_func.to_string(),
+                params: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     // handle-send params: (state, tuple(list<u8>))
     let send_input = Value::Tuple(vec![
@@ -532,13 +565,19 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     let (state, _) = decode_actor_result(&send_result)?;
 
     // Record WasmResult event
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
-            function_name: send_func.to_string(),
-            result: (None, vec![]),
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+                function_name: send_func.to_string(),
+                state: Value::Tuple(vec![]),
+                response: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     println!("  handle-send returned Ok, state: {}", format_state(&state));
     println!();
@@ -550,13 +589,18 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     let request_func = "theater:simple/message-server-client.handle-request";
 
     // Record WasmCall event
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
-            function_name: request_func.to_string(),
-            params: vec![],
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+                function_name: request_func.to_string(),
+                params: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     // handle-request params: (state, tuple(string, list<u8>))
     let request_input = Value::Tuple(vec![
@@ -573,12 +617,13 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     // Extract the response from extras: tuple(option<list<u8>>)
     let response_desc = if let Some(Value::Tuple(response_fields)) = extras.first() {
         match response_fields.first() {
-            Some(Value::Option { value: Some(list_val), .. }) => {
-                match list_val.as_ref() {
-                    Value::List { items, .. } => format!("Some({} bytes)", items.len()),
-                    _ => "Some(?)".to_string(),
-                }
-            }
+            Some(Value::Option {
+                value: Some(list_val),
+                ..
+            }) => match list_val.as_ref() {
+                Value::List { items, .. } => format!("Some({} bytes)", items.len()),
+                _ => "Some(?)".to_string(),
+            },
             Some(Value::Option { value: None, .. }) => "None".to_string(),
             _ => format!("{:?}", response_fields),
         }
@@ -587,13 +632,19 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     };
 
     // Record WasmResult event
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
-            function_name: request_func.to_string(),
-            result: (None, vec![]),
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+                function_name: request_func.to_string(),
+                state: Value::Tuple(vec![]),
+                response: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     println!(
         "  handle-request returned Ok, state: {}, response: {}",
@@ -602,44 +653,18 @@ async fn run_test_messaging(wasm_path: &str) -> Result<()> {
     );
     println!();
 
-    // --- Print event chain ---
-    let chain = instance.actor_store.chain.read().unwrap();
-    let events = chain.get_events();
-    println!("=== Event Chain ({} events) ===", events.len());
-    for event in events {
-        let hash_prefix = hex::encode(&event.hash[..std::cmp::min(4, event.hash.len())]);
-        // Try to deserialize the event data for a readable summary
-        let summary = if let Ok(payload) = serde_json::from_slice::<ChainEventPayload>(&event.data)
-        {
-            match payload {
-                ChainEventPayload::Wasm(WasmEventData::WasmCall { function_name, .. }) => {
-                    format!("WasmCall {{ function: \"{}\" }}", function_name)
-                }
-                ChainEventPayload::Wasm(WasmEventData::WasmResult {
-                    function_name, ..
-                }) => {
-                    format!("WasmResult {{ function: \"{}\" }}", function_name)
-                }
-                ChainEventPayload::Wasm(WasmEventData::WasmError {
-                    function_name,
-                    message,
-                }) => {
-                    format!(
-                        "WasmError {{ function: \"{}\", message: \"{}\" }}",
-                        function_name, message
-                    )
-                }
-                other => format!("{:?}", other),
-            }
-        } else {
-            format!("(raw: {} bytes)", event.data.len())
-        };
-        println!("  [{}] {} — {}", hash_prefix, event.event_type, summary);
+    // --- Event chain ---
+    // The current Theater StateChain no longer retains an in-memory event list
+    // (events are emitted to subscribers instead), so the previous full chain dump
+    // and verify() are unavailable. The head hash is still queryable.
+    let chain = instance.actor_store.chain.read().await;
+    match chain.head_hash() {
+        Some(h) => println!(
+            "Event chain head: {}",
+            hex::encode(&h[..std::cmp::min(4, h.len())])
+        ),
+        None => println!("Event chain head: (empty)"),
     }
-    println!();
-
-    let verified = chain.verify();
-    println!("Chain verified: {}", verified);
 
     Ok(())
 }
@@ -693,8 +718,8 @@ fn infer_scalar_type(expr: &str) -> &'static str {
 /// This loads the REPL actor and the Wisp compiler, then evaluates expressions
 /// via handle-request, with results compiled and executed in real-time.
 async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
-    use theater::events::{ChainEventData, ChainEventPayload};
     use theater::events::wasm::WasmEventData;
+    use theater::events::{ChainEventData, ChainEventPayload};
     use theater::pack_bridge::AsyncCtx;
 
     println!("=== REPL Actor Test ===");
@@ -704,7 +729,11 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
     let compiler_path = "examples/wisp-compiler.wasm";
     let compiler_bytes = std::fs::read(compiler_path)
         .with_context(|| format!("Failed to read compiler: {}", compiler_path))?;
-    info!("Loaded {} bytes from {}", compiler_bytes.len(), compiler_path);
+    info!(
+        "Loaded {} bytes from {}",
+        compiler_bytes.len(),
+        compiler_path
+    );
 
     // Create compiler PackInstance
     let runtime = AsyncRuntime::new();
@@ -772,8 +801,8 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
     let compiler = Arc::new(tokio::sync::Mutex::new(compiler_instance));
 
     // Load the REPL actor WASM
-    let actor_bytes = std::fs::read(wasm_path)
-        .with_context(|| format!("Failed to read {}", wasm_path))?;
+    let actor_bytes =
+        std::fs::read(wasm_path).with_context(|| format!("Failed to read {}", wasm_path))?;
     info!("Loaded {} bytes from {}", actor_bytes.len(), wasm_path);
 
     let actor_store = create_actor_store();
@@ -998,7 +1027,7 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
 
                         let response = make_eval_response(Some(result_bytes));
                         // Debug: encode to see CGRF bytes
-                        let encoded = pack::abi::encode(&response).unwrap();
+                        let encoded = theater::pack_bridge::encode_value(&response).unwrap();
                         info!("[EVAL-REQUEST] CGRF response ({} bytes): {:02x?}", encoded.len(), &encoded[..]);
                         // Debug: parse option node structure
                         if encoded.len() > 70 {
@@ -1035,7 +1064,10 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
         ("(i32.add (i32.const 40) (i32.const 2))", "42"),
         ("(i32.mul (i32.const 6) (i32.const 7))", "42"),
         // i64 (s64) - this is the key test for the s64 fix
-        ("(i64.add (i64.const 1000000000000) (i64.const 1))", "1000000000001"),
+        (
+            "(i64.add (i64.const 1000000000000) (i64.const 1))",
+            "1000000000001",
+        ),
         // f32 (float literals truncated to int: 3.14 -> 3, 2.86 -> 2, so 3+2=5)
         ("(f32.add (f32.const 3.14) (f32.const 2.86))", "5"),
         // f64 (float literals truncated to int: 3.14... -> 3, 2.0 -> 2, so 3*2=6)
@@ -1047,13 +1079,18 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
     println!("[1/{}] Calling init...", total_steps);
     let init_func = "theater:simple/actor.init";
 
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
-            function_name: init_func.to_string(),
-            params: vec![],
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+                function_name: init_func.to_string(),
+                params: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     let init_state: Option<Vec<u8>> = None;
     let init_input = Value::Tuple(vec![state_to_value(&init_state), Value::Tuple(vec![])]);
@@ -1061,13 +1098,19 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
 
     let (state, _) = decode_actor_result(&init_result)?;
 
-    instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-        event_type: "wasm".to_string(),
-        data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
-            function_name: init_func.to_string(),
-            result: (None, vec![]),
-        }),
-    })?;
+    instance
+        .actor_store
+        .chain
+        .write()
+        .await
+        .add_typed_event(ChainEventData {
+            event_type: "wasm".to_string(),
+            data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+                function_name: init_func.to_string(),
+                state: Value::Tuple(vec![]),
+                response: Value::Tuple(vec![]),
+            }),
+        }).await?;
 
     println!("  init returned Ok, state: {}", format_state(&state));
     println!();
@@ -1080,13 +1123,18 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
 
         let request_func = "theater:simple/message-server-client.handle-request";
 
-        instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-            event_type: "wasm".to_string(),
-            data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
-                function_name: request_func.to_string(),
-                params: vec![],
-            }),
-        })?;
+        instance
+            .actor_store
+            .chain
+            .write()
+            .await
+            .add_typed_event(ChainEventData {
+                event_type: "wasm".to_string(),
+                data: ChainEventPayload::Wasm(WasmEventData::WasmCall {
+                    function_name: request_func.to_string(),
+                    params: Value::Tuple(vec![]),
+                }),
+            }).await?;
 
         // handle-request params: (state, tuple(string, list<u8>))
         let request_id = format!("test-{}", i);
@@ -1094,10 +1142,7 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
 
         let request_input = Value::Tuple(vec![
             state_to_value(&current_state),
-            Value::Tuple(vec![
-                Value::String(request_id),
-                bytes_to_value(body_bytes),
-            ]),
+            Value::Tuple(vec![Value::String(request_id), bytes_to_value(body_bytes)]),
         ]);
 
         let request_result = instance.call_value(request_func, &request_input).await?;
@@ -1112,18 +1157,22 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
         // Extract response from extras: tuple(option<list<u8>>)
         let response = if let Some(Value::Tuple(response_fields)) = extras.first() {
             match response_fields.first() {
-                Some(Value::Option { value: Some(list_val), .. }) => {
-                    match list_val.as_ref() {
-                        Value::List { items, .. } => {
-                            let bytes: Vec<u8> = items.iter().map(|v| match v {
+                Some(Value::Option {
+                    value: Some(list_val),
+                    ..
+                }) => match list_val.as_ref() {
+                    Value::List { items, .. } => {
+                        let bytes: Vec<u8> = items
+                            .iter()
+                            .map(|v| match v {
                                 Value::U8(b) => *b,
                                 _ => 0,
-                            }).collect();
-                            String::from_utf8_lossy(&bytes).to_string()
-                        }
-                        _ => "?".to_string(),
+                            })
+                            .collect();
+                        String::from_utf8_lossy(&bytes).to_string()
                     }
-                }
+                    _ => "?".to_string(),
+                },
                 Some(Value::Option { value: None, .. }) => "None".to_string(),
                 _ => format!("{:?}", response_fields),
             }
@@ -1131,13 +1180,19 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
             "N/A".to_string()
         };
 
-        instance.actor_store.chain.write().unwrap().add_typed_event(ChainEventData {
-            event_type: "wasm".to_string(),
-            data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
-                function_name: request_func.to_string(),
-                result: (None, vec![]),
-            }),
-        })?;
+        instance
+            .actor_store
+            .chain
+            .write()
+            .await
+            .add_typed_event(ChainEventData {
+                event_type: "wasm".to_string(),
+                data: ChainEventPayload::Wasm(WasmEventData::WasmResult {
+                    function_name: request_func.to_string(),
+                    state: Value::Tuple(vec![]),
+                    response: Value::Tuple(vec![]),
+                }),
+            }).await?;
 
         println!("  Result: {} (expected: {})", response, expected);
         if response == *expected {
@@ -1150,34 +1205,16 @@ async fn run_test_repl_actor(wasm_path: &str) -> Result<()> {
         current_state = new_state;
     }
 
-    // Print event chain
-    let chain = instance.actor_store.chain.read().unwrap();
-    let events = chain.get_events();
-    println!("=== Event Chain ({} events) ===", events.len());
-    for event in events {
-        let hash_prefix = hex::encode(&event.hash[..std::cmp::min(4, event.hash.len())]);
-        let summary = if let Ok(payload) = serde_json::from_slice::<ChainEventPayload>(&event.data) {
-            match payload {
-                ChainEventPayload::Wasm(WasmEventData::WasmCall { function_name, .. }) => {
-                    format!("WasmCall {{ function: \"{}\" }}", function_name)
-                }
-                ChainEventPayload::Wasm(WasmEventData::WasmResult { function_name, .. }) => {
-                    format!("WasmResult {{ function: \"{}\" }}", function_name)
-                }
-                ChainEventPayload::Wasm(WasmEventData::WasmError { function_name, message }) => {
-                    format!("WasmError {{ function: \"{}\", message: \"{}\" }}", function_name, message)
-                }
-                other => format!("{:?}", other),
-            }
-        } else {
-            format!("(raw: {} bytes)", event.data.len())
-        };
-        println!("  [{}] {} — {}", hash_prefix, event.event_type, summary);
+    // Event chain: StateChain no longer retains events in memory (they are emitted
+    // to subscribers), so only the head hash is available now.
+    let chain = instance.actor_store.chain.read().await;
+    match chain.head_hash() {
+        Some(h) => println!(
+            "Event chain head: {}",
+            hex::encode(&h[..std::cmp::min(4, h.len())])
+        ),
+        None => println!("Event chain head: (empty)"),
     }
-    println!();
-
-    let verified = chain.verify();
-    println!("Chain verified: {}", verified);
 
     Ok(())
 }
@@ -1440,6 +1477,15 @@ enum ReplReturnType {
 enum EvalResult {
     /// Simple scalar result (i32)
     Scalar(i32),
+    /// A `(fn …)` was compiled into the live image (M2); carries its name.
+    FnDefined(String),
+    /// The raw result of evaluating a `define` value (M3): the scalar value or heap
+    /// pointer, whether it is a scalar, and its wisp type token.
+    RawResult {
+        value: i32,
+        is_scalar: bool,
+        ty: String,
+    },
     /// Compound result decoded from CGRF (string, list, record, etc.)
     Compound(pack::abi::Value),
     /// Native string from WASM linear memory
@@ -1528,13 +1574,15 @@ fn format_value(value: &pack::abi::Value) -> String {
     }
 }
 
-/// Preprocess string literals in an expression.
-/// Replaces `(str.const "...")` with `(i32.const <addr>)` and collects string data.
-/// Strings are stored in memory at addresses starting from 0x100 in format [len:u32][utf8_bytes...].
-fn preprocess_string_literals(source: &str) -> (String, Vec<(i32, String)>) {
+/// Unwrap `(str.const "X")` into a bare string literal `"X"` (M4).
+///
+/// Strings are heap values: the self-hosted compiler's `compile-string` already lowers a
+/// literal `"X"` to a heap allocation (`[len:u32][bytes]` bumped off `$__heap_ptr`), which
+/// — because the heap is shared and persistent (M1) — Just Works across REPL lines. So we
+/// no longer assign fixed low-memory addresses or emit data segments; we only strip the
+/// `(str.const …)` wrapper so the compiler sees the literal. Raw `"X"` needs no unwrapping.
+fn preprocess_string_literals(source: &str) -> String {
     let mut result = source.to_string();
-    let mut strings = Vec::new();
-    let mut addr: i32 = 0x100; // Start at offset 256
 
     while let Some(start) = result.find("(str.const \"") {
         let content_start = start + "(str.const \"".len();
@@ -1542,14 +1590,8 @@ fn preprocess_string_literals(source: &str) -> (String, Vec<(i32, String)>) {
             let content_end = content_start + quote_end;
             let paren_end = content_end + 1; // ')' after closing quote
             if paren_end < result.len() && result.as_bytes()[paren_end] == b')' {
-                let string_value = result[content_start..content_end].to_string();
-                let replacement = format!("(i32.const {})", addr);
-                result.replace_range(start..=paren_end, &replacement);
-
-                // Allocate: 4 bytes length + string bytes, aligned to 4
-                let total = 4 + string_value.len() as i32;
-                strings.push((addr, string_value));
-                addr += (total + 3) & !3;
+                let literal = format!("\"{}\"", &result[content_start..content_end]);
+                result.replace_range(start..=paren_end, &literal);
             } else {
                 break; // Malformed, stop
             }
@@ -1558,7 +1600,138 @@ fn preprocess_string_literals(source: &str) -> (String, Vec<(i32, String)>) {
         }
     }
 
-    (result, strings)
+    result
+}
+
+/// Rewrite a compiled line's WAT so it *shares* one persistent linear memory and one
+/// persistent bump-heap pointer with every other REPL line, instead of defining its own.
+/// This is the core of the live-image "dynamic linking" (see
+/// docs/changes/LIVE-REPL-DYNAMIC-LINKING.md, M1):
+///
+/// - `(memory (export "memory") N)` / `(memory N)` becomes
+///   `(import "env" "memory" (memory N))`, and the memory is re-exported so existing
+///   result extraction (`get_memory("memory")`, `caller.get_export("memory")`) keeps working.
+/// - `(global $__heap_ptr (mut i32) (i32.const …))` becomes an imported mutable global, so
+///   the bump pointer never resets across lines — allocations keep growing on one heap.
+///
+/// Each replacement is conditional on the definition being present. Injected imports go
+/// immediately after `(module`, before any definition.
+fn rewrite_for_shared_memory(wat: &str) -> String {
+    let mut pages = "1".to_string();
+    let mut heap_used = false;
+    let mut kept: Vec<&str> = Vec::with_capacity(wat.lines().count());
+
+    for line in wat.lines() {
+        let t = line.trim_start();
+        if t.starts_with("(memory") {
+            // Page count is the first bare integer token (forms: `(memory 1)` or
+            // `(memory (export "memory") 1)`).
+            if let Some(tok) = t
+                .split(|c: char| c == ' ' || c == '(' || c == ')')
+                .find(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            {
+                pages = tok.to_string();
+            }
+            continue; // drop the original memory definition
+        }
+        if t.starts_with("(global $__heap_ptr") {
+            heap_used = true;
+            continue; // drop the original heap-pointer definition
+        }
+        kept.push(line);
+    }
+
+    let mut out = String::with_capacity(wat.len() + 128);
+    let mut injected = false;
+    for line in kept {
+        out.push_str(line);
+        out.push('\n');
+        if !injected && line.trim_start().starts_with("(module") {
+            out.push_str(&format!("  (import \"env\" \"memory\" (memory {}))\n", pages));
+            if heap_used {
+                out.push_str(
+                    "  (import \"env\" \"__heap_ptr\" (global $__heap_ptr (mut i32)))\n",
+                );
+            }
+            out.push_str("  (export \"memory\" (memory 0))\n");
+            injected = true;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod m1_shared_memory_tests {
+    use super::rewrite_for_shared_memory;
+    use wasmtime::{
+        Config, Engine, Global, GlobalType, Linker, Memory, MemoryType, Module, Mutability,
+        Store, Val, ValType,
+    };
+
+    // A module shaped like the self-hosted compiler's output: it defines its own memory
+    // and `$__heap_ptr`, and bump-allocates a 4-byte cell holding `val`.
+    const COMPILED: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $__heap_ptr (mut i32) (i32.const 49152))
+  (func (export "alloc") (param $val i32) (result i32)
+    (local $ptr i32)
+    global.get $__heap_ptr
+    local.set $ptr
+    global.get $__heap_ptr
+    i32.const 4
+    i32.add
+    global.set $__heap_ptr
+    local.get $ptr
+    local.get $val
+    i32.store
+    local.get $ptr))
+"#;
+
+    #[test]
+    fn rewrite_produces_shareable_module_with_persistent_heap() {
+        let shared = rewrite_for_shared_memory(COMPILED);
+        assert!(shared.contains("(import \"env\" \"memory\" (memory 1))"));
+        assert!(shared.contains("(import \"env\" \"__heap_ptr\" (global $__heap_ptr (mut i32)))"));
+        assert!(shared.contains("(export \"memory\" (memory 0))"));
+        // The heap-ptr *definition* (with its initializer) is gone; only the import remains.
+        assert!(!shared.contains("i32.const 49152"));
+        assert!(!shared.contains("(memory (export"));
+
+        let engine = Engine::new(&Config::new()).unwrap();
+        let mut store = Store::new(&engine, ());
+        let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+        let heap = Global::new(
+            &mut store,
+            GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(49152),
+        )
+        .unwrap();
+
+        // Name-based wiring — the same mechanism eval_expression will use.
+        let mut linker = Linker::new(&engine);
+        linker.define(&store, "env", "memory", memory).unwrap();
+        linker.define(&store, "env", "__heap_ptr", heap).unwrap();
+
+        let module = Module::new(&engine, &shared).unwrap();
+        // Two independent instances of the compiled line, sharing one heap.
+        let a = linker.instantiate(&mut store, &module).unwrap();
+        let b = linker.instantiate(&mut store, &module).unwrap();
+        let alloc_a = a.get_typed_func::<i32, i32>(&mut store, "alloc").unwrap();
+        let alloc_b = b.get_typed_func::<i32, i32>(&mut store, "alloc").unwrap();
+
+        let p1 = alloc_a.call(&mut store, 42).unwrap();
+        let p2 = alloc_b.call(&mut store, 99).unwrap(); // different instance, same heap
+        assert_eq!(p1, 49152, "first alloc at heap start");
+        assert_eq!(p2, 49156, "second instance saw the persisted heap pointer");
+
+        // Both values readable through the one shared memory.
+        let data = memory.data(&store);
+        let read =
+            |p: i32| i32::from_le_bytes(data[p as usize..p as usize + 4].try_into().unwrap());
+        assert_eq!(read(p1), 42);
+        assert_eq!(read(p2), 99);
+    }
 }
 
 /// Encode a string into WAT data segment format: length prefix + UTF-8 bytes
@@ -2507,11 +2680,14 @@ fn infer_return_type(
     record_defs: &HashMap<String, ReplRecordDef>,
     variant_defs: &HashMap<String, ReplVariantDef>,
     used_imports: &[(&LoadedInterface, &ExportedFunction)],
+    image_fns: &HashMap<String, ImageFn>,
 ) -> ReplReturnType {
     let trimmed = expr.trim();
 
-    // Check for string-returning operations
-    if trimmed.starts_with("(string-append")
+    // Check for string-returning operations, or a bare string literal (M4: strings are
+    // heap values, so a literal `"…"` evaluates to a heap pointer we decode as a string).
+    if trimmed.starts_with('"')
+        || trimmed.starts_with("(string-append")
         || trimmed.starts_with("(substring")
         || trimmed.starts_with("(str.const")
     {
@@ -2552,6 +2728,19 @@ fn infer_return_type(
             if case.name == first_sym {
                 return ReplReturnType::NativeVariant(vname.clone());
             }
+        }
+    }
+
+    // Check if it's a call to an image fn returning a compound type (M2).
+    if let Some(f) = image_fns.get(first_sym) {
+        if record_defs.contains_key(&f.ret) {
+            return ReplReturnType::NativeRecord(f.ret.clone());
+        }
+        if variant_defs.contains_key(&f.ret) {
+            return ReplReturnType::NativeVariant(f.ret.clone());
+        }
+        if f.ret == "string" {
+            return ReplReturnType::NativeString;
         }
     }
 
@@ -2647,6 +2836,106 @@ fn read_variant_from_memory(
 /// - Compiles expressions with inlined values using self-hosted compiler
 /// - Loads and uses Pack packages via (import <interface> from <source>)
 /// - Executes and prints results
+/// The persistent state a live REPL image shares across every line: one wasm engine,
+/// one store, one linear memory, and one bump-heap pointer. Each compiled line is
+/// instantiated into this store and imports the shared memory + `$__heap_ptr`, so
+/// allocations accumulate on a single heap that never resets between lines. The string
+/// See docs/changes/LIVE-REPL-DYNAMIC-LINKING.md (M1). Strings are ordinary heap values
+/// (M4), so there is no separate string arena.
+struct ReplSession {
+    engine: Engine,
+    store: Store<()>,
+    memory: Memory,
+    heap_ptr: Global,
+    /// Live image functions: each user `(fn …)` is compiled once into its own instance in
+    /// this store and exported. Later lines reach it by import instead of recompiling its
+    /// source (M2 — incremental linking). Keyed by function name.
+    image_fns: HashMap<String, ImageFn>,
+}
+
+/// A function that lives in the image: its exported wasm `Func` (callable in the session
+/// store) plus the wisp-source param list and return type, used to emit an `(import …)`
+/// declaration when another line references it.
+#[derive(Clone)]
+struct ImageFn {
+    func: wasmtime::Func,
+    /// Wisp param source, e.g. `((n s32))` → we store the inside: `(n s32)`.
+    params: String,
+    /// Wisp return-type token, e.g. `s32` or a record name.
+    ret: String,
+    /// True when this entry is a `define`d value rather than a user `(fn …)` — a nullary
+    /// function returning the value's heap pointer (M3). Value references are written bare
+    /// (`p`) and rewritten to a nullary call `(p)` before compiling.
+    is_value: bool,
+}
+
+/// Parse `(fn name (params...) ret body...)` into `(name, params-inside, ret)`, where
+/// `params-inside` is the text between the params parens (may be empty). Returns None if
+/// the form is not a well-shaped fn definition (e.g. a generic `(fn … (where …) …)`,
+/// which M2 does not yet link incrementally).
+fn parse_fn_header(def: &str) -> Option<(String, String, String)> {
+    let rest = def.trim().strip_prefix("(fn ")?;
+    // name
+    let rest = rest.trim_start();
+    let name_end = rest.find(|c: char| c.is_whitespace() || c == '(')?;
+    let name = rest[..name_end].to_string();
+    let rest = rest[name_end..].trim_start();
+    // params — a parenthesized group; capture its inside by paren matching
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut end = None;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = end?;
+    let params_inside = rest[1..close].trim().to_string();
+    // a `where` clause here means it's a generic template — not incrementally linkable yet
+    let after = rest[close + 1..].trim_start();
+    let ret_end = after.find(|c: char| c.is_whitespace() || c == '(')?;
+    let ret = after[..ret_end].to_string();
+    if params_inside.contains("where") || ret == "where" {
+        return None;
+    }
+    Some((name, params_inside, ret))
+}
+
+impl ReplSession {
+    fn new() -> Result<Self> {
+        let mut config = Config::new();
+        config.wasm_tail_call(true);
+        let engine = Engine::new(&config)?;
+        let mut store = Store::new(&engine, ());
+        // Shared heap: growable, min 16 pages (1 MiB). The heap pointer starts at 49152
+        // (0xC000), matching the self-hosted compiler's layout; the low region
+        // [0x100, 49152) holds the persistent string arena.
+        let memory = Memory::new(&mut store, MemoryType::new(16, None))?;
+        let heap_ptr = Global::new(
+            &mut store,
+            GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(49152),
+        )?;
+        Ok(Self {
+            engine,
+            store,
+            memory,
+            heap_ptr,
+            image_fns: HashMap::new(),
+        })
+    }
+}
+
 async fn run_repl() -> Result<()> {
     println!("Wisp REPL (self-hosted compiler)");
     println!("Commands: (define x 42), (fn name ...), (import <interface> from <source>)");
@@ -2658,6 +2947,8 @@ async fn run_repl() -> Result<()> {
     let mut imports: Vec<LoadedInterface> = Vec::new();
     let mut record_defs: HashMap<String, ReplRecordDef> = HashMap::new();
     let mut variant_defs: HashMap<String, ReplVariantDef> = HashMap::new();
+    // The persistent live-image session: one shared engine/store/memory/heap for all lines.
+    let mut session = ReplSession::new()?;
     // Loaded Pack packages: path -> LoadedPackage
     let mut loaded_packages: HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>> = HashMap::new();
     // Pack runtime for loading packages
@@ -2693,33 +2984,118 @@ async fn run_repl() -> Result<()> {
 
         // Check for special forms
         if line.starts_with("(define ") {
-            // Parse (define name value)
-            if let Some(rest) = line.strip_prefix("(define ") {
-                if let Some(rest) = rest.strip_suffix(')') {
-                    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        let name = parts[0].to_string();
-                        if let Ok(value) = parts[1].parse::<i32>() {
-                            bindings.insert(name.clone(), value);
-                            println!("defined {} = {}", name, value);
-                            continue;
-                        }
-                    }
+            // (define name <expr>) — evaluate the expression and keep its result live (M3).
+            let inner = line
+                .strip_prefix("(define ")
+                .and_then(|s| s.strip_suffix(')'));
+            let (name, value_expr) = match inner {
+                Some(inner) => {
+                    let mut it = inner.splitn(2, char::is_whitespace);
+                    (
+                        it.next().unwrap_or("").trim().to_string(),
+                        it.next().unwrap_or("").trim().to_string(),
+                    )
                 }
+                None => (String::new(), String::new()),
+            };
+            if name.is_empty() || value_expr.is_empty() {
+                println!("error: invalid define syntax. Use: (define name expr)");
+                continue;
             }
-            println!("error: invalid define syntax");
+
+            // Bare-integer shorthand keeps working: (define x 10).
+            if let Ok(v) = value_expr.parse::<i32>() {
+                session.image_fns.remove(&name);
+                bindings.insert(name.clone(), v);
+                println!("defined {} = {}", name, v);
+                continue;
+            }
+
+            match eval_expression(
+                &compiler_wasm,
+                &runtime,
+                &value_expr,
+                &bindings,
+                &functions,
+                &imports,
+                &loaded_packages,
+                &record_defs,
+                &variant_defs,
+                &mut session,
+                EvalMode::DefineValue,
+            )
+            .await
+            {
+                Ok(EvalResult::RawResult {
+                    value,
+                    is_scalar: true,
+                    ..
+                }) => {
+                    session.image_fns.remove(&name);
+                    bindings.insert(name.clone(), value);
+                    println!("defined {} = {}", name, value);
+                }
+                Ok(EvalResult::RawResult {
+                    value,
+                    is_scalar: false,
+                    ty,
+                }) => {
+                    // Register a nullary image fn that returns the value's heap pointer.
+                    // The heap persists, so the pointer stays valid for later lines.
+                    let func = wasmtime::Func::wrap(&mut session.store, move || -> i32 { value });
+                    bindings.remove(&name);
+                    session.image_fns.insert(
+                        name.clone(),
+                        ImageFn {
+                            func,
+                            params: String::new(),
+                            ret: ty.clone(),
+                            is_value: true,
+                        },
+                    );
+                    println!("defined {} : {}", name, ty);
+                }
+                Ok(_) => println!("error: unexpected define result"),
+                Err(e) => println!("error defining {}: {:#}", name, e),
+            }
             continue;
         }
 
         if line.starts_with("(fn ") {
-            // Store function definition
-            functions.push(line.to_string());
-            // Extract function name for display
-            if let Some(name) = line
-                .strip_prefix("(fn ")
-                .and_then(|s| s.split_whitespace().next())
-            {
-                println!("defined function {}", name);
+            if let Some((name, params, ret)) = parse_fn_header(line) {
+                // Monomorphic fn: compile once into the live image (M2 incremental linking).
+                match eval_expression(
+                    &compiler_wasm,
+                    &runtime,
+                    line,
+                    &bindings,
+                    &functions,
+                    &imports,
+                    &loaded_packages,
+                    &record_defs,
+                    &variant_defs,
+                    &mut session,
+                    EvalMode::DefineFn {
+                        name: &name,
+                        params: &params,
+                        ret: &ret,
+                    },
+                )
+                .await
+                {
+                    Ok(EvalResult::FnDefined(n)) => println!("defined function {}", n),
+                    Ok(_) => println!("defined function {}", name),
+                    Err(e) => println!("error defining function {}: {:#}", name, e),
+                }
+            } else {
+                // Generic / unparseable fn: keep the inline fallback (recompiled per line).
+                functions.push(line.to_string());
+                if let Some(name) = line
+                    .strip_prefix("(fn ")
+                    .and_then(|s| s.split_whitespace().next())
+                {
+                    println!("defined function {}", name);
+                }
             }
             continue;
         }
@@ -2746,9 +3122,29 @@ async fn run_repl() -> Result<()> {
             continue;
         }
 
+        if line == "(heap)" {
+            // Observe the live-image session: the bump-heap pointer and string-arena
+            // pointer both persist across lines, so they grow rather than reset.
+            let hp = session.heap_ptr.get(&mut session.store).unwrap_i32();
+            println!("heap_ptr = {} (0x{:x})", hp, hp);
+            continue;
+        }
+
         if line == "(list)" {
             println!("bindings: {:?}", bindings);
-            println!("functions: {} defined", functions.len());
+            println!(
+                "functions: {} image + {} inline",
+                session.image_fns.len(),
+                functions.len()
+            );
+            if !session.image_fns.is_empty() {
+                let mut names: Vec<&String> = session.image_fns.keys().collect();
+                names.sort();
+                for name in names {
+                    let f = &session.image_fns[name];
+                    println!("  {} ({}) -> {}", name, f.params, f.ret);
+                }
+            }
             if !variant_defs.is_empty() {
                 println!("variants:");
                 for (name, vdef) in &variant_defs {
@@ -2832,6 +3228,8 @@ async fn run_repl() -> Result<()> {
             loaded_packages.clear();
             record_defs.clear();
             variant_defs.clear();
+            // Reset the live image entirely: fresh store, heap, and image fns.
+            session = ReplSession::new()?;
             println!("cleared");
             continue;
         }
@@ -2882,10 +3280,13 @@ async fn run_repl() -> Result<()> {
             &loaded_packages,
             &record_defs,
             &variant_defs,
+            &mut session,
+            EvalMode::Expr,
         )
         .await
         {
             Ok(EvalResult::Scalar(n)) => println!("{}", n),
+            Ok(EvalResult::FnDefined(_)) | Ok(EvalResult::RawResult { .. }) => {}
             Ok(EvalResult::Compound(v)) => println!("{}", format_value(&v)),
             Ok(EvalResult::NativeString(s)) => println!("\"{}\"", s),
             Ok(EvalResult::NativeRecord { type_name, fields }) => {
@@ -2932,19 +3333,15 @@ async fn test_actor_command(line: &str) -> Result<()> {
     .await?;
 
     // Build init input: Tuple(Option<List<U8>>(None), Tuple([]))
-    let state = pack::abi::Value::Option {
-        inner_type: ValueType::List(Box::new(ValueType::U8)),
-        value: None,
-    };
-    let params = pack::abi::Value::Tuple(vec![]);
-    let input = pack::abi::Value::Tuple(vec![state, params]);
+    let init_state: Option<Vec<u8>> = None;
+    let input = Value::Tuple(vec![state_to_value(&init_state), Value::Tuple(vec![])]);
 
     // Call the init function via Pack's Graph ABI
     let result = instance
         .call_value("theater:simple/actor.init", &input)
         .await;
     match result {
-        Ok(value) => println!("init returned: {}", format_value(&value)),
+        Ok(value) => println!("init returned: {:?}", value),
         Err(e) => println!("init failed: {}", e),
     }
 
@@ -2958,6 +3355,50 @@ async fn test_actor_command(line: &str) -> Result<()> {
 /// 2. Encode to CGRF via generated wrapper
 /// 3. Call Pack instance via Graph ABI bridge
 /// 4. Decode result back (scalar or compound)
+/// What a compile unit produces: evaluate an expression, or define a function into the
+/// live image. In `DefineFn` mode `expr` carries the whole `(fn …)` form; the unit exports
+/// the function (rather than `eval`) and its `Func` is registered in `session.image_fns`.
+#[derive(Clone, Copy)]
+enum EvalMode<'a> {
+    Expr,
+    DefineFn {
+        name: &'a str,
+        params: &'a str,
+        ret: &'a str,
+    },
+    /// Evaluate an expression and return its raw value + type for a `(define …)` (M3),
+    /// rather than decoding it for display.
+    DefineValue,
+}
+
+/// Rewrite references to `define`d names in `expr`: scalar bindings become their constant
+/// (`x` → `(i32.const v)`), and value defines become a nullary call (`p` → `(p)`) so the
+/// compiler emits a typed `call` to the value's image function. Matches the three
+/// whitespace/paren-delimited positions a symbol can appear in.
+fn substitute_defines(
+    expr: &str,
+    bindings: &HashMap<String, i32>,
+    image_fns: &HashMap<String, ImageFn>,
+) -> String {
+    // Pad so a name appearing alone (whole expression) matches the surround patterns too.
+    let mut s = format!(" {} ", expr.trim());
+    for (name, value) in bindings {
+        let v = format!("(i32.const {})", value);
+        s = s.replace(&format!(" {} ", name), &format!(" {} ", v));
+        s = s.replace(&format!(" {})", name), &format!(" {})", v));
+        s = s.replace(&format!("({} ", name), &format!("({} ", v));
+    }
+    for (name, f) in image_fns {
+        if f.is_value {
+            let call = format!("({})", name);
+            s = s.replace(&format!(" {} ", name), &format!(" {} ", call));
+            s = s.replace(&format!(" {})", name), &format!(" {})", call));
+            s = s.replace(&format!("({} ", name), &format!("({} ", call));
+        }
+    }
+    s.trim().to_string()
+}
+
 async fn eval_expression(
     compiler_wasm: &[u8],
     runtime: &AsyncRuntime,
@@ -2968,6 +3409,8 @@ async fn eval_expression(
     loaded_packages: &HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>>,
     record_defs: &HashMap<String, ReplRecordDef>,
     variant_defs: &HashMap<String, ReplVariantDef>,
+    session: &mut ReplSession,
+    mode: EvalMode<'_>,
 ) -> Result<EvalResult> {
     // Preprocess string literals in expression and function definitions.
     // (str.const "hello") -> (i32.const <addr>) with data segments.
@@ -2978,7 +3421,11 @@ async fn eval_expression(
         full_text.push('\n');
     }
     full_text.push_str(expr);
-    let (processed_full, all_strings) = preprocess_string_literals(&full_text);
+    let processed_full = preprocess_string_literals(&full_text);
+    // M4: strings are heap-allocated by the compiler, so there are no host-placed string
+    // data segments. Kept as an (always-empty) binding so the Pack/data-segment
+    // post-processing below stays intact for the Pack-import path.
+    let all_strings: Vec<(i32, String)> = Vec::new();
 
     // Split back into functions and expression
     let mut processed_functions = Vec::new();
@@ -2989,7 +3436,8 @@ async fn eval_expression(
             remaining = &remaining[newline_pos + 1..];
         }
     }
-    let processed_expr = remaining.to_string();
+    // Rewrite references to defined names: scalars → constants, values → nullary calls (M3).
+    let processed_expr = substitute_defines(remaining, bindings, &session.image_fns);
 
     // Find which imported functions are used in the expression or user-defined functions
     let mut used_imports: Vec<(&LoadedInterface, &ExportedFunction)> = Vec::new();
@@ -3023,14 +3471,43 @@ async fn eval_expression(
         .iter()
         .any(|(imp, _)| matches!(imp.source, ImportSource::Component(_)));
 
-    // Infer the return type of the expression
-    let return_type = infer_return_type(&processed_expr, record_defs, variant_defs, &used_imports);
+    // Infer the return type of the expression (only meaningful when evaluating one).
+    let return_type = match mode {
+        EvalMode::Expr | EvalMode::DefineValue => infer_return_type(
+            &processed_expr,
+            record_defs,
+            variant_defs,
+            &used_imports,
+            &session.image_fns,
+        ),
+        EvalMode::DefineFn { .. } => ReplReturnType::Scalar,
+    };
     let needs_memory_export = matches!(
         return_type,
         ReplReturnType::NativeString
             | ReplReturnType::NativeRecord(_)
             | ReplReturnType::NativeVariant(_)
     );
+
+    // Live-image functions this unit references (M2): emit an `(import …)` for each and
+    // wire its Func by name below. Exclude the fn being defined — its self-calls are local
+    // recursion, not imports. Collect owned data so we don't hold a borrow on `session`.
+    let defining_name = match mode {
+        EvalMode::DefineFn { name, .. } => Some(name),
+        EvalMode::Expr | EvalMode::DefineValue => None,
+    };
+    let referenced_image_fns: Vec<(String, String, String, wasmtime::Func)> = session
+        .image_fns
+        .iter()
+        .filter(|(name, _)| Some(name.as_str()) != defining_name)
+        .filter(|(name, _)| {
+            let hit = |s: &str| {
+                s.contains(&format!("({}", name)) || s.contains(&format!(" {}", name))
+            };
+            hit(&processed_expr) || processed_functions.iter().any(|f| hit(f))
+        })
+        .map(|(name, f)| (name.clone(), f.params.clone(), f.ret.clone(), f.func))
+        .collect();
 
     // Generate source with all functions and an eval wrapper
     let mut source = String::new();
@@ -3091,26 +3568,30 @@ async fn eval_expression(
         }
     }
 
-    // Add all function definitions (preprocessed for string literals)
+    // Image-fn imports (M2): reach prior definitions by import instead of recompiling
+    // their source. `params` is the inside of the param parens, e.g. `(n s32)`, so wrapping
+    // it once yields the import's param list `((n s32))`.
+    for (name, params, ret, _func) in &referenced_image_fns {
+        source.push_str(&format!("(import wisp:image {} ({}) {})\n", name, params, ret));
+    }
+
+    // Add fallback function definitions (generics / unparseable fns kept inline)
     for func in &processed_functions {
         source.push_str(func);
         source.push('\n');
     }
 
-    // Inline bindings into the expression
-    let mut inlined_expr = processed_expr.clone();
-    for (name, value) in bindings {
-        // Simple string replacement (not perfect but works for basic cases)
-        inlined_expr =
-            inlined_expr.replace(&format!(" {} ", name), &format!(" (i32.const {}) ", value));
-        inlined_expr =
-            inlined_expr.replace(&format!(" {})", name), &format!(" (i32.const {}))", value));
-        inlined_expr =
-            inlined_expr.replace(&format!("({} ", name), &format!("((i32.const {}) ", value));
+    // Emit the exported form: an eval wrapper for an expression (define bindings were
+    // already substituted into `processed_expr`), or the fn itself for a definition.
+    match mode {
+        EvalMode::Expr | EvalMode::DefineValue => {
+            source.push_str(&format!("(export (fn eval () s32 {}))", processed_expr));
+        }
+        EvalMode::DefineFn { .. } => {
+            // `processed_expr` is the whole `(fn …)` form; export it under its own name.
+            source.push_str(&format!("(export {})", processed_expr));
+        }
     }
-
-    // Wrap expression in eval function
-    source.push_str(&format!("(export (fn eval () s32 {}))", inlined_expr));
 
     // Compile using self-hosted compiler
     let actor_store = create_actor_store();
@@ -3293,20 +3774,29 @@ async fn eval_expression(
         anyhow::bail!("Compile error in generated WAT:\n{}", wat);
     }
 
-    // Assemble WAT to WASM
+    // Rewrite so this line shares the session's one memory + bump-heap pointer, then assemble.
+    let wat = rewrite_for_shared_memory(&wat);
     let wasm_bytes =
         wat::parse_str(&wat).with_context(|| format!("Failed to assemble WAT:\n{}", wat))?;
 
-    // Load and run
-    let mut config = wasmtime::Config::new();
-    config.wasm_tail_call(true);
-    let engine = Engine::new(&config)?;
+    // Load and run on the persistent session: one shared engine, store, memory, and
+    // bump-heap pointer across every REPL line (see LIVE-REPL-DYNAMIC-LINKING.md, M1).
+    let engine = session.engine.clone();
     let module = Module::new(&engine, &wasm_bytes)
         .with_context(|| format!("Failed to compile WASM from WAT:\n{}", wat))?;
-    let mut store = Store::new(&engine, ());
+    let mut store = &mut session.store;
 
-    // Build imports list by instantiating imported components
-    let mut extern_imports: Vec<wasmtime::Extern> = Vec::new();
+    // Wire imports by name via a Linker (robust as the image grows). Every line imports
+    // the session's shared memory + heap pointer; host/Pack functions are defined per
+    // interface + name.
+    let mut linker: Linker<()> = Linker::new(&engine);
+    linker.allow_shadowing(true);
+    linker.define(&store, "env", "memory", session.memory)?;
+    linker.define(&store, "env", "__heap_ptr", session.heap_ptr)?;
+    // Wire prior image functions this line imports (M2).
+    for (name, _p, _r, func) in &referenced_image_fns {
+        linker.define(&store, "wisp:image", name, *func)?;
+    }
 
     for (imp, exported_func) in &used_imports {
         match &imp.source {
@@ -3318,28 +3808,28 @@ async fn eval_expression(
                             println!("[debug] {}", value);
                             value // Return the value for chaining
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     ("wisp:repl/debug", "print-i64") => {
                         let func = wasmtime::Func::wrap(&mut store, |value: i64| -> i64 {
                             println!("[debug] {}", value);
                             value
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     ("wisp:repl/debug", "print-f32") => {
                         let func = wasmtime::Func::wrap(&mut store, |value: f32| -> f32 {
                             println!("[debug] {}", value);
                             value
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     ("wisp:repl/debug", "print-f64") => {
                         let func = wasmtime::Func::wrap(&mut store, |value: f64| -> f64 {
                             println!("[debug] {}", value);
                             value
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     _ => {
                         anyhow::bail!(
@@ -3461,12 +3951,32 @@ async fn eval_expression(
                     },
                 );
 
-                extern_imports.push(func.into());
+                linker.define(&store, &imp.interface, &exported_func.name, func)?;
             }
         }
     }
 
-    let instance = Instance::new(&mut store, &module, &extern_imports)?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .with_context(|| format!("Failed to instantiate:\n{}", wat))?;
+
+    // Define mode: register the exported function into the live image and return. The
+    // instance stays alive in the session store, so its Func is callable from later lines.
+    if let EvalMode::DefineFn { name, params, ret } = mode {
+        let func = instance
+            .get_func(&mut store, name)
+            .with_context(|| format!("defined function '{}' was not exported", name))?;
+        session.image_fns.insert(
+            name.to_string(),
+            ImageFn {
+                func,
+                params: params.to_string(),
+                ret: ret.to_string(),
+                is_value: false,
+            },
+        );
+        return Ok(EvalResult::FnDefined(name.to_string()));
+    }
 
     let eval_func = instance
         .get_func(&mut store, "eval")
@@ -3474,6 +3984,28 @@ async fn eval_expression(
 
     let mut results = vec![wasmtime::Val::I32(0)];
     eval_func.call(&mut store, &[], &mut results)?;
+
+    // Define-value mode (M3): return the raw scalar/pointer + type, no decoding. The value
+    // lives on the persistent shared heap, so a stored pointer stays valid for later lines.
+    if let EvalMode::DefineValue = mode {
+        let value = match results.first() {
+            Some(wasmtime::Val::I32(n)) => *n,
+            other => anyhow::bail!("define value: expected i32 result, got {:?}", other),
+        };
+        let (is_scalar, ty) = match return_type {
+            ReplReturnType::Scalar => (true, "s32".to_string()),
+            ReplReturnType::NativeRecord(t) | ReplReturnType::NativeVariant(t) => (false, t),
+            ReplReturnType::NativeString => (false, "string".to_string()),
+            ReplReturnType::PackCompound => {
+                anyhow::bail!("define of a Pack-compound value is not supported yet")
+            }
+        };
+        return Ok(EvalResult::RawResult {
+            value,
+            is_scalar,
+            ty,
+        });
+    }
 
     // Determine result type based on inference
     match return_type {

@@ -5,7 +5,9 @@ result
 .cargo/config.toml
 wisp-actor/target
 
-# Compiled examples (can be regenerated)
+# Compiled artifacts (can be regenerated)
+compiled/
+**/compiled/
 examples/*.wasm
 examples/*.wat
 examples/*.wit
