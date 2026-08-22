@@ -1,6 +1,6 @@
 # Live REPL via WASM dynamic linking
 
-**Status**: M1 ✅ + M2 ✅ complete → M3 next
+**Status**: M1 ✅ + M2 ✅ + M3 ✅ complete → M4 next (optional)
 **Started**: 2026-08-22
 **Related**: [WISP-REPL-ARCHITECTURE.md](WISP-REPL-ARCHITECTURE.md) (the current REPL),
 [GENERICS-AND-TRAITS.md](GENERICS-AND-TRAITS.md) / [DERIVING.md](DERIVING.md) (the
@@ -149,12 +149,21 @@ instances and wire by name via the `Linker`, so it does not bite.
 - **Proof**: define `sq` on line 2; call it on line 5 without recompiling line 2; O(1)
   compile per line.
 
-### M3 — `define` as a live value
-- Running a `define` allocates on the shared heap and returns a pointer; store
-  `name → pointer` (+ type) in the symbol table; later lines inline the pointer.
-- Print results by decoding CGRF from the **persistent** memory (the REPL already has
-  the decoders). Support redefine and, later, `set!`.
-- **Proof**: `(define p (point 1 2))` then `(point.x p)` ⇒ `1` across lines.
+### M3 — `define` as a live value ✅ DONE
+Implemented in `crates/test-runtime/src/main.rs`. `(define name expr)` evaluates `expr`
+via a new `EvalMode::DefineValue` that returns the raw scalar/pointer + type instead of
+decoding. A **scalar** result is kept in `bindings` and inlined as `(i32.const v)` (the old
+bare-int shorthand `(define x 10)` still works). A **compound** result (record / variant /
+string) is a heap pointer; because the heap persists (M1), the value is registered as a
+*nullary image function* returning that pointer, typed — reusing M2's linking. References
+are rewritten by `substitute_defines`: scalars → their constant, values → a nullary call
+`p` → `(p)`, so the compiler emits a typed `call` and everything type-checks. `(clear)`
+resets the image; redefining rebinds. Proven live: `(define p (point 1 2))` then
+`(point.x p)` / `(point.y p)` on later lines ⇒ 1 / 2; a string `define` reads back on its
+own line; `(define q p)` aliases, `(getx p)` passes a value to an image fn, and after
+redefining `p` the old alias `q` still reads its captured value (value semantics). Known
+limit: `s64`/`f64` scalar and Pack-compound `define`s are not supported yet (the `eval`
+wrapper is `s32`); `set!` is future work.
 
 ### M4 — Strings as heap values (in the compiler)
 The principled removal of the low string arena. Today string literals are a **host-side

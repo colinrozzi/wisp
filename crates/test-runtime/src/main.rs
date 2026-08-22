@@ -1479,6 +1479,13 @@ enum EvalResult {
     Scalar(i32),
     /// A `(fn …)` was compiled into the live image (M2); carries its name.
     FnDefined(String),
+    /// The raw result of evaluating a `define` value (M3): the scalar value or heap
+    /// pointer, whether it is a scalar, and its wisp type token.
+    RawResult {
+        value: i32,
+        is_scalar: bool,
+        ty: String,
+    },
     /// Compound result decoded from CGRF (string, list, record, etc.)
     Compound(pack::abi::Value),
     /// Native string from WASM linear memory
@@ -2864,6 +2871,10 @@ struct ImageFn {
     params: String,
     /// Wisp return-type token, e.g. `s32` or a record name.
     ret: String,
+    /// True when this entry is a `define`d value rather than a user `(fn …)` — a nullary
+    /// function returning the value's heap pointer (M3). Value references are written bare
+    /// (`p`) and rewritten to a nullary call `(p)` before compiling.
+    is_value: bool,
 }
 
 /// Parse `(fn name (params...) ret body...)` into `(name, params-inside, ret)`, where
@@ -2982,21 +2993,80 @@ async fn run_repl() -> Result<()> {
 
         // Check for special forms
         if line.starts_with("(define ") {
-            // Parse (define name value)
-            if let Some(rest) = line.strip_prefix("(define ") {
-                if let Some(rest) = rest.strip_suffix(')') {
-                    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        let name = parts[0].to_string();
-                        if let Ok(value) = parts[1].parse::<i32>() {
-                            bindings.insert(name.clone(), value);
-                            println!("defined {} = {}", name, value);
-                            continue;
-                        }
-                    }
+            // (define name <expr>) — evaluate the expression and keep its result live (M3).
+            let inner = line
+                .strip_prefix("(define ")
+                .and_then(|s| s.strip_suffix(')'));
+            let (name, value_expr) = match inner {
+                Some(inner) => {
+                    let mut it = inner.splitn(2, char::is_whitespace);
+                    (
+                        it.next().unwrap_or("").trim().to_string(),
+                        it.next().unwrap_or("").trim().to_string(),
+                    )
                 }
+                None => (String::new(), String::new()),
+            };
+            if name.is_empty() || value_expr.is_empty() {
+                println!("error: invalid define syntax. Use: (define name expr)");
+                continue;
             }
-            println!("error: invalid define syntax");
+
+            // Bare-integer shorthand keeps working: (define x 10).
+            if let Ok(v) = value_expr.parse::<i32>() {
+                session.image_fns.remove(&name);
+                bindings.insert(name.clone(), v);
+                println!("defined {} = {}", name, v);
+                continue;
+            }
+
+            match eval_expression(
+                &compiler_wasm,
+                &runtime,
+                &value_expr,
+                &bindings,
+                &functions,
+                &imports,
+                &loaded_packages,
+                &record_defs,
+                &variant_defs,
+                &mut session,
+                EvalMode::DefineValue,
+            )
+            .await
+            {
+                Ok(EvalResult::RawResult {
+                    value,
+                    is_scalar: true,
+                    ..
+                }) => {
+                    session.image_fns.remove(&name);
+                    bindings.insert(name.clone(), value);
+                    println!("defined {} = {}", name, value);
+                }
+                Ok(EvalResult::RawResult {
+                    value,
+                    is_scalar: false,
+                    ty,
+                }) => {
+                    // Register a nullary image fn that returns the value's heap pointer.
+                    // The heap persists, so the pointer stays valid for later lines.
+                    let func = wasmtime::Func::wrap(&mut session.store, move || -> i32 { value });
+                    bindings.remove(&name);
+                    session.image_fns.insert(
+                        name.clone(),
+                        ImageFn {
+                            func,
+                            params: String::new(),
+                            ret: ty.clone(),
+                            is_value: true,
+                        },
+                    );
+                    println!("defined {} : {}", name, ty);
+                }
+                Ok(_) => println!("error: unexpected define result"),
+                Err(e) => println!("error defining {}: {:#}", name, e),
+            }
             continue;
         }
 
@@ -3228,7 +3298,7 @@ async fn run_repl() -> Result<()> {
         .await
         {
             Ok(EvalResult::Scalar(n)) => println!("{}", n),
-            Ok(EvalResult::FnDefined(_)) => {}
+            Ok(EvalResult::FnDefined(_)) | Ok(EvalResult::RawResult { .. }) => {}
             Ok(EvalResult::Compound(v)) => println!("{}", format_value(&v)),
             Ok(EvalResult::NativeString(s)) => println!("\"{}\"", s),
             Ok(EvalResult::NativeRecord { type_name, fields }) => {
@@ -3308,6 +3378,37 @@ enum EvalMode<'a> {
         params: &'a str,
         ret: &'a str,
     },
+    /// Evaluate an expression and return its raw value + type for a `(define …)` (M3),
+    /// rather than decoding it for display.
+    DefineValue,
+}
+
+/// Rewrite references to `define`d names in `expr`: scalar bindings become their constant
+/// (`x` → `(i32.const v)`), and value defines become a nullary call (`p` → `(p)`) so the
+/// compiler emits a typed `call` to the value's image function. Matches the three
+/// whitespace/paren-delimited positions a symbol can appear in.
+fn substitute_defines(
+    expr: &str,
+    bindings: &HashMap<String, i32>,
+    image_fns: &HashMap<String, ImageFn>,
+) -> String {
+    // Pad so a name appearing alone (whole expression) matches the surround patterns too.
+    let mut s = format!(" {} ", expr.trim());
+    for (name, value) in bindings {
+        let v = format!("(i32.const {})", value);
+        s = s.replace(&format!(" {} ", name), &format!(" {} ", v));
+        s = s.replace(&format!(" {})", name), &format!(" {})", v));
+        s = s.replace(&format!("({} ", name), &format!("({} ", v));
+    }
+    for (name, f) in image_fns {
+        if f.is_value {
+            let call = format!("({})", name);
+            s = s.replace(&format!(" {} ", name), &format!(" {} ", call));
+            s = s.replace(&format!(" {})", name), &format!(" {})", call));
+            s = s.replace(&format!("({} ", name), &format!("({} ", call));
+        }
+    }
+    s.trim().to_string()
 }
 
 async fn eval_expression(
@@ -3345,7 +3446,8 @@ async fn eval_expression(
             remaining = &remaining[newline_pos + 1..];
         }
     }
-    let processed_expr = remaining.to_string();
+    // Rewrite references to defined names: scalars → constants, values → nullary calls (M3).
+    let processed_expr = substitute_defines(remaining, bindings, &session.image_fns);
 
     // Find which imported functions are used in the expression or user-defined functions
     let mut used_imports: Vec<(&LoadedInterface, &ExportedFunction)> = Vec::new();
@@ -3381,7 +3483,7 @@ async fn eval_expression(
 
     // Infer the return type of the expression (only meaningful when evaluating one).
     let return_type = match mode {
-        EvalMode::Expr => infer_return_type(
+        EvalMode::Expr | EvalMode::DefineValue => infer_return_type(
             &processed_expr,
             record_defs,
             variant_defs,
@@ -3402,7 +3504,7 @@ async fn eval_expression(
     // recursion, not imports. Collect owned data so we don't hold a borrow on `session`.
     let defining_name = match mode {
         EvalMode::DefineFn { name, .. } => Some(name),
-        EvalMode::Expr => None,
+        EvalMode::Expr | EvalMode::DefineValue => None,
     };
     let referenced_image_fns: Vec<(String, String, String, wasmtime::Func)> = session
         .image_fns
@@ -3489,26 +3591,15 @@ async fn eval_expression(
         source.push('\n');
     }
 
-    // Inline bindings into the expression
-    let mut inlined_expr = processed_expr.clone();
-    for (name, value) in bindings {
-        // Simple string replacement (not perfect but works for basic cases)
-        inlined_expr =
-            inlined_expr.replace(&format!(" {} ", name), &format!(" (i32.const {}) ", value));
-        inlined_expr =
-            inlined_expr.replace(&format!(" {})", name), &format!(" (i32.const {}))", value));
-        inlined_expr =
-            inlined_expr.replace(&format!("({} ", name), &format!("((i32.const {}) ", value));
-    }
-
-    // Emit the exported form: an eval wrapper for an expression, or the fn itself.
+    // Emit the exported form: an eval wrapper for an expression (define bindings were
+    // already substituted into `processed_expr`), or the fn itself for a definition.
     match mode {
-        EvalMode::Expr => {
-            source.push_str(&format!("(export (fn eval () s32 {}))", inlined_expr));
+        EvalMode::Expr | EvalMode::DefineValue => {
+            source.push_str(&format!("(export (fn eval () s32 {}))", processed_expr));
         }
         EvalMode::DefineFn { .. } => {
-            // `inlined_expr` is the whole `(fn …)` form; export it under its own name.
-            source.push_str(&format!("(export {})", inlined_expr));
+            // `processed_expr` is the whole `(fn …)` form; export it under its own name.
+            source.push_str(&format!("(export {})", processed_expr));
         }
     }
 
@@ -3891,6 +3982,7 @@ async fn eval_expression(
                 func,
                 params: params.to_string(),
                 ret: ret.to_string(),
+                is_value: false,
             },
         );
         return Ok(EvalResult::FnDefined(name.to_string()));
@@ -3902,6 +3994,28 @@ async fn eval_expression(
 
     let mut results = vec![wasmtime::Val::I32(0)];
     eval_func.call(&mut store, &[], &mut results)?;
+
+    // Define-value mode (M3): return the raw scalar/pointer + type, no decoding. The value
+    // lives on the persistent shared heap, so a stored pointer stays valid for later lines.
+    if let EvalMode::DefineValue = mode {
+        let value = match results.first() {
+            Some(wasmtime::Val::I32(n)) => *n,
+            other => anyhow::bail!("define value: expected i32 result, got {:?}", other),
+        };
+        let (is_scalar, ty) = match return_type {
+            ReplReturnType::Scalar => (true, "s32".to_string()),
+            ReplReturnType::NativeRecord(t) | ReplReturnType::NativeVariant(t) => (false, t),
+            ReplReturnType::NativeString => (false, "string".to_string()),
+            ReplReturnType::PackCompound => {
+                anyhow::bail!("define of a Pack-compound value is not supported yet")
+            }
+        };
+        return Ok(EvalResult::RawResult {
+            value,
+            is_scalar,
+            ty,
+        });
+    }
 
     // Determine result type based on inference
     match return_type {
