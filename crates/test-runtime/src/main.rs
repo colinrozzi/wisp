@@ -1477,6 +1477,8 @@ enum ReplReturnType {
 enum EvalResult {
     /// Simple scalar result (i32)
     Scalar(i32),
+    /// A `(fn …)` was compiled into the live image (M2); carries its name.
+    FnDefined(String),
     /// Compound result decoded from CGRF (string, list, record, etc.)
     Compound(pack::abi::Value),
     /// Native string from WASM linear memory
@@ -2680,6 +2682,7 @@ fn infer_return_type(
     record_defs: &HashMap<String, ReplRecordDef>,
     variant_defs: &HashMap<String, ReplVariantDef>,
     used_imports: &[(&LoadedInterface, &ExportedFunction)],
+    image_fns: &HashMap<String, ImageFn>,
 ) -> ReplReturnType {
     let trimmed = expr.trim();
 
@@ -2725,6 +2728,19 @@ fn infer_return_type(
             if case.name == first_sym {
                 return ReplReturnType::NativeVariant(vname.clone());
             }
+        }
+    }
+
+    // Check if it's a call to an image fn returning a compound type (M2).
+    if let Some(f) = image_fns.get(first_sym) {
+        if record_defs.contains_key(&f.ret) {
+            return ReplReturnType::NativeRecord(f.ret.clone());
+        }
+        if variant_defs.contains_key(&f.ret) {
+            return ReplReturnType::NativeVariant(f.ret.clone());
+        }
+        if f.ret == "string" {
+            return ReplReturnType::NativeString;
         }
     }
 
@@ -2832,6 +2848,64 @@ struct ReplSession {
     memory: Memory,
     heap_ptr: Global,
     next_string_addr: i32,
+    /// Live image functions: each user `(fn …)` is compiled once into its own instance in
+    /// this store and exported. Later lines reach it by import instead of recompiling its
+    /// source (M2 — incremental linking). Keyed by function name.
+    image_fns: HashMap<String, ImageFn>,
+}
+
+/// A function that lives in the image: its exported wasm `Func` (callable in the session
+/// store) plus the wisp-source param list and return type, used to emit an `(import …)`
+/// declaration when another line references it.
+#[derive(Clone)]
+struct ImageFn {
+    func: wasmtime::Func,
+    /// Wisp param source, e.g. `((n s32))` → we store the inside: `(n s32)`.
+    params: String,
+    /// Wisp return-type token, e.g. `s32` or a record name.
+    ret: String,
+}
+
+/// Parse `(fn name (params...) ret body...)` into `(name, params-inside, ret)`, where
+/// `params-inside` is the text between the params parens (may be empty). Returns None if
+/// the form is not a well-shaped fn definition (e.g. a generic `(fn … (where …) …)`,
+/// which M2 does not yet link incrementally).
+fn parse_fn_header(def: &str) -> Option<(String, String, String)> {
+    let rest = def.trim().strip_prefix("(fn ")?;
+    // name
+    let rest = rest.trim_start();
+    let name_end = rest.find(|c: char| c.is_whitespace() || c == '(')?;
+    let name = rest[..name_end].to_string();
+    let rest = rest[name_end..].trim_start();
+    // params — a parenthesized group; capture its inside by paren matching
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut end = None;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = end?;
+    let params_inside = rest[1..close].trim().to_string();
+    // a `where` clause here means it's a generic template — not incrementally linkable yet
+    let after = rest[close + 1..].trim_start();
+    let ret_end = after.find(|c: char| c.is_whitespace() || c == '(')?;
+    let ret = after[..ret_end].to_string();
+    if params_inside.contains("where") || ret == "where" {
+        return None;
+    }
+    Some((name, params_inside, ret))
 }
 
 impl ReplSession {
@@ -2855,6 +2929,7 @@ impl ReplSession {
             memory,
             heap_ptr,
             next_string_addr: 0x100,
+            image_fns: HashMap::new(),
         })
     }
 }
@@ -2926,14 +3001,40 @@ async fn run_repl() -> Result<()> {
         }
 
         if line.starts_with("(fn ") {
-            // Store function definition
-            functions.push(line.to_string());
-            // Extract function name for display
-            if let Some(name) = line
-                .strip_prefix("(fn ")
-                .and_then(|s| s.split_whitespace().next())
-            {
-                println!("defined function {}", name);
+            if let Some((name, params, ret)) = parse_fn_header(line) {
+                // Monomorphic fn: compile once into the live image (M2 incremental linking).
+                match eval_expression(
+                    &compiler_wasm,
+                    &runtime,
+                    line,
+                    &bindings,
+                    &functions,
+                    &imports,
+                    &loaded_packages,
+                    &record_defs,
+                    &variant_defs,
+                    &mut session,
+                    EvalMode::DefineFn {
+                        name: &name,
+                        params: &params,
+                        ret: &ret,
+                    },
+                )
+                .await
+                {
+                    Ok(EvalResult::FnDefined(n)) => println!("defined function {}", n),
+                    Ok(_) => println!("defined function {}", name),
+                    Err(e) => println!("error defining function {}: {:#}", name, e),
+                }
+            } else {
+                // Generic / unparseable fn: keep the inline fallback (recompiled per line).
+                functions.push(line.to_string());
+                if let Some(name) = line
+                    .strip_prefix("(fn ")
+                    .and_then(|s| s.split_whitespace().next())
+                {
+                    println!("defined function {}", name);
+                }
             }
             continue;
         }
@@ -2973,7 +3074,19 @@ async fn run_repl() -> Result<()> {
 
         if line == "(list)" {
             println!("bindings: {:?}", bindings);
-            println!("functions: {} defined", functions.len());
+            println!(
+                "functions: {} image + {} inline",
+                session.image_fns.len(),
+                functions.len()
+            );
+            if !session.image_fns.is_empty() {
+                let mut names: Vec<&String> = session.image_fns.keys().collect();
+                names.sort();
+                for name in names {
+                    let f = &session.image_fns[name];
+                    println!("  {} ({}) -> {}", name, f.params, f.ret);
+                }
+            }
             if !variant_defs.is_empty() {
                 println!("variants:");
                 for (name, vdef) in &variant_defs {
@@ -3057,6 +3170,8 @@ async fn run_repl() -> Result<()> {
             loaded_packages.clear();
             record_defs.clear();
             variant_defs.clear();
+            // Reset the live image entirely: fresh store, heap, and image fns.
+            session = ReplSession::new()?;
             println!("cleared");
             continue;
         }
@@ -3108,10 +3223,12 @@ async fn run_repl() -> Result<()> {
             &record_defs,
             &variant_defs,
             &mut session,
+            EvalMode::Expr,
         )
         .await
         {
             Ok(EvalResult::Scalar(n)) => println!("{}", n),
+            Ok(EvalResult::FnDefined(_)) => {}
             Ok(EvalResult::Compound(v)) => println!("{}", format_value(&v)),
             Ok(EvalResult::NativeString(s)) => println!("\"{}\"", s),
             Ok(EvalResult::NativeRecord { type_name, fields }) => {
@@ -3180,6 +3297,19 @@ async fn test_actor_command(line: &str) -> Result<()> {
 /// 2. Encode to CGRF via generated wrapper
 /// 3. Call Pack instance via Graph ABI bridge
 /// 4. Decode result back (scalar or compound)
+/// What a compile unit produces: evaluate an expression, or define a function into the
+/// live image. In `DefineFn` mode `expr` carries the whole `(fn …)` form; the unit exports
+/// the function (rather than `eval`) and its `Func` is registered in `session.image_fns`.
+#[derive(Clone, Copy)]
+enum EvalMode<'a> {
+    Expr,
+    DefineFn {
+        name: &'a str,
+        params: &'a str,
+        ret: &'a str,
+    },
+}
+
 async fn eval_expression(
     compiler_wasm: &[u8],
     runtime: &AsyncRuntime,
@@ -3191,6 +3321,7 @@ async fn eval_expression(
     record_defs: &HashMap<String, ReplRecordDef>,
     variant_defs: &HashMap<String, ReplVariantDef>,
     session: &mut ReplSession,
+    mode: EvalMode<'_>,
 ) -> Result<EvalResult> {
     // Preprocess string literals in expression and function definitions.
     // (str.const "hello") -> (i32.const <addr>) with data segments.
@@ -3248,14 +3379,43 @@ async fn eval_expression(
         .iter()
         .any(|(imp, _)| matches!(imp.source, ImportSource::Component(_)));
 
-    // Infer the return type of the expression
-    let return_type = infer_return_type(&processed_expr, record_defs, variant_defs, &used_imports);
+    // Infer the return type of the expression (only meaningful when evaluating one).
+    let return_type = match mode {
+        EvalMode::Expr => infer_return_type(
+            &processed_expr,
+            record_defs,
+            variant_defs,
+            &used_imports,
+            &session.image_fns,
+        ),
+        EvalMode::DefineFn { .. } => ReplReturnType::Scalar,
+    };
     let needs_memory_export = matches!(
         return_type,
         ReplReturnType::NativeString
             | ReplReturnType::NativeRecord(_)
             | ReplReturnType::NativeVariant(_)
     );
+
+    // Live-image functions this unit references (M2): emit an `(import …)` for each and
+    // wire its Func by name below. Exclude the fn being defined — its self-calls are local
+    // recursion, not imports. Collect owned data so we don't hold a borrow on `session`.
+    let defining_name = match mode {
+        EvalMode::DefineFn { name, .. } => Some(name),
+        EvalMode::Expr => None,
+    };
+    let referenced_image_fns: Vec<(String, String, String, wasmtime::Func)> = session
+        .image_fns
+        .iter()
+        .filter(|(name, _)| Some(name.as_str()) != defining_name)
+        .filter(|(name, _)| {
+            let hit = |s: &str| {
+                s.contains(&format!("({}", name)) || s.contains(&format!(" {}", name))
+            };
+            hit(&processed_expr) || processed_functions.iter().any(|f| hit(f))
+        })
+        .map(|(name, f)| (name.clone(), f.params.clone(), f.ret.clone(), f.func))
+        .collect();
 
     // Generate source with all functions and an eval wrapper
     let mut source = String::new();
@@ -3316,7 +3476,14 @@ async fn eval_expression(
         }
     }
 
-    // Add all function definitions (preprocessed for string literals)
+    // Image-fn imports (M2): reach prior definitions by import instead of recompiling
+    // their source. `params` is the inside of the param parens, e.g. `(n s32)`, so wrapping
+    // it once yields the import's param list `((n s32))`.
+    for (name, params, ret, _func) in &referenced_image_fns {
+        source.push_str(&format!("(import wisp:image {} ({}) {})\n", name, params, ret));
+    }
+
+    // Add fallback function definitions (generics / unparseable fns kept inline)
     for func in &processed_functions {
         source.push_str(func);
         source.push('\n');
@@ -3334,8 +3501,16 @@ async fn eval_expression(
             inlined_expr.replace(&format!("({} ", name), &format!("((i32.const {}) ", value));
     }
 
-    // Wrap expression in eval function
-    source.push_str(&format!("(export (fn eval () s32 {}))", inlined_expr));
+    // Emit the exported form: an eval wrapper for an expression, or the fn itself.
+    match mode {
+        EvalMode::Expr => {
+            source.push_str(&format!("(export (fn eval () s32 {}))", inlined_expr));
+        }
+        EvalMode::DefineFn { .. } => {
+            // `inlined_expr` is the whole `(fn …)` form; export it under its own name.
+            source.push_str(&format!("(export {})", inlined_expr));
+        }
+    }
 
     // Compile using self-hosted compiler
     let actor_store = create_actor_store();
@@ -3537,6 +3712,10 @@ async fn eval_expression(
     linker.allow_shadowing(true);
     linker.define(&store, "env", "memory", session.memory)?;
     linker.define(&store, "env", "__heap_ptr", session.heap_ptr)?;
+    // Wire prior image functions this line imports (M2).
+    for (name, _p, _r, func) in &referenced_image_fns {
+        linker.define(&store, "wisp:image", name, *func)?;
+    }
 
     for (imp, exported_func) in &used_imports {
         match &imp.source {
@@ -3699,6 +3878,23 @@ async fn eval_expression(
     let instance = linker
         .instantiate(&mut store, &module)
         .with_context(|| format!("Failed to instantiate:\n{}", wat))?;
+
+    // Define mode: register the exported function into the live image and return. The
+    // instance stays alive in the session store, so its Func is callable from later lines.
+    if let EvalMode::DefineFn { name, params, ret } = mode {
+        let func = instance
+            .get_func(&mut store, name)
+            .with_context(|| format!("defined function '{}' was not exported", name))?;
+        session.image_fns.insert(
+            name.to_string(),
+            ImageFn {
+                func,
+                params: params.to_string(),
+                ret: ret.to_string(),
+            },
+        );
+        return Ok(EvalResult::FnDefined(name.to_string()));
+    }
 
     let eval_func = instance
         .get_func(&mut store, "eval")

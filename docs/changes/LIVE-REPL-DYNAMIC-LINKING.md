@@ -1,6 +1,6 @@
 # Live REPL via WASM dynamic linking
 
-**Status**: M1 complete ✅ → M2 next
+**Status**: M1 ✅ + M2 ✅ complete → M3 next
 **Started**: 2026-08-22
 **Related**: [WISP-REPL-ARCHITECTURE.md](WISP-REPL-ARCHITECTURE.md) (the current REPL),
 [GENERICS-AND-TRAITS.md](GENERICS-AND-TRAITS.md) / [DERIVING.md](DERIVING.md) (the
@@ -97,13 +97,55 @@ Original plan:
   shared memory those would collide. Reserve a data arena and persist a data pointer
   (or move strings above a per-session watermark). Track here.
 
-### M2 — Incremental function linking
-- Stop concatenating prior `(fn …)` source. Compile **only** the new form.
-- Keep every prior instance alive; record `name → (Func, signature)` in a host symbol
-  table.
-- For each prior name a new line references, emit an `(import …)` declaration and wire
-  it to that `Func`. Intra-image calls are plain wasm `call`s with pointer args in the
-  shared memory (NOT CGRF-bridged — that path is for external Pack packages only).
+### M2 — Incremental function linking ✅ DONE
+Implemented in `crates/test-runtime/src/main.rs`. `ReplSession.image_fns: name → ImageFn
+{ func, params, ret }`. `eval_expression` grew an `EvalMode` (`Expr` | `DefineFn`): both
+modes share the whole compile→post-process→`rewrite_for_shared_memory`→Linker→instantiate
+pipeline. A `(fn …)` that `parse_fn_header` accepts (monomorphic) is compiled once into
+the session, exported, and registered as an `ImageFn`; generic/unparseable fns fall back
+to the old inline `functions` path. An expression (or fn body) referencing a prior image
+fn emits `(import wisp:image name (params) ret)` and the `Func` is wired by name through
+the `Linker` — prior bodies are never recompiled. `infer_return_type` now consults
+`image_fns` so a compound-returning image fn decodes correctly. `(clear)` resets the whole
+session; `(list)` shows image vs inline fns. Proven live: `(add1 (sq 6))` = 37 (two image
+fns composed by import), `quad`→`double` (fn→fn link at define time), `fact` recursion
+(local self-call), and record pointers passed across image fns via the shared memory.
+Known follow-ups: generics stay on the inline path; calling a cleared fn shows a raw WAT
+error (pre-existing error-quality issue, not M2).
+
+Original plan / ABI verdict below.
+
+**ABI verdict (probed 2026-08-22): no compiler changes needed.** The self-hosted
+compiler already emits everything plainly (`examples/wisp-compiler.lisp`):
+- local fn → `(func $name (param $x i32) … (result i32) …)`; compound params are i32
+  pointers (`compile-fn-def` ~1305, `compile-param` ~1185, `type-to-wat` ~1178);
+- local call → plain `call $name`, args on the stack (`compile-fn-call` ~802);
+- import → `(import "mod" "name" (func $name (param …) (result …)))`, called with the
+  **same** plain `call` — **no CGRF bridge** (`compile-import` ~1149);
+- export → `(func $eval …) (export "eval" (func $eval))`, natural signature, plain
+  (`compile-export-simple` ~1369); this is why the REPL calls `eval` with no args for a
+  direct i32.
+
+So a `fn` exported by line A is ABI-compatible with an `(import … name …)` in line B —
+plain `call`, matching signature — and M1's shared memory makes pointer args valid across
+them. The "unique names" caveat only applies if modules are *merged*; we keep separate
+instances and wire by name via the `Linker`, so it does not bite.
+
+**Design.**
+- Session symbol table `image_fns: name → ImageFn { func: Func, params: String, ret:
+  String }` on `ReplSession`.
+- On `(fn name (params) ret body)`: assemble a unit = prepended type defs + `(import
+  "wisp:image" f (…) …)` for each prior fn the body references + the fn itself + `(export
+  (fn name (params) ret body))`; compile once, `rewrite_for_shared_memory`, instantiate
+  into the session store (Linker wires shared memory + heap + referenced image Funcs),
+  grab the exported `Func`, store it. Self-calls stay local (recursion needs no import).
+- On an expression: same, but the unit imports only the fns the expression references and
+  exports `eval`; **no prior fn bodies are recompiled** — the O(1)-per-line win.
+- Factor the shared pipeline (assemble → compile via PackInstance → WAT post-process →
+  rewrite → Linker+instantiate) so both paths reuse it; the expression path adds result
+  extraction, the fn path grabs the export.
+- Open sub-question: generics/traits are templates (no callable until specialized) — scope
+  M2 to monomorphic fns first; a generic `(fn … (where …) …)` can keep the inline path.
 - **Proof**: define `sq` on line 2; call it on line 5 without recompiling line 2; O(1)
   compile per line.
 
