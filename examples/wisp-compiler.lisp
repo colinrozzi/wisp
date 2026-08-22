@@ -729,21 +729,31 @@
 ; Generate code to store bytes of a string starting at offset
 ; Returns WAT code that stores bytes at (heap_ptr + offset)
 ; Uses tail recursion with accumulator to avoid stack overflow on long strings
-(fn compile-string-bytes-acc ((s string) (idx s32) (len s32) (offset s32) (acc string)) string
-  (if (i32.ge_s idx len)
-    acc
-    (let (byte (string-ref s idx))
-      (let (byte-code (string-append
-              "global.get $__heap_ptr i32.const " (string-append
-              (i32-to-string offset) (string-append
-              " i32.add i32.const " (string-append
-              (i32-to-string byte)
-              " i32.store8 ")))))
-        (compile-string-bytes-acc s (i32.add idx (i32.const 1)) len (i32.add offset (i32.const 1))
-          (string-append acc byte-code))))))
+; Emit the WAT that stores one byte of a string literal at (heap_ptr + offset).
+(fn emit-string-byte ((byte s32) (offset s32)) string
+  (string-append
+    "global.get $__heap_ptr i32.const " (string-append
+    (i32-to-string offset) (string-append
+    " i32.add i32.const " (string-append
+    (i32-to-string byte)
+    " i32.store8 ")))))
 
-(fn compile-string-bytes ((s string) (idx s32) (len s32) (offset s32)) string
-  (compile-string-bytes-acc s idx len offset ""))
+; Emit store8 instructions for bytes [idx, end) of s, joining halves with
+; divide-and-conquer so the output is assembled with balanced string-append
+; (O(N log N) allocation) instead of a linear left-fold (O(N^2) -- which, at
+; ~40 WAT bytes per source byte, blew past 1 GB on the 5 KB runtime literal).
+; Stack depth is O(log N), so long literals do not overflow either.
+(fn compile-string-bytes ((s string) (idx s32) (end s32) (offset s32)) string
+  (let (n (i32.sub end idx))
+    (if (i32.le_s n (i32.const 0))
+      ""
+      (if (i32.eq n (i32.const 1))
+        (emit-string-byte (string-ref s idx) offset)
+        (let (half (i32.div_s n (i32.const 2)))
+          (let (mid (i32.add idx half))
+            (string-append
+              (compile-string-bytes s idx mid offset)
+              (compile-string-bytes s mid end (i32.add offset half)))))))))
 
 ; Compile a string literal to WAT
 ; String layout: 4 bytes length + bytes
@@ -1482,20 +1492,28 @@
     (compile-by-name (get-sym head) items ctx)
     "(error: not symbol)"))
 
-; Compile multiple top-level forms
+; Compile multiple top-level forms, joining them with newlines. Uses
+; divide-and-conquer so the ~150 KB module body is assembled with balanced
+; string-append (O(N log F)) rather than a linear left-fold (O(N*F)). The
+; outer signature (idx=0, len) is kept for callers; [idx, len) is the range.
 (fn compile-toplevels ((forms (list sexpr)) (idx s32) (len s32) (acc string) (ctx compile-ctx)) string
-  (if (i32.ge_s idx len)
-    acc
-    (let (form (list-get forms idx))
-      (let (compiled (compile-toplevel form ctx))
-        (let (new-acc (if (i32.eq idx (i32.const 0))
-                        compiled
-                        (string-append acc (string-append "\n" compiled))))
-          (compile-toplevels forms (i32.add idx (i32.const 1)) len new-acc ctx))))))
+  (compile-toplevels-range forms idx len ctx))
+
+(fn compile-toplevels-range ((forms (list sexpr)) (start s32) (end s32) (ctx compile-ctx)) string
+  (let (n (i32.sub end start))
+    (if (i32.le_s n (i32.const 0))
+      ""
+      (if (i32.eq n (i32.const 1))
+        (compile-toplevel (list-get forms start) ctx)
+        (let (mid (i32.add start (i32.div_s n (i32.const 2))))
+          (string-append
+            (compile-toplevels-range forms start mid ctx)
+            (string-append "\n"
+              (compile-toplevels-range forms mid end ctx))))))))
 
 ; Runtime helpers for string, list, and variant operations
 (fn get-runtime () string
-  "  (global $__heap_ptr (mut i32) (i32.const 49152))\n  (func $__string_append (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $tot i32) (local $ptr i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb local.get $la local.get $lb i32.add local.set $tot global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $tot i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $tot i32.store local.get $ptr i32.const 4 i32.add local.get $a i32.const 4 i32.add local.get $la memory.copy local.get $ptr i32.const 4 i32.add local.get $la i32.add local.get $b i32.const 4 i32.add local.get $lb memory.copy local.get $ptr)\n  (func $__string_eq (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $i i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb block (result i32) local.get $la local.get $lb i32.ne if (result i32) i32.const 0 else i32.const 0 local.set $i block (result i32) loop local.get $i local.get $la i32.ge_u if i32.const 1 br 2 end local.get $a i32.const 4 i32.add local.get $i i32.add i32.load8_u local.get $b i32.const 4 i32.add local.get $i i32.add i32.load8_u i32.ne if i32.const 0 br 3 end local.get $i i32.const 1 i32.add local.set $i br 0 end i32.const 1 end end end)\n  (func $__substring (param $s i32) (param $start i32) (param $end i32) (result i32) (local $new_len i32) (local $ptr i32) local.get $end local.get $start i32.sub local.set $new_len global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $new_len i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $new_len i32.store local.get $ptr i32.const 4 i32.add local.get $s i32.const 4 i32.add local.get $start i32.add local.get $new_len memory.copy local.get $ptr)\n  (func $__list_new (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr i32.const 0 i32.store local.get $ptr i32.const 4 i32.add i32.const 0 i32.store local.get $ptr i32.const 8 i32.add i32.const 0 i32.store local.get $ptr)\n  (func $__list_push (param $lst i32) (param $item i32) (result i32) (local $len i32) (local $new_data i32) (local $old_data i32) local.get $lst i32.load local.set $len global.get $__heap_ptr local.set $new_data global.get $__heap_ptr local.get $len i32.const 1 i32.add i32.const 4 i32.mul i32.add global.set $__heap_ptr local.get $lst i32.const 8 i32.add i32.load local.set $old_data local.get $new_data local.get $old_data local.get $len i32.const 4 i32.mul memory.copy local.get $new_data local.get $len i32.const 4 i32.mul i32.add local.get $item i32.store local.get $lst local.get $len i32.const 1 i32.add i32.store local.get $lst i32.const 8 i32.add local.get $new_data i32.store local.get $lst)\n  (func $__make_variant_0 (param $tag i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr)\n  (func $__make_variant_1 (param $tag i32) (param $payload i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr i32.const 4 i32.add local.get $payload i32.store local.get $ptr)\n  (func $__make_record_2 (param $f0 i32) (param $f1 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr)\n  (func $__make_record_3 (param $f0 i32) (param $f1 i32) (param $f2 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr i32.const 8 i32.add local.get $f2 i32.store local.get $ptr)\n  (func $__make_record_1 (param $f0 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr)\n  (func $__make_record_4 (param $f0 i32) (param $f1 i32) (param $f2 i32) (param $f3 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 16 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr i32.const 8 i32.add local.get $f2 i32.store local.get $ptr i32.const 12 i32.add local.get $f3 i32.store local.get $ptr)\n  (func $__make_record_5 (param $f0 i32) (param $f1 i32) (param $f2 i32) (param $f3 i32) (param $f4 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 20 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr i32.const 8 i32.add local.get $f2 i32.store local.get $ptr i32.const 12 i32.add local.get $f3 i32.store local.get $ptr i32.const 16 i32.add local.get $f4 i32.store local.get $ptr)\n")
+  "  (global $__heap_ptr (mut i32) (i32.const 49152))\n  (func $__string_append (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $tot i32) (local $ptr i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb local.get $la local.get $lb i32.add local.set $tot global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $tot i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $tot i32.store local.get $ptr i32.const 4 i32.add local.get $a i32.const 4 i32.add local.get $la memory.copy local.get $ptr i32.const 4 i32.add local.get $la i32.add local.get $b i32.const 4 i32.add local.get $lb memory.copy local.get $ptr)\n  (func $__string_eq (param $a i32) (param $b i32) (result i32) (local $la i32) (local $lb i32) (local $i i32) local.get $a i32.load local.set $la local.get $b i32.load local.set $lb block (result i32) local.get $la local.get $lb i32.ne if (result i32) i32.const 0 else i32.const 0 local.set $i block (result i32) loop local.get $i local.get $la i32.ge_u if i32.const 1 br 2 end local.get $a i32.const 4 i32.add local.get $i i32.add i32.load8_u local.get $b i32.const 4 i32.add local.get $i i32.add i32.load8_u i32.ne if i32.const 0 br 3 end local.get $i i32.const 1 i32.add local.set $i br 0 end i32.const 1 end end end)\n  (func $__substring (param $s i32) (param $start i32) (param $end i32) (result i32) (local $new_len i32) (local $ptr i32) local.get $end local.get $start i32.sub local.set $new_len global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 local.get $new_len i32.add i32.add global.set $__heap_ptr local.get $ptr local.get $new_len i32.store local.get $ptr i32.const 4 i32.add local.get $s i32.const 4 i32.add local.get $start i32.add local.get $new_len memory.copy local.get $ptr)\n  (func $__list_new (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr i32.const 0 i32.store local.get $ptr i32.const 4 i32.add i32.const 0 i32.store local.get $ptr i32.const 8 i32.add i32.const 0 i32.store local.get $ptr)\n  (func $__list_push (param $lst i32) (param $item i32) (result i32) (local $len i32) (local $cap i32) (local $data i32) (local $new_cap i32) (local $new_data i32) local.get $lst i32.load local.set $len local.get $lst i32.const 4 i32.add i32.load local.set $cap local.get $lst i32.const 8 i32.add i32.load local.set $data local.get $len local.get $cap i32.lt_s if local.get $data local.get $len i32.const 4 i32.mul i32.add local.get $item i32.store local.get $lst local.get $len i32.const 1 i32.add i32.store else local.get $cap i32.const 0 i32.eq if (result i32) i32.const 4 else local.get $cap i32.const 2 i32.mul end local.set $new_cap global.get $__heap_ptr local.set $new_data global.get $__heap_ptr local.get $new_cap i32.const 4 i32.mul i32.add global.set $__heap_ptr local.get $new_data local.get $data local.get $len i32.const 4 i32.mul memory.copy local.get $new_data local.get $len i32.const 4 i32.mul i32.add local.get $item i32.store local.get $lst local.get $len i32.const 1 i32.add i32.store local.get $lst i32.const 4 i32.add local.get $new_cap i32.store local.get $lst i32.const 8 i32.add local.get $new_data i32.store end local.get $lst)\n  (func $__make_variant_0 (param $tag i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr)\n  (func $__make_variant_1 (param $tag i32) (param $payload i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $tag i32.store local.get $ptr i32.const 4 i32.add local.get $payload i32.store local.get $ptr)\n  (func $__make_record_2 (param $f0 i32) (param $f1 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 8 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr)\n  (func $__make_record_3 (param $f0 i32) (param $f1 i32) (param $f2 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 12 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr i32.const 8 i32.add local.get $f2 i32.store local.get $ptr)\n  (func $__make_record_1 (param $f0 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 4 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr)\n  (func $__make_record_4 (param $f0 i32) (param $f1 i32) (param $f2 i32) (param $f3 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 16 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr i32.const 8 i32.add local.get $f2 i32.store local.get $ptr i32.const 12 i32.add local.get $f3 i32.store local.get $ptr)\n  (func $__make_record_5 (param $f0 i32) (param $f1 i32) (param $f2 i32) (param $f3 i32) (param $f4 i32) (result i32) (local $ptr i32) global.get $__heap_ptr local.set $ptr global.get $__heap_ptr i32.const 20 i32.add global.set $__heap_ptr local.get $ptr local.get $f0 i32.store local.get $ptr i32.const 4 i32.add local.get $f1 i32.store local.get $ptr i32.const 8 i32.add local.get $f2 i32.store local.get $ptr i32.const 12 i32.add local.get $f3 i32.store local.get $ptr i32.const 16 i32.add local.get $f4 i32.store local.get $ptr)\n")
 
 ; Compile source to WAT module
 (fn compile ((src string)) string

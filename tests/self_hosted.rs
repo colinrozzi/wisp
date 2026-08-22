@@ -630,9 +630,23 @@ fn test_compile_with_string_literal() {
 }
 
 #[test]
-#[ignore = "Tokenizer uses recursion that exceeds memory limits for 42KB file"]
 fn test_bootstrap_self_compile() {
-    // The ultimate test: compile the compiler with itself
+    // The ultimate test: compile the compiler with itself.
+    //
+    // This used to trap "out of bounds memory access": codegen assembled its
+    // ~150 KB WAT output with linear left-fold `string-append` accumulators,
+    // which are O(N^2), and the bump heap never frees -- the 5 KB runtime
+    // literal alone (emitted as ~40 WAT bytes per source byte) blew past 1 GB.
+    // Codegen now assembles output with divide-and-conquer string-append
+    // (O(N log N)); the self-compile completes in ~1s.
+    //
+    // NOTE: the produced module is not yet a valid WAT *fixpoint*. The
+    // compiler's own source uses four forms it cannot yet compile
+    // (top-level `(global ...)`, `begin`, `global.get`, `global.set`), so the
+    // output contains one `(error: unknown form)` and miscompiles the i64
+    // number helpers. Closing that gap is the next self-hosting step; see
+    // test_bootstrap_v2_compiles_factorial. This test guards only that the
+    // O(N^2) blow-up stays fixed and the compiler runs to completion.
     let compiler_source = get_compiler_source();
     println!("Compiler source length: {} chars", compiler_source.len());
 
@@ -694,7 +708,9 @@ fn test_bootstrap_self_compile() {
 }
 
 #[test]
-#[ignore = "Requires bootstrap to pass first"]
+#[ignore = "Self-compiled module is not yet a valid fixpoint: the compiler cannot \
+            yet compile the `global`/`begin`/`global.get`/`global.set` forms its own \
+            source uses, so the output does not parse. Enable once that gap is closed."]
 fn test_bootstrap_v2_compiles_factorial() {
     // Load the self-compiled WAT and use it to compile a program!
     let wat = std::fs::read_to_string("/tmp/bootstrap_output.wat")
