@@ -1574,18 +1574,15 @@ fn format_value(value: &pack::abi::Value) -> String {
     }
 }
 
-/// Preprocess string literals in an expression.
-/// Replaces `(str.const "...")` with `(i32.const <addr>)` and collects string data.
-/// Strings are stored in memory at addresses starting from 0x100 in format [len:u32][utf8_bytes...].
-fn preprocess_string_literals(
-    source: &str,
-    start_addr: i32,
-) -> (String, Vec<(i32, String)>, i32) {
+/// Unwrap `(str.const "X")` into a bare string literal `"X"` (M4).
+///
+/// Strings are heap values: the self-hosted compiler's `compile-string` already lowers a
+/// literal `"X"` to a heap allocation (`[len:u32][bytes]` bumped off `$__heap_ptr`), which
+/// — because the heap is shared and persistent (M1) — Just Works across REPL lines. So we
+/// no longer assign fixed low-memory addresses or emit data segments; we only strip the
+/// `(str.const …)` wrapper so the compiler sees the literal. Raw `"X"` needs no unwrapping.
+fn preprocess_string_literals(source: &str) -> String {
     let mut result = source.to_string();
-    let mut strings = Vec::new();
-    // Continue the session's string arena rather than restarting, so a persistent shared
-    // memory never sees two lines write different strings to the same address.
-    let mut addr: i32 = start_addr;
 
     while let Some(start) = result.find("(str.const \"") {
         let content_start = start + "(str.const \"".len();
@@ -1593,14 +1590,8 @@ fn preprocess_string_literals(
             let content_end = content_start + quote_end;
             let paren_end = content_end + 1; // ')' after closing quote
             if paren_end < result.len() && result.as_bytes()[paren_end] == b')' {
-                let string_value = result[content_start..content_end].to_string();
-                let replacement = format!("(i32.const {})", addr);
-                result.replace_range(start..=paren_end, &replacement);
-
-                // Allocate: 4 bytes length + string bytes, aligned to 4
-                let total = 4 + string_value.len() as i32;
-                strings.push((addr, string_value));
-                addr += (total + 3) & !3;
+                let literal = format!("\"{}\"", &result[content_start..content_end]);
+                result.replace_range(start..=paren_end, &literal);
             } else {
                 break; // Malformed, stop
             }
@@ -1609,7 +1600,7 @@ fn preprocess_string_literals(
         }
     }
 
-    (result, strings, addr)
+    result
 }
 
 /// Rewrite a compiled line's WAT so it *shares* one persistent linear memory and one
@@ -2693,8 +2684,10 @@ fn infer_return_type(
 ) -> ReplReturnType {
     let trimmed = expr.trim();
 
-    // Check for string-returning operations
-    if trimmed.starts_with("(string-append")
+    // Check for string-returning operations, or a bare string literal (M4: strings are
+    // heap values, so a literal `"…"` evaluates to a heap pointer we decode as a string).
+    if trimmed.starts_with('"')
+        || trimmed.starts_with("(string-append")
         || trimmed.starts_with("(substring")
         || trimmed.starts_with("(str.const")
     {
@@ -2847,14 +2840,13 @@ fn read_variant_from_memory(
 /// one store, one linear memory, and one bump-heap pointer. Each compiled line is
 /// instantiated into this store and imports the shared memory + `$__heap_ptr`, so
 /// allocations accumulate on a single heap that never resets between lines. The string
-/// arena (`next_string_addr`) is a second bump pointer over the low region below the heap.
-/// See docs/changes/LIVE-REPL-DYNAMIC-LINKING.md (M1).
+/// See docs/changes/LIVE-REPL-DYNAMIC-LINKING.md (M1). Strings are ordinary heap values
+/// (M4), so there is no separate string arena.
 struct ReplSession {
     engine: Engine,
     store: Store<()>,
     memory: Memory,
     heap_ptr: Global,
-    next_string_addr: i32,
     /// Live image functions: each user `(fn …)` is compiled once into its own instance in
     /// this store and exported. Later lines reach it by import instead of recompiling its
     /// source (M2 — incremental linking). Keyed by function name.
@@ -2939,7 +2931,6 @@ impl ReplSession {
             store,
             memory,
             heap_ptr,
-            next_string_addr: 0x100,
             image_fns: HashMap::new(),
         })
     }
@@ -3135,10 +3126,7 @@ async fn run_repl() -> Result<()> {
             // Observe the live-image session: the bump-heap pointer and string-arena
             // pointer both persist across lines, so they grow rather than reset.
             let hp = session.heap_ptr.get(&mut session.store).unwrap_i32();
-            println!(
-                "heap_ptr = {} (0x{:x}), string_arena = {} (0x{:x})",
-                hp, hp, session.next_string_addr, session.next_string_addr
-            );
+            println!("heap_ptr = {} (0x{:x})", hp, hp);
             continue;
         }
 
@@ -3433,9 +3421,11 @@ async fn eval_expression(
         full_text.push('\n');
     }
     full_text.push_str(expr);
-    let (processed_full, all_strings, next_string_addr) =
-        preprocess_string_literals(&full_text, session.next_string_addr);
-    session.next_string_addr = next_string_addr;
+    let processed_full = preprocess_string_literals(&full_text);
+    // M4: strings are heap-allocated by the compiler, so there are no host-placed string
+    // data segments. Kept as an (always-empty) binding so the Pack/data-segment
+    // post-processing below stays intact for the Pack-import path.
+    let all_strings: Vec<(i32, String)> = Vec::new();
 
     // Split back into functions and expression
     let mut processed_functions = Vec::new();

@@ -1,6 +1,6 @@
 # Live REPL via WASM dynamic linking
 
-**Status**: M1 ✅ + M2 ✅ + M3 ✅ complete → M4 next (optional)
+**Status**: M1 ✅ + M2 ✅ + M3 ✅ + M4 ✅ — live image complete
 **Started**: 2026-08-22
 **Related**: [WISP-REPL-ARCHITECTURE.md](WISP-REPL-ARCHITECTURE.md) (the current REPL),
 [GENERICS-AND-TRAITS.md](GENERICS-AND-TRAITS.md) / [DERIVING.md](DERIVING.md) (the
@@ -165,7 +165,23 @@ redefining `p` the old alias `q` still reads its captured value (value semantics
 limit: `s64`/`f64` scalar and Pack-compound `define`s are not supported yet (the `eval`
 wrapper is `s32`); `set!` is future work.
 
-### M4 — Strings as heap values (in the compiler)
+### M4 — Strings as heap values ✅ DONE (no compiler change needed!)
+**Investigation surprise**: the self-hosted compiler *already* lowers a string literal
+`"…"` to a heap allocation — `compile-string` (`examples/wisp-compiler.lisp` ~750-767)
+bump-allocates `len+4` off `$__heap_ptr`, writes the length + bytes, returns the pointer;
+its tokenizer already reads `"…"`. Raw strings in the REPL already heap-allocated. The low
+arena was used *only* because the host intercepted `(str.const "…")` first. So M4 was a
+**removal**, not a compiler change: `preprocess_string_literals` now just unwraps
+`(str.const "X")` → `"X"` and lets the compiler allocate on the shared heap;
+`infer_return_type` recognizes a bare `"…"` literal; `next_string_addr` and the `(heap)`
+arena readout are gone (the data-segment post-processing stays only for the Pack path, on
+an always-empty string list). Proven: `(define g "persisted")` reads back on a later line;
+`(string-append g (str.const "!"))` = `"persisted!"` composes a prior-line string on the
+heap; `string_arena` never moves. A string is now just another heap value in the one image.
+
+---
+
+Historical plan (superseded by the above):
 The principled removal of the low string arena. Today string literals are a **host-side
 text shim** (`preprocess_string_literals`): each `(str.const "…")` is placed at a fixed
 low address `[0x100, 49152)` via an active data segment — a second, parallel memory
