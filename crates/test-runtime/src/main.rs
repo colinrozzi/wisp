@@ -28,7 +28,10 @@ use theater::pack_bridge::{AsyncRuntime, Ctx, PackInstance, Value};
 use theater::ValueType;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use wasmtime::{Engine, Instance, Module, Store};
+use wasmtime::{
+    Config, Engine, Global, GlobalType, Instance, Linker, Memory, MemoryType, Module, Mutability,
+    Store, Val, ValType,
+};
 
 // Pack runtime for loading imported packages
 use pack::Runtime as PackRuntime;
@@ -1565,10 +1568,15 @@ fn format_value(value: &pack::abi::Value) -> String {
 /// Preprocess string literals in an expression.
 /// Replaces `(str.const "...")` with `(i32.const <addr>)` and collects string data.
 /// Strings are stored in memory at addresses starting from 0x100 in format [len:u32][utf8_bytes...].
-fn preprocess_string_literals(source: &str) -> (String, Vec<(i32, String)>) {
+fn preprocess_string_literals(
+    source: &str,
+    start_addr: i32,
+) -> (String, Vec<(i32, String)>, i32) {
     let mut result = source.to_string();
     let mut strings = Vec::new();
-    let mut addr: i32 = 0x100; // Start at offset 256
+    // Continue the session's string arena rather than restarting, so a persistent shared
+    // memory never sees two lines write different strings to the same address.
+    let mut addr: i32 = start_addr;
 
     while let Some(start) = result.find("(str.const \"") {
         let content_start = start + "(str.const \"".len();
@@ -1592,7 +1600,138 @@ fn preprocess_string_literals(source: &str) -> (String, Vec<(i32, String)>) {
         }
     }
 
-    (result, strings)
+    (result, strings, addr)
+}
+
+/// Rewrite a compiled line's WAT so it *shares* one persistent linear memory and one
+/// persistent bump-heap pointer with every other REPL line, instead of defining its own.
+/// This is the core of the live-image "dynamic linking" (see
+/// docs/changes/LIVE-REPL-DYNAMIC-LINKING.md, M1):
+///
+/// - `(memory (export "memory") N)` / `(memory N)` becomes
+///   `(import "env" "memory" (memory N))`, and the memory is re-exported so existing
+///   result extraction (`get_memory("memory")`, `caller.get_export("memory")`) keeps working.
+/// - `(global $__heap_ptr (mut i32) (i32.const …))` becomes an imported mutable global, so
+///   the bump pointer never resets across lines — allocations keep growing on one heap.
+///
+/// Each replacement is conditional on the definition being present. Injected imports go
+/// immediately after `(module`, before any definition.
+fn rewrite_for_shared_memory(wat: &str) -> String {
+    let mut pages = "1".to_string();
+    let mut heap_used = false;
+    let mut kept: Vec<&str> = Vec::with_capacity(wat.lines().count());
+
+    for line in wat.lines() {
+        let t = line.trim_start();
+        if t.starts_with("(memory") {
+            // Page count is the first bare integer token (forms: `(memory 1)` or
+            // `(memory (export "memory") 1)`).
+            if let Some(tok) = t
+                .split(|c: char| c == ' ' || c == '(' || c == ')')
+                .find(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            {
+                pages = tok.to_string();
+            }
+            continue; // drop the original memory definition
+        }
+        if t.starts_with("(global $__heap_ptr") {
+            heap_used = true;
+            continue; // drop the original heap-pointer definition
+        }
+        kept.push(line);
+    }
+
+    let mut out = String::with_capacity(wat.len() + 128);
+    let mut injected = false;
+    for line in kept {
+        out.push_str(line);
+        out.push('\n');
+        if !injected && line.trim_start().starts_with("(module") {
+            out.push_str(&format!("  (import \"env\" \"memory\" (memory {}))\n", pages));
+            if heap_used {
+                out.push_str(
+                    "  (import \"env\" \"__heap_ptr\" (global $__heap_ptr (mut i32)))\n",
+                );
+            }
+            out.push_str("  (export \"memory\" (memory 0))\n");
+            injected = true;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod m1_shared_memory_tests {
+    use super::rewrite_for_shared_memory;
+    use wasmtime::{
+        Config, Engine, Global, GlobalType, Linker, Memory, MemoryType, Module, Mutability,
+        Store, Val, ValType,
+    };
+
+    // A module shaped like the self-hosted compiler's output: it defines its own memory
+    // and `$__heap_ptr`, and bump-allocates a 4-byte cell holding `val`.
+    const COMPILED: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $__heap_ptr (mut i32) (i32.const 49152))
+  (func (export "alloc") (param $val i32) (result i32)
+    (local $ptr i32)
+    global.get $__heap_ptr
+    local.set $ptr
+    global.get $__heap_ptr
+    i32.const 4
+    i32.add
+    global.set $__heap_ptr
+    local.get $ptr
+    local.get $val
+    i32.store
+    local.get $ptr))
+"#;
+
+    #[test]
+    fn rewrite_produces_shareable_module_with_persistent_heap() {
+        let shared = rewrite_for_shared_memory(COMPILED);
+        assert!(shared.contains("(import \"env\" \"memory\" (memory 1))"));
+        assert!(shared.contains("(import \"env\" \"__heap_ptr\" (global $__heap_ptr (mut i32)))"));
+        assert!(shared.contains("(export \"memory\" (memory 0))"));
+        // The heap-ptr *definition* (with its initializer) is gone; only the import remains.
+        assert!(!shared.contains("i32.const 49152"));
+        assert!(!shared.contains("(memory (export"));
+
+        let engine = Engine::new(&Config::new()).unwrap();
+        let mut store = Store::new(&engine, ());
+        let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+        let heap = Global::new(
+            &mut store,
+            GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(49152),
+        )
+        .unwrap();
+
+        // Name-based wiring — the same mechanism eval_expression will use.
+        let mut linker = Linker::new(&engine);
+        linker.define(&store, "env", "memory", memory).unwrap();
+        linker.define(&store, "env", "__heap_ptr", heap).unwrap();
+
+        let module = Module::new(&engine, &shared).unwrap();
+        // Two independent instances of the compiled line, sharing one heap.
+        let a = linker.instantiate(&mut store, &module).unwrap();
+        let b = linker.instantiate(&mut store, &module).unwrap();
+        let alloc_a = a.get_typed_func::<i32, i32>(&mut store, "alloc").unwrap();
+        let alloc_b = b.get_typed_func::<i32, i32>(&mut store, "alloc").unwrap();
+
+        let p1 = alloc_a.call(&mut store, 42).unwrap();
+        let p2 = alloc_b.call(&mut store, 99).unwrap(); // different instance, same heap
+        assert_eq!(p1, 49152, "first alloc at heap start");
+        assert_eq!(p2, 49156, "second instance saw the persisted heap pointer");
+
+        // Both values readable through the one shared memory.
+        let data = memory.data(&store);
+        let read =
+            |p: i32| i32::from_le_bytes(data[p as usize..p as usize + 4].try_into().unwrap());
+        assert_eq!(read(p1), 42);
+        assert_eq!(read(p2), 99);
+    }
 }
 
 /// Encode a string into WAT data segment format: length prefix + UTF-8 bytes
@@ -2681,6 +2820,45 @@ fn read_variant_from_memory(
 /// - Compiles expressions with inlined values using self-hosted compiler
 /// - Loads and uses Pack packages via (import <interface> from <source>)
 /// - Executes and prints results
+/// The persistent state a live REPL image shares across every line: one wasm engine,
+/// one store, one linear memory, and one bump-heap pointer. Each compiled line is
+/// instantiated into this store and imports the shared memory + `$__heap_ptr`, so
+/// allocations accumulate on a single heap that never resets between lines. The string
+/// arena (`next_string_addr`) is a second bump pointer over the low region below the heap.
+/// See docs/changes/LIVE-REPL-DYNAMIC-LINKING.md (M1).
+struct ReplSession {
+    engine: Engine,
+    store: Store<()>,
+    memory: Memory,
+    heap_ptr: Global,
+    next_string_addr: i32,
+}
+
+impl ReplSession {
+    fn new() -> Result<Self> {
+        let mut config = Config::new();
+        config.wasm_tail_call(true);
+        let engine = Engine::new(&config)?;
+        let mut store = Store::new(&engine, ());
+        // Shared heap: growable, min 16 pages (1 MiB). The heap pointer starts at 49152
+        // (0xC000), matching the self-hosted compiler's layout; the low region
+        // [0x100, 49152) holds the persistent string arena.
+        let memory = Memory::new(&mut store, MemoryType::new(16, None))?;
+        let heap_ptr = Global::new(
+            &mut store,
+            GlobalType::new(ValType::I32, Mutability::Var),
+            Val::I32(49152),
+        )?;
+        Ok(Self {
+            engine,
+            store,
+            memory,
+            heap_ptr,
+            next_string_addr: 0x100,
+        })
+    }
+}
+
 async fn run_repl() -> Result<()> {
     println!("Wisp REPL (self-hosted compiler)");
     println!("Commands: (define x 42), (fn name ...), (import <interface> from <source>)");
@@ -2692,6 +2870,8 @@ async fn run_repl() -> Result<()> {
     let mut imports: Vec<LoadedInterface> = Vec::new();
     let mut record_defs: HashMap<String, ReplRecordDef> = HashMap::new();
     let mut variant_defs: HashMap<String, ReplVariantDef> = HashMap::new();
+    // The persistent live-image session: one shared engine/store/memory/heap for all lines.
+    let mut session = ReplSession::new()?;
     // Loaded Pack packages: path -> LoadedPackage
     let mut loaded_packages: HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>> = HashMap::new();
     // Pack runtime for loading packages
@@ -2777,6 +2957,17 @@ async fn run_repl() -> Result<()> {
                 }
                 None => println!("error: invalid record syntax. Use: (record name (field1 type1) (field2 type2) ...)"),
             }
+            continue;
+        }
+
+        if line == "(heap)" {
+            // Observe the live-image session: the bump-heap pointer and string-arena
+            // pointer both persist across lines, so they grow rather than reset.
+            let hp = session.heap_ptr.get(&mut session.store).unwrap_i32();
+            println!(
+                "heap_ptr = {} (0x{:x}), string_arena = {} (0x{:x})",
+                hp, hp, session.next_string_addr, session.next_string_addr
+            );
             continue;
         }
 
@@ -2916,6 +3107,7 @@ async fn run_repl() -> Result<()> {
             &loaded_packages,
             &record_defs,
             &variant_defs,
+            &mut session,
         )
         .await
         {
@@ -2998,6 +3190,7 @@ async fn eval_expression(
     loaded_packages: &HashMap<PathBuf, Arc<Mutex<pack::Instance<()>>>>,
     record_defs: &HashMap<String, ReplRecordDef>,
     variant_defs: &HashMap<String, ReplVariantDef>,
+    session: &mut ReplSession,
 ) -> Result<EvalResult> {
     // Preprocess string literals in expression and function definitions.
     // (str.const "hello") -> (i32.const <addr>) with data segments.
@@ -3008,7 +3201,9 @@ async fn eval_expression(
         full_text.push('\n');
     }
     full_text.push_str(expr);
-    let (processed_full, all_strings) = preprocess_string_literals(&full_text);
+    let (processed_full, all_strings, next_string_addr) =
+        preprocess_string_literals(&full_text, session.next_string_addr);
+    session.next_string_addr = next_string_addr;
 
     // Split back into functions and expression
     let mut processed_functions = Vec::new();
@@ -3323,20 +3518,25 @@ async fn eval_expression(
         anyhow::bail!("Compile error in generated WAT:\n{}", wat);
     }
 
-    // Assemble WAT to WASM
+    // Rewrite so this line shares the session's one memory + bump-heap pointer, then assemble.
+    let wat = rewrite_for_shared_memory(&wat);
     let wasm_bytes =
         wat::parse_str(&wat).with_context(|| format!("Failed to assemble WAT:\n{}", wat))?;
 
-    // Load and run
-    let mut config = wasmtime::Config::new();
-    config.wasm_tail_call(true);
-    let engine = Engine::new(&config)?;
+    // Load and run on the persistent session: one shared engine, store, memory, and
+    // bump-heap pointer across every REPL line (see LIVE-REPL-DYNAMIC-LINKING.md, M1).
+    let engine = session.engine.clone();
     let module = Module::new(&engine, &wasm_bytes)
         .with_context(|| format!("Failed to compile WASM from WAT:\n{}", wat))?;
-    let mut store = Store::new(&engine, ());
+    let mut store = &mut session.store;
 
-    // Build imports list by instantiating imported components
-    let mut extern_imports: Vec<wasmtime::Extern> = Vec::new();
+    // Wire imports by name via a Linker (robust as the image grows). Every line imports
+    // the session's shared memory + heap pointer; host/Pack functions are defined per
+    // interface + name.
+    let mut linker: Linker<()> = Linker::new(&engine);
+    linker.allow_shadowing(true);
+    linker.define(&store, "env", "memory", session.memory)?;
+    linker.define(&store, "env", "__heap_ptr", session.heap_ptr)?;
 
     for (imp, exported_func) in &used_imports {
         match &imp.source {
@@ -3348,28 +3548,28 @@ async fn eval_expression(
                             println!("[debug] {}", value);
                             value // Return the value for chaining
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     ("wisp:repl/debug", "print-i64") => {
                         let func = wasmtime::Func::wrap(&mut store, |value: i64| -> i64 {
                             println!("[debug] {}", value);
                             value
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     ("wisp:repl/debug", "print-f32") => {
                         let func = wasmtime::Func::wrap(&mut store, |value: f32| -> f32 {
                             println!("[debug] {}", value);
                             value
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     ("wisp:repl/debug", "print-f64") => {
                         let func = wasmtime::Func::wrap(&mut store, |value: f64| -> f64 {
                             println!("[debug] {}", value);
                             value
                         });
-                        extern_imports.push(func.into());
+                        linker.define(&store, &imp.interface, &exported_func.name, func)?;
                     }
                     _ => {
                         anyhow::bail!(
@@ -3491,12 +3691,14 @@ async fn eval_expression(
                     },
                 );
 
-                extern_imports.push(func.into());
+                linker.define(&store, &imp.interface, &exported_func.name, func)?;
             }
         }
     }
 
-    let instance = Instance::new(&mut store, &module, &extern_imports)?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .with_context(|| format!("Failed to instantiate:\n{}", wat))?;
 
     let eval_func = instance
         .get_func(&mut store, "eval")
