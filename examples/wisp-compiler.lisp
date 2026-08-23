@@ -902,9 +902,11 @@
                       (string-append "(i32.load " (string-append rec-wat ")"))
                       (string-append "(i32.load (i32.add " (string-append rec-wat (string-append " (i32.const " (string-append (i32-to-string offset) ")))")))))))
                 ; WASM instruction or function call
+                (if (i32.eq (is-begin-or-global name) (i32.const 1))
+                  (compile-begin-or-global-sub name items binding-name scrutinee-wat ctx is-tail)
                 (if (is-wasm-instr name)
                   (compile-wasm-call-sub name items binding-name scrutinee-wat ctx)
-                  (compile-fn-call-sub name items binding-name scrutinee-wat ctx is-tail))))))
+                  (compile-fn-call-sub name items binding-name scrutinee-wat ctx is-tail)))))))
         "(error)"))))
 
 (fn compile-wasm-call-sub ((instr string) (items (list sexpr)) (binding-name string) (scrutinee-wat string) (ctx compile-ctx)) string
@@ -983,6 +985,94 @@
         (let (first-case (list-get items (i32.const 2)))
           (let (num-cases (i32.sub (list-len items) (i32.const 2)))
             (compile-match-case first-case scrutinee-wat items (i32.const 0) num-cases ctx is-tail)))))))
+
+; ============================================================
+; begin / global.get / global.set  (special forms the compiler's own
+; source uses, e.g. the i64 number helpers that smuggle an s64 out of a
+; match through the $__temp_i64 global)
+; ============================================================
+
+(fn is-begin-or-global ((name string)) s32
+  (if (string=? name "begin") (i32.const 1)
+    (if (string=? name "global.get") (i32.const 1)
+      (if (string=? name "global.set") (i32.const 1)
+        (i32.const 0)))))
+
+; A store instruction (i32.store, i64.store8, ...) leaves nothing on the stack.
+(fn instr-is-store ((n string)) s32
+  (if (i32.lt_s (string-len n) (i32.const 9))
+    (i32.const 0)
+    (if (string=? (substring n (i32.const 4) (i32.const 9)) "store")
+      (i32.const 1)
+      (i32.const 0))))
+
+; Does this expr leave no value on the stack? begin uses this to decide
+; whether a non-final expression must be dropped.
+(fn is-void-expr ((e sexpr)) s32
+  (if (is-lst e)
+    (let (its (get-lst e))
+      (if (i32.gt_s (list-len its) (i32.const 0))
+        (let (h (list-get its (i32.const 0)))
+          (if (is-sym h)
+            (if (string=? (get-sym h) "global.set")
+              (i32.const 1)
+              (instr-is-store (get-sym h)))
+            (i32.const 0)))
+        (i32.const 0)))
+    (i32.const 0)))
+
+; Compile the non-final exprs of a begin, dropping any that leave a value.
+(fn compile-begin-stmts ((items (list sexpr)) (idx s32) (last-idx s32) (ctx compile-ctx) (acc string)) string
+  (if (i32.ge_s idx last-idx)
+    acc
+    (let (e (list-get items idx))
+      (let (c (compile-expr e ctx (i32.const 0)))
+        (let (stmt (if (i32.eq (is-void-expr e) (i32.const 1))
+                     c
+                     (string-append "(drop " (string-append c ")"))))
+          (compile-begin-stmts items (i32.add idx (i32.const 1)) last-idx ctx
+            (string-append acc (string-append stmt " "))))))))
+
+; (begin e1 ... en) -> evaluate all in order, value is en (e1..e(n-1) dropped
+; if they leave a value). Emitted as a bare instruction sequence -- no block --
+; so the last expr's type (which may be i64) flows to the enclosing context.
+(fn compile-begin ((items (list sexpr)) (ctx compile-ctx) (is-tail s32)) string
+  (let (last-idx (i32.sub (list-len items) (i32.const 1)))
+    (let (stmts (compile-begin-stmts items (i32.const 1) last-idx ctx ""))
+      (string-append stmts (compile-expr (list-get items last-idx) ctx is-tail)))))
+
+(fn compile-begin-or-global ((name string) (items (list sexpr)) (ctx compile-ctx) (is-tail s32)) string
+  (if (string=? name "global.get")
+    (string-append "(global.get " (string-append (get-sym (list-get items (i32.const 1))) ")"))
+    (if (string=? name "global.set")
+      (string-append "(global.set " (string-append (get-sym (list-get items (i32.const 1)))
+        (string-append " " (string-append (compile-expr (list-get items (i32.const 2)) ctx (i32.const 0)) ")"))))
+      (compile-begin items ctx is-tail))))
+
+; sub variants: same forms, but inside match arms (thread binding/scrutinee)
+(fn compile-begin-stmts-sub ((items (list sexpr)) (idx s32) (last-idx s32) (binding-name string) (scrutinee-wat string) (ctx compile-ctx) (acc string)) string
+  (if (i32.ge_s idx last-idx)
+    acc
+    (let (e (list-get items idx))
+      (let (c (compile-expr-sub e binding-name scrutinee-wat ctx (i32.const 0)))
+        (let (stmt (if (i32.eq (is-void-expr e) (i32.const 1))
+                     c
+                     (string-append "(drop " (string-append c ")"))))
+          (compile-begin-stmts-sub items (i32.add idx (i32.const 1)) last-idx binding-name scrutinee-wat ctx
+            (string-append acc (string-append stmt " "))))))))
+
+(fn compile-begin-sub ((items (list sexpr)) (binding-name string) (scrutinee-wat string) (ctx compile-ctx) (is-tail s32)) string
+  (let (last-idx (i32.sub (list-len items) (i32.const 1)))
+    (let (stmts (compile-begin-stmts-sub items (i32.const 1) last-idx binding-name scrutinee-wat ctx ""))
+      (string-append stmts (compile-expr-sub (list-get items last-idx) binding-name scrutinee-wat ctx is-tail)))))
+
+(fn compile-begin-or-global-sub ((name string) (items (list sexpr)) (binding-name string) (scrutinee-wat string) (ctx compile-ctx) (is-tail s32)) string
+  (if (string=? name "global.get")
+    (string-append "(global.get " (string-append (get-sym (list-get items (i32.const 1))) ")"))
+    (if (string=? name "global.set")
+      (string-append "(global.set " (string-append (get-sym (list-get items (i32.const 1)))
+        (string-append " " (string-append (compile-expr-sub (list-get items (i32.const 2)) binding-name scrutinee-wat ctx (i32.const 0)) ")"))))
+      (compile-begin-sub items binding-name scrutinee-wat ctx is-tail))))
 
 (fn compile-expr ((expr sexpr) (ctx compile-ctx) (is-tail s32)) string
   (match expr
@@ -1111,9 +1201,11 @@
                                           (string-append "(i32.load (i32.add " (string-append rec-wat (string-append " (i32.const " (string-append (i32-to-string offset) ")))")))))))
                                     ; Regular function call or WASM instruction
                                     (let (args (build-args-list items (i32.const 1) (i32.sub (list-len items) (i32.const 1)) (list-new sexpr)))
+                                      (if (i32.eq (is-begin-or-global name) (i32.const 1))
+                                        (compile-begin-or-global name items ctx is-tail)
                                       (if (is-wasm-instr name)
                                         (compile-wasm-call name args ctx)
-                                        (compile-fn-call name args ctx is-tail)))))))))))))))))))
+                                        (compile-fn-call name args ctx is-tail))))))))))))))))))))
         "(error: list head not symbol)"))))
 
 ; ============================================================
@@ -1474,7 +1566,24 @@
             ""
             (if (string=? name "data")
               ""
-              "(error: unknown form)")))))))
+              (if (string=? name "global")
+                (compile-global items)
+                "(error: unknown form)"))))))))
+
+; Compile a top-level global declaration:
+;   (global $name type mut|const init)  ->  (global $name (mut T) (T.const v))
+; The name symbol already carries its leading $; init is assumed to be a number.
+(fn compile-global ((items (list sexpr)) ) string
+  (let (name (get-sym (list-get items (i32.const 1))))
+    (let (ty (type-to-wat-imp (get-sym (list-get items (i32.const 2)))))
+      (let (mutability (get-sym (list-get items (i32.const 3))))
+        (let (init-val (i64-to-string (get-num-i64 (list-get items (i32.const 4)))))
+          (let (init-wat (string-append "(" (string-append ty (string-append ".const " (string-append init-val ")")))))
+            (let (type-decl (if (string=? mutability "mut")
+                              (string-append "(mut " (string-append ty ")"))
+                              ty))
+              (string-append "  (global " (string-append name (string-append " "
+                (string-append type-decl (string-append " " (string-append init-wat ")\n")))))))))))))
 
 ; Compile a top-level form
 (fn compile-toplevel ((form sexpr) (ctx compile-ctx)) string
