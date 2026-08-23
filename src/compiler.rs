@@ -14600,12 +14600,14 @@ fn generate_cgrf_decode_string(out: &mut String) {
     out.push_str("    i32.add\n");
     out.push_str("    global.set $__heap_ptr\n");
 
-    // Write length to wisp string
-    out.push_str("    local.get $str_ptr\n");
-    out.push_str("    local.get $str_len\n");
-    out.push_str("    i32.store\n");
-
-    // Copy string data from CGRF to wisp string
+    // Copy string data from CGRF to wisp string FIRST, then write the length
+    // header. Order matters: the caller may place the input just below the heap
+    // base, so $str_ptr (= heap_ptr) can land inside the still-unread CGRF input
+    // for inputs larger than ~45 KB. Writing the 4-byte length header before the
+    // copy would clobber source bytes that memory.copy is about to read,
+    // corrupting the decoded string (the self-hosting size cliff). memory.copy is
+    // memmove-safe, so the overlapping copy itself is fine; and after it the
+    // source is consumed, so writing the header at $str_ptr is then safe.
     // Source: $in_ptr + 28 (24 for header+node + 4 for length prefix in payload)
     // Dest: $str_ptr + 4
     out.push_str("    local.get $str_ptr\n");
@@ -14616,6 +14618,11 @@ fn generate_cgrf_decode_string(out: &mut String) {
     out.push_str("    i32.add\n"); // src
     out.push_str("    local.get $str_len\n"); // len
     out.push_str("    memory.copy\n");
+
+    // Write length to wisp string (after the copy has consumed the source)
+    out.push_str("    local.get $str_ptr\n");
+    out.push_str("    local.get $str_len\n");
+    out.push_str("    i32.store\n");
 
     // Return the wisp string pointer
     out.push_str("    local.get $str_ptr\n");
