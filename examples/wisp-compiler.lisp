@@ -885,6 +885,9 @@
     (let (head (list-get items (i32.const 0)))
       (if (is-sym head)
         (let (name (get-sym head))
+          ; Control forms (if/let/match) can nest inside match arms too
+          (if (i32.eq (is-ctrl-form name) (i32.const 1))
+            (compile-ctrl-sub items name binding-name scrutinee-wat ctx is-tail)
           ; Context-aware variant constructor (in match body)
           (if (is-variant-constructor ctx name)
             (if (i32.eq (constructor-has-payload ctx name) (i32.const 0))
@@ -901,13 +904,88 @@
                     (if (i32.eq offset (i32.const 0))
                       (string-append "(i32.load " (string-append rec-wat ")"))
                       (string-append "(i32.load (i32.add " (string-append rec-wat (string-append " (i32.const " (string-append (i32-to-string offset) ")))")))))))
+                ; String/list builtins (also valid inside match arms)
+                (if (i32.eq (is-builtin-call name) (i32.const 1))
+                  (compile-builtin-sub name items binding-name scrutinee-wat ctx)
                 ; WASM instruction or function call
                 (if (i32.eq (is-begin-or-global name) (i32.const 1))
                   (compile-begin-or-global-sub name items binding-name scrutinee-wat ctx is-tail)
                 (if (is-wasm-instr name)
                   (compile-wasm-call-sub name items binding-name scrutinee-wat ctx)
-                  (compile-fn-call-sub name items binding-name scrutinee-wat ctx is-tail)))))))
+                  (compile-fn-call-sub name items binding-name scrutinee-wat ctx is-tail)))))))))
         "(error)"))))
+
+; Builtins that take compiled sub-expression args and appear in match arm bodies.
+(fn is-builtin-call ((name string)) s32
+  (if (string=? name "string-append") (i32.const 1)
+    (if (string=? name "string=?") (i32.const 1)
+      (if (string=? name "substring") (i32.const 1)
+        (if (string=? name "string-len") (i32.const 1)
+          (if (string=? name "string-ref") (i32.const 1)
+            (if (string=? name "list-len") (i32.const 1)
+              (if (string=? name "list-get") (i32.const 1)
+                (if (string=? name "list-push") (i32.const 1)
+                  (if (string=? name "list-new") (i32.const 1)
+                    (i32.const 0)))))))))))
+
+; Compile a string/list builtin call inside a match arm (args via compile-expr-sub).
+(fn compile-builtin-sub ((name string) (items (list sexpr)) (binding-name string) (scrutinee-wat string) (ctx compile-ctx)) string
+  (if (string=? name "list-new")
+    "(call $__list_new)"
+    (if (string=? name "string-len")
+      (string-append "(i32.load " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx) ")"))
+      (if (string=? name "list-len")
+        (string-append "(i32.load " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx) ")"))
+        (if (string=? name "string-ref")
+          (string-append "(i32.load8_u (i32.add (i32.add " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx)
+            (string-append " (i32.const 4)) " (string-append (cbsub items (i32.const 2) binding-name scrutinee-wat ctx) "))"))))
+          (if (string=? name "list-get")
+            (string-append "(i32.load (i32.add (i32.load (i32.add " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx)
+              (string-append " (i32.const 8))) (i32.mul " (string-append (cbsub items (i32.const 2) binding-name scrutinee-wat ctx) " (i32.const 4))))"))))
+            (if (string=? name "string-append")
+              (string-append "(call $__string_append " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx)
+                (string-append " " (string-append (cbsub items (i32.const 2) binding-name scrutinee-wat ctx) ")"))))
+              (if (string=? name "string=?")
+                (string-append "(call $__string_eq " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx)
+                  (string-append " " (string-append (cbsub items (i32.const 2) binding-name scrutinee-wat ctx) ")"))))
+                (if (string=? name "list-push")
+                  (string-append "(call $__list_push " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx)
+                    (string-append " " (string-append (cbsub items (i32.const 2) binding-name scrutinee-wat ctx) ")"))))
+                  ; substring
+                  (string-append "(call $__substring " (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx)
+                    (string-append " " (string-append (cbsub items (i32.const 2) binding-name scrutinee-wat ctx)
+                      (string-append " " (string-append (cbsub items (i32.const 3) binding-name scrutinee-wat ctx) ")")))))))))))))))
+
+; Short helper: compile the item at idx as a sub-expression (non-tail).
+(fn cbsub ((items (list sexpr)) (idx s32) (binding-name string) (scrutinee-wat string) (ctx compile-ctx)) string
+  (compile-expr-sub (list-get items idx) binding-name scrutinee-wat ctx (i32.const 0)))
+
+; Control forms that can appear inside a match arm body.
+(fn is-ctrl-form ((name string)) s32
+  (if (string=? name "if") (i32.const 1)
+    (if (string=? name "let") (i32.const 1)
+      (if (string=? name "match") (i32.const 1)
+        (i32.const 0)))))
+
+; Compile if/let/match inside a match arm (sub-expressions keep the substitution
+; context; a nested match delegates to the normal compiler for its own scrutinee).
+(fn compile-ctrl-sub ((items (list sexpr)) (name string) (binding-name string) (scrutinee-wat string) (ctx compile-ctx) (is-tail s32)) string
+  (if (string=? name "if")
+    (string-append "(if (result i32) "
+      (string-append (cbsub items (i32.const 1) binding-name scrutinee-wat ctx)
+        (string-append " (then "
+          (string-append (compile-expr-sub (list-get items (i32.const 2)) binding-name scrutinee-wat ctx is-tail)
+            (string-append ") (else "
+              (string-append (compile-expr-sub (list-get items (i32.const 3)) binding-name scrutinee-wat ctx is-tail) "))"))))))
+    (if (string=? name "let")
+      (let (binding (get-lst (list-get items (i32.const 1))))
+        (string-append "(local.tee $"
+          (string-append (get-sym (list-get binding (i32.const 0)))
+            (string-append " "
+              (string-append (cbsub binding (i32.const 1) binding-name scrutinee-wat ctx)
+                (string-append ") "
+                  (compile-expr-sub (list-get items (i32.const 2)) binding-name scrutinee-wat ctx is-tail)))))))
+      (compile-match items ctx is-tail))))
 
 (fn compile-wasm-call-sub ((instr string) (items (list sexpr)) (binding-name string) (scrutinee-wat string) (ctx compile-ctx)) string
   (let (args (build-args-list items (i32.const 1) (i32.sub (list-len items) (i32.const 1)) (list-new sexpr)))
@@ -1392,16 +1470,31 @@
       (let (acc2 (collect-locals item acc))
         (collect-locals-list items (i32.add idx (i32.const 1)) len acc2)))))
 
-; Generate local declarations from a list of names
+; Is `name` present in names[0, idx)? Used to skip duplicate local declarations
+; (the same binding name can appear in several match arms / let bodies, but WAT
+; requires each local identifier to be unique within a function).
+(fn name-seen-before ((names (list string)) (idx s32) (name string)) s32
+  (name-seen-loop names (i32.const 0) idx name))
+
+(fn name-seen-loop ((names (list string)) (i s32) (idx s32) (name string)) s32
+  (if (i32.ge_s i idx)
+    (i32.const 0)
+    (if (string=? (list-get names i) name)
+      (i32.const 1)
+      (name-seen-loop names (i32.add i (i32.const 1)) idx name))))
+
+; Generate local declarations from a list of names, de-duplicating repeats.
 (fn gen-locals ((names (list string)) (idx s32) (len s32) (acc string)) string
   (if (i32.ge_s idx len)
     acc
     (let (name (list-get names idx))
-      (let (decl (string-append "(local $" (string-append name " i32)")))
-        (let (new-acc (if (i32.eq idx (i32.const 0))
-                        decl
-                        (string-append acc (string-append " " decl))))
-          (gen-locals names (i32.add idx (i32.const 1)) len new-acc))))))
+      (if (i32.eq (name-seen-before names idx name) (i32.const 1))
+        (gen-locals names (i32.add idx (i32.const 1)) len acc)
+        (let (decl (string-append "(local $" (string-append name " i32)")))
+          (let (new-acc (if (i32.eq (string-len acc) (i32.const 0))
+                          decl
+                          (string-append acc (string-append " " decl))))
+            (gen-locals names (i32.add idx (i32.const 1)) len new-acc)))))))
 
 ; Compile (fn name ((params...)) ret-type body)
 (fn compile-fn-def ((items (list sexpr)) (ctx compile-ctx)) string
