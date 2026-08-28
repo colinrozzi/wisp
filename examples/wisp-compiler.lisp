@@ -3,19 +3,13 @@
 ; Combines tokenizer, parser, and code generator
 
 ; ============================================================
-; Global for i64 extraction workaround (match bug with i64 return types)
-; ============================================================
-
-(global $__temp_i64 s64 mut 0s64)
-
-; ============================================================
 ; Token Type
 ; ============================================================
 
 (variant token
   (lparen)
   (rparen)
-  (number s64)
+  (number s32)
   (float-lit string)   ; Float literal stored as string (e.g., "3.14159")
   (symbol string)
   (str-lit string))
@@ -26,7 +20,7 @@
 
 (variant sexpr
   (sym string)
-  (num s64)
+  (num s32)
   (fnum string)  ; Float number stored as string for pass-through to WAT
   (str string)
   (lst (list sexpr)))
@@ -131,24 +125,25 @@
       (i32.const 1)
       (has-decimal src (i32.add start (i32.const 1)) end))))
 
-; Parse integer part of a number string
-(fn parse-int-value ((src string) (pos s32) (end s32) (acc s64)) s64
+; Parse integer part of a number string. Numbers are represented as s32; literals
+; wider than 32 bits are truncated (a known gap vs the Rust compiler's full s64).
+(fn parse-int-value ((src string) (pos s32) (end s32) (acc s32)) s32
   (if (i32.ge_s pos end)
     acc
     (let (c (string-ref src pos))
       (if (is-digit c)
         (parse-int-value src (i32.add pos (i32.const 1)) end
-          (i64.add (i64.mul acc (i64.const 10)) (i64.extend_i32_s (digit-value c))))
+          (i32.add (i32.mul acc (i32.const 10)) (digit-value c)))
         acc))))
 
-; Read a number - returns either (number s64) or (float-lit string)
+; Read a number - returns either (number s32) or (float-lit string)
 (fn read-number ((src string) (pos s32) (len s32)) token-result
   (let (end (find-number-end src pos len (i32.const 0)))
     (if (has-decimal src pos end)
       ; Float: return as string for pass-through to WAT
       (token-result (float-lit (substring src pos end)) end)
-      ; Integer: parse and return as s64
-      (token-result (number (parse-int-value src pos end (i64.const 0))) end))))
+      ; Integer: parse and return as s32
+      (token-result (number (parse-int-value src pos end (i32.const 0))) end))))
 
 (fn find-symbol-end ((src string) (pos s32) (len s32)) s32
   (if (i32.ge_s pos len)
@@ -196,7 +191,7 @@
                   (if (is-digit next-c)
                     (let (result (read-number src (i32.add pos (i32.const 1)) len))
                       (match (token-result.tok result)
-                        ((number n) (token-result (number (i64.sub (i64.const 0) n)) (token-result.new-pos result)))
+                        ((number n) (token-result (number (i32.sub (i32.const 0) n)) (token-result.new-pos result)))
                         ((float-lit f) (token-result (float-lit (string-append "-" f)) (token-result.new-pos result)))
                         ((lparen) result)
                         ((rparen) result)
@@ -330,24 +325,9 @@
 (fn get-sym ((e sexpr)) string
   (match e ((sym s) s) ((num n) "") ((fnum f) "") ((str s) "") ((lst l) "")))
 
-; Return s32 truncated value for compatibility (match bug with i64 return types)
+; Return the numeric value of a (num ...) sexpr.
 (fn get-num ((e sexpr)) s32
-  (match e ((sym s) (i32.const 0)) ((num n) (i32.wrap_i64 n)) ((fnum f) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
-
-; Return full s64 value using global variable workaround (match bug with i64 return types)
-; The match stores the value in $__temp_i64, then we read it back
-(fn get-num-i64-helper ((e sexpr)) s32
-  (match e
-    ((sym s) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
-    ((num n) (begin (global.set $__temp_i64 n) (i32.const 1)))
-    ((fnum f) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
-    ((str s) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))
-    ((lst l) (begin (global.set $__temp_i64 (i64.const 0)) (i32.const 0)))))
-
-(fn get-num-i64 ((e sexpr)) s64
-  (begin
-    (get-num-i64-helper e)
-    (global.get $__temp_i64)))
+  (match e ((sym s) (i32.const 0)) ((num n) n) ((fnum f) (i32.const 0)) ((str s) (i32.const 0)) ((lst l) (i32.const 0))))
 
 ; Get float number string
 (fn get-fnum ((e sexpr)) string
@@ -615,25 +595,6 @@
       (string-append "-" (i32-to-string-pos (i32.sub (i32.const 0) n) ""))
       (i32-to-string-pos n ""))))
 
-; Convert i64 to string for large numbers
-; Note: The let binding for result prevents tail call optimization, working around
-; a compiler bug with mixed i64/i32 tail call arguments
-(fn i64-to-string-pos ((n s64) (acc string)) string
-  (if (i64.eq n (i64.const 0))
-    acc
-    (let (digit (i32.wrap_i64 (i64.rem_s n (i64.const 10))))
-      (let (rest (i64.div_s n (i64.const 10)))
-        (let (new-acc (string-append (digit-to-string digit) acc))
-          (let (result (i64-to-string-pos rest new-acc))
-            result))))))
-
-(fn i64-to-string ((n s64)) string
-  (if (i64.eq n (i64.const 0))
-    "0"
-    (if (i64.lt_s n (i64.const 0))
-      (string-append "-" (i64-to-string-pos (i64.sub (i64.const 0) n) ""))
-      (i64-to-string-pos n ""))))
-
 ; ============================================================
 ; Code Generator
 ; ============================================================
@@ -717,11 +678,9 @@
                   (if (string=? name "lst") (i32.const 3)
                     (i32.const -1)))))))))))
 
-; Compile a number literal - use i32.const for small numbers, i64.const for large
-(fn compile-number ((n s64)) string
-  (if (i32.and (i64.ge_s n (i64.const -2147483648)) (i64.le_s n (i64.const 2147483647)))
-    (string-append "(i32.const " (string-append (i64-to-string n) ")"))
-    (string-append "(i64.const " (string-append (i64-to-string n) ")"))))
+; Compile a bare number literal. Bare integers default to s32.
+(fn compile-number ((n s32)) string
+  (string-append "(i32.const " (string-append (i32-to-string n) ")")))
 
 (fn compile-var ((name string)) string
   (string-append "(local.get $" (string-append name ")")))
@@ -801,7 +760,7 @@
     (if (is-const-instr instr)
       (let (arg (list-get args (i32.const 0)))
         (if (is-num arg)
-          (string-append "(" (string-append instr (string-append " " (string-append (i64-to-string (get-num-i64 arg)) ")"))))
+          (string-append "(" (string-append instr (string-append " " (string-append (i32-to-string (get-num arg)) ")"))))
           (if (is-fnum arg)
             ; Float literal - use string directly
             (string-append "(" (string-append instr (string-append " " (string-append (get-fnum arg) ")"))))
@@ -979,7 +938,7 @@
               (string-append (compile-expr-sub (list-get items (i32.const 3)) binding-name scrutinee-wat ctx is-tail) "))"))))))
     (if (string=? name "let")
       (let (binding (get-lst (list-get items (i32.const 1))))
-        (string-append "(local.tee $"
+        (string-append "(local.set $"
           (string-append (get-sym (list-get binding (i32.const 0)))
             (string-append " "
               (string-append (cbsub binding (i32.const 1) binding-name scrutinee-wat ctx)
@@ -995,7 +954,7 @@
       (if (is-const-instr instr)
         (let (arg (list-get args (i32.const 0)))
           (if (is-num arg)
-            (string-append "(" (string-append instr (string-append " " (string-append (i64-to-string (get-num-i64 arg)) ")"))))
+            (string-append "(" (string-append instr (string-append " " (string-append (i32-to-string (get-num arg)) ")"))))
             (if (is-fnum arg)
               ; Float literal - use string directly
               (string-append "(" (string-append instr (string-append " " (string-append (get-fnum arg) ")"))))
@@ -1196,7 +1155,7 @@
                                 (let (var-name (get-sym name-expr))
                                   (let (value-wat (compile-expr value-expr ctx (i32.const 0)))
                                     (let (body-wat (compile-expr body ctx is-tail))
-                                      (string-append "(local.tee $"
+                                      (string-append "(local.set $"
                                         (string-append var-name
                                           (string-append " "
                                             (string-append value-wat
@@ -1670,7 +1629,7 @@
   (let (name (get-sym (list-get items (i32.const 1))))
     (let (ty (type-to-wat-imp (get-sym (list-get items (i32.const 2)))))
       (let (mutability (get-sym (list-get items (i32.const 3))))
-        (let (init-val (i64-to-string (get-num-i64 (list-get items (i32.const 4)))))
+        (let (init-val (i32-to-string (get-num (list-get items (i32.const 4)))))
           (let (init-wat (string-append "(" (string-append ty (string-append ".const " (string-append init-val ")")))))
             (let (type-decl (if (string=? mutability "mut")
                               (string-append "(mut " (string-append ty ")"))

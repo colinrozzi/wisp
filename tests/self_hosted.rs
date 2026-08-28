@@ -707,102 +707,86 @@ fn test_bootstrap_self_compile() {
     );
 }
 
+/// The real fixpoint proof: the self-compiled compiler (gen-2) is a valid module
+/// AND works as a compiler. gen-2 uses the plain ABI it emits for its own exports:
+/// `compile-source(src_ptr) -> out_ptr`, where a string is `[len: u32][utf8 bytes]`
+/// in linear memory (NOT the CGRF ABI the Rust bootstrap wraps exports in).
 #[test]
-#[ignore = "Self-compiled module is not yet a valid fixpoint: the compiler cannot \
-            yet compile the `global`/`begin`/`global.get`/`global.set` forms its own \
-            source uses, so the output does not parse. Enable once that gap is closed."]
 fn test_bootstrap_v2_compiles_factorial() {
-    // Load the self-compiled WAT and use it to compile a program!
-    let wat = std::fs::read_to_string("/tmp/bootstrap_output.wat")
-        .expect("Run test_bootstrap_self_compile first to generate WAT");
+    // Produce gen-2 directly (gen-1 compiling its own source), so this test does
+    // not depend on another test having written a temp file.
+    let compiler_source = get_compiler_source();
+    let wat =
+        compile_and_call_with_string_arg(&compiler_source, "compile-source", &compiler_source);
+    run_big_stack(move || {
+        let mut config = Config::new();
+        config.max_wasm_stack(128 * 1024 * 1024);
+        config.wasm_tail_call(true);
+        let engine = Engine::new(&config).expect("failed to create engine");
+        let module = Module::new(&engine, &wat).expect("failed to parse self-compiled WAT");
+        let mut store = Store::new(&engine, ());
+        let instance =
+            Instance::new(&mut store, &module, &[]).expect("failed to instantiate v2 compiler");
 
-    // Create engine with tail call support
-    let mut config = Config::new();
-    config.max_wasm_stack(128 * 1024 * 1024);
-    config.wasm_tail_call(true);
-    let engine = Engine::new(&config).expect("failed to create engine");
+        let func = instance
+            .get_typed_func::<i32, i32>(&mut store, "compile-source")
+            .expect("compile-source not found in v2 compiler");
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("memory not found");
 
-    // Load the self-compiled module directly from WAT
-    let module = Module::new(&engine, &wat).expect("failed to parse self-compiled WAT");
-    let mut store = Store::new(&engine, ());
-    let instance =
-        Instance::new(&mut store, &module, &[]).expect("failed to instantiate v2 compiler");
+        // Give gen-2's bump heap (base 0xC000) room to grow.
+        memory.grow(&mut store, 64).expect("failed to grow memory");
 
-    let func = instance
-        .get_func(&mut store, "compile-source")
-        .expect("compile-source not found in v2 compiler");
+        let test_program = "(fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (i32.mul n (factorial (i32.sub n (i32.const 1))))))";
 
-    let memory = instance
-        .get_memory(&mut store, "memory")
-        .expect("memory not found");
+        // Write the input as a wisp string [len][bytes] at a low address, below the
+        // heap base. The program is tiny, so heap growth won't reach it.
+        let in_ptr: i32 = 0x1000;
+        let bytes = test_program.as_bytes();
+        memory
+            .write(&mut store, in_ptr as usize, &(bytes.len() as u32).to_le_bytes())
+            .unwrap();
+        memory
+            .write(&mut store, (in_ptr + 4) as usize, bytes)
+            .unwrap();
 
-    // Grow memory for our test
-    memory.grow(&mut store, 64).expect("failed to grow memory");
+        println!("V2 compiler: compiling factorial...");
+        let out_ptr = func
+            .call(&mut store, in_ptr)
+            .expect("v2 compiler call failed");
 
-    // Simple test program - just arithmetic (no match needed in compiler)
-    let test_program = "(fn add-one ((x s32)) s32 (i32.add x (i32.const 1)))";
+        // Read the output wisp string [len][bytes].
+        let mut len_buf = [0u8; 4];
+        memory
+            .read(&store, out_ptr as usize, &mut len_buf)
+            .expect("failed to read output length");
+        let out_len = i32::from_le_bytes(len_buf) as usize;
+        let mut str_buf = vec![0u8; out_len];
+        memory
+            .read(&store, (out_ptr + 4) as usize, &mut str_buf)
+            .expect("failed to read output bytes");
+        let v2_output = String::from_utf8(str_buf).expect("invalid utf8");
 
-    let in_ptr: i32 = 0x1000;
-    // Scratch slots for the returned pointer/length, in the reserved low region.
-    let out_ptr_ptr: i32 = 0x800;
-    let out_len_ptr: i32 = 0x804;
+        println!(
+            "V2 compiler output ({} chars):\n{}",
+            v2_output.len(),
+            &v2_output[..500.min(v2_output.len())]
+        );
 
-    // Write input in CGRF format
-    let in_len = write_cgrf_string(&memory, &mut store, in_ptr, test_program) as i32;
+        assert!(
+            v2_output.contains("(module"),
+            "v2 output should contain module"
+        );
+        assert!(
+            v2_output.contains("(func $factorial"),
+            "v2 output should contain factorial"
+        );
+        assert!(
+            v2_output.contains("i32.mul"),
+            "v2 output should contain multiply"
+        );
 
-    println!("V2 compiler: compiling factorial...");
-
-    let mut results = [wasmtime::Val::I32(0)];
-    func.call(
-        &mut store,
-        &[
-            wasmtime::Val::I32(in_ptr),
-            wasmtime::Val::I32(in_len),
-            wasmtime::Val::I32(out_ptr_ptr),
-            wasmtime::Val::I32(out_len_ptr),
-        ],
-        &mut results,
-    )
-    .expect("v2 compiler call failed");
-
-    // The callee allocated the output buffer; read its pointer from the slot.
-    let mut ptr_buf = [0u8; 4];
-    memory
-        .read(&store, out_ptr_ptr as usize, &mut ptr_buf)
-        .expect("failed to read output pointer");
-    let out_ptr = i32::from_le_bytes(ptr_buf);
-
-    // Read the result
-    let mut len_buf = [0u8; 4];
-    memory
-        .read(&store, (out_ptr + 24) as usize, &mut len_buf)
-        .expect("failed to read len");
-    let str_len = i32::from_le_bytes(len_buf) as usize;
-
-    let mut str_buf = vec![0u8; str_len];
-    memory
-        .read(&store, (out_ptr + 28) as usize, &mut str_buf)
-        .expect("failed to read string");
-    let v2_output = String::from_utf8(str_buf).expect("invalid utf8");
-
-    println!(
-        "V2 compiler output ({} chars):\n{}",
-        v2_output.len(),
-        &v2_output[..500.min(v2_output.len())]
-    );
-
-    assert!(
-        v2_output.contains("(module"),
-        "v2 output should contain module"
-    );
-    assert!(
-        v2_output.contains("(func $factorial"),
-        "v2 output should contain factorial"
-    );
-    assert!(
-        v2_output.contains("i32.mul"),
-        "v2 output should contain multiply"
-    );
-
-    println!("V2 compiler successfully compiled factorial!");
+        println!("V2 compiler successfully compiled factorial!");
+    });
 }
