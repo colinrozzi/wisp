@@ -1,6 +1,9 @@
 [workspace]
-members = ["wisp-repl", "crates/test-runtime", "crates/theater-repl", "crates/theater-handler-wisp"]
-# Note: assembler-handler temporarily excluded - needs update for new theater API
+members = ["wisp-repl"]
+default-members = ["."]
+exclude = ["crates", "wisp-actor"]
+resolver = "3"
+# Theater integrations have their own workspace in crates/.
 
 [package]
 name = "wisp"

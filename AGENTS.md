@@ -1,19 +1,45 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-Rust sources live in `src/main.rs`, which houses tokenizing, parsing, and Wasm/WIT emission. Sample programs go under the repo root (see `prog.lisp`) and compiled artifacts are written as `<stem>.wat/.wasm/.wit`. Keep additional compiler modules inside `src/` (e.g., `src/parser.rs`) and add fixtures under a future `tests/fixtures/` directory so they can be shared across regression tests. Temporary build products stay confined to `target/`.
+The root Cargo workspace contains the `wisp` compiler and `wisp-repl`. Rust compiler
+code lives in `src/compiler.rs`, exposed by `src/lib.rs`; `src/main.rs` implements
+the CLI. Keep additional compiler modules inside `src/`. The self-hosted compiler
+is `examples/wisp-compiler.lisp`, and standard library sources live in `std/`.
+Shared fixtures belong in `tests/fixtures/`. Theater integrations use a separate
+workspace in `crates/`; see `crates/README.md` before working on them.
 
 ## Build, Test, and Development Commands
-- `cargo run -- prog.lisp tiny` compiles the sample program and emits `tiny.wat`, `tiny.wasm`, and `tiny.wit`.
-- `cargo run -- <source.lisp> <out-stem>` is the general entry point; it tokenizes, builds the AST, emits WAT/WIT, and converts to Wasm via the `wat` crate.
-- `wasmtime --invoke run tiny.wasm 5` executes the exported `run` function for quick sanity checks. Substitute the export (`double`, `factorial`, etc.) as needed.
-- `cargo fmt && cargo clippy --all-targets --all-features` keeps the Rust codebase formatted and linted before opening a PR.
+- `nix develop` supplies Rust and native build dependencies.
+- `cargo build --workspace` builds the compiler and Rust-backed REPL.
+- `cargo run -p wisp -- compile examples/prog.lisp` writes `examples/compiled/prog.wasm`.
+- `cargo run -p wisp -- compile <source.lisp> <out-stem> --emit-wat --emit-pact`
+  also writes readable WAT and interface text. Explicit output stems are relative
+  to the current directory; use `target/` for temporary build products.
+- `cargo test --workspace` runs compiler and REPL library tests.
+- `cargo test -p wisp --test self_hosted test_bootstrap_fixpoint` verifies self-hosting.
+- `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` check style.
+
+The current output is a raw Wasm module using the Pack/Graph ABI, not a component.
+Do not assume `wasmtime --invoke export module.wasm 5` matches source signatures.
+The CLI and interactive REPL still have a CGRF v2/v3 migration gap; see README.md.
 
 ## Coding Style & Naming Conventions
-Follow idiomatic Rust 2021 style: four-space indentation, snake_case for functions/variables, CamelCase for types/enums, and upper-case acronyms only when conventional (`CmpOp`). Parser, emitter, and analyzer helpers should be grouped in focused modules with clear prefixes (`tokenize_*`, `parse_*`, `generate_*`). Keep S-expression examples in test fixtures short and descriptive (`double_then_factorial.lisp`).
+Follow idiomatic Rust 2024 style in the root workspace: four-space indentation,
+snake_case for functions/variables, and CamelCase for types/enums. Keep parser,
+emitter, and analyzer helpers grouped by responsibility. Name S-expression fixtures
+descriptively, such as `double_then_factorial.lisp`.
 
 ## Testing Guidelines
-Automated tests are pending; prefer golden tests that run `cargo run -- tests/fixtures/foo.lisp foo` and diff the produced WAT/WIT to expected snapshots. Until those land, manually recompile `prog.lisp` plus any new fixture and run `wasmtime` against every exported function touched by the change. Name future tests `test_<area>_<behavior>` and keep fixtures deterministic (no randomness or external IO).
+Use the existing integration suites in `tests/` for regression coverage. Tests
+compile short deterministic programs and execute the generated modules through
+Wasmtime; self-hosting tests also exercise the compiler written in Wisp. Name new
+tests `test_<area>_<behavior>`. Run focused tests during development and the full
+root workspace suite for compiler changes. Keep scratch artifacts under `target/`.
+Preserve intentional WAT/WIT golden fixtures when cleaning generated files.
 
 ## Commit & Pull Request Guidelines
-History favors short, imperative summaries (`multiple exports`, `conditionals`). Match that tone, reference the subsystem touched, and keep to ~50 characters when possible. Every PR should describe the compiler surface affected, list new commands or fixtures added, and note manual `wasmtime` output for confidence. Link issues when applicable and attach sample diffs (e.g., snippets of generated WAT) whenever the change alters codegen semantics.
+Use short imperative summaries, around 50 characters when possible. Describe the
+compiler surface affected, new commands or fixtures, and validation results. Link
+issues when applicable and include sample generated-WAT diffs when codegen semantics
+change. Preserve existing uncommitted work when making unrelated edits.

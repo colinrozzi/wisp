@@ -1,4 +1,4 @@
-mod compiler;
+use wisp::compiler;
 
 use std::path::{Path, PathBuf};
 

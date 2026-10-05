@@ -906,7 +906,7 @@ fn test_debug_symbol_len_index1() {
       (get-symbol-len tok)))))
 "#;
     // symbol "abc" should have length 3
-    assert_eq!(compile_and_run(&source), 3);
+    assert_eq!(compile_and_run(source), 3);
 }
 
 // Debug test: tokenize "(a)" WITHOUT sexpr variant
@@ -1030,7 +1030,7 @@ fn test_debug_paren_a_no_sexpr() {
       (get-token-tag tok)))))
 "#;
     // symbol "a" should have tag 3
-    assert_eq!(compile_and_run(&source), 3);
+    assert_eq!(compile_and_run(source), 3);
 }
 
 // Debug test: tokenize "(a)" and check tag at index 1

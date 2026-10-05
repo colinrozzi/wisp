@@ -4,24 +4,6 @@ use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn read_string_from_memory(
-    memory: &wasmtime::Memory,
-    store: &wasmtime::Store<()>,
-    ptr: i32,
-) -> String {
-    let mut len_buf = [0u8; 4];
-    memory
-        .read(store, ptr as usize, &mut len_buf)
-        .expect("failed to read len");
-    let len = i32::from_le_bytes(len_buf) as usize;
-
-    let mut str_buf = vec![0u8; len];
-    memory
-        .read(store, (ptr + 4) as usize, &mut str_buf)
-        .expect("failed to read string");
-    String::from_utf8(str_buf).expect("invalid utf8")
-}
-
 /// Write a string to memory in CGRF format
 /// Returns the total number of bytes written
 fn write_cgrf_string(

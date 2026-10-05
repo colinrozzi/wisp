@@ -42,9 +42,16 @@ Each change document should include:
 3. **Completed** - All success criteria met, status updated
 4. **Archived** - Moved to a subdirectory after completion (optional)
 
-## Active Changes
+## Useful starting points
 
-- [PHASE-0-WASM-INSTRUCTIONS.md](./PHASE-0-WASM-INSTRUCTIONS.md) - Exposing core WASM instructions
+- [SELF-HOSTED-COMPILER.md](SELF-HOSTED-COMPILER.md) — bootstrap and fixpoint work.
+- [REPL-MIGRATION.md](REPL-MIGRATION.md) — runtime API migration and workspace setup.
+- [GENERICS-AND-TRAITS.md](GENERICS-AND-TRAITS.md) — language design and lowering.
+- [STDLIB.md](STDLIB.md) — standard library implementation.
+
+Phase documents record earlier implementation work and may describe superseded
+interfaces. Use the [root README](../../README.md) for current commands and the
+tests for the supported behavior of each compiler.
 
 ## Tips
 

@@ -800,7 +800,7 @@ fn test_simple_list_push_get() {
           ; index 2 = rparen (tag 1)
           (get-token-tag (list-get l3 (i32.const 1)))))))))
 "#;
-    assert_eq!(compile_and_run(&source), 3);
+    assert_eq!(compile_and_run(source), 3);
 }
 
 // Debug: verify index 0 gives correct value
@@ -829,7 +829,7 @@ fn test_list_get_index0() {
         ; index 0 should be lparen (tag 0)
         (get-token-tag (list-get l2 (i32.const 0))))))))
 "#;
-    assert_eq!(compile_and_run(&source), 0);
+    assert_eq!(compile_and_run(source), 0);
 }
 
 // Debug: verify index 1 after two pushes
@@ -858,7 +858,7 @@ fn test_list_get_index1_two_items() {
         ; index 1 should be symbol (tag 3)
         (get-token-tag (list-get l2 (i32.const 1))))))))
 "#;
-    assert_eq!(compile_and_run(&source), 3);
+    assert_eq!(compile_and_run(source), 3);
 }
 
 // Debug: verify index 1 after three pushes
@@ -888,7 +888,7 @@ fn test_list_get_index1_three_items() {
           ; index 1 should be symbol (tag 3)
           (get-token-tag (list-get l3 (i32.const 1)))))))))
 "#;
-    assert_eq!(compile_and_run(&source), 3);
+    assert_eq!(compile_and_run(source), 3);
 }
 
 // Debug: push symbol first, then lparen - does index 0 return symbol (3) or lparen (0)?
@@ -920,7 +920,7 @@ fn test_list_push_order() {
 "#;
     // After pushing [symbol, lparen], index 0 SHOULD be symbol (tag 3)
     // But if copy is broken, it will be uninitialized (likely 0)
-    assert_eq!(compile_and_run(&source), 3);
+    assert_eq!(compile_and_run(source), 3);
 }
 
 // Debug: three items but using only lparen/rparen (no data variants)
@@ -957,7 +957,7 @@ fn test_list_three_items_no_data() {
               (get-token-tag (list-get l3 (i32.const 2)))))))))))
 "#;
     // lparen=0, rparen=1, lparen=0 -> 0*100 + 1*10 + 0 = 10
-    assert_eq!(compile_and_run(&source), 10);
+    assert_eq!(compile_and_run(source), 10);
 }
 
 // Debug: verify all indices with three items
@@ -993,7 +993,7 @@ fn test_list_get_all_indices_three_items() {
               (get-token-tag (list-get l3 (i32.const 2)))))))))))
 "#;
     // tag0=0, tag1=3, tag2=1 -> 0*100 + 3*10 + 1 = 31
-    assert_eq!(compile_and_run(&source), 31);
+    assert_eq!(compile_and_run(source), 31);
 }
 
 // Test accessing index 1 - symbol after lparen

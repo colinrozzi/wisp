@@ -1,13 +1,13 @@
-/target
+**/target/
 result
+.direnv/
 
 # Local cargo overrides (dev-only)
-.cargo/config.toml
-wisp-actor/target
+**/.cargo/config.toml
+.cargo/*.local.toml
 
 # Compiled artifacts (can be regenerated)
 compiled/
-**/compiled/
 examples/*.wasm
 examples/*.wat
 examples/*.wit

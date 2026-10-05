@@ -5,8 +5,8 @@
 // line must do to join one persistent heap.
 
 use wasmtime::{
-    Config, Engine, Extern, Global, GlobalType, Instance, Memory, MemoryType, Module,
-    Mutability, Store, Val, ValType,
+    Config, Engine, Extern, Global, GlobalType, Instance, Memory, MemoryType, Module, Mutability,
+    Store, Val, ValType,
 };
 
 const MODULE_A: &str = r#"

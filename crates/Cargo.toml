@@ -1,0 +1,7 @@
+[workspace]
+members = ["test-runtime", "theater-repl", "theater-handler-wisp"]
+exclude = ["assembler-handler"]
+resolver = "2"
+
+# These experimental integrations track Theater separately from the compiler.
+# See README.md for their current build requirements.
