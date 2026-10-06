@@ -30,3 +30,9 @@ wasmtime = "21.0.2"
 wit-component = "0.220.1"
 wit-parser = "0.220.1"
 pack.workspace = true
+
+[dev-dependencies]
+# Exercise the capture-based engine interface used by current Theater.
+packr-core = "=0.24.1"
+packr-wasmtime = "=0.24.1"
+tokio = { version = "1", features = ["rt"] }

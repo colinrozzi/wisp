@@ -18,6 +18,9 @@ uses the newer capture-based host API, while `theater-repl` and
 `theater-handler-wisp` still use older APIs. Their manifests pin Theater v0.3.0;
 the migrated runtime needs dependency alignment before a fresh build can succeed.
 See [REPL-MIGRATION.md](../docs/changes/REPL-MIGRATION.md) for details.
+The [interpreter integration plan](../docs/changes/INTERPRETER-THEATER.md)
+records the current build mismatch, a passing engine-boundary preflight, and the
+next local actor/RPC acceptance checks.
 
 After aligning dependencies, select this workspace explicitly:
 

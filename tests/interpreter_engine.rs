@@ -1,0 +1,131 @@
+//! Preflight for Theater's engine/host-import boundary. This deliberately does
+//! not claim actor lifecycle or chain replay coverage.
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use packr_core::abi::{Value, ValueType};
+use packr_core::{HostImports, WasmEngine, call_with_value, host_fn};
+use packr_wasmtime::{WasmtimeEngine, WasmtimeInstance};
+
+fn source_result(result: Result<String, String>) -> Value {
+    Value::Result {
+        ok_type: ValueType::String,
+        err_type: ValueType::String,
+        value: result
+            .map(|s| Box::new(Value::String(s)))
+            .map_err(|s| Box::new(Value::String(s))),
+    }
+}
+
+fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
+    let mut imports = HostImports::new();
+    imports.define(
+        "wisp-source",
+        "resolve-path",
+        host_fn(|input| async move {
+            let Value::Tuple(args) = input else {
+                panic!("resolve-path input: {input:?}")
+            };
+            let [Value::String(_base), Value::String(path)] = args.as_slice() else {
+                panic!("resolve-path args: {args:?}")
+            };
+            Ok(source_result(if path == "library.lisp" {
+                Ok("/bundle/library.lisp".into())
+            } else {
+                Err("source is not in the actor bundle".into())
+            }))
+        }),
+    );
+    imports.define(
+        "wisp-source",
+        "read-source",
+        host_fn(move |input| {
+            let calls = calls.clone();
+            async move {
+                let Value::String(path) = input else {
+                    panic!("read-source input: {input:?}")
+                };
+                calls.lock().unwrap().push(path.clone());
+                Ok(source_result(if path == "/bundle/library.lisp" {
+                    Ok("(fn increment ((x s32)) s32 (i32.add x 1))".into())
+                } else {
+                    Err("source is not in the actor bundle".into())
+                }))
+            }
+        }),
+    );
+    imports
+}
+
+async fn evaluate(instance: &mut WasmtimeInstance, source: &str) -> String {
+    // Theater's call_function_with_value wraps a single argument in a tuple.
+    let result = call_with_value(
+        instance,
+        "evaluate",
+        &Value::Tuple(vec![Value::String(source.into())]),
+    )
+    .await
+    .unwrap();
+    let Value::String(result) = result else {
+        panic!("evaluate output: {result:?}")
+    };
+    result
+}
+
+#[test]
+fn test_interpreter_capture_based_engine_session_and_imports() {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(engine_session());
+}
+
+async fn engine_session() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let package = wisp::compiler::compile(
+        &root.join("interpreter/evaluator.lisp"),
+        &root.join(format!(
+            "target/interpreter-engine/{}/evaluator",
+            std::process::id()
+        )),
+        wisp::compiler::EmitOptions::default(),
+    )
+    .unwrap();
+    let wasm = std::fs::read(package.wasm).unwrap();
+    let metadata = packr_core::metadata::metadata_with_hashes_from_module(&wasm)
+        .unwrap()
+        .expect("embedded metadata readable by Theater");
+    assert!(!metadata.import_hashes.is_empty());
+    let engine = WasmtimeEngine::new();
+    let module = engine.compile(&wasm).await.unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut first = engine
+        .instantiate(&module, imports(calls.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        evaluate(&mut first, "(define add-two (lambda (x) (+ x 2)))").await,
+        "#<closure>"
+    );
+    assert_eq!(evaluate(&mut first, "(add-two 40)").await, "42");
+    assert_eq!(
+        evaluate(&mut first, "(include \"library.lisp\") (increment 41)").await,
+        "42"
+    );
+    assert_eq!(*calls.lock().unwrap(), ["/bundle/library.lisp"]);
+    assert!(
+        evaluate(&mut first, "(define marker 0) (include \"missing.lisp\")")
+            .await
+            .starts_with("error:")
+    );
+    assert!(evaluate(&mut first, "marker").await.contains("unbound"));
+    assert_eq!(evaluate(&mut first, "(add-two 40)").await, "42");
+    assert!(evaluate(&mut first, "(/ 1 0)").await.starts_with("error:"));
+    let mut second = engine.instantiate(&module, imports(calls)).await.unwrap();
+    assert!(
+        evaluate(&mut second, "(add-two 40)")
+            .await
+            .contains("unbound")
+    );
+    assert_eq!(evaluate(&mut first, "(increment 41)").await, "42");
+}

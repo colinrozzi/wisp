@@ -1079,6 +1079,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "packr-core"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65918c3c36705e9917ec9d87ee5327ab754a956d19b4accb6ed0260e499edd42"
+dependencies = [
+ "async-trait",
+ "packr-abi",
+ "sha2",
+ "thiserror 1.0.69",
+ "wasmparser 0.219.2",
+]
+
+[[package]]
+name = "packr-wasmtime"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b9e9ad05207ddefa660296d31ab96039352b2f9977cc511137dc26ac3f02f02"
+dependencies = [
+ "async-trait",
+ "packr-core",
+ "wasmtime 27.0.0",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2521,6 +2545,9 @@ dependencies = [
  "anyhow",
  "clap",
  "packr",
+ "packr-core",
+ "packr-wasmtime",
+ "tokio",
  "wasmtime 21.0.2",
  "wat",
  "wit-component",
