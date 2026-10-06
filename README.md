@@ -67,6 +67,22 @@ See [examples/](examples/), [test fixtures](tests/fixtures/), and the
 [standard library](std/) for executable examples. Features in the Rust and
 self-hosted compilers are tested separately; support is not identical.
 
+## Interpreted REPL
+
+A small interpreter written in Wisp now runs inside one persistent Wasm instance:
+
+```sh
+cargo run --example interpreter
+# wisp> (define add-two (lambda (x) (+ x 2)))
+# #<closure>
+# wisp> (add-two 40)
+# 42
+```
+
+It supports lexical closures, persistent definitions, recursion, lists, and
+recoverable errors. This is an initial Lisp subset; Theater calls and full Wisp
+language parity are still ahead. See [interpreter/README.md](interpreter/README.md).
+
 ## Execution and ABI status
 
 The current compiler emits **raw Wasm modules using the Pack/Graph ABI**.
@@ -108,8 +124,10 @@ integrations remain a separate migration; see the [runtime migration notes](docs
 | --- | --- |
 | `src/compiler.rs` | Rust compiler pipeline and Wasm/interface emission |
 | `src/lib.rs` | Public compiler library |
+| `src/interpreter.rs` | Local host for the Wisp-written interpreter |
 | `src/main.rs` | Compile and execution CLI |
 | `examples/wisp-compiler.lisp` | Self-hosted compiler |
+| `interpreter/` | Interpreter, reader, and printer written in Wisp |
 | `std/` | Wisp standard library sources |
 | `tests/` | Compiler, language, and self-hosting integration tests |
 | `wisp-repl/` | Rust-backed REPL library and experimental interactive runner |
