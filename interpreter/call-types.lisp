@@ -129,3 +129,12 @@
           (eval-inferred-args items (i32.add index 1) env depth (list-push args v) callee hints expected))))))
 (fn needs-inference? ((callee value)) s32
   (value-case callee ((generic-function params result body vars constraints) 1) ((trait-method trait method) 1) (else 0)))
+
+; Wasm s32 operands also accept u8. Preserve a known byte-producing signature
+; during generic inference; the primitive converts the value at its boundary.
+(fn operand-hint ((callee value) (expr value) (env (list binding)) (hint string)) string
+  (value-case callee
+    ((builtin name)
+      (if (i32.and (string=? hint "s32") (i32.and (numeric-primitive? name) (i32.eq (numeric-type? name) 0)))
+        (if (string=? (symbol-name (peek-type expr env 0)) "u8") "u8" hint) hint))
+    (else hint)))

@@ -3,6 +3,7 @@
 ; uses integer-literal; evaluation/quotation resolves it to an actual integer.
 (variant value
   (integer s32)
+  (byte-value s32)
   (wide-integer s64)
   (integer-literal s64)
   (single f32)
@@ -36,6 +37,7 @@
       (match expr
         arm ...
         ((integer ignored-n) fallback)
+        ((byte-value ignored-byte) fallback)
         ((wide-integer ignored-wide) fallback)
         ((integer-literal ignored-literal) fallback)
         ((single ignored-single) fallback)

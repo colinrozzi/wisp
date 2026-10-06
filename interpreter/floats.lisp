@@ -60,6 +60,14 @@
           (let (prefix (substring name 0 3))
             (if (float-type? prefix) prefix (integer-operand-type name))) source)))))
 (fn apply-numeric-primitive ((name string) (args (list value))) value
+  (apply-typed-numeric-primitive name
+    (if (i32.and (i32.eq (numeric-type? name) 0) (string=? (numeric-operand-type name) "s32"))
+      (byte-operands args 0 (list-new value)) args)))
+(fn byte-operands ((args (list value)) (index s32) (out (list value))) (list value)
+  (if (i32.ge_s index (list-len args)) out
+    (byte-operands args (i32.add index 1)
+      (list-push out (value-case (list-get args index) ((byte-value n) (integer n)) (else (list-get args index)))))))
+(fn apply-typed-numeric-primitive ((name string) (args (list value))) value
   (if (numeric-type? name)
     (if (i32.eq (list-len args) 1) (numeric-cast name (list-get args 0)) (failure "wrong number of arguments"))
     (let (source (float-conversion-source name))

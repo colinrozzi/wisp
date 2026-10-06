@@ -4,28 +4,35 @@
 (fn result-type ((ok-type value) (err-type value)) value
   (sequence (list-push (list-push (list-push (list-new value) (symbol "result")) ok-type) err-type)))
 (fn known-compound-type? ((parts (list value)) (self string)) s32
-  (if (i32.lt_s (list-len parts) 2) 0
-    (let (name (symbol-name (list-get parts 0)))
-      (if (i32.or (string=? name "list") (string=? name "option"))
-        (if (i32.eq (list-len parts) 2) (known-type? (list-get parts 1) self) 0)
-        (if (string=? name "result")
-          (if (i32.eq (list-len parts) 3) (validate-case-types parts 1 self) 0)
-          (if (i32.or (string=? name "tuple") (string=? name "->")) (validate-case-types parts 1 self) 0))))))
+  (if (i32.eq (list-len parts) 0) 0
+    (if (string=? (symbol-name (list-get parts 0)) "tuple") (validate-case-types parts 1 self)
+      (if (i32.lt_s (list-len parts) 2) 0
+        (let (name (symbol-name (list-get parts 0)))
+          (if (i32.or (string=? name "list") (string=? name "option"))
+            (if (i32.eq (list-len parts) 2) (known-type? (list-get parts 1) self) 0)
+            (if (string=? name "result")
+              (if (i32.eq (list-len parts) 3) (validate-case-types parts 1 self) 0)
+              (if (string=? name "->") (validate-case-types parts 1 self) 0))))))))
+(fn unit-type? ((ty value)) s32
+  (if (string=? (symbol-name ty) "unit") 1
+    (if (string=? (form-head ty) "tuple") (i32.eq (list-len (items-of ty)) 1) 0)))
 (fn same-types? ((left (list value)) (right (list value)) (index s32)) s32
   (if (i32.ne (list-len left) (list-len right)) 0
     (if (i32.ge_s index (list-len left)) 1
       (if (same-type? (list-get left index) (list-get right index))
         (same-types? left right (i32.add index 1)) 0))))
 (fn same-type? ((left value) (right value)) s32
-  (if (symbol? left) (if (symbol? right) (string=? (symbol-name left) (symbol-name right)) 0)
-    (value-case left
-      ((sequence parts)
-        (value-case right ((sequence other) (same-types? parts other 0)) (else 0)))
-      (else 0))))
+  (if (unit-type? left) (unit-type? right)
+    (if (symbol? left) (if (symbol? right) (string=? (symbol-name left) (symbol-name right)) 0)
+      (value-case left
+        ((sequence parts)
+          (value-case right ((sequence other) (same-types? parts other 0)) (else 0)))
+        (else 0)))))
 
 (fn value-type ((v value)) value
   (value-case v
     ((integer n) (symbol "s32"))
+    ((byte-value n) (symbol "u8"))
     ((wide-integer n) (symbol "s64"))
     ((single n) (symbol "f32"))
     ((double n) (symbol "f64"))
@@ -77,16 +84,15 @@
     (else (argument-type callee index))))
 (fn apply-collection ((name string) (args (list value))) value
   (if (string=? name "tuple")
-    (if (i32.eq (list-len args) 0) (failure "tuple expects at least one value")
       (let (ty (tuple-types args 0 (list-push (list-new value) (symbol "tuple"))))
-        (if (failed? ty) ty (compound ty "tuple" args))))
+        (if (failed? ty) ty (compound ty "tuple" args)))
     (if (i32.ne (list-len args) (if (string=? name "list-len") 1 2))
       (failure "wrong number of list arguments")
       (value-case (list-get args 0)
         ((typed-list element items)
           (if (string=? name "list-len") (integer (list-len items))
             (if (string=? name "list-push")
-              (let (checked (require-type (list-get args 1) element))
+              (let (checked (list-element (list-get args 1) element))
                 (if (failed? checked) checked (typed-list element (list-push items checked))))
               (value-case (list-get args 1)
                 ((integer index)
@@ -94,6 +100,12 @@
                     (list-get items index) (failure "list index out of bounds")))
                 (else (failure "list index must be s32"))))))
         (else (failure "expected typed list"))))))
+
+; The compiler permits s32 elements in byte lists; retain the u8 type on reads.
+(fn list-element ((v value) (ty value)) value
+  (if (string=? (symbol-name ty) "u8")
+    (value-case v ((integer n) (checked-byte (i64.extend_i32_s n))) (else (require-type v ty)))
+    (require-type v ty)))
 
 ; Reuse the existing variant arm validation and lexical binding machinery.
 (fn compound-cases ((ty value)) (list value)

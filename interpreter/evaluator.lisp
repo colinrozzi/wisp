@@ -16,6 +16,7 @@
 (include "syntax-case.lisp")
 (include "generics.lisp")
 (include "traits.lisp")
+(include "deriving.lisp")
 (include "call-types.lisp")
 
 (global $started s32 mut 0)
@@ -106,6 +107,7 @@
 (fn truthy? ((v value)) s32
   (value-case v
     ((integer n) (i32.ne n 0))
+    ((byte-value n) (i32.ne n 0))
     ((wide-integer n) (i64.ne n 0))
     ((single n) (f32.ne n 0f32))
     ((double n) (f64.ne n 0.0))
@@ -124,13 +126,14 @@
 
 (fn eval-named-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (if (string=? name "trait") (declare-trait items top)
-    (if (string=? name "instance") (declare-instance items top)
-      (if (string=? name "fn") (eval-fn items top)
-        (if (string=? name "record") (eval-record items top)
-          (if (string=? name "variant") (eval-variant items top)
-            (if (string=? name "match") (eval-match items env depth expected)
-              (if (string=? name "export") (eval-export items env depth top)
-                (eval-call items env depth expected)))))))))
+    (if (string=? name "derive") (eval-derive items top)
+      (if (string=? name "instance") (declare-instance items top)
+        (if (string=? name "fn") (eval-fn items top)
+          (if (string=? name "record") (eval-record items top)
+            (if (string=? name "variant") (eval-variant items top)
+              (if (string=? name "match") (eval-match items env depth expected)
+                (if (string=? name "export") (eval-export items env depth top)
+                  (eval-call items env depth expected))))))))))
 
 (fn eval-if ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.ne (list-len items) 4) (failure "if expects condition, then, else")
@@ -198,7 +201,8 @@
 
 (fn eval-args ((items (list value)) (index s32) (env (list binding)) (depth s32) (args (list value)) (callee value)) value
   (if (i32.ge_s index (list-len items)) (sequence args)
-    (let (v (eval-expected (list-get items index) env depth 0 (call-argument-type callee args (i32.sub index 1))))
+    (let (v (eval-expected (list-get items index) env depth 0
+              (operand-hint callee (list-get items index) env (call-argument-type callee args (i32.sub index 1)))))
       (if (failed? v) v
         (eval-args items (i32.add index 1) env depth (list-push args v) callee)))))
 

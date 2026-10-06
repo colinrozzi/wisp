@@ -18,12 +18,14 @@
 
 (fn global-initial-value ((ty value) (n s64)) value
   (let (name (symbol-name ty))
+    (if (string=? name "u8")
+      (let (v (checked-byte n)) (if (failed? v) v (sequence (list-push (list-new value) v))))
     (if (numeric-type? name)
       (if (if (string=? name "s32") (i32.or (i64.lt_s n -2147483648) (i64.gt_s n 4294967295)) 0)
         (failure "global initializer out of s32 range")
         (sequence (list-push (list-new value) (numeric-cast name (wide-integer n)))))
       (if (i64.eq n 0) (sequence (list-new value))
-        (failure "non-numeric global initializer must be zero")))))
+        (failure "non-numeric global initializer must be zero"))))))
 (fn global-initializer ((ty value) (expr value)) value
   (value-case expr
     ((integer-literal n) (global-initial-value ty n))

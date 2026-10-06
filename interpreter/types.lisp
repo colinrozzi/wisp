@@ -12,7 +12,7 @@
 (fn known-type? ((ty value) (self string)) s32
   (if (symbol? ty)
     (let (name (symbol-name ty))
-      (i32.or (i32.or (numeric-type? name) (string=? name "string"))
+      (i32.or (i32.or (numeric-type? name) (i32.or (string=? name "string") (i32.or (string=? name "u8") (string=? name "unit"))))
         (i32.or (string=? name self) (i32.ge_s (type-index name) 0))))
     (value-case ty ((sequence parts) (known-compound-type? parts self)) (else 0))))
 
@@ -21,6 +21,7 @@
     (let (name (symbol-name ty))
       (value-case v
         ((integer n) (string=? name "s32"))
+        ((byte-value n) (string=? name "u8"))
         ((wide-integer n) (string=? name "s64"))
         ((single n) (string=? name "f32"))
         ((double n) (string=? name "f64"))

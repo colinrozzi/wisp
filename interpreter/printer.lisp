@@ -48,6 +48,7 @@
   (if (i32.ge_s depth 64) "#<depth-limit>"
   (match v
     ((integer n) (show-integer n))
+    ((byte-value n) (string-append "#<u8 " (string-append (show-integer n) ">")))
     ((wide-integer n) (show-wide n))
     ((integer-literal n) "#<integer-literal>")
     ((single n) (show-float (f64.promote_f32 n) 9 "f32"))

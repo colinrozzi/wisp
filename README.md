@@ -80,16 +80,17 @@ cargo run --example interpreter
 ```
 
 It supports lexical closures, persistent definitions, typed functions, records,
-variants and pattern matching, s32/s64/f32/f64 arithmetic and casts, recursion,
+variants and pattern matching, s32/s64/f32/f64 arithmetic and casts, u8 values, unit, recursion,
 typed lists/options/results/tuples, Lisp lists, typed globals, and recoverable errors.
 Generic functions, trait instances, and higher-order arguments run directly in the
-interpreter, including the algorithms in `std/list.lisp`.
+interpreter, including the algorithms in `std/list.lisp`. Record equality can be
+derived with `(derive Eq Type)`.
 Persistent `defmacro` templates support quasiquotation and splicing; hygienic
 `syntax-rules` supports literal patterns and nested ellipses. Procedural
 `syntax-case-lambda` adds guards and computation during expansion.
 Source files can be loaded as command-line arguments, with relative `include`
 directives resolved from each file's directory.
-This is an initial subset; additional types, static checking, derived instances, and Theater
+This is an initial subset; resource handles, static checking, and Theater
 calls remain ahead. See [interpreter/README.md](interpreter/README.md).
 
 ## Execution and ABI status

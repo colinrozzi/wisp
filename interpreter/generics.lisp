@@ -22,7 +22,8 @@
       (let (name (form-head ty))
         (if (if (i32.or (string=? name "list") (string=? name "option")) (i32.eq (list-len parts) 2)
               (if (string=? name "result") (i32.eq (list-len parts) 3)
-                (if (i32.or (string=? name "tuple") (string=? name "->")) (i32.ge_s (list-len parts) 2) 0)))
+                (if (string=? name "tuple") (i32.ge_s (list-len parts) 1)
+                  (if (string=? name "->") (i32.ge_s (list-len parts) 2) 0))))
           (generic-types? parts 1 vars) 0)))))
 (fn generic-types? ((types (list value)) (index s32) (vars (list value))) s32
   (if (i32.ge_s index (list-len types)) 1

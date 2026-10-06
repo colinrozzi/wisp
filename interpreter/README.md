@@ -30,10 +30,11 @@ for a sequence inside a function body. `:quit`, `:q`, or EOF exits. Piped input
 works too. The reader itself accepts multiline source through `evaluate`.
 
 The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lists, closures,
-named records and variants, typed lists, options, results, tuples, and built-in functions.
+u8 bytes, unit, named records and variants, typed lists, options, results, tuples,
+and built-in functions.
 Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
-`global`, `global.get`, `global.set`, `include`, `trait`, `instance`, `defmacro`, `define-syntax`, `quasiquote`, and
+`global`, `global.get`, `global.set`, `include`, `trait`, `instance`, `derive`, `defmacro`, `define-syntax`, `quasiquote`, and
 `export`. Both `(x s32)` and
 `(x : s32)` parameter/field declarations work.
 `let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
@@ -79,6 +80,25 @@ comparisons, promotion/demotion, and signed/unsigned conversion instructions wor
 (s32 -2.75)                         ; -2
 (s64 inff64)                        ; error: float-to-integer conversion out of range
 ```
+
+`u8` values preserve their type in parameters, records, variants, lists, globals,
+and generic functions. Unsuffixed literals adopt an expected `u8` type; byte lists
+also accept stored s32 values in the range 0–255. Values outside that range are
+diagnostics, with no list/global mutation. A byte prints as `#<u8 255>` (a display
+form, not reader syntax). Wasm instructions expecting s32 accept byte operands,
+matching the compiler; ordinary typed s32 parameters remain distinct.
+
+```lisp
+(define bytes (list-push (list-new u8) 255))
+(list-get bytes 0)                   ; #<u8 255>
+(i32.add (list-get bytes 0) 1)        ; 256
+(fn finished () unit (tuple))
+(finished)                          ; (tuple)
+```
+
+`unit` and `(tuple)` name the same type, including inside compound types. The
+expression `(tuple)` constructs its sole value. It is distinct from Lisp `nil`
+and can be stored in options, results, lists, records, and globals.
 
 Floating-point operations preserve IEEE behavior, including subnormals, signed
 zero, infinity, and NaN. Numeric zero is false; NaN is true. Conversion to an
@@ -317,6 +337,16 @@ binds their methods locally. These bindings survive in captured closures.
 Direct method calls select an instance from arguments and the expected scalar
 return type; an ambiguous call is a diagnostic.
 
+`(derive Eq Record)` creates a normal equality instance for an existing record.
+Declare `Eq` first. Each field must have type s32, s64, f32, f64, or u8; strings,
+nested records, containers, unit fields, and variants are not derived. Empty
+records compare equal. Float fields use Wasm equality: NaN differs from itself,
+and positive and negative zero compare equal. The generated method captures its
+primitive operations and field accessors, so redefining those names later cannot
+change the comparison. Signature checks and duplicate-instance checks run before
+publication. Both the Rust compiler's `=` method and the self-hosted compiler's
+`eq` spelling are recognized, with `=` preferred when present.
+
 Function parameters use `(-> argument-types... result-type)`. Typed functions,
 generic functions, trait methods, and lexical closures can be passed as values.
 Function contracts check argument and return types when called. An untyped lambda
@@ -364,8 +394,9 @@ imports and bounds file reads.
 cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
-This is a feasibility implementation, not full compiled-Wisp parity: u8/unit values,
-derived instances and Theater RPC built-ins are not implemented yet. Type checks
+This is a feasibility implementation, not full compiled-Wisp parity: resource
+handles, general imports, raw memory access, byte/string conversion operations,
+and Theater RPC built-ins are not implemented yet. Type checks
 run during evaluation; unexecuted branches and function bodies are not checked.
 `export` accepts compiled source declarations; interpreted functions remain inside
 the session rather than becoming new Wasm exports.
@@ -420,3 +451,11 @@ construction are compared across both compilers and the interpreter. The standar
 list algorithms, including higher-order calls, are compared with the Rust compiler.
 Interpreter tests cover multi-parameter traits, expected return dispatch, closures,
 hygienic macros, declaration rollback, type errors, and argument effect ordering.
+Byte values and numeric-field derived equality are compared with the Rust
+compiler, including CGRF byte outputs, wide integer differences, NaN, and signed
+zero. Interpreter-only tests cover unit construction and empty-record equality:
+the Rust compiler recognizes unit in types but its constructor/code generation
+support is incomplete, and it rejects empty record declarations. It also stores
+out-of-range s32 values in byte lists without validating their range; the
+interpreter rejects those values. Shared deriving fixtures use typed maker
+functions because the compiler cannot infer trait types from constructor calls.

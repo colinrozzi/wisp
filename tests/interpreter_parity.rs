@@ -125,6 +125,186 @@ fn test_parity_existing_typed_factorial() {
 }
 
 #[test]
+fn test_parity_small_types_bytes() {
+    compare_example(
+        "tests/fixtures/interpreter_small_types.lisp",
+        &[
+            ("byte-add", &[], 256),
+            ("byte-wide", &[], 200),
+            ("byte-record", &[], 42),
+            ("byte-variant", &[], 42),
+            ("byte-generic", &[], 42),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn test_small_types_cgrf_values() {
+    let path = root().join("tests/fixtures/interpreter_small_types.lisp");
+    let module =
+        Module::from_file(&cgrf_guest::engine(), compile(&path, "small-types-values")).unwrap();
+    let mut compiled = Guest::new(&module);
+    let mut interpreted = session();
+    assert!(!interpreted.load_file(path).unwrap().starts_with("error:"));
+    assert_eq!(
+        compiled.call("byte-value", Value::Tuple(vec![])),
+        Value::U8(255)
+    );
+    assert_eq!(interpreted.evaluate("(byte-value)").unwrap(), "#<u8 255>");
+}
+
+#[test]
+fn test_parity_derived_record_equality() {
+    compare_example(
+        "tests/fixtures/interpreter_derive.lisp",
+        &[
+            ("equal", &[], 1),
+            ("first-diff", &[], 0),
+            ("last-diff", &[], 0),
+            ("mixed-equal", &[], 1),
+            ("wide-diff", &[], 0),
+            ("nan-diff", &[], 0),
+            ("zero-equal", &[], 1),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn test_small_types_preserve_types_and_recover() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(tuple)", "(tuple)"),
+        ("(fn finish () unit (tuple)) (finish)", "(tuple)"),
+        ("(fn id ((x T)) T (where T) x) (id (tuple))", "(tuple)"),
+        (
+            "(fn accept ((u (tuple))) unit u) (accept (finish))",
+            "(tuple)",
+        ),
+        (
+            "(fn result () (result unit string) (ok unit string (tuple))) (match (result) ((ok u) (accept u)) ((err e) (tuple)))",
+            "(tuple)",
+        ),
+        (
+            "(record holder (u unit)) (holder.u (holder (tuple)))",
+            "(tuple)",
+        ),
+        (
+            "(fn alias ((x (list unit))) (list (tuple)) x) (alias (list-push (list-new unit) (tuple)))",
+            "#<list unit ((tuple))>",
+        ),
+        ("(fn byte () u8 255) (byte)", "#<u8 255>"),
+        (
+            "(define bytes (list-new u8)) (define stored 42) (list-push bytes stored) (id (list-get bytes 0))",
+            "#<u8 42>",
+        ),
+        ("(i32.add (byte) 1)", "256"),
+        ("(f64.convert_i32_u (byte))", "255f64"),
+        ("(global $b u8 mut 255) (global.get $b)", "#<u8 255>"),
+        ("(global.set $b 0) (if (global.get $b) 1 0)", "0"),
+        (
+            "(global $u unit mut 0) (global.set $u (tuple)) (global.get $u)",
+            "(tuple)",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    for source in [
+        "(fn bad () unit nil) (bad)",
+        "(fn bad () unit 0) (bad)",
+        "(list-push (list-new unit) nil)",
+        "(list-push bytes 256)",
+        "(list-push bytes -1)",
+        "(list-push bytes 1s64)",
+        "(global.set $b 256)",
+        "(global $bad u8 mut -1)",
+        "(fn wrong ((x s32)) s32 x) (wrong (byte))",
+        "(fn narrow () u8 stored) (narrow)",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+    }
+    assert_eq!(s.evaluate("(list-len bytes)").unwrap(), "1");
+    assert_eq!(s.evaluate("(global.get $b)").unwrap(), "#<u8 0>");
+}
+
+#[test]
+fn test_derived_instances_validate_and_capture_operations() {
+    let mut s = session();
+    assert_eq!(
+        s.evaluate(
+            "(trait (Eq T) (fn = ((a T) (b T)) s32)) (record point (x : s32)) (derive Eq point)"
+        )
+        .unwrap(),
+        "()"
+    );
+    assert_eq!(
+        s.evaluate(
+            "(define original point.x) (define point.x (lambda (x) 0)) (= (point 1) (point 2))"
+        )
+        .unwrap(),
+        "0"
+    );
+    assert_eq!(
+        s.evaluate("(define i32.eq (lambda (a b) 0)) (= (point 42) (point 42))")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        s.evaluate("(record empty) (derive Eq empty) (= (empty) (empty))")
+            .unwrap(),
+        "1"
+    );
+    for source in [
+        "(derive)",
+        "(derive Eq)",
+        "(derive Eq point extra)",
+        "(derive Nope point)",
+        "(derive Eq unknown)",
+        "(derive Eq s32)",
+        "(derive Eq point)",
+        "(variant v (one)) (derive Eq v)",
+        "(record text-record (s string)) (derive Eq text-record)",
+        "(record nested (p point)) (derive Eq nested)",
+        "(record units (u unit)) (derive Eq units)",
+        "(record mixed (x s32) (s string)) (derive Eq mixed)",
+        "((lambda () (derive Eq point)))",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+    }
+    assert_eq!(s.evaluate("(instance (Eq mixed) (fn = ((a mixed) (b mixed)) s32 42)) (= (mixed 1 \"a\") (mixed 2 \"b\"))").unwrap(), "42");
+    assert_eq!(s.evaluate("(define-syntax deriving (syntax-rules () ((_ name) (derive Eq name)))) (record macro-point (x s32)) (deriving macro-point) (= (macro-point 1) (macro-point 1))").unwrap(), "1");
+    let mut fresh = session();
+    assert!(
+        fresh
+            .evaluate("(record p (x s32)) (derive Eq p)")
+            .unwrap()
+            .starts_with("error:")
+    );
+    assert_eq!(
+        fresh
+            .evaluate("(trait (Eq T) (fn eq ((a T) (b T)) s32)) (derive Eq p) (eq (p 1) (p 1))")
+            .unwrap(),
+        "1"
+    );
+    let mut wrong_trait = session();
+    assert!(
+        wrong_trait
+            .evaluate("(trait (Eq T) (fn = ((a T) (b T)) s64)) (record p (x s32)) (derive Eq p)")
+            .unwrap()
+            .starts_with("error:")
+    );
+    assert_eq!(
+        wrong_trait
+            .evaluate("(instance (Eq p) (fn = ((a p) (b p)) s64 42)) (= (p 1) (p 2))")
+            .unwrap(),
+        "42s64"
+    );
+}
+
+#[test]
 fn test_parity_generic_functions_and_trait_instances() {
     compare_example(
         "tests/fixtures/interpreter_generics.lisp",
@@ -1407,7 +1587,6 @@ fn test_malformed_compound_forms_do_not_trap_or_publish() {
         "(err s32 string)",
         "(ok unknown string 42)",
         "(ok s32 unknown 42)",
-        "(tuple)",
         "(list-get)",
         "(list-get (list-new s32))",
         "(list-len)",
@@ -1417,7 +1596,6 @@ fn test_malformed_compound_forms_do_not_trap_or_publish() {
         "(list-push (list-new s32) 1 2)",
         "(fn broken ((x (list))) s32 1)",
         "(fn broken ((x (list s32 string))) s32 1)",
-        "(fn broken ((x (tuple))) s32 1)",
         "(fn broken ((x (result s32))) s32 1)",
         "(fn broken () (option unknown) 1)",
         "(record broken (x (tuple s32 unknown)))",

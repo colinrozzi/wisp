@@ -10,9 +10,14 @@
       (failure "unsupported ascription type"))))
 
 (fn resolve-integer ((n s64) (expected string)) value
-  (if (string=? expected "f64") (double (f64.convert_i64_s n))
-    (if (string=? expected "f32") (single (f32.demote_f64 (f64.convert_i64_s n)))
-      (resolve-integer-width n expected))))
+  (if (string=? expected "u8") (checked-byte n)
+    (if (string=? expected "f64") (double (f64.convert_i64_s n))
+      (if (string=? expected "f32") (single (f32.demote_f64 (f64.convert_i64_s n)))
+        (resolve-integer-width n expected)))))
+
+(fn checked-byte ((n s64)) value
+  (if (i32.or (i64.lt_s n 0) (i64.gt_s n 255)) (failure "integer out of u8 range")
+    (byte-value (i32.wrap_i64 n))))
 
 (fn resolve-integer-width ((n s64) (expected string)) value
   (if (string=? expected "s64") (wide-integer n)
