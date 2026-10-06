@@ -7580,10 +7580,15 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             Type::Variant(variant_name.clone())
         }
-        Expr::Match { expr, cases } => {
+        Expr::Match {
+            expr: scrutinee,
+            cases,
+        } => {
+            // Keep the checked language type, including pointer-backed values.
+            let result_ty = expr_type(expr, env, signatures, globals, records, variants);
             // Evaluate the expression to get the pointer
             let expr_ty = gen_expr(
-                expr, out, indent, env, signatures, globals, records, variants, false,
+                scrutinee, out, indent, env, signatures, globals, records, variants, false,
             );
 
             // Save the pointer to a local
@@ -7597,9 +7602,6 @@ fn gen_expr(
                     // Load discriminant
                     out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
                     out.push_str(&format!("{}i32.load\n", pad));
-
-                    // Determine result type (simplified)
-                    let result_ty = Type::S32; // Will be overridden by actual arm body type
 
                     let num_cases = cases.len();
                     for (i, arm) in cases.iter().enumerate() {
@@ -7701,9 +7703,6 @@ fn gen_expr(
                     out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
                     out.push_str(&format!("{}i32.load\n", pad));
 
-                    // Determine result type (simplified)
-                    let result_ty = Type::S32;
-
                     let num_cases = cases.len();
                     for (i, arm) in cases.iter().enumerate() {
                         let (case_idx, payload_ty) = match arm.case_name.as_str() {
@@ -7804,29 +7803,6 @@ fn gen_expr(
                     // Load discriminant
                     out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
                     out.push_str(&format!("{}i32.load\n", pad));
-
-                    // Determine result type from first arm
-                    let result_ty = if let Some(first_arm) = cases.first() {
-                        // Build environment for first arm to get its type
-                        let (_, first_case) = variant_def
-                            .find_case(&first_arm.case_name)
-                            .expect("case should exist");
-                        let mut arm_env = HashMap::new();
-                        for (binding, ty) in
-                            first_arm.bindings.iter().zip(first_case.payload.iter())
-                        {
-                            arm_env.insert(binding.clone(), ty.clone());
-                        }
-                        // Get type from body - simplified, assumes type checking passed
-                        match &first_arm.body {
-                            Expr::Int { ty, .. } => ty.clone(),
-                            Expr::Float { ty, .. } => ty.clone(),
-                            Expr::Var(name) => arm_env.get(name).cloned().unwrap_or(Type::S32),
-                            _ => Type::S32, // Default fallback
-                        }
-                    } else {
-                        Type::S32
-                    };
 
                     // For simplicity, use nested if-else for now
                     let num_cases = cases.len();

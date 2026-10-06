@@ -348,3 +348,48 @@ fn test_sexpr_variant() {
 "#;
     assert_eq!(compile_and_run(source), 1);
 }
+
+// Match codegen must retain the language result type, even when several types
+// happen to share an i32 pointer representation in Wasm.
+#[test]
+fn test_match_preserves_compound_result_type() {
+    let source = r#"
+(variant expr (num s32) (str string))
+(fn choose ((e expr)) expr
+  (if 1 (num 42)
+    (match e ((num n) (num n)) ((str s) (str s)))))
+(export (fn test-func () s32
+  (let (chosen (choose (str "unused")))
+    (match chosen ((num n) n) ((str s) 0)))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn test_match_option_and_result_return_non_i32_values() {
+    let source = r#"
+(fn label ((v (option s32))) string
+  (if 1
+    (match v ((none) "absent") ((some n) "present"))
+    "unused"))
+(fn number ((v (result s32 string))) f64
+  (match v ((ok n) (f64.add 20.0 22.0)) ((err message) 0.0)))
+(export (fn test-func () s32
+  (if (string=? (label (some s32 1)) "present")
+    (i32.trunc_f64_s (number (ok s32 string 1)))
+    0)))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn test_match_variant_returns_wide_call_result() {
+    let source = r#"
+(variant choice (yes) (no))
+(fn wide () s64 (i64.const 4294967338))
+(fn choose ((v choice)) s64
+  (match v ((yes) (wide)) ((no) (i64.const 0))))
+(export (fn test-func () s32 (i32.wrap_i64 (choose (yes)))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
