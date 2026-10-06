@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tokio::io::{AsyncWriteExt, BufReader};
-use wisp_interpreter_actor::{Runtime, adapter, source::SourceBundle, transport};
+use wisp_interpreter_actor::{Runtime, source::SourceBundle, transport};
 
 #[derive(Parser)]
 struct Args {
-    /// Directory containing the built actor, manifest, and immutable source bundle.
-    #[arg(long, default_value = env!("CARGO_MANIFEST_DIR"))]
+    /// Directory containing the built actor, manifest, and immutable source bundle
+    /// (the wisp-repl actor dir — this host crate's parent).
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/.."))]
     actor_dir: PathBuf,
     /// JSON object mapping bundle paths to source strings; loaded once at startup.
     #[arg(long)]
@@ -17,7 +18,6 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
-    Build,
     Repl,
     /// Local TCP endpoint: newline-delimited JSON strings, one session per connection.
     Serve {
@@ -29,11 +29,6 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if matches!(args.command, Command::Build) {
-        adapter::build(&args.actor_dir)?;
-        println!("{}", args.actor_dir.join("actor.wasm").display());
-        return Ok(());
-    }
     let manifest = theater::ManifestConfig::from_toml_str(&std::fs::read_to_string(
         args.actor_dir.join("manifest.toml"),
     )?)?;
@@ -89,13 +84,16 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(address).await?;
     // Current Theater exits when its last actor stops. Keep a service actor
     // alive while the listener exists, including between client connections.
-    let _listener_actor = runtime
+    let listener_actor = runtime
         .spawn_with_manifest(wasm.clone(), manifest.clone())
         .await?;
     eprintln!(
         "Wisp Theater REPL listening on {} (JSON strings, one per line)",
         listener.local_addr()?
     );
+    // A live sibling actor in the same runtime — a real target for rpc verbs:
+    //   (describe "<id>") / (exports "<id>") / (implements "<id>" "<iface>")
+    eprintln!("rpc target actor id: {}", listener_actor.id);
     let mut connections = tokio::task::JoinSet::new();
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);

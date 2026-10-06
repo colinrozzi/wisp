@@ -1,6 +1,8 @@
-pub mod adapter;
 pub mod source;
 pub mod transport;
+
+/// The actor's public evaluation export (theater:simple/wisp.evaluate).
+pub const EVALUATE: &str = "theater:simple/wisp.evaluate";
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -13,7 +15,7 @@ use theater::utils::ResourceCache;
 use theater::{ManifestConfig, TheaterId};
 use tokio::sync::{mpsc, oneshot};
 
-pub const MANIFEST: &str = include_str!("../manifest.toml");
+pub const MANIFEST: &str = include_str!("../../manifest.toml");
 
 pub struct Runtime {
     pub commands: mpsc::UnboundedSender<TheaterCommand>,
@@ -26,6 +28,25 @@ impl Runtime {
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
         handlers.register(theater_handler_rpc::RpcHandler::new(commands.clone()));
+        // Per-interface handlers the local runtime provides. Each is one line;
+        // real Theater deployments enable handlers via the actor manifest.
+        handlers.register(theater_handler_self::SelfHandler::new(
+            theater_handler_self::SelfHostConfig {},
+            commands.clone(),
+            None,
+        ));
+        handlers.register(theater_handler_store::StoreHandler::new(
+            theater_handler_store::StoreHandlerConfig::default(),
+            None,
+        ));
+        // Grant the REPL full runtime control so it can manage other actors.
+        handlers.register(theater_handler_runtime::RuntimeHandler::new(
+            theater_handler_runtime::RuntimeHostConfig {},
+            Some(theater::config::permissions::RuntimePermissions {
+                inspect: true,
+                mutate: true,
+            }),
+        ));
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,
@@ -93,7 +114,7 @@ impl Session {
         }
         match self
             .handle
-            .call_function(adapter::EVALUATE.into(), Value::String(source.into()))
+            .call_function(EVALUATE.into(), Value::String(source.into()))
             .await?
         {
             Value::String(output) => Ok(output),

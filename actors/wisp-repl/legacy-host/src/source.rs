@@ -89,7 +89,7 @@ impl Handler for SourceBundle {
     }
     fn interfaces(&self) -> Vec<InterfaceImpl> {
         vec![InterfaceImpl::from_pact(
-            &parse_pact(include_str!("../source.pact")).expect("source interface"),
+            &parse_pact(include_str!("../../source.pact")).expect("source interface"),
         )]
     }
     fn register_host_functions(
