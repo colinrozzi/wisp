@@ -23,7 +23,10 @@
   (checked-function value (list value) value)
   (aggregate string s32 string (list value))
   (constructor string s32 string (list value))
-  (field-reader string s32 s32))
+  (field-reader string s32 s32)
+  (boolean s32)
+  (u64-value s64)
+  (open-variant string string s32 (list value)))
 
 (record binding (name string) (item value))
 (record read-result (item value) (next s32))
@@ -57,7 +60,10 @@
         ((checked-function ignored-target ignored-params ignored-result) fallback)
         ((aggregate ignored-type ignored-id ignored-case ignored-fields) fallback)
         ((constructor ignored-type ignored-id ignored-case ignored-schema) fallback)
-        ((field-reader ignored-type ignored-id ignored-index) fallback)))))
+        ((field-reader ignored-type ignored-id ignored-index) fallback)
+        ((boolean ignored-bool) fallback)
+        ((u64-value ignored-u64) fallback)
+        ((open-variant ignored-tn ignored-cn ignored-tag ignored-fields) fallback)))))
 
 (fn failed? ((v value)) s32
   (value-case v ((failure message) 1) (else 0)))

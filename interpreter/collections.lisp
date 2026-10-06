@@ -33,6 +33,9 @@
   (value-case v
     ((integer n) (symbol "s32"))
     ((byte-value n) (symbol "u8"))
+    ((boolean b) (symbol "bool"))
+    ((u64-value n) (symbol "u64"))
+    ((open-variant tn cn tag fields) (symbol tn))
     ((wide-integer n) (symbol "s64"))
     ((single n) (symbol "f32"))
     ((double n) (symbol "f64"))

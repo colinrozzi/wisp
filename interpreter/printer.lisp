@@ -71,4 +71,9 @@
     ((constructor name id case-name types) (string-append "#<constructor " (string-append case-name ">")))
     ((field-reader name id index) (string-append "#<field " (string-append name ">")))
     ((builtin name) (string-append "#<builtin " (string-append name ">")))
+    ((open-variant tn cn tag fields)
+      (show-list-at fields 0 (string-append "(" (string-append cn (if (list-len fields) " " ""))) depth))
+    ((boolean b) (if b "true" "false"))
+    ; wide-digits divides unsigned, so this prints the full u64 range correctly.
+    ((u64-value n) (string-append (if (i64.eq n 0) "0" (wide-digits n "")) "u64"))
     ((failure message) (string-append "error: " message)))))

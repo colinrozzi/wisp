@@ -164,6 +164,21 @@ impl Interpreter {
                 source_import(&mut caller, false, ptr, len, out_ptr, out_len)
             },
         )?;
+        // Theater rpc bridge. The local host has no Theater runtime, so these are
+        // placeholders that only satisfy linking — a real host (or the actor)
+        // supplies them over Theater's recording/replay path. Never invoked unless
+        // a session evaluates the matching verb.
+        for name in ["describe", "exports", "implements", "call"] {
+            linker.func_wrap(
+                "theater:simple/rpc",
+                name,
+                |_caller: Caller<'_, SourceBudget>, _: i32, _: i32, _: i32, _: i32| -> i32 { -1 },
+            )?;
+        }
+        // Any other Theater host import the actor declares (self/store/timer/...)
+        // traps if invoked — the local host has no Theater. One line instead of a
+        // stub per import; real Theater supplies them all.
+        linker.define_unknown_imports_as_traps(&module)?;
         let instance = linker.instantiate(&mut store, &module)?;
         Ok(Self {
             memory: instance

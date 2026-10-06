@@ -49,17 +49,23 @@
 
 (fn read-integer-token ((s string)) value
   (let (size (string-len s))
-    (let (wide (if (i32.gt_s size 3) (string=? (substring s (i32.sub size 3) size) "s64") 0))
-      (let (base (if wide (substring s 0 (i32.sub size 3)) s))
-        (let (negative (i32.eq (string-ref base 0) 45))
-          (let (v (read-integer base (if (i32.or negative (i32.eq (string-ref base 0) 43)) 1 0) 0s64 negative))
-            (value-case v
-              ((integer-literal n) (if wide (wide-integer n) v))
-              (else v))))))))
+    (let (suffix (if (i32.gt_s size 3) (substring s (i32.sub size 3) size) ""))
+      (let (wide (string=? suffix "s64"))
+        (let (uwide (string=? suffix "u64"))
+          (let (base (if (i32.or wide uwide) (substring s 0 (i32.sub size 3)) s))
+            (let (negative (i32.eq (string-ref base 0) 45))
+              (let (v (read-integer base (if (i32.or negative (i32.eq (string-ref base 0) 43)) 1 0) 0s64 negative))
+                (value-case v
+                  ; Note: u64 literals above s64 range are not yet readable (the
+                  ; accumulator is s64-range-checked); covers the common cases.
+                  ((integer-literal n) (if wide (wide-integer n) (if uwide (u64-value n) v)))
+                  (else v))))))))))
 
 (fn read-atom ((s string)) value
   (if (string=? s "...") (symbol s)
-    (if (numeric-token? s) (read-number s) (symbol s))))
+    (if (string=? s "true") (boolean 1)
+      (if (string=? s "false") (boolean 0)
+        (if (numeric-token? s) (read-number s) (symbol s))))))
 
 (fn read-string ((src string) (pos s32) (acc string)) read-result
   (if (i32.ge_s pos (string-len src))
