@@ -12,7 +12,7 @@
 (fn known-type? ((ty value) (self string)) s32
   (value-case ty
     ((symbol name)
-      (i32.or (i32.or (string=? name "s32") (string=? name "string"))
+      (i32.or (i32.or (integer-type? name) (string=? name "string"))
         (i32.or (string=? name self) (i32.ge_s (type-index name) 0))))
     (else 0)))
 
@@ -20,6 +20,7 @@
   (let (name (symbol-name ty))
     (value-case v
       ((integer n) (string=? name "s32"))
+      ((wide-integer n) (string=? name "s64"))
       ((text s) (string=? name "string"))
       ((aggregate type-name id case-name fields)
         (let (index (type-index name))
@@ -95,7 +96,7 @@
 (fn apply-typed ((params (list value)) (result value) (body value) (args (list value)) (depth s32)) value
   (let (checked (check-arguments (schema-types params 0 (list-new value)) args 0))
     (if (failed? checked) checked
-      (require-type (eval body (typed-bindings params args 0 (list-new binding)) depth 0) result))))
+      (require-type (eval-expected body (typed-bindings params args 0 (list-new binding)) depth 0 (symbol-name result)) result))))
 
 (fn add-accessors ((name string) (id s32) (fields (list value)) (index s32)) value
   (if (i32.ge_s index (list-len fields)) (nil)

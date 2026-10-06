@@ -10,6 +10,18 @@
     (if (i32.lt_s n 0) (string-append "-" (digits (i32.sub 0 n) ""))
       (digits n ""))))
 
+(fn wide-digits ((n s64) (acc string)) string
+  (if (i64.eq n 0) acc
+    (let (d (i32.wrap_i64 (i64.rem_u n 10)))
+      (wide-digits (i64.div_u n 10)
+        (string-append (substring "0123456789" d (i32.add d 1)) acc)))))
+
+(fn show-wide ((n s64)) string
+  (string-append
+    (if (i64.eq n 0) "0"
+      (if (i64.lt_s n 0) (string-append "-" (wide-digits (i64.sub 0 n) ""))
+        (wide-digits n ""))) "s64"))
+
 (fn escape-text ((s string) (pos s32) (out string)) string
   (if (i32.ge_s pos (string-len s)) out
     (let (c (string-ref s pos))
@@ -30,6 +42,8 @@
 (fn show ((v value)) string
   (match v
     ((integer n) (show-integer n))
+    ((wide-integer n) (show-wide n))
+    ((integer-literal n) "#<integer-literal>")
     ((text s) (string-append "\"" (string-append (escape-text s 0 "") "\"")))
     ((symbol s) s)
     ((sequence items) (show-list items 0 "("))

@@ -31,24 +31,35 @@
     (if (delimiter? (string-ref src pos)) pos
       (atom-end src (i32.add pos 1)))))
 
-; Accumulate negatively to represent -2147483648 without overflow.
-(fn read-integer ((s string) (pos s32) (acc s32) (negative s32)) value
+; Retain unsuffixed literals until evaluation knows their expected type.
+; Accumulate negatively so the minimum signed 64-bit value never overflows.
+(fn read-integer ((s string) (pos s32) (acc s64) (negative s32)) value
   (if (i32.ge_s pos (string-len s))
-    (if negative (integer acc) (integer (i32.sub 0 acc)))
+    (integer-literal (if negative acc (i64.sub 0 acc)))
     (let (c (string-ref s pos))
       (if (digit? c)
         (let (d (i32.sub c 48))
-          (if (i32.or (i32.lt_s acc -214748364)
-                (i32.and (i32.eq acc -214748364)
+          (if (i32.or (i64.lt_s acc -922337203685477580)
+                (i32.and (i64.eq acc -922337203685477580)
                   (i32.gt_s d (if negative 8 7))))
-            (failure "integer out of s32 range")
-            (read-integer s (i32.add pos 1) (i32.sub (i32.mul acc 10) d) negative)))
+            (failure "integer out of s64 range")
+            (read-integer s (i32.add pos 1) (i64.sub (i64.mul acc 10) (i64.extend_i32_s d)) negative)))
         (failure "unsupported number literal")))))
 
+(fn read-number ((s string)) value
+  (let (size (string-len s))
+    (let (wide (if (i32.gt_s size 3) (string=? (substring s (i32.sub size 3) size) "s64") 0))
+      (let (base (if wide (substring s 0 (i32.sub size 3)) s))
+        (let (negative (i32.eq (string-ref base 0) 45))
+          (let (v (read-integer base (if negative 1 0) 0s64 negative))
+            (value-case v
+              ((integer-literal n) (if wide (wide-integer n) v))
+              (else v))))))))
+
 (fn read-atom ((s string)) value
-  (if (digit? (string-ref s 0)) (read-integer s 0 0 0)
+  (if (digit? (string-ref s 0)) (read-number s)
     (if (i32.and (i32.eq (string-ref s 0) 45) (i32.gt_s (string-len s) 1))
-      (if (digit? (string-ref s 1)) (read-integer s 1 0 1) (symbol s))
+      (if (digit? (string-ref s 1)) (read-number s) (symbol s))
       (symbol s))))
 
 (fn read-string ((src string) (pos s32) (acc string)) read-result

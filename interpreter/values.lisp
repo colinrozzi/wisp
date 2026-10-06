@@ -1,7 +1,10 @@
 ; Syntax and runtime data share values. Named aggregates carry a session-local
-; nominal type ID; constructors/accessors preserve it across calls.
+; nominal type ID; constructors/accessors preserve it across calls. Only syntax
+; uses integer-literal; evaluation/quotation resolves it to an actual integer.
 (variant value
   (integer s32)
+  (wide-integer s64)
+  (integer-literal s64)
   (text string)
   (symbol string)
   (sequence (list value))
@@ -25,6 +28,8 @@
       (match expr
         arm ...
         ((integer ignored-n) fallback)
+        ((wide-integer ignored-wide) fallback)
+        ((integer-literal ignored-literal) fallback)
         ((text ignored-s) fallback)
         ((symbol ignored-name) fallback)
         ((sequence ignored-items) fallback)

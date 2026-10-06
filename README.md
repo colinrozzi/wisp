@@ -80,7 +80,8 @@ cargo run --example interpreter
 ```
 
 It supports lexical closures, persistent definitions, typed functions, records,
-variants and pattern matching, recursion, lists, and recoverable errors. Existing
+variants and pattern matching, s32/s64 arithmetic and casts, recursion, lists,
+and recoverable errors. Existing
 factorial and record/variant examples can be loaded as command-line arguments.
 This is an initial subset; additional types, static checking, macros, and Theater
 calls remain ahead. See [interpreter/README.md](interpreter/README.md).

@@ -29,18 +29,34 @@ Enter one input per line; an input can contain several expressions. Use `begin`
 for a sequence inside a function body. `:quit`, `:q`, or EOF exits. Piped input
 works too. The reader itself accepts multiline source through `evaluate`.
 
-The initial language has s32 integers, strings, symbols, lists, closures, named
+The initial language has s32 and s64 integers, strings, symbols, lists, closures, named
 records and variants, and built-in functions. Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
 and `export`. Both `(x s32)` and `(x : s32)` parameter/field declarations work.
 `let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
-Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<` take two integers; `list`
+Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<` take two integers of the same type; `list`
 takes any number of values, with `cons`, `car`, and `cdr` for list operations.
 Zero and the empty list (`nil` or `'()`) are false; other values are true.
-Arithmetic wraps at 32 bits except division errors, which produce diagnostics.
-The compiler's `i32.const`, arithmetic, bitwise, shift/rotate, and comparison
-operations are available. String operations are `string-len`, `string-ref`,
+Arithmetic wraps at the operand width except division errors, which produce diagnostics.
+The compiler's `i32` and `i64` constants, arithmetic, bitwise, shift/rotate, and comparison
+operations are available. Comparisons return s32. String operations are `string-len`, `string-ref`,
 `string-append`, `string=?`, and `substring`; positions and lengths count bytes.
+
+Use an `s64` suffix for an explicit wide integer; the printer preserves that suffix.
+Unsuffixed integers default to s32 and must fit its range. A literal can instead
+adopt s64 from a typed return, parameter, field, annotated let, cast, or instruction
+operand. Expected types flow through `if` branches and `let` bodies. Stored and
+quoted values keep their types; they do not implicitly widen. Use `(s64 expr)` or
+`(expr : s64)` to convert an s32 value, and `(s32 expr)` to keep the low 32 bits of
+an s64. `i64.extend_i32_s`, `i64.extend_i32_u`, and `i32.wrap_i64` are also available.
+
+```lisp
+(i64.add 4294967296 2)                ; 4294967298s64
+(define wide 9223372036854775807s64)
+(+ wide 1s64)                        ; -9223372036854775808s64
+(i64.div_s -9223372036854775808 -1)    ; error: division overflow
+(s32 4294967297s64)                   ; 1
+```
 
 Typed functions check arguments and return values at runtime. Constructors check
 field/payload types, field access checks record identity, and `match` checks cases
@@ -71,8 +87,8 @@ compiled directly for a host that keeps its Wasm instance alive:
 cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
-This is a feasibility implementation, not full compiled-Wisp parity: other numeric
-widths, typed lists/options/results/tuples, macros, traits/generics, globals,
+This is a feasibility implementation, not full compiled-Wisp parity: floating-point
+and u8 values, typed lists/options/results/tuples, macros, traits/generics, globals,
 `include`, and Theater RPC built-ins are not implemented yet. `export` accepts
 compiled source declarations; the module's external entry point remains `evaluate`.
 There is no garbage collection; the existing bump allocator
@@ -88,3 +104,10 @@ The existing multi-payload variant example is compared against the Rust compiler
 the self-hosted compiler currently emits an undefined local for its second payload.
 The self-hosted compiler also misprints the minimum s32 literal; the shared fixture
 constructs that value by arithmetic to test operations independently of that bug.
+Full-width s64 literals, typed payloads, and all integer operations at boundary
+values are compared against the Rust compiler. The self-hosted reader currently
+truncates integer literals to 32 bits, so its i64 fixture builds values with Wasm
+instructions. The Rust compiler currently needs explicit suffixes/casts for ordinary
+function and constructor arguments where the interpreter can adopt their expected
+type. Expected-type propagation through `begin` and `match` remains incomplete;
+use explicit suffixes in those result positions.
