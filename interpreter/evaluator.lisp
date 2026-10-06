@@ -11,6 +11,7 @@
 (include "collections.lisp")
 (include "globals.lisp")
 (include "loading.lisp")
+(include "macros.lisp")
 
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)
@@ -75,7 +76,13 @@
 (fn eval-form ((items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (if (if (i32.eq (list-len items) 3) (string=? (symbol-name (list-get items 1)) ":") 0)
     (eval-numeric-ascription items env depth)
-    (eval-named-form items env depth top expected)))
+    (if (quotation-prefix? (symbol-name (list-get items 0)))
+      (if (string=? (symbol-name (list-get items 0)) "quasiquote")
+        (if (i32.eq (list-len items) 2)
+          (qq-walk (list-get items 1) env depth 1 0)
+          (failure "quasiquote expects one expression"))
+        (failure "unquote is only supported inside quasiquote"))
+      (eval-named-form items env depth top expected))))
 
 (fn eval-named-form ((items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (value-case (list-get items 0)
@@ -265,6 +272,7 @@
         (global.set $bindings (list-new binding))
         (global.set $types (list-new named-type))
         (global.set $session-globals (list-new global-binding))
+        (global.set $session-macros (list-new binding))
         (global.set $started 1) 0))
     (global.set $steps 0)
     (global.set $include-seen (list-new string))
@@ -272,5 +280,9 @@
     (if (i32.gt_s (string-len source) (if (string-len base) 65536 4096)) "error: source exceeds input limit"
       (let (forms (expand-source source base 0))
         (value-case forms
-          ((sequence items) (show (eval-body items 0 (list-new binding) 0 1 (nil))))
+          ((sequence items)
+            (let (expanded (prepare-macros items))
+              (value-case expanded
+                ((sequence ready) (show (eval-body ready 0 (list-new binding) 0 1 (nil))))
+                (else (show expanded)))))
           (else (show forms))))))))

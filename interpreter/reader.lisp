@@ -13,7 +13,8 @@
 (fn delimiter? ((c s32)) s32
   (i32.or (whitespace? c)
     (i32.or (i32.or (i32.eq c 40) (i32.eq c 41))
-      (i32.or (i32.eq c 59) (i32.or (i32.eq c 34) (i32.eq c 39))))))
+      (i32.or (i32.eq c 59) (i32.or (i32.eq c 34)
+        (i32.or (i32.eq c 39) (i32.or (i32.eq c 96) (i32.eq c 44))))))))
 
 (fn skip-comment ((src string) (pos s32)) s32
   (if (i32.ge_s pos (string-len src)) pos
@@ -91,6 +92,13 @@
             (read-list src (read-result.next one)
               (list-push items (read-result.item one)) depth)))))))
 
+(fn read-prefix ((src string) (pos s32) (depth s32) (name string)) read-result
+  (let (one (read-one src pos (i32.add depth 1)))
+    (if (failed? (read-result.item one)) one
+      (read-result
+        (sequence (list-push (list-push (list-new value) (symbol name)) (read-result.item one)))
+        (read-result.next one)))))
+
 (fn read-one ((src string) (pos s32) (depth s32)) read-result
   (let (start (skip-space src pos))
     (if (i32.gt_s depth 64) (read-result (failure "reader nesting limit") start)
@@ -100,14 +108,14 @@
           (if (i32.eq c 40) (read-list src (i32.add start 1) (list-new value) (i32.add depth 1))
             (if (i32.eq c 41) (read-result (failure "unexpected closing parenthesis") start)
               (if (i32.eq c 34) (read-string src (i32.add start 1) "")
-                (if (i32.eq c 39)
-                  (let (one (read-one src (i32.add start 1) (i32.add depth 1)))
-                    (if (failed? (read-result.item one)) one
-                      (read-result
-                        (sequence (list-push (list-push (list-new value) (symbol "quote")) (read-result.item one)))
-                        (read-result.next one))))
-                  (let (end (atom-end src start))
-                    (read-result (read-atom (substring src start end)) end)))))))))))
+                (if (i32.eq c 39) (read-prefix src (i32.add start 1) depth "quote")
+                  (if (i32.eq c 96) (read-prefix src (i32.add start 1) depth "quasiquote")
+                    (if (i32.eq c 44)
+                      (if (if (i32.lt_s (i32.add start 1) (string-len src)) (i32.eq (string-ref src (i32.add start 1)) 64) 0)
+                        (read-prefix src (i32.add start 2) depth "unquote-splice")
+                        (read-prefix src (i32.add start 1) depth "unquote"))
+                      (let (end (atom-end src start))
+                        (read-result (read-atom (substring src start end)) end)))))))))))))
 
 (fn read-forms ((src string) (pos s32) (items (list value))) value
   (let (start (skip-space src pos))

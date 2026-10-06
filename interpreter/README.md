@@ -33,7 +33,8 @@ The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lis
 named records and variants, typed lists, options, results, tuples, and built-in functions.
 Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
-`global`, `global.get`, `global.set`, `include`, and `export`. Both `(x s32)` and
+`global`, `global.get`, `global.set`, `include`, `defmacro`, `quasiquote`, and
+`export`. Both `(x s32)` and
 `(x : s32)` parameter/field declarations work.
 `let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
 Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<` take two numbers of the same type; `list`
@@ -168,6 +169,45 @@ functions or `begin` are rejected; quoted forms and comments do not load files.
 The Rust host's `Interpreter::load_file(path)` and command-line file arguments use
 this file-relative loading behavior.
 
+`defmacro` defines a persistent syntax template. Arguments are unevaluated forms;
+commas substitute parameters and comma-at splices a list of forms. As in the
+existing compiler surface, this is template substitution, not an arbitrary
+compile-time Lisp function. Parameters must be distinct symbols and arity is
+checked before expansion. A template can call other macros recursively.
+
+```lisp
+(defmacro when (condition body) `(if ,condition ,body 0))
+(when 1 (+ 20 22))                   ; 42
+(when 0 (/ 1 0))                     ; 0: body is not evaluated
+(defmacro sumargs (xs) `(i32.add ,@xs))
+(sumargs (15 27))                    ; 42
+(define x 42)
+`(answer ,x ,@(list 1 2))             ; (answer 42 1 2)
+```
+
+Includes expand first. Then all direct top-level macro declarations are collected
+and all remaining forms are expanded before evaluation, allowing a function to
+use a macro declared later in the same load graph. Definitions persist between
+inputs; the latest definition wins. Existing functions and closures retain their
+already expanded bodies. Quote protects data from expansion; quasiquote expands
+only the expressions in active unquotes. Backquote, comma, and comma-at also work
+for ordinary runtime list construction, with nested quasiquotes tracking their
+own commas. Splicing requires a Lisp list, and standalone comma forms are errors.
+
+Invalid macro declarations or expansion failures publish neither new macros nor
+ordinary definitions. After successful expansion the macro table is published;
+a subsequent evaluation error retains it along with earlier successful effects.
+Macros cannot generate new include directives or macro declarations for another
+collection pass. Quotation prefixes, `quote`, `include`, `defmacro`, and
+`define-syntax` are reserved macro names.
+
+These are classic, name-based macros, matching the self-hosted compiler's capture
+behavior. Template-introduced local names can capture names in substituted code;
+the Rust compiler instead tracks hygiene scopes. `define-syntax`, `syntax-rules`,
+`syntax-case`, and hygienic expansion remain parity work. The Rust compiler also
+currently fails to substitute a bare parameter in comma-at; the shared fixture
+uses a spliced literal list containing unquotes to compare all three paths.
+
 `evaluator.lisp` exports `evaluate(source: string) -> string`: a printed value or
 an `error:` diagnostic. Interpreter values stay in the session. This is a local
 REPL text boundary, not a structured value transport. The module can also be
@@ -188,16 +228,17 @@ cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
 This is a feasibility implementation, not full compiled-Wisp parity: u8/unit values,
-macros, traits/generics, and Theater RPC built-ins are not implemented yet.
+hygienic macros, traits/generics, and Theater RPC built-ins are not implemented yet.
 `export` accepts compiled source declarations; interpreted functions remain inside
 the session rather than becoming new Wasm exports.
 There is no garbage collection; the existing bump allocator
 retains allocations until the session is discarded. Interactive inputs are limited
 to 4096 bytes; files to 64 KiB each, with at most 256 files and 1 MiB of source per
 load graph. Include nesting and reader nesting are limited to 64, evaluator
-nesting to 128, and evaluation to 10,000 steps. The local host also applies
-Wasmtime fuel to reader/printer work, which can be exhausted before the file
-limits are reached. These
+nesting to 128, and evaluation to 10,000 steps. Macro expansion allows at most
+100 nesting levels and 10,000 syntax visits per input. The local host also applies
+Wasmtime fuel to reader/printer and expansion work, which can be exhausted before
+the file limits are reached. These
 are fixed implementation limits, not an expanded request protocol.
 
 Run the behavioral checks with `cargo test --test interpreter --test interpreter_parity`.
@@ -227,3 +268,7 @@ Globals are compared across all three paths using declarations without a colon;
 the self-hosted compiler does not currently parse the optional colon there.
 Relative includes, canonical path deduplication, and cycles are compared against
 the Rust compiler. Loading tests cover preflight failures and session recovery.
+Macro fixtures compare the existing macro example, recursive expansion, lazy
+branches, spliced templates, and repeated side effects across both compilers and
+the interpreter. Interpreter tests also cover persistence, redefinition, quoted
+data, nested quasiquotes, invalid declarations, and expansion recovery.

@@ -82,9 +82,10 @@ cargo run --example interpreter
 It supports lexical closures, persistent definitions, typed functions, records,
 variants and pattern matching, s32/s64/f32/f64 arithmetic and casts, recursion,
 typed lists/options/results/tuples, Lisp lists, typed globals, and recoverable errors.
+Persistent `defmacro` templates support quasiquotation and splicing.
 Source files can be loaded as command-line arguments, with relative `include`
 directives resolved from each file's directory.
-This is an initial subset; additional types, static checking, macros, and Theater
+This is an initial subset; additional types, static checking, hygienic macros, and Theater
 calls remain ahead. See [interpreter/README.md](interpreter/README.md).
 
 ## Execution and ABI status

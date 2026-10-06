@@ -1460,3 +1460,191 @@ fn test_include_depth_limit_and_recovery() {
     std::fs::write(dir.join("1.lisp"), "42").unwrap();
     assert_eq!(s.load_file(dir.join("0.lisp")).unwrap(), "42");
 }
+
+#[test]
+fn test_macro_parity_across_both_compilers() {
+    compare_example(
+        "examples/macro-test.lisp",
+        &[
+            ("double", &[21], 42),
+            ("add-five", &[37], 42),
+            ("factorial", &[6], 720),
+            ("test-when", &[0], 0),
+            ("test-when", &[7], 49),
+        ],
+        true,
+    );
+    compare_example(
+        "tests/fixtures/interpreter_macros.lisp",
+        &[
+            ("answer", &[], 42),
+            ("sum", &[], 42),
+            ("lazy", &[], 42),
+            ("duplicate", &[], 3),
+            ("calls", &[], 2),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn test_macro_persistence_redefinition_and_quoted_data() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(defmacro inc (x) `(i32.add ,x 1))", "()"),
+        ("(inc 41)", "42"),
+        ("(define saved (lambda (x) (inc x)))", "#<closure>"),
+        ("(fn typed ((x s32)) s32 (inc x))", "#<function>"),
+        ("(defmacro inc (x) `(i32.add ,x 2)) (inc 40)", "42"),
+        ("(saved 41)", "42"),
+        ("(typed 41)", "42"),
+        ("'(inc 41)", "(inc 41)"),
+        ("`((inc 41) ,(inc 40))", "((inc 41) 42)"),
+        (
+            "(defmacro sumargs (xs) `(i32.add ,@xs)) (sumargs (15 27))",
+            "42",
+        ),
+        ("(defmacro identity (x) ,x) (identity 42)", "42"),
+        ("(defmacro literal (x) 42) (literal missing)", "42"),
+        // Classic defmacro uses name-based substitution, like the self-hosted compiler.
+        (
+            "(defmacro capture (body) `(let (x 9) ,body)) (let (x 42) (capture x))",
+            "9",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    assert!(
+        session()
+            .evaluate("(inc 1)")
+            .unwrap()
+            .contains("unbound symbol")
+    );
+}
+
+#[test]
+fn test_quasiquote_nesting_splicing_and_side_effects() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(define x 42) `(a ,x ,@(list 1 2) z)", "(a 42 1 2 z)"),
+        ("`(a ,@'() z)", "(a z)"),
+        ("`,x", "42"),
+        (
+            "`(a `(b ,x ,,x))",
+            "(a (quasiquote (b (unquote x) (unquote 42))))",
+        ),
+        (
+            "'(a `b ,c ,@d)",
+            "(a (quasiquote b) (unquote c) (unquote-splice d))",
+        ),
+        ("`(1, x)", "(1 42)"),
+        (
+            "(global $n s32 mut 0) `(,(global.set $n 1) ,(global.set $n 2))",
+            "(1 2)",
+        ),
+        ("(global.get $n)", "2"),
+        ("(defmacro data (x) `(quote (,x))) (data 42)", "(42)"),
+        (
+            "(defmacro delayed (x) `(quasiquote (,x ,,x))) (delayed 42)",
+            "(42 42)",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    for source in [
+        "`",
+        ",",
+        ",@",
+        ",x",
+        ",@x",
+        "`(,@42)",
+        "`,@'(1 2)",
+        "(quasiquote)",
+        "(quasiquote 1 2)",
+        "`((unquote))",
+        "`((unquote-splice 1 2))",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+    }
+    assert_eq!(s.evaluate("x").unwrap(), "42");
+}
+
+#[test]
+fn test_macro_expansion_failures_preserve_session() {
+    let mut s = session();
+    assert_eq!(
+        s.evaluate("(define marker 42) (defmacro stable (x) ,x)")
+            .unwrap(),
+        "42"
+    );
+    for source in [
+        "(defmacro)",
+        "(defmacro bad)",
+        "(defmacro bad ())",
+        "(defmacro bad () 1 2)",
+        "(defmacro 1 () 42)",
+        "(defmacro bad x 42)",
+        "(defmacro bad (1) 42)",
+        "(defmacro bad (x x) 42)",
+        "(defmacro quote (x) ,x)",
+        "(defmacro bad (x) ,x) (bad)",
+        "(defmacro bad () 42) (bad 1)",
+        "(defmacro bad (x) `(i32.add ,@x)) (bad 42)",
+        "(defmacro bad () (quasiquote)) (bad)",
+        "(defmacro bad () (unquote)) (bad)",
+        "(defmacro bad () `(bad)) (bad)",
+        "(defmacro stable (x) 99) (defmacro bad () `(bad)) (bad)",
+        "(begin (defmacro bad () 42))",
+    ] {
+        let out = s.evaluate(&format!("(define marker 0) {source}")).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+        assert_eq!(s.evaluate("marker").unwrap(), "42", "{source}");
+        assert_eq!(s.evaluate("(stable 42)").unwrap(), "42");
+        assert!(s.evaluate("(bad)").unwrap().contains("unbound symbol: bad"));
+    }
+    // Expansion succeeds before evaluation starts; a later runtime error does not
+    // roll back either the macro publication or earlier ordinary definitions.
+    assert!(
+        s.evaluate("(defmacro good () 42) (define marker 7) missing")
+            .unwrap()
+            .starts_with("error:")
+    );
+    assert_eq!(s.evaluate("(good)").unwrap(), "42");
+    assert_eq!(s.evaluate("marker").unwrap(), "7");
+    // Broad expansion is bounded as well as recursive expansion depth.
+    assert_eq!(
+        s.evaluate("(defmacro duplicate (x) `(begin ,x ,x))")
+            .unwrap(),
+        "()"
+    );
+    let mut broad = "1".to_string();
+    for _ in 0..14 {
+        broad = format!("(duplicate {broad})");
+    }
+    let out = s.evaluate(&broad).unwrap();
+    assert!(out.contains("macro expansion step limit"), "{out}");
+    assert_eq!(s.evaluate("(good)").unwrap(), "42");
+}
+
+#[test]
+fn test_macros_collected_across_includes() {
+    let mut s = session();
+    let dir = root().join(format!(
+        "target/interpreter-parity/{}/macro-includes",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("main.lisp"),
+        "(fn answer () s32 (twice 21)) (include \"macros.lisp\") (answer)",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("macros.lisp"),
+        "(defmacro twice (x) `(i32.add ,x ,x))",
+    )
+    .unwrap();
+    assert_eq!(s.load_file(dir.join("main.lisp")).unwrap(), "42");
+    assert_eq!(s.evaluate("(twice 21)").unwrap(), "42");
+}
