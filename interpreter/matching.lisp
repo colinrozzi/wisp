@@ -32,6 +32,12 @@
     (let (v (eval (list-get items 1) env depth 0))
       (value-case v
         ((failure message) v)
+        ((compound ty case-name fields)
+          (let (cases (compound-cases ty))
+            (if (i32.eq (list-len cases) 0) (failure "match expects an option, result, or variant")
+              (let (arms (declaration-tail items))
+                (let (checked (validate-arms arms 0 cases))
+                  (if (failed? checked) checked (match-arms arms 0 case-name fields env depth)))))))
         ((aggregate name id case-name fields)
           (let (ty (list-get (global.get $types) id))
             (if (named-type.variant? ty)

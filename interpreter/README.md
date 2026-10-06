@@ -29,14 +29,16 @@ Enter one input per line; an input can contain several expressions. Use `begin`
 for a sequence inside a function body. `:quit`, `:q`, or EOF exits. Piped input
 works too. The reader itself accepts multiline source through `evaluate`.
 
-The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lists, closures, named
-records and variants, and built-in functions. Forms include `define`, `lambda`,
+The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lists, closures,
+named records and variants, typed lists, options, results, tuples, and built-in functions.
+Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
 and `export`. Both `(x s32)` and `(x : s32)` parameter/field declarations work.
 `let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
 Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<` take two numbers of the same type; `list`
 takes any number of values, with `cons`, `car`, and `cdr` for list operations.
-Zero and the empty list (`nil` or `'()`) are false; other values are true.
+Zero and the empty Lisp list (`nil` or `'()`) are false; other values are true,
+including typed lists and option/result values.
 Integer arithmetic wraps at the operand width except division errors, which produce diagnostics.
 The compiler's `i32` and `i64` constants, arithmetic, bitwise, shift/rotate, and comparison
 operations are available. Comparisons return s32. String operations are `string-len`, `string-ref`,
@@ -86,7 +88,7 @@ The evaluator, including decimal conversion, remains entirely in Wisp.
 
 Typed functions check arguments and return values at runtime. Constructors check
 field/payload types, field access checks record identity, and `match` checks cases
-and binding counts against the declared variant. Named types cannot currently be
+and binding counts against the declared variant, option, or result. Named types cannot currently be
 redefined. Function bodies are checked as they execute; compile-time rejection of
 invalid unexecuted branches and other static checks remain parity work.
 
@@ -97,6 +99,35 @@ invalid unexecuted branches and other static checks remain parity work.
 (variant shape (circle s32) (rectangle s32 s32))
 (match (rectangle 6 7) ((circle r) r) ((rectangle w h) (i32.mul w h))) ; 42
 ```
+
+Compound type declarations can nest `(list T)`, `(option T)`, `(result T E)`,
+and `(tuple T1 T2 ...)`, including named record/variant types. Empty lists and
+absent option/result branches retain their declared types. Tuple construction
+infers each field's type; values can be passed, returned, and stored in other
+containers. Like the compiler, `(tuple ...)` requires at least one element and
+there is currently no tuple projection form.
+
+```lisp
+(define xs (list-new s64))
+(list-push xs 4294967296)             ; #<list s64 (4294967296s64)>
+(list-get xs 0)                      ; 4294967296s64
+(list-len xs)                        ; 1
+(some s32 42)                        ; (some s32 42)
+(none (list s32))                    ; (none (list s32))
+(err s32 string "oops")              ; (err s32 string "oops")
+(match (some s32 42) ((some n) n) ((none) 0)) ; 42
+(tuple 42 "x" (none s32))             ; (tuple 42 "x" (none s32))
+```
+
+`list-push` mutates a typed list and returns it, matching compiled Wisp. Aliases,
+closures, and containers holding that list observe the update. Both operands
+are evaluated before the push; type checks complete before that push mutates the
+list. Earlier successful side effects remain if a later operation fails.
+`list-get` checks its s32 index and reports out-of-bounds access as a diagnostic.
+The Lisp `list`/`cons`/`car`/`cdr` operations remain separate from typed lists.
+Typed lists display as `#<list TYPE (...)>`; this is a display format, not source
+syntax. Recursive printing stops at depth 64 with `#<depth-limit>`, allowing
+cyclic records and lists to be inspected without unbounded recursion.
 
 Local bindings are lexical. Closures see current top-level definitions, so
 recursive functions and top-level redefinition work. Each call extends a copy
@@ -113,8 +144,8 @@ compiled directly for a host that keeps its Wasm instance alive:
 cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
-This is a feasibility implementation, not full compiled-Wisp parity: u8 values,
-typed lists/options/results/tuples, macros, traits/generics, globals,
+This is a feasibility implementation, not full compiled-Wisp parity: u8/unit values,
+macros, traits/generics, globals,
 `include`, and Theater RPC built-ins are not implemented yet. `export` accepts
 compiled source declarations; the module's external entry point remains `evaluate`.
 There is no garbage collection; the existing bump allocator
@@ -134,10 +165,15 @@ Full-width s64 literals, typed payloads, and all integer operations at boundary
 values are compared against the Rust compiler. The self-hosted reader currently
 truncates integer literals to 32 bits, so its i64 fixture builds values with Wasm
 instructions. The Rust compiler currently needs explicit suffixes/casts for ordinary
-function and constructor arguments where the interpreter can adopt their expected
-type. Expected-type propagation through `begin` and `match` remains incomplete;
+function and constructor arguments and typed list elements where the interpreter can
+adopt their expected type. The interpreter also accepts compound let annotations;
+the Rust compiler currently accepts only scalar let annotations.
+Expected-type propagation through `begin` and `match` remains incomplete;
 use explicit suffixes in those result positions.
 Float arithmetic and every conversion instruction are compared with compiled
 Wasm. Reader/printer tests cover rounding boundaries, subnormals, signed zero,
 non-finite values, and samples across binary exponents. A shared float fixture
 also runs through both compilers.
+Compound-operation fixtures compare nested containers, option/result matching,
+tuple arguments, aliases, and nested list mutations across all three paths.
+Structured outputs are also compared with the Rust compiler's CGRF values.

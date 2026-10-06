@@ -8,6 +8,7 @@
 (include "integers.lisp")
 (include "decimal.lisp")
 (include "floats.lisp")
+(include "collections.lisp")
 
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)
@@ -35,7 +36,7 @@
       (let (root (global.get $bindings))
         (let (found (lookup-local name root (i32.sub (list-len root) 1)))
           (if (failed? found)
-            (if (if (builtin? name) 1 (if (string-primitive? name) 1 (numeric-primitive? name))) (builtin name)
+            (if (if (builtin? name) 1 (if (collection-builtin? name) 1 (if (string-primitive? name) 1 (numeric-primitive? name)))) (builtin name)
               (if (string=? name "nil") (nil) found))
             found)))
       local)))
@@ -97,6 +98,10 @@
     (else 1)))
 
 (fn eval-declaration-or-call ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
+  (if (collection-form? name) (eval-collection-form name items env depth)
+    (eval-declaration name items env depth top)))
+
+(fn eval-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
   (if (string=? name "fn") (eval-fn items top)
     (if (string=? name "record") (eval-record items top)
       (if (string=? name "variant") (eval-variant items top)
@@ -173,7 +178,7 @@
 
 (fn eval-args ((items (list value)) (index s32) (env (list binding)) (depth s32) (args (list value)) (callee value)) value
   (if (i32.ge_s index (list-len items)) (sequence args)
-    (let (v (eval-expected (list-get items index) env depth 0 (argument-type callee (i32.sub index 1))))
+    (let (v (eval-expected (list-get items index) env depth 0 (call-argument-type callee args (i32.sub index 1))))
       (if (failed? v) v
         (eval-args items (i32.add index 1) env depth (list-push args v) callee)))))
 
@@ -196,8 +201,9 @@
                 (if (i32.ne (list-len params) (list-len args)) (failure "wrong number of arguments")
                   (eval body (bind-args params args 0 (copy-env captured 0 (list-new binding))) depth 0)))
               ((builtin name)
-                (if (numeric-primitive? name) (apply-numeric-primitive name args)
-                  (if (string-primitive? name) (apply-string name args) (apply-builtin name args))))
+                (if (collection-builtin? name) (apply-collection name args)
+                  (if (numeric-primitive? name) (apply-numeric-primitive name args)
+                    (if (string-primitive? name) (apply-string name args) (apply-builtin name args)))))
               ((typed-function params result body) (apply-typed params result body args depth))
               ((constructor name id case-name types) (apply-constructor name id case-name types args))
               ((field-reader name id index) (apply-field name id index args))

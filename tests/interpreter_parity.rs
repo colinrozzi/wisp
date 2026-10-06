@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use pack::abi::Value;
+use pack::abi::{Value, ValueType};
 use wasmtime::Module;
 use wisp::{compiler, interpreter::Interpreter};
 
@@ -903,5 +903,307 @@ fn test_parity_float_primitives_across_both_compilers() {
             ("truncate", &[], -2),
         ],
         true,
+    );
+}
+
+#[test]
+fn test_parity_compound_operations_across_both_compilers() {
+    compare_example(
+        "tests/fixtures/interpreter_collections.lisp",
+        &[
+            ("list-sum", &[], 42),
+            ("list-alias", &[], 42),
+            ("nested-push", &[], 12),
+            ("option-present", &[], 42),
+            ("option-absent", &[], 7),
+            ("result-ok", &[], 42),
+            ("result-err", &[], 4),
+            ("tuple-argument", &[], 42),
+            ("nested-list", &[], 42),
+            ("record-list", &[], 42),
+            ("variant-list", &[], 42),
+            ("nested-option", &[], 42),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn test_compound_values_match_compiled_exports() {
+    let file = root().join("tests/fixtures/interpreter_collection_values.lisp");
+    let mut s = session();
+    let loaded = s
+        .evaluate(&std::fs::read_to_string(&file).unwrap())
+        .unwrap();
+    assert!(!loaded.starts_with("error:"), "{loaded}");
+    let module =
+        Module::from_file(&cgrf_guest::engine(), compile(&file, "collection-values")).unwrap();
+    let mut compiled = Guest::new(&module);
+    for (name, expected, display) in [
+        (
+            "make-list",
+            Value::List {
+                elem_type: ValueType::S64,
+                items: vec![Value::S64(4294967296)],
+            },
+            "#<list s64 (4294967296s64)>",
+        ),
+        (
+            "make-some",
+            Value::Option {
+                inner_type: ValueType::F64,
+                value: Some(Box::new(Value::F64(2.5))),
+            },
+            "(some f64 2.5f64)",
+        ),
+        (
+            "make-none",
+            Value::Option {
+                inner_type: ValueType::String,
+                value: None,
+            },
+            "(none string)",
+        ),
+        (
+            "make-ok",
+            Value::Result {
+                ok_type: ValueType::S64,
+                err_type: ValueType::String,
+                value: Ok(Box::new(Value::S64(4294967296))),
+            },
+            "(ok s64 string 4294967296s64)",
+        ),
+        (
+            "make-err",
+            Value::Result {
+                ok_type: ValueType::S64,
+                err_type: ValueType::String,
+                value: Err(Box::new(Value::String("oops".into()))),
+            },
+            "(err s64 string \"oops\")",
+        ),
+        (
+            "make-tuple",
+            Value::Tuple(vec![
+                Value::S32(42),
+                Value::F64(2.5),
+                Value::Option {
+                    inner_type: ValueType::String,
+                    value: Some(Box::new(Value::String("x".into()))),
+                },
+            ]),
+            "(tuple 42 2.5f64 (some string \"x\"))",
+        ),
+        (
+            "make-nested",
+            Value::List {
+                elem_type: ValueType::Option(Box::new(ValueType::S32)),
+                items: vec![
+                    Value::Option {
+                        inner_type: ValueType::S32,
+                        value: Some(Box::new(Value::S32(42))),
+                    },
+                    Value::Option {
+                        inner_type: ValueType::S32,
+                        value: None,
+                    },
+                ],
+            },
+            "#<list (option s32) ((some s32 42) (none s32))>",
+        ),
+    ] {
+        assert_eq!(
+            compiled.call(name, Value::Tuple(vec![])),
+            expected,
+            "{name}"
+        );
+        assert_eq!(s.evaluate(&format!("({name})")).unwrap(), display, "{name}");
+    }
+}
+
+#[test]
+fn test_compound_types_validate_nested_and_absent_payloads() {
+    let mut s = session();
+    for (source, expected) in [
+        (
+            "(fn read-list ((xs (list s64))) s64 (list-get xs 0)) (read-list (list-push (list-new s64) 42))",
+            "42s64",
+        ),
+        (
+            "(fn maybe ((v (option s32))) s32 (match v ((some n) n) ((none) 42))) (maybe (none s32))",
+            "42",
+        ),
+        (
+            "(fn result ((v (result s32 string))) s32 (match v ((ok n) n) ((err e) (string-len e)))) (result (err s32 string \"oops\"))",
+            "4",
+        ),
+        (
+            "(fn pair ((v (tuple s32 string))) (tuple s32 string) v) (pair (tuple 42 \"x\"))",
+            "(tuple 42 \"x\")",
+        ),
+        (
+            "(fn nested ((v (list (option s32)))) s32 (list-len v)) (nested (list-new (option s32)))",
+            "0",
+        ),
+        (
+            "(let (xs : (list s32) (list-push (list-new s32) 42)) (list-get xs 0))",
+            "42",
+        ),
+        ("(some f64 42)", "(some f64 42f64)"),
+        (
+            "(ok (tuple s32 string) (list s32) (tuple 42 \"x\"))",
+            "(ok (tuple s32 string) (list s32) (tuple 42 \"x\"))",
+        ),
+        (
+            "(define push list-push) (list-get (push (list-new f32) 42) 0)",
+            "42f32",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    for source in [
+        "(read-list (list-new s32))",
+        "(maybe (none string))",
+        "(maybe (some string \"x\"))",
+        "(result (ok s32 s32 42))",
+        "(result (err string string \"oops\"))",
+        "(pair (tuple 42 1))",
+        "(pair (tuple 42 \"x\" 1))",
+        "(pair '(42 x))",
+        "(nested (list-new (option string)))",
+        "(list-push (list-new (option s32)) (none string))",
+        "(list-push (list-new (list s32)) (list-new string))",
+        "(tuple (lambda () 1))",
+        "(tuple '(1))",
+        "(some s32 \"bad\")",
+        "(ok s32 string \"bad\")",
+        "(err s32 string 42)",
+        "(fn bad-compound () (option s32) (none string)) (bad-compound)",
+        "(match (some s32 42) ((some) 0))",
+        "(match (none s32) ((none x) x))",
+        "(match (some s32 42) ((some x y) x))",
+        "(match (some s32 42) ((ok x) x))",
+        "(match (some s32 42) ((none) 0))",
+        "(match (ok s32 string 42) ((ok) 0))",
+        "(match (ok s32 string 42) ((some x) x))",
+        "(match (tuple 42) ((tuple x) x))",
+    ] {
+        let output = s.evaluate(source).unwrap();
+        assert!(output.starts_with("error:"), "{source}: {output}");
+        assert_eq!(s.evaluate("(maybe (none s32))").unwrap(), "42");
+    }
+}
+
+#[test]
+fn test_typed_list_aliases_and_failed_mutation_recover() {
+    let mut s = session();
+    assert_eq!(
+        s.evaluate("(define xs (list-new s32)) (define alias xs) (list-push xs 42)")
+            .unwrap(),
+        "#<list s32 (42)>"
+    );
+    assert_eq!(s.evaluate("(list-get alias 0)").unwrap(), "42");
+    assert_eq!(
+        s.evaluate("(define push-one (lambda () (list-push xs 1))) (push-one) (list-len alias)")
+            .unwrap(),
+        "2"
+    );
+    for source in [
+        "(list-push xs \"bad\")",
+        "(list-push xs 1s64)",
+        "(list-get xs -1)",
+        "(list-get xs 2)",
+        "(list-get xs 0s64)",
+        "(list-get (list-new s32) 0)",
+        "(list-len '(1 2))",
+        "(list-push '(1) 2)",
+        "(car xs)",
+    ] {
+        let output = s.evaluate(source).unwrap();
+        assert!(output.starts_with("error:"), "{source}: {output}");
+        assert_eq!(s.evaluate("alias").unwrap(), "#<list s32 (42 1)>");
+    }
+    // Nominal identity remains enforced inside mutable containers.
+    s.evaluate("(record point (x s32)) (record other (x s32)) (define points (list-new point))")
+        .unwrap();
+    assert!(
+        s.evaluate("(list-push points (other 1))")
+            .unwrap()
+            .starts_with("error:")
+    );
+    assert_eq!(
+        s.evaluate("(list-push points (point 42)) (point.x (list-get points 0))")
+            .unwrap(),
+        "42"
+    );
+    // A recursive record can introduce a cycle through its mutable children.
+    s.evaluate("(record node (children (list node))) (define children (list-new node)) (define root (node children))").unwrap();
+    let output = s.evaluate("(list-push children root)").unwrap();
+    assert!(output.contains("#<depth-limit>"), "{output}");
+    assert_eq!(
+        s.evaluate("(list-len (node.children (list-get children 0)))")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(s.evaluate("(list-get xs 0)").unwrap(), "42");
+    // Errors do not roll back an earlier, successful mutation in a payload.
+    assert!(
+        s.evaluate("(list-push xs (begin (list-push xs 7) \"bad\"))")
+            .unwrap()
+            .starts_with("error:")
+    );
+    assert_eq!(s.evaluate("alias").unwrap(), "#<list s32 (42 1 7)>");
+}
+
+#[test]
+fn test_malformed_compound_forms_do_not_trap_or_publish() {
+    let mut s = session();
+    for source in [
+        "(list-new)",
+        "(list-new s32 s32)",
+        "(list-new unknown)",
+        "(list-new ())",
+        "(list-new (list))",
+        "(some)",
+        "(some s32)",
+        "(some s32 1 2)",
+        "(none)",
+        "(none s32 1)",
+        "(none (option))",
+        "(ok)",
+        "(ok s32 string)",
+        "(err s32 string)",
+        "(ok unknown string 42)",
+        "(ok s32 unknown 42)",
+        "(tuple)",
+        "(list-get)",
+        "(list-get (list-new s32))",
+        "(list-len)",
+        "(list-len 42)",
+        "(list-push)",
+        "(list-push (list-new s32))",
+        "(list-push (list-new s32) 1 2)",
+        "(fn broken ((x (list))) s32 1)",
+        "(fn broken ((x (list s32 string))) s32 1)",
+        "(fn broken ((x (tuple))) s32 1)",
+        "(fn broken ((x (result s32))) s32 1)",
+        "(fn broken () (option unknown) 1)",
+        "(record broken (x (tuple s32 unknown)))",
+        "(variant broken (a (list unknown)))",
+        "(record broken (x (option)))",
+    ] {
+        let output = s.evaluate(source).unwrap();
+        assert!(output.starts_with("error:"), "{source}: {output}");
+        assert_eq!(
+            s.evaluate("broken").unwrap(),
+            "error: unbound symbol: broken"
+        );
+    }
+    assert_eq!(
+        s.evaluate(
+            "(record broken (items (list s32))) (list-len (broken.items (broken (list-new s32))))"
+        )
+        .unwrap(),
+        "0"
     );
 }

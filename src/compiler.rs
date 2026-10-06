@@ -8160,6 +8160,14 @@ fn gen_expr(
             let list_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.set {}\n", pad, list_local));
 
+            // Evaluate both operands before reading or changing the list header.
+            // The value expression can itself push into this same list.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            let value_local = env.declare_local(elem_type.clone());
+            out.push_str(&format!("{}local.set {}\n", pad, value_local));
+
             // Get current len
             let len_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.get {}\n", pad, list_local));
@@ -8212,9 +8220,7 @@ fn gen_expr(
             out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
             out.push_str(&format!("{}i32.mul\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
-            gen_expr(
-                value, out, indent, env, signatures, globals, records, variants, false,
-            );
+            out.push_str(&format!("{}local.get {}\n", pad, value_local));
             let store_instr = match &elem_type {
                 Type::S32 => "i32.store",
                 Type::S64 => "i64.store",

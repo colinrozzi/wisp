@@ -14,6 +14,7 @@
     ((symbol name)
       (i32.or (i32.or (numeric-type? name) (string=? name "string"))
         (i32.or (string=? name self) (i32.ge_s (type-index name) 0))))
+    ((sequence parts) (known-compound-type? parts self))
     (else 0)))
 
 (fn value-has-type? ((v value) (ty value)) s32
@@ -23,6 +24,8 @@
       ((wide-integer n) (string=? name "s64"))
       ((single n) (string=? name "f32"))
       ((double n) (string=? name "f64"))
+      ((typed-list element items) (same-type? (unary-type "list" element) ty))
+      ((compound actual case-name fields) (same-type? actual ty))
       ((text s) (string=? name "string"))
       ((aggregate type-name id case-name fields)
         (let (index (type-index name))
