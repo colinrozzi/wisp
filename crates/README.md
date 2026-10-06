@@ -1,6 +1,8 @@
 # Theater integrations
 
-This is a separate Cargo workspace for experimental Theater integrations. The
+This directory contains a separate Cargo workspace for legacy Theater
+integrations. The current interpreter actor lives in
+[`actors/wisp-repl`](../actors/wisp-repl/README.md), with its own workspace. The
 compiler and Rust-backed REPL live in the root workspace and can be built and
 tested without resolving Theater dependencies.
 
@@ -13,7 +15,7 @@ tested without resolving Theater dependencies.
 
 ## Build status
 
-These integrations are mid-migration between Theater/Pack APIs. `test-runtime`
+The legacy integrations are mid-migration between Theater/Pack APIs. `test-runtime`
 uses the newer capture-based host API, while `theater-repl` and
 `theater-handler-wisp` still use older APIs. Their manifests pin Theater v0.3.0;
 the migrated runtime needs dependency alignment before a fresh build can succeed.
@@ -24,7 +26,8 @@ next local actor/RPC acceptance checks.
 
 For new interpreter actor work, the root flake pins current upstream Theater:
 `nix develop .#theater` adds its CLI, and `nix run .#theater -- --help` runs it
-directly. This runtime pin does not update the legacy Cargo dependencies above.
+directly. The [interpreter actor](../actors/wisp-repl/README.md) now builds against
+that same Theater revision. This does not update the legacy Cargo dependencies.
 
 After aligning dependencies, select this workspace explicitly:
 

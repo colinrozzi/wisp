@@ -1,9 +1,9 @@
 [workspace]
 members = ["wisp-repl"]
 default-members = ["."]
-exclude = ["crates", "wisp-actor"]
+exclude = ["crates", "wisp-actor", "actors/wisp-repl"]
 resolver = "3"
-# Theater integrations have their own workspace in crates/.
+# Legacy Theater integrations use crates/; the current actor uses actors/wisp-repl/.
 
 [workspace.dependencies]
 # Keep compiler metadata and both Rust runners on the same CGRF v3 implementation.

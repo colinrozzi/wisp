@@ -11,3 +11,7 @@ compiled/
 examples/*.wasm
 examples/*.wat
 examples/*.wit
+
+# Shareable interpreter actor artifacts (rebuild with actors/wisp-repl/build.sh).
+actors/wisp-repl/actor.wasm
+actors/wisp-repl/actor.wat

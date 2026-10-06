@@ -90,8 +90,10 @@ Persistent `defmacro` templates support quasiquotation and splicing; hygienic
 `syntax-case-lambda` adds guards and computation during expansion.
 Source files can be loaded as command-line arguments, with relative `include`
 directives resolved from each file's directory.
-This is an initial subset; resource handles, static checking, and Theater
-calls remain ahead. See [interpreter/README.md](interpreter/README.md).
+The [Theater interpreter actor](actors/wisp-repl/README.md) runs the same
+evaluator through a real actor mailbox, with a local socket REPL and RPC
+discovery. General Theater effects from interpreted programs, resource handles,
+and static checking remain ahead. See [interpreter/README.md](interpreter/README.md).
 
 ## Execution and ABI status
 

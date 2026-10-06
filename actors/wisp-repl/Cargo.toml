@@ -1,0 +1,22 @@
+[package]
+name = "wisp-interpreter-actor"
+version = "0.1.0"
+edition = "2024"
+
+# Keep the current actor independent of the legacy integration workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+pack = { package = "packr", version = "=0.24.1" }
+serde_json = "1"
+theater = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-native = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-rpc = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+tokio = { version = "1", features = ["full"] }
+wat = "1.242"
+wisp = { path = "../.." }
+
+[profile.dev]
+debug = 0

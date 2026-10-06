@@ -1,0 +1,5 @@
+name = "wisp-interpreter"
+version = "0.1.0"
+package = "actor.wasm"
+
+# The embedding host registers wisp-source using the adjacent sources.json.
