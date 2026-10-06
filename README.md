@@ -83,10 +83,11 @@ It supports lexical closures, persistent definitions, typed functions, records,
 variants and pattern matching, s32/s64/f32/f64 arithmetic and casts, recursion,
 typed lists/options/results/tuples, Lisp lists, typed globals, and recoverable errors.
 Persistent `defmacro` templates support quasiquotation and splicing; hygienic
-`syntax-rules` supports literal patterns and nested ellipses.
+`syntax-rules` supports literal patterns and nested ellipses. Procedural
+`syntax-case-lambda` adds guards and computation during expansion.
 Source files can be loaded as command-line arguments, with relative `include`
 directives resolved from each file's directory.
-This is an initial subset; additional types, static checking, procedural macros, and Theater
+This is an initial subset; additional types, static checking, traits/generics, and Theater
 calls remain ahead. See [interpreter/README.md](interpreter/README.md).
 
 ## Execution and ABI status

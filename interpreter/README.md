@@ -235,12 +235,61 @@ helpers, like ordinary functions. Quotation prints/materializes ordinary symbols
 private identities do not become user-visible names. Record/variant type names,
 field names, explicit globals, and literal keyword matching remain name-based.
 
-Both macro forms share a persistent namespace: the latest declaration wins,
+All macro forms share a persistent namespace: the latest declaration wins,
 including across forms. The existing expansion/publication and recovery rules
-apply to both. Local macro declarations and procedural `syntax-case` are not
-supported. The self-hosted compiler does not implement `syntax-rules`; the Rust
+apply to each. Local macro declarations are not supported.
+The self-hosted compiler does not implement `syntax-rules`; the Rust
 compiler currently has incomplete nested/compound repetition capture and numeric
 literal pattern matching, so those cases have interpreter-specific tests.
+
+Procedural transformers use the compiler's `syntax-case-lambda` form. Each clause
+has a pattern, an optional guard, and an expression that must produce syntax.
+Use `#'` for syntax quotation, or quasisyntax with unsyntax to insert computed
+syntax. Pattern variables substitute automatically inside either kind of syntax
+template. The transformer's single parameter holds its entire input form.
+
+```lisp
+(define-syntax fold-add
+  (syntax-case-lambda (stx)
+    ((_ a b)
+     (and (integer? #'a) (integer? #'b))
+     (let (sum (+ (syntax->datum #'a) (syntax->datum #'b)))
+       #`(i32.const #,sum)))
+    ((_ a b) #'(i32.add a b))))
+(fold-add 20 22)                     ; 42
+(define-syntax gather
+  (syntax-case-lambda (stx) ((_ x ...) #`(list #,@x))))
+(gather 1 2 3)                       ; (1 2 3)
+```
+
+An optional `(syntax-case stx (literals...) clauses...)` wrapper selects literal
+keywords, using the same pattern matcher as `syntax-rules`. The wrapper's input
+must be the transformer parameter. `syntax-case` is not a general runtime form.
+Syntax prefixes read as `syntax`, `quasisyntax`, `unsyntax`, and `unsyntax-splice`
+forms; they are reserved for transformer expressions. Repeated captures can be
+spliced with `#,@`, including empty and compound-pattern captures. A repeated
+capture cannot be substituted as a single syntax value. Nested quasisyntax tracks
+which unsyntax expressions are active. Introduced syntax retains the same hygiene
+and top-level helper resolution as `syntax-rules`.
+
+The transformer language provides `if`, lexical `let`, `identifier?`, `number?`,
+`integer?`, `syntax->datum`, `not`, `and`, `or`, integer `+`/`-`, and `syntax-error`.
+Integer computation uses wrapping signed 64-bit arithmetic; inserted results are
+unsuffixed syntax literals whose type is determined when evaluated. Predicates
+produce transformer booleans. As in the compiler, only a boolean false rejects a
+guard; `if` also treats a computed integer zero as false. Syntax objects, including
+quoted zero, are truthy. `and`/`or` evaluate all operands. `syntax->datum` extracts an
+integer or removes an identifier's context; other values pass through unchanged.
+An unbound transformer name denotes introduced syntax, and an unrecognized call
+constructs a syntax application. Neither executes ordinary session code. A clause
+returning a computed number/boolean rather than syntax is an error.
+
+Transformer failures use the normal expansion diagnostics and publish no session
+changes. This implementation additionally binds the whole-input parameter,
+evaluates compound unsyntax expressions, and splices list-shaped syntax objects;
+those paths are incomplete in the Rust compiler. It rejects invalid builtin
+arguments instead of silently treating them as zero. Procedure bodies and helper
+functions from the ordinary session are not callable during expansion.
 
 `evaluator.lisp` exports `evaluate(source: string) -> string`: a printed value or
 an `error:` diagnostic. Interpreter values stay in the session. This is a local
@@ -262,7 +311,7 @@ cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
 This is a feasibility implementation, not full compiled-Wisp parity: u8/unit values,
-procedural macros, traits/generics, and Theater RPC built-ins are not implemented yet.
+traits/generics and Theater RPC built-ins are not implemented yet.
 `export` accepts compiled source declarations; interpreted functions remain inside
 the session rather than becoming new Wasm exports.
 There is no garbage collection; the existing bump allocator
@@ -270,7 +319,7 @@ retains allocations until the session is discarded. Interactive inputs are limit
 to 4096 bytes; files to 64 KiB each, with at most 256 files and 1 MiB of source per
 load graph. Include nesting and reader nesting are limited to 64, evaluator
 nesting to 128, and evaluation to 10,000 steps. Macro expansion allows at most
-100 nesting levels and 10,000 syntax visits per input. The local host also applies
+100 nesting levels and 10,000 syntax/transformer visits per input. The local host also applies
 Wasmtime fuel to reader/printer and expansion work, which can be exhausted before
 the file limits are reached. These
 are fixed implementation limits, not an expanded request protocol.
@@ -309,3 +358,7 @@ data, nested quasiquotes, invalid declarations, and expansion recovery.
 Syntax-rules tests compare the existing example and introduced-binding hygiene
 with the Rust compiler, and cover nested/empty repetitions, free identifier
 resolution, typed bindings, redefinition, and invalid-rule recovery.
+Procedural macro fixtures compare the existing example, guards, integer folding,
+literal clauses, hygiene, and splicing against the Rust compiler. Additional tests
+cover phase separation, nested quasisyntax, includes, overflow, invalid results,
+and bounded expansion with recovery.

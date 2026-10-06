@@ -13,6 +13,7 @@
 (include "loading.lisp")
 (include "macros.lisp")
 (include "syntax-rules.lisp")
+(include "syntax-case.lisp")
 
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)

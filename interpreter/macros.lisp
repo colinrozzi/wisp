@@ -13,7 +13,7 @@
 (fn quotation-prefix? ((name string)) s32
   (i32.or (string=? name "quasiquote")
     (i32.or (string=? name "unquote") (string=? name "unquote-splice"))))
-(fn macro-reserved? ((name string)) s32
+(fn macro-reserved-core? ((name string)) s32
   (i32.or (quotation-prefix? name)
     (i32.or (string=? name "quote")
       (i32.or (string=? name "defmacro")
@@ -25,7 +25,7 @@
       (let (checked (if (string=? (form-head form) "defmacro")
                        (collect-session-macro (items-of form))
                        (if (string=? (form-head form) "define-syntax")
-                         (collect-syntax-rules (items-of form)) (nil))))
+                         (collect-procedural-or-rules (items-of form)) (nil))))
         (if (failed? checked) checked
           (collect-session-macros forms (i32.add index 1)))))))
 (fn collect-session-macro ((parts (list value))) value
@@ -55,6 +55,11 @@
       (else (qq-walk expr env depth 1 mode)))
     (eval expr env depth 0)))
 (fn qq-walk ((expr value) (env (list binding)) (depth s32) (level s32) (mode s32)) value
+  (if (if mode (i32.ge_s (global.get $macro-steps) 10000) 0) (failure "macro expansion step limit")
+    (begin
+      (if mode (global.set $macro-steps (i32.add (global.get $macro-steps) 1)) 0)
+      (qq-walk-body expr env depth level mode))))
+(fn qq-walk-body ((expr value) (env (list binding)) (depth s32) (level s32) (mode s32)) value
   (if (i32.ge_s depth 128) (failure "quasiquote nesting limit")
     (let (name (form-head expr))
       (if (quotation-prefix? name)
@@ -108,17 +113,16 @@
         (let (name (form-head form))
           (if (string=? name "quote") form
             (if (string=? name "quasiquote") (expand-quoted form depth 0)
-              (if (macro-declaration? name) (failure "macro declarations are only supported as top-level source directives")
-                (let (definition (lookup-local name (global.get $pending-macros)
-                                  (i32.sub (list-len (global.get $pending-macros)) 1)))
-                  (if (failed? definition)
-                    (value-case form
-                      ((sequence items) (expand-macro-items items 0 (i32.add depth 1) (list-new value)))
-                      (else form))
-                    (let (expanded (if (i32.eq (list-len (items-of definition)) 3)
-                                      (expand-syntax-rules definition form)
-                                      (macro-template definition (items-of form))))
-                      (if (failed? expanded) expanded (expand-macro-form expanded (i32.add depth 1))))))))))))))
+              (if (sc-prefix? name) (failure "syntax prefixes are only supported in transformers")
+                (if (macro-declaration? name) (failure "macro declarations are only supported as top-level source directives")
+                  (let (definition (lookup-local name (global.get $pending-macros)
+                                    (i32.sub (list-len (global.get $pending-macros)) 1)))
+                    (if (failed? definition)
+                      (value-case form
+                        ((sequence items) (expand-macro-items items 0 (i32.add depth 1) (list-new value)))
+                        (else form))
+                      (let (expanded (expand-transformer definition form))
+                        (if (failed? expanded) expanded (expand-macro-form expanded (i32.add depth 1)))))))))))))))
 (fn expand-macro-items ((items (list value)) (index s32) (depth s32) (out (list value))) value
   (if (i32.ge_s index (list-len items)) (sequence out)
     (let (v (expand-macro-form (list-get items index) depth))
@@ -164,3 +168,15 @@
 
 (fn macro-declaration? ((name string)) s32
   (i32.or (string=? name "defmacro") (string=? name "define-syntax")))
+
+(fn macro-reserved? ((name string)) s32
+  (i32.or (macro-reserved-core? name) (sc-prefix? name)))
+(fn collect-procedural-or-rules ((parts (list value))) value
+  (if (i32.ne (list-len parts) 3) (failure "define-syntax expects name and transformer")
+    (if (string=? (form-head (list-get parts 2)) "syntax-case-lambda")
+      (collect-syntax-case parts) (collect-syntax-rules parts))))
+(fn expand-transformer ((definition value) (input value)) value
+  (let (size (list-len (items-of definition)))
+    (if (i32.eq size 4) (expand-syntax-case definition input)
+      (if (i32.eq size 3) (expand-syntax-rules definition input)
+        (macro-template definition (items-of input))))))

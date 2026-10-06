@@ -1853,3 +1853,251 @@ fn test_syntax_rules_invalid_declarations_and_recovery() {
     assert!(out.contains("macro expansion step limit"), "{out}");
     assert_eq!(s.evaluate("(good)").unwrap(), "42");
 }
+
+#[test]
+fn test_syntax_case_examples_and_computation_match_rust_compiler() {
+    compare_example(
+        "examples/syntax-case-test.lisp",
+        &[
+            ("test-simple", &[20, 22], 42),
+            ("test-guard-id", &[21], 42),
+            ("test-guard-nonid", &[], 21),
+            ("test-quasisyntax", &[41], 42),
+            ("test-ct-let", &[14], 42),
+            ("test-when", &[0], 0),
+            ("test-when", &[7], 49),
+        ],
+        false,
+    );
+    compare_example(
+        "tests/fixtures/interpreter_syntax_case.lisp",
+        &[
+            ("folded", &[], 42),
+            ("dynamic", &[40], 42),
+            ("difference", &[], 42),
+            ("spliced", &[], 42),
+            ("literal", &[], 42),
+            ("conditional", &[1], 42),
+            ("conditional", &[0], 0),
+            ("hygienic", &[], 42),
+            ("identifier-predicate", &[7], 1),
+            ("numeric-predicate", &[], 2),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn test_syntax_case_computation_splicing_and_phase_separation() {
+    let mut s = session();
+    for (source, expected) in [
+        (
+            "(define-syntax fold (syntax-case-lambda (stx) ((_ a b) (let (n (+ a b)) #`(i32.const #,n))))) (fold 20 22)",
+            "42",
+        ),
+        (
+            "(define-syntax negate (syntax-case-lambda (stx) ((_ x) (let (n (- (syntax->datum #'x))) #`(i32.const #,n))))) (negate -42)",
+            "42",
+        ),
+        (
+            "(define-syntax direct (syntax-case-lambda (stx) ((_ x) #`(i32.const #,(+ x 2))))) (direct 40)",
+            "42",
+        ),
+        (
+            "(define-syntax identity (syntax-case-lambda (stx) ((_ x) x))) (identity 42)",
+            "42",
+        ),
+        (
+            "(define-syntax build (syntax-case-lambda (stx) ((_ x) (i32.add x 2)))) (build 40)",
+            "42",
+        ),
+        (
+            "(define-syntax gather (syntax-case-lambda (stx) ((_ x ...) #`(list #,@x)))) (gather 1 2 3)",
+            "(1 2 3)",
+        ),
+        ("(gather)", "()"),
+        (
+            "(define-syntax gather-pairs (syntax-case-lambda (stx) ((_ (a b) ...) #`(list #,@a #,@b)))) (gather-pairs (1 2) (3 4))",
+            "(1 3 2 4)",
+        ),
+        (
+            "(define-syntax syntax-list (syntax-case-lambda (stx) ((_ xs) #`(list #,@xs)))) (syntax-list (1 2))",
+            "(1 2)",
+        ),
+        (
+            "(define-syntax show-input (syntax-case-lambda (stx) ((_ x) #`(quote #,stx)))) (show-input hello)",
+            "(show-input hello)",
+        ),
+        (
+            "(define-syntax test-if (syntax-case-lambda (stx) ((_) (if 0 (syntax-error bad) #'42)))) (test-if)",
+            "42",
+        ),
+        (
+            "(define-syntax test-syntax-truth (syntax-case-lambda (stx) ((_) (if #'0 #'42 (syntax-error bad))))) (test-syntax-truth)",
+            "42",
+        ),
+        (
+            "(define-syntax test-zero-guard (syntax-case-lambda (stx) ((_) 0 #'42) ((_) #'0))) (test-zero-guard)",
+            "42",
+        ),
+        (
+            "(define-syntax numeric (syntax-case-lambda (stx) ((_ x) (and (number? #'x) (not (integer? #'x))) #'1) ((_ x) #'0))) (numeric 1.5)",
+            "1",
+        ),
+        ("(numeric 1)", "0"),
+        ("(numeric named)", "0"),
+        (
+            "(define-syntax named-error (syntax-case-lambda (stx) ((_) (syntax-error \"needs an argument\")))) (named-error)",
+            "error: needs an argument",
+        ),
+        (
+            "(global $calls s32 mut 0) (define-syntax phase (syntax-case-lambda (stx) ((_) (let (discarded (global.set $calls 99)) #'42)))) (phase)",
+            "42",
+        ),
+        ("(global.get $calls)", "0"),
+        (
+            "'(a #'b #`c #,d #,@e)",
+            "(a (syntax b) (quasisyntax c) (unsyntax d) (unsyntax-splice e))",
+        ),
+        (
+            "(define-syntax shadow (syntax-case-lambda (stx) ((_ x) (let (x #'42) #'x)))) (shadow 0)",
+            "42",
+        ),
+        (
+            "(define-syntax nested (syntax-case-lambda (stx) ((_ x) #`(quote #`(#,(+ x 1) #,#,(+ x 2)))))) (nested 42)",
+            "(quasisyntax ((unsyntax (+ 42 1)) (unsyntax 44)))",
+        ),
+        ("'(a#'b)", "(a (syntax b))"),
+        (
+            "(define-syntax wrap (syntax-case-lambda (stx) ((_ x) (let (n (+ x 1)) #`(i64.const #,n))))) (wrap 9223372036854775807s64)",
+            "-9223372036854775808s64",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_syntax_case_hygiene_persistence_and_include_loading() {
+    let mut s = session();
+    for (source, expected) in [
+        (
+            "(define helper (lambda (x) (+ x 1))) (define-syntax call-helper (syntax-case-lambda (stx) ((_ x) #'(helper x))))",
+            "#<closure>",
+        ),
+        ("(let (helper (lambda (x) 0)) (call-helper 41))", "42"),
+        (
+            "(define-syntax add (syntax-case-lambda (stx) ((_ x) #'(+ x 1)))) (define saved (lambda (x) (add x)))",
+            "#<closure>",
+        ),
+        (
+            "(define-syntax add (syntax-case-lambda (stx) ((_ x) #'(+ x 2)))) (saved 41)",
+            "42",
+        ),
+        ("(add 40)", "42"),
+        (
+            "(define-syntax add (syntax-rules () ((_ x) (+ x 3)))) (add 39)",
+            "42",
+        ),
+        (
+            "(define-syntax add (syntax-case-lambda (stx) ((_ x) #'(+ x 4)))) (add 38)",
+            "42",
+        ),
+        (
+            "(define-syntax close (syntax-case-lambda (stx) ((_ body) #'(lambda (tmp) (+ tmp body))))) (let (tmp 40) ((close tmp) 2))",
+            "42",
+        ),
+        (
+            "(define-syntax intro (syntax-rules () ((_ body) (let (tmp 1) body)))) (define-syntax intro2 (syntax-case-lambda (stx) ((_ body) #'(let (tmp 2) (intro (+ tmp body)))))) (let (tmp 40) (intro2 tmp))",
+            "42",
+        ),
+        ("`((add 38) ,(add 38))", "((add 38) 42)"),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    assert!(
+        session()
+            .evaluate("(add 38)")
+            .unwrap()
+            .contains("unbound symbol")
+    );
+    let dir = root().join(format!(
+        "target/interpreter-parity/{}/syntax-case-includes",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("main.lisp"),
+        "(fn answer () s32 (twice 21)) (include \"macro.lisp\") (answer)",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("macro.lisp"),
+        "(define-syntax twice (syntax-case-lambda (stx) ((_ x) #'(+ x x))))",
+    )
+    .unwrap();
+    assert_eq!(s.load_file(dir.join("main.lisp")).unwrap(), "42");
+}
+
+#[test]
+fn test_syntax_case_failures_do_not_publish() {
+    let mut s = session();
+    assert_eq!(
+        s.evaluate("(define marker 42) (define-syntax good (syntax-case-lambda (stx) ((_) #'42)))")
+            .unwrap(),
+        "42"
+    );
+    for source in [
+        "#'",
+        "#`",
+        "#,",
+        "#,@",
+        "#'42",
+        "#`42",
+        "#,42",
+        "#,@42",
+        "(define-syntax bad (syntax-case-lambda))",
+        "(define-syntax bad (syntax-case-lambda () ((_) #'1)))",
+        "(define-syntax bad (syntax-case-lambda (a b) ((_) #'1)))",
+        "(define-syntax bad (syntax-case-lambda (1) ((_) #'1)))",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) #'1 #'2 #'3)))",
+        "(define-syntax bad (syntax-case-lambda (stx) (syntax-case wrong () ((_) #'1))))",
+        "(define-syntax bad (syntax-case-lambda (stx) (syntax-case stx nope ((_) #'1))))",
+        "(define-syntax bad (syntax-case-lambda (stx) (syntax-case stx () ((_) #'1)) ((_) #'2)))",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_ x x) #'x)))",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) (if 1 #'1))))",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) (let (1 #'1) #'1))))",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) (identifier?))))",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) #,x)))",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_ x) #'x))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) (identifier? #'42) #'1))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) 42))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) (identifier? #'x)))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_ x ...) #'x))) (bad 1 2)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) #`(list #,@42)))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) #`#,@42))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) #`(unsyntax)))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) #`#,(1 2)))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) (let (n (+ #'x 1)) #`#,n)))) (bad)",
+        "(define-syntax bad (syntax-case-lambda (stx) ((_) (syntax-error rejected)))) (bad)",
+        "(define-syntax good (syntax-case-lambda (stx) ((_) #'0))) (define-syntax bad (syntax-case-lambda (stx) ((_) #'(bad)))) (bad)",
+    ] {
+        let out = s.evaluate(&format!("(define marker 0) {source}")).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+        assert_eq!(s.evaluate("marker").unwrap(), "42", "{source}");
+        assert_eq!(s.evaluate("(good)").unwrap(), "42");
+        assert!(s.evaluate("(bad)").unwrap().contains("unbound symbol: bad"));
+    }
+    assert_eq!(
+        s.evaluate("(define-syntax duplicate (syntax-case-lambda (stx) ((_ x) #'(begin x x))))")
+            .unwrap(),
+        "()"
+    );
+    let mut broad = "1".to_string();
+    for _ in 0..14 {
+        broad = format!("(duplicate {broad})");
+    }
+    let out = s.evaluate(&broad).unwrap();
+    assert!(out.contains("macro expansion step limit"), "{out}");
+    assert_eq!(s.evaluate("(good)").unwrap(), "42");
+}
