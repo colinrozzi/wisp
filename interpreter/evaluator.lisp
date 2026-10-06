@@ -9,6 +9,8 @@
 (include "decimal.lisp")
 (include "floats.lisp")
 (include "collections.lisp")
+(include "globals.lisp")
+(include "loading.lisp")
 
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)
@@ -98,10 +100,16 @@
     (else 1)))
 
 (fn eval-declaration-or-call ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
-  (if (collection-form? name) (eval-collection-form name items env depth)
-    (eval-declaration name items env depth top)))
+  (if (global-form? name)
+    (if (string=? name "global") (declare-global items top) (eval-global-access name items env depth))
+    (if (collection-form? name) (eval-collection-form name items env depth)
+      (eval-declaration name items env depth top))))
 
 (fn eval-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
+  (if (string=? name "include") (failure "include is only supported as a top-level source directive")
+    (eval-named-declaration name items env depth top)))
+
+(fn eval-named-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
   (if (string=? name "fn") (eval-fn items top)
     (if (string=? name "record") (eval-record items top)
       (if (string=? name "variant") (eval-variant items top)
@@ -246,15 +254,23 @@
 ; Actual values and closures stay in the session heap. A Theater adapter can
 ; route the same text through actor I/O later, without changing the evaluator.
 (export (fn evaluate ((source string)) string
+  (evaluate-from source "")))
+
+; base is the canonical source file, or empty for interactive input. Each input
+; gets its own include-once set, matching one compiler expansion graph.
+(export (fn evaluate-from ((source string) (base string)) string
   (begin
     (if (global.get $started) 0
       (begin
         (global.set $bindings (list-new binding))
         (global.set $types (list-new named-type))
+        (global.set $session-globals (list-new global-binding))
         (global.set $started 1) 0))
     (global.set $steps 0)
-    (if (i32.gt_s (string-len source) 4096) "error: input exceeds 4096 bytes"
-      (let (forms (read-forms source 0 (list-new value)))
+    (global.set $include-seen (list-new string))
+    (if (string-len base) (begin (global.set $include-seen (list-push (global.get $include-seen) base)) 0) 0)
+    (if (i32.gt_s (string-len source) (if (string-len base) 65536 4096)) "error: source exceeds input limit"
+      (let (forms (expand-source source base 0))
         (value-case forms
           ((sequence items) (show (eval-body items 0 (list-new binding) 0 1 (nil))))
           (else (show forms))))))))

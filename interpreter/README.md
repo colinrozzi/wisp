@@ -2,7 +2,7 @@
 
 A small Lisp interpreter written in Wisp. The Rust compiler builds the evaluator
 once; one Wasm instance then reads and evaluates every input, retaining its own
-environment and closures. Rust only supplies the local terminal/ABI adapter.
+environment and closures. Rust supplies the local terminal/ABI adapter and file I/O.
 
 From the repository root, inside `nix develop`:
 
@@ -33,7 +33,8 @@ The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lis
 named records and variants, typed lists, options, results, tuples, and built-in functions.
 Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
-and `export`. Both `(x s32)` and `(x : s32)` parameter/field declarations work.
+`global`, `global.get`, `global.set`, `include`, and `export`. Both `(x s32)` and
+`(x : s32)` parameter/field declarations work.
 `let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
 Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<` take two numbers of the same type; `list`
 takes any number of values, with `cons`, `car`, and `cdr` for list operations.
@@ -135,23 +136,68 @@ of its captured environment. `define` is currently top-level only and publishes
 its binding after the expression succeeds. A whole input is read before any
 evaluation; successful preceding definitions remain if a later expression fails.
 
+Explicit globals have their own namespace, separate from lexical variables and
+`define`. Declarations are top-level, with a type, `mut` or `const`, and an integer
+constant initializer. An optional colon before the type is accepted. Assignments
+check the declared type and return the assigned value; immutable globals reject
+assignment before evaluating its expression. Duplicate declarations are errors.
+
+```lisp
+(global $counter s32 mut 0)
+(fn next () s32
+  (global.set $counter (i32.add (global.get $counter) 1)))
+(next)                              ; 1
+(next)                              ; 2
+(global $items (list s32) mut 0)
+(global.set $items (list-new s32))
+(list-push (global.get $items) 42)
+```
+
+Numeric initializers convert to the declared scalar type. Other types accept only
+the compiler's zero placeholder; reading one before assigning a typed value is a
+diagnostic. Globals persist across inputs and are isolated between sessions.
+
+Top-level `(include "path.lisp")` expands source before evaluation. File paths are
+relative to the including file's directory; interactive includes start at the
+host's working directory. Canonical paths are included once per input graph,
+including cycles and aliases. Loading again reads and evaluates the files again;
+there is no session-wide include cache. Every file is read and parsed before any
+form executes, so file/reader failures leave language state unchanged. Evaluation
+errors retain earlier successful definitions and side effects. Includes inside
+functions or `begin` are rejected; quoted forms and comments do not load files.
+The Rust host's `Interpreter::load_file(path)` and command-line file arguments use
+this file-relative loading behavior.
+
 `evaluator.lisp` exports `evaluate(source: string) -> string`: a printed value or
 an `error:` diagnostic. Interpreter values stay in the session. This is a local
 REPL text boundary, not a structured value transport. The module can also be
-compiled directly for a host that keeps its Wasm instance alive:
+compiled directly for a host that keeps its Wasm instance alive. It also exports
+`evaluate-from(source: string, base: string) -> string`, where `base` is the
+canonical source filename or empty for interactive input. Both use the Pack/Graph
+ABI. Hosts must supply two imports in the `wisp-source` module:
+
+- `resolve-path(base: string, path: string) -> (result string string)` returns a canonical filename.
+- `read-source(path: string) -> (result string string)` returns UTF-8 source.
+
+Ordinary I/O failures use the result's error string. Reading Lisp syntax, expanding
+includes, and evaluating forms remain in Wisp. The local host implements these
+imports and bounds file reads.
 
 ```sh
 cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
 This is a feasibility implementation, not full compiled-Wisp parity: u8/unit values,
-macros, traits/generics, globals,
-`include`, and Theater RPC built-ins are not implemented yet. `export` accepts
-compiled source declarations; the module's external entry point remains `evaluate`.
+macros, traits/generics, and Theater RPC built-ins are not implemented yet.
+`export` accepts compiled source declarations; interpreted functions remain inside
+the session rather than becoming new Wasm exports.
 There is no garbage collection; the existing bump allocator
-retains allocations until the session is discarded. Inputs are limited to 4096
-bytes, reader nesting to 64, evaluator nesting to 128, and evaluation to 10,000
-steps. The local host also applies Wasmtime fuel to reader/printer work. These
+retains allocations until the session is discarded. Interactive inputs are limited
+to 4096 bytes; files to 64 KiB each, with at most 256 files and 1 MiB of source per
+load graph. Include nesting and reader nesting are limited to 64, evaluator
+nesting to 128, and evaluation to 10,000 steps. The local host also applies
+Wasmtime fuel to reader/printer work, which can be exhausted before the file
+limits are reached. These
 are fixed implementation limits, not an expanded request protocol.
 
 Run the behavioral checks with `cargo test --test interpreter --test interpreter_parity`.
@@ -177,3 +223,7 @@ also runs through both compilers.
 Compound-operation fixtures compare nested containers, option/result matching,
 tuple arguments, aliases, and nested list mutations across all three paths.
 Structured outputs are also compared with the Rust compiler's CGRF values.
+Globals are compared across all three paths using declarations without a colon;
+the self-hosted compiler does not currently parse the optional colon there.
+Relative includes, canonical path deduplication, and cycles are compared against
+the Rust compiler. Loading tests cover preflight failures and session recovery.

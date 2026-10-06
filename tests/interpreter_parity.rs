@@ -1207,3 +1207,256 @@ fn test_malformed_compound_forms_do_not_trap_or_publish() {
         "0"
     );
 }
+
+#[test]
+fn test_global_state_parity_across_both_compilers() {
+    compare_example(
+        "tests/fixtures/interpreter_globals.lisp",
+        &[
+            ("current", &[], 0),
+            ("next", &[], 2),
+            ("next", &[], 4),
+            ("lexical", &[], 4),
+            ("reset", &[], 0),
+            ("next", &[], 2),
+            ("initialize-list", &[], 42),
+            ("ratio", &[], 1),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn test_global_types_mutability_and_session_isolation() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(global $count s32 mut 0)", "()"),
+        ("(global $fixed : s32 const 42)", "()"),
+        ("(global.set $count 7)", "7"),
+        ("(let ($count 99) (global.get $count))", "7"),
+        (
+            "(define reader (lambda () (global.get $count))) (global.set $count 8) (reader)",
+            "8",
+        ),
+        (
+            "(global $wide s64 mut 4294967296) (global.get $wide)",
+            "4294967296s64",
+        ),
+        ("(global $single f32 mut 2) (global.get $single)", "2f32"),
+        (
+            "(global $double f64 mut 2) (global.set $double 2.5)",
+            "2.5f64",
+        ),
+        (
+            "(global $wrap s32 const 4294967295) (global.get $wrap)",
+            "-1",
+        ),
+        ("(global $items (list s32) mut 0)", "()"),
+        (
+            "(global.set $items (list-push (list-new s32) 42)) (list-get (global.get $items) 0)",
+            "42",
+        ),
+        (
+            "(global $maybe (option s32) mut 0) (global.set $maybe (none s32))",
+            "(none s32)",
+        ),
+        (
+            "(global $tuple (tuple s32 string) mut 0) (global.set $tuple (tuple 42 \"x\"))",
+            "(tuple 42 \"x\")",
+        ),
+        ("(global.set $count (begin (global.set $count 9) 10))", "10"),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    for source in [
+        "(global.get $missing)",
+        "(global.set $missing 1)",
+        "(global.set $fixed 1)",
+        "(global.set $count \"bad\")",
+        "(global.set $items (list-new string))",
+        "(global.set $maybe (none string))",
+        "(global.set $tuple (tuple 1 2))",
+        "(global.set $count 1s64)",
+        "(global $count s32 mut 1)",
+        "(global.set $fixed (begin (global.set $count 99) 1))",
+        "(global.set $count (/ 1 0))",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+        assert_eq!(s.evaluate("(global.get $count)").unwrap(), "10");
+    }
+    assert_eq!(s.evaluate("(global $pending string mut 0)").unwrap(), "()");
+    assert!(
+        s.evaluate("(global.get $pending)")
+            .unwrap()
+            .contains("not been initialized")
+    );
+    assert_eq!(
+        s.evaluate("(global.set $pending \"ready\")").unwrap(),
+        "\"ready\""
+    );
+    let mut other = session();
+    assert_eq!(
+        other.evaluate("(global.get $count)").unwrap(),
+        "error: unknown global"
+    );
+    assert_eq!(s.evaluate("(reader)").unwrap(), "10");
+}
+
+#[test]
+fn test_malformed_globals_do_not_publish() {
+    let mut s = session();
+    for source in [
+        "(global)",
+        "(global $bad)",
+        "(global $bad s32 mut)",
+        "(global $bad s32 maybe 0)",
+        "(global $bad s32 : mut 0)",
+        "(global plain s32 mut 0)",
+        "(global 1 s32 mut 0)",
+        "(global $bad unknown mut 0)",
+        "(global $bad (list) mut 0)",
+        "(global $bad s32 mut 1.5)",
+        "(global $bad s32 mut (i32.const 1))",
+        "(global $bad string mut \"x\")",
+        "(global $bad (list s32) mut 1)",
+        "(global $bad s32 mut 4294967296)",
+        "(let (x 1) (global $bad s32 mut 0))",
+        "(global.get)",
+        "(global.get 1)",
+        "(global.get plain)",
+        "(global.set)",
+        "(global.set $bad)",
+        "(global.set $bad 1 2)",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+        assert_eq!(
+            s.evaluate("(global.get $bad)").unwrap(),
+            "error: unknown global"
+        );
+    }
+    assert_eq!(
+        s.evaluate("(global $bad s32 mut 42) (global.get $bad)")
+            .unwrap(),
+        "42"
+    );
+}
+
+#[test]
+fn test_includes_relative_paths_cycles_and_compiled_parity() {
+    let file = root().join("tests/fixtures/interpreter_include/main.lisp");
+    let mut s = session();
+    assert_eq!(s.load_file(&file).unwrap(), "#<function>");
+    let module = Module::from_file(&cgrf_guest::engine(), compile(&file, "included")).unwrap();
+    let mut compiled = Guest::new(&module);
+    for expected in [2, 4, 6] {
+        assert_eq!(
+            compiled.call("next", Value::Tuple(vec![])),
+            Value::S32(expected)
+        );
+        assert_eq!(s.evaluate("(next)").unwrap(), expected.to_string());
+    }
+    let mut interactive = session();
+    let source = format!("(include {:?}) (next)", file.to_str().unwrap());
+    assert_eq!(interactive.evaluate(&source).unwrap(), "2");
+    // Includes are once per input graph, not cached for the lifetime of a session.
+    assert!(
+        interactive
+            .evaluate(&source)
+            .unwrap()
+            .contains("already declared")
+    );
+    assert_eq!(interactive.evaluate("(current)").unwrap(), "2");
+    let mut relative = session();
+    assert_eq!(
+        relative
+            .evaluate("(include \"tests/fixtures/interpreter_include/main.lisp\") (next)")
+            .unwrap(),
+        "2"
+    );
+}
+
+#[test]
+fn test_include_failures_preflight_and_recovery() {
+    let mut s = session();
+    let dir = root().join(format!(
+        "target/interpreter-parity/{}/loading",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = dir.join("main.lisp");
+    let child = dir.join("child.lisp");
+    std::fs::write(&main, "(define marker 0) (include \"child.lisp\")").unwrap();
+    assert_eq!(s.evaluate("(define marker 42)").unwrap(), "42");
+    let out = s.load_file(&main).unwrap();
+    assert!(
+        out.contains("child.lisp") && out.starts_with("error:"),
+        "{out}"
+    );
+    assert_eq!(s.evaluate("marker").unwrap(), "42");
+    std::fs::write(&child, "(define child-value 7) (").unwrap();
+    assert!(s.load_file(&main).unwrap().contains("unclosed parenthesis"));
+    assert_eq!(s.evaluate("marker").unwrap(), "42");
+    assert!(s.evaluate("child-value").unwrap().starts_with("error:"));
+    std::fs::write(&child, "(define child-value 7)").unwrap();
+    assert_eq!(s.load_file(&main).unwrap(), "7");
+    assert_eq!(s.evaluate("marker").unwrap(), "0");
+    // Quoted strings/forms and comments do not trigger file access.
+    assert_eq!(
+        s.evaluate("'(include \"missing\")").unwrap(),
+        "(include \"missing\")"
+    );
+    assert_eq!(s.evaluate("; (include \"missing\")\n42").unwrap(), "42");
+    for source in [
+        "(include)",
+        "(include 1)",
+        "(include \"missing\" 1)",
+        "(begin (include \"missing\"))",
+    ] {
+        assert!(
+            s.evaluate(source).unwrap().starts_with("error:"),
+            "{source}"
+        );
+    }
+    // Evaluation errors retain successful preceding mutations/definitions.
+    std::fs::write(&child, "(define child-value 9) missing").unwrap();
+    assert!(
+        s.load_file(&main)
+            .unwrap()
+            .contains("unbound symbol: missing")
+    );
+    assert_eq!(s.evaluate("child-value").unwrap(), "9");
+    std::fs::write(&child, vec![0xff]).unwrap();
+    assert!(s.load_file(&main).unwrap().contains("UTF-8"));
+    std::fs::write(&child, " ".repeat(65537)).unwrap();
+    assert!(s.load_file(&main).unwrap().contains("65536"));
+    std::fs::write(
+        &child,
+        format!("{}(define child-value 12)", "; padding\n".repeat(600)),
+    )
+    .unwrap();
+    assert_eq!(s.load_file(&main).unwrap(), "12");
+    assert_eq!(s.load_file(&child).unwrap(), "12");
+}
+
+#[test]
+fn test_include_depth_limit_and_recovery() {
+    let mut s = session();
+    let dir = root().join(format!(
+        "target/interpreter-parity/{}/include-depth",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for index in 0..66 {
+        std::fs::write(
+            dir.join(format!("{index}.lisp")),
+            format!("(include \"{}.lisp\")", index + 1),
+        )
+        .unwrap();
+    }
+    let out = s.load_file(dir.join("0.lisp")).unwrap();
+    assert!(out.contains("include nesting limit"), "{out}");
+    std::fs::write(dir.join("1.lisp"), "42").unwrap();
+    assert_eq!(s.load_file(dir.join("0.lisp")).unwrap(), "42");
+}
