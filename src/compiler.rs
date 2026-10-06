@@ -23,6 +23,9 @@ pub enum Type {
     Borrow(Box<Type>),            // borrow<T> - borrowed reference
     Tuple(Vec<Type>),             // tuple<T1, T2, ...> - product type
     U8,                           // unsigned 8-bit integer
+    Bool,                         // boolean (i32 in WASM; 1-byte CGRF payload like u8)
+    U64,                          // unsigned 64-bit integer (i64 in WASM; like s64)
+    Any,                          // Pack dynamic `value` - self-describing CGRF blob
 }
 
 /// A value that can be inlined during REPL compilation
@@ -713,6 +716,58 @@ pub enum Expr {
     StringFromBytes {
         bytes: Box<Expr>,
     },
+    /// Construct a dynamic `any` from an s32: (any-s32 n) -> any
+    AnyFromS32 {
+        value: Box<Expr>,
+    },
+    /// Read the s32 payload of a dynamic `any`: (any-as-s32 x) -> s32
+    AnyToS32 {
+        value: Box<Expr>,
+    },
+    /// Construct a dynamic `any` from a string: (any-string s) -> any
+    AnyFromString {
+        value: Box<Expr>,
+    },
+    /// Read the string payload of a dynamic `any`: (any-as-string x) -> string
+    AnyToString {
+        value: Box<Expr>,
+    },
+    /// Allocate n bytes on the compiler heap: (heap-alloc n) -> s32 (pointer).
+    HeapAlloc {
+        size: Box<Expr>,
+    },
+    /// Reinterpret an `any` as the address of its [len:u32][cgrf] blob:
+    /// (any-addr x) -> s32. The inverse of any-from-addr.
+    AnyAddr {
+        value: Box<Expr>,
+    },
+    /// Reinterpret a blob address as an `any`: (any-from-addr p) -> any. The
+    /// address must point to a [len:u32][cgrf] buffer (e.g. built via heap-alloc).
+    AnyFromAddr {
+        value: Box<Expr>,
+    },
+    /// Reinterpret a string as the address of its [len:u32][bytes] buffer:
+    /// (string-addr s) -> s32. Lets Wisp copy string bytes into a CGRF buffer.
+    StringAddr {
+        value: Box<Expr>,
+    },
+    /// Reinterpret an address as a string: (string-from-addr p) -> string. The
+    /// address must point to a [len:u32][bytes] buffer (e.g. a CGRF string payload).
+    StringFromAddr {
+        value: Box<Expr>,
+    },
+    /// Invoke a host import's raw CGRF entry point with a pre-encoded args blob:
+    /// `args-any` is a len-prefixed CGRF blob (built by `marshal`), passed straight
+    /// to `$__raw_<import>`, and the returned CGRF is wrapped back into an `any`.
+    /// `import` names the import (e.g. "call" for rpc.call, "get" for store.get).
+    /// `(call-raw args)` is sugar for `import = "call"`; `(raw-invoke "name" args)`
+    /// targets any declared import. This is the raw-CGRF calling convention: the
+    /// import is declared with its real typed signature (so the interface hash
+    /// matches Theater), but values cross as CGRF and are bridged by marshal/unmarshal.
+    RawInvoke {
+        import: String,
+        value: Box<Expr>,
+    },
     /// Convert string to bytes: (string-to-bytes string) -> list<u8>
     StringToBytes {
         string: Box<Expr>,
@@ -891,6 +946,8 @@ fn type_size(ty: &Type) -> usize {
         Type::S32 | Type::F32 => 4,
         Type::S64 | Type::F64 => 8,
         Type::U8 => 4, // stored as i32 in Wisp memory; byte-packing only in list<u8> data arrays
+        Type::Bool => 4, // i32 in Wisp memory (0/1); 1-byte only in CGRF payload
+        Type::U64 => 8, // i64 in Wisp memory
         // Records, variants, options, results, lists, strings, and tuples are pointer-sized
         Type::Record(_)
         | Type::Variant(_)
@@ -898,7 +955,8 @@ fn type_size(ty: &Type) -> usize {
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
-        | Type::Tuple(_) => 4,
+        | Type::Tuple(_)
+        | Type::Any => 4,
         // Resources and borrows are i32 handles
         Type::Resource(_) | Type::Borrow(_) => 4,
     }
@@ -907,14 +965,15 @@ fn type_size(ty: &Type) -> usize {
 /// Check if a type requires heap allocation
 fn type_needs_heap(ty: &Type) -> bool {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::U8 => false,
+        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::U8 | Type::Bool | Type::U64 => false,
         Type::Record(_)
         | Type::Variant(_)
         | Type::Option(_)
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
-        | Type::Tuple(_) => true,
+        | Type::Tuple(_)
+        | Type::Any => true,
         // Resources don't need heap - they're opaque handles managed externally
         Type::Resource(_) | Type::Borrow(_) => false,
     }
@@ -925,8 +984,8 @@ fn type_needs_heap(ty: &Type) -> bool {
 fn cgrf_element_node_size(ty: &Type) -> usize {
     match ty {
         // Scalars: node header (8) + payload (4 or 8)
-        Type::S32 | Type::F32 | Type::U8 => 12,
-        Type::S64 | Type::F64 => 16,
+        Type::S32 | Type::F32 | Type::U8 | Type::Bool => 12,
+        Type::S64 | Type::F64 | Type::U64 => 16,
         // Strings: node header (8) + length (4) + average string data (~32)
         Type::Str => 44,
         // Lists: node header (8) + child indices (~16) + nested elements
@@ -939,6 +998,8 @@ fn cgrf_element_node_size(ty: &Type) -> usize {
         }
         // Records, variants, results: estimate conservatively
         Type::Record(_) | Type::Variant(_) | Type::Result(_, _) => 64,
+        // Dynamic value: a self-contained CGRF blob; estimate conservatively
+        Type::Any => 64,
         // Resources/borrows: just a handle
         Type::Resource(_) | Type::Borrow(_) => 12,
     }
@@ -973,6 +1034,14 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::ListLen { list } => expr_uses_heap(list),
         Expr::StringLen { string } => expr_uses_heap(string),
         Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
+        Expr::AnyFromS32 { .. } | Expr::AnyFromString { .. } => true, // allocate a CGRF blob
+        Expr::AnyToS32 { value } | Expr::AnyToString { value } => expr_uses_heap(value),
+        Expr::HeapAlloc { .. } => true, // allocates
+        Expr::AnyAddr { value }
+        | Expr::AnyFromAddr { value }
+        | Expr::StringAddr { value }
+        | Expr::StringFromAddr { value } => expr_uses_heap(value),
+        Expr::RawInvoke { .. } => true, // allocates the result blob
         Expr::Substring { .. }
         | Expr::StringAppend { .. }
         | Expr::StringFromBytes { .. }
@@ -2012,6 +2081,79 @@ fn check_expr(
             }
             Ok(Type::Str)
         }
+        Expr::AnyFromS32 { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("any-s32 expects an s32, got {:?}", ty);
+            }
+            Ok(Type::Any)
+        }
+        Expr::AnyToS32 { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!("any-as-s32 expects an any, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::AnyFromString { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Str {
+                bail!("any-string expects a string, got {:?}", ty);
+            }
+            Ok(Type::Any)
+        }
+        Expr::AnyToString { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!("any-as-string expects an any, got {:?}", ty);
+            }
+            Ok(Type::Str)
+        }
+        Expr::HeapAlloc { size } => {
+            let ty = check_expr(size, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("heap-alloc expects an s32 size, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::AnyAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!("any-addr expects an any, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::AnyFromAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("any-from-addr expects an s32 address, got {:?}", ty);
+            }
+            Ok(Type::Any)
+        }
+        Expr::StringAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Str {
+                bail!("string-addr expects a string, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::StringFromAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("string-from-addr expects an s32 address, got {:?}", ty);
+            }
+            Ok(Type::Str)
+        }
+        Expr::RawInvoke { value, .. } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!(
+                    "raw-invoke expects an any (encoded args tuple), got {:?}",
+                    ty
+                );
+            }
+            Ok(Type::Any)
+        }
         Expr::StringAppend { left, right } => {
             let left_ty = check_expr(left, env, signatures, globals, records, variants)?;
             if left_ty != Type::Str {
@@ -2055,6 +2197,8 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
         Type::U8 => bail!("{}: expected numeric type, got u8", msg),
+        Type::Bool => bail!("{}: expected numeric type, got bool", msg),
+        Type::U64 => bail!("{}: expected numeric type, got u64", msg),
         Type::Record(name) => bail!("{}: expected numeric type, got record '{}'", msg, name),
         Type::Variant(name) => bail!("{}: expected numeric type, got variant '{}'", msg, name),
         Type::Option(_) => bail!("{}: expected numeric type, got option", msg),
@@ -2062,6 +2206,7 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
         Type::List(_) => bail!("{}: expected numeric type, got list", msg),
         Type::Str => bail!("{}: expected numeric type, got string", msg),
         Type::Tuple(_) => bail!("{}: expected numeric type, got tuple", msg),
+        Type::Any => bail!("{}: expected numeric type, got any", msg),
         Type::Resource(name) => bail!("{}: expected numeric type, got resource '{}'", msg, name),
         Type::Borrow(_) => bail!("{}: expected numeric type, got borrow", msg),
     }
@@ -4070,6 +4215,8 @@ fn scalar_type_name(ty: &Type) -> Option<String> {
             Type::F32 => "f32",
             Type::F64 => "f64",
             Type::U8 => "u8",
+            Type::Bool => "bool",
+            Type::U64 => "u64",
             _ => return None,
         }
         .to_string(),
@@ -6208,7 +6355,10 @@ fn parse_type_symbol(
         "f32" => Ok(Type::F32),
         "f64" => Ok(Type::F64),
         "u8" => Ok(Type::U8),
+        "bool" => Ok(Type::Bool),
+        "u64" => Ok(Type::U64),
         "string" => Ok(Type::Str),
+        "any" => Ok(Type::Any),            // Pack dynamic `value`
         "unit" => Ok(Type::Tuple(vec![])), // unit type is empty tuple
         // Check if this is a variant type name
         other if variant_names.contains(other) => Ok(Type::Variant(other.to_string())),
@@ -6223,7 +6373,7 @@ fn parse_type_symbol(
 fn is_type_symbol(sym: &str) -> bool {
     matches!(
         sym,
-        "s32" | "s64" | "f32" | "f64" | "u8" | "string" | "unit"
+        "s32" | "s64" | "f32" | "f64" | "u8" | "bool" | "u64" | "string" | "any" | "unit"
     )
 }
 
@@ -6745,6 +6895,160 @@ fn parse_expr(
                         string: Box::new(string),
                         start: Box::new(start),
                         end: Box::new(end),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-s32" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-s32' expression",
+                            list_span,
+                            "expected: (any-s32 s32-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyFromS32 {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-as-s32" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-as-s32' expression",
+                            list_span,
+                            "expected: (any-as-s32 any-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyToS32 {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-string" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-string' expression",
+                            list_span,
+                            "expected: (any-string string-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyFromString {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-as-string" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-as-string' expression",
+                            list_span,
+                            "expected: (any-as-string any-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyToString {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "heap-alloc" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'heap-alloc' expression",
+                            list_span,
+                            "expected: (heap-alloc size-expr)",
+                        ));
+                    }
+                    let size = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::HeapAlloc {
+                        size: Box::new(size),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-addr' expression",
+                            list_span,
+                            "expected: (any-addr any-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-from-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-from-addr' expression",
+                            list_span,
+                            "expected: (any-from-addr addr-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyFromAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-addr' expression",
+                            list_span,
+                            "expected: (string-addr string-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string-from-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-from-addr' expression",
+                            list_span,
+                            "expected: (string-from-addr addr-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringFromAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "call-raw" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'call-raw' expression",
+                            list_span,
+                            "expected: (call-raw args-any)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::RawInvoke {
+                        import: "call".to_string(),
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "raw-invoke" => {
+                    // (raw-invoke "import-name" args-any) -> any. Generic raw-CGRF
+                    // call to any declared host import; args-any is a marshalled blob.
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'raw-invoke' expression",
+                            list_span,
+                            "expected: (raw-invoke \"import-name\" args-any)",
+                        ));
+                    }
+                    let SExpr::Str(import, _) = &items[1] else {
+                        return Err(ctx.error_with_note(
+                            "raw-invoke import name must be a string literal",
+                            list_span,
+                            "expected: (raw-invoke \"import-name\" args-any)",
+                        ));
+                    };
+                    let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::RawInvoke {
+                        import: import.clone(),
+                        value: Box::new(value),
                     })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "string-append" => {
@@ -7438,6 +7742,8 @@ fn gen_expr(
                 let store_instr = match &field_def.ty {
                     Type::S32 => "i32.store",
                     Type::S64 => "i64.store",
+                    Type::U64 => "i64.store",
+                    Type::Bool => "i32.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     // All compound types are pointers, resources are i32 handles
@@ -7450,7 +7756,8 @@ fn gen_expr(
                     | Type::Tuple(_)
                     | Type::U8
                     | Type::Resource(_)
-                    | Type::Borrow(_) => "i32.store",
+                    | Type::Borrow(_)
+                    | Type::Any => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
             }
@@ -7490,6 +7797,8 @@ fn gen_expr(
             let load_instr = match &field_def.ty {
                 Type::S32 => "i32.load",
                 Type::S64 => "i64.load",
+                Type::U64 => "i64.load",
+                Type::Bool => "i32.load",
                 Type::F32 => "f32.load",
                 Type::F64 => "f64.load",
                 // All compound types are pointers, resources are i32 handles
@@ -7502,7 +7811,8 @@ fn gen_expr(
                 | Type::Tuple(_)
                 | Type::U8
                 | Type::Resource(_)
-                | Type::Borrow(_) => "i32.load",
+                | Type::Borrow(_)
+                | Type::Any => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
             field_def.ty.clone()
@@ -7559,6 +7869,8 @@ fn gen_expr(
                 let store_instr = match payload_ty {
                     Type::S32 => "i32.store",
                     Type::S64 => "i64.store",
+                    Type::U64 => "i64.store",
+                    Type::Bool => "i32.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     Type::Record(_)
@@ -7570,7 +7882,8 @@ fn gen_expr(
                     | Type::Tuple(_)
                     | Type::U8
                     | Type::Resource(_)
-                    | Type::Borrow(_) => "i32.store",
+                    | Type::Borrow(_)
+                    | Type::Any => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
                 payload_offset += type_size(payload_ty);
@@ -7639,6 +7952,8 @@ fn gen_expr(
                             let load_instr = match **inner_ty {
                                 Type::S32 => "i32.load",
                                 Type::S64 => "i64.load",
+                                Type::U64 => "i64.load",
+                                Type::Bool => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -7650,7 +7965,8 @@ fn gen_expr(
                                 | Type::Tuple(_)
                                 | Type::U8
                                 | Type::Resource(_)
-                                | Type::Borrow(_) => "i32.load",
+                                | Type::Borrow(_)
+                                | Type::Any => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -7739,6 +8055,8 @@ fn gen_expr(
                             let load_instr = match payload_ty {
                                 Type::S32 => "i32.load",
                                 Type::S64 => "i64.load",
+                                Type::U64 => "i64.load",
+                                Type::Bool => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -7750,7 +8068,8 @@ fn gen_expr(
                                 | Type::Tuple(_)
                                 | Type::U8
                                 | Type::Resource(_)
-                                | Type::Borrow(_) => "i32.load",
+                                | Type::Borrow(_)
+                                | Type::Any => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -7841,6 +8160,8 @@ fn gen_expr(
                             let load_instr = match payload_ty {
                                 Type::S32 => "i32.load",
                                 Type::S64 => "i64.load",
+                                Type::U64 => "i64.load",
+                                Type::Bool => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -7852,7 +8173,8 @@ fn gen_expr(
                                 | Type::Tuple(_)
                                 | Type::U8
                                 | Type::Resource(_)
-                                | Type::Borrow(_) => "i32.load",
+                                | Type::Borrow(_)
+                                | Type::Any => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -8391,6 +8713,222 @@ fn gen_expr(
             Type::Str
         }
         // String: append - concatenate two strings
+        Expr::AnyFromS32 { value } => {
+            // Build a len-prefixed CGRF blob [len:u32][16B header][S32 node] for n.
+            // The payload S32 node sits at cgrf offset 16 (header) + 8 (node header).
+            let n_local = env.declare_local(Type::S32);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, n_local));
+            let ptr = env.declare_local(Type::S32);
+            // Bump the shared heap by 32 bytes (4 len prefix + 28 CGRF scalar value).
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr));
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 32\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            // A little helper writes `local.get ptr; i32.const v; <instr> offset=o`.
+            {
+                let mut w = |v: String, instr: &str, o: u32| {
+                    out.push_str(&format!("{}local.get {}\n", pad, ptr));
+                    out.push_str(&format!("{}{}\n", pad, v));
+                    out.push_str(&format!("{}{} offset={}\n", pad, instr, o));
+                };
+                w("i32.const 28".into(), "i32.store", 0); // len prefix = CGRF byte length
+                w(format!("i32.const {}", CGRF_MAGIC), "i32.store", 4);
+                w(format!("i32.const {}", CGRF_VERSION), "i32.store16", 8);
+                w("i32.const 0".into(), "i32.store16", 10); // flags
+                w("i32.const 1".into(), "i32.store", 12); // node_count
+                w("i32.const 0".into(), "i32.store", 16); // root index
+                w(format!("i32.const {}", CGRF_S32), "i32.store8", 20); // node kind
+                w("i32.const 0".into(), "i32.store8", 21); // node flags
+                w("i32.const 0".into(), "i32.store16", 22); // reserved
+                w("i32.const 4".into(), "i32.store", 24); // payload_len
+                w(format!("local.get {}", n_local), "i32.store", 28); // payload value
+            }
+            // Result: the `any` pointer.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr));
+            Type::Any
+        }
+        Expr::AnyToS32 { value } => {
+            // The S32 payload sits at blob+28 (4 len prefix + 16 header + 8 node header).
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}i32.load offset=28\n", pad));
+            Type::S32
+        }
+        Expr::AnyFromString { value } => {
+            // Build a len-prefixed CGRF String node blob [len:u32][16B header][node]
+            // for s. A Wisp string is a pointer to [len:u32][bytes], and the CGRF
+            // string payload (at cgrf offset 24) is the same [len:u32][bytes]
+            // layout, so the byte copy is a straight memcpy of the string body.
+            let s_local = env.declare_local(Type::S32);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, s_local));
+            let slen = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, s_local));
+            out.push_str(&format!("{}i32.load\n", pad)); // string byte length
+            out.push_str(&format!("{}local.set {}\n", pad, slen));
+            let ptr = env.declare_local(Type::S32);
+            // Bump the heap by 32 + slen (4 len prefix + 28 CGRF fixed + bytes).
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr));
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 32\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            // Fixed header fields.
+            {
+                let mut w = |v: String, instr: &str, o: u32| {
+                    out.push_str(&format!("{}local.get {}\n", pad, ptr));
+                    out.push_str(&format!("{}{}\n", pad, v));
+                    out.push_str(&format!("{}{} offset={}\n", pad, instr, o));
+                };
+                w(format!("i32.const {}", CGRF_MAGIC), "i32.store", 4);
+                w(format!("i32.const {}", CGRF_VERSION), "i32.store16", 8);
+                w("i32.const 0".into(), "i32.store16", 10); // flags
+                w("i32.const 1".into(), "i32.store", 12); // node_count
+                w("i32.const 0".into(), "i32.store", 16); // root index
+                w(format!("i32.const {}", CGRF_STRING), "i32.store8", 20); // node kind
+                w("i32.const 0".into(), "i32.store8", 21); // node flags
+                w("i32.const 0".into(), "i32.store16", 22); // reserved
+            }
+            // Dynamic fields: len prefix (28 + slen), payload_len (4 + slen),
+            // and the CGRF string length field.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr)); // len prefix @0
+            out.push_str(&format!("{}i32.const 28\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, ptr)); // payload_len @24
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.store offset=24\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, ptr)); // string length @28
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.store offset=28\n", pad));
+            // Copy the string bytes: dest = ptr+32, src = s+4, len = slen.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr));
+            out.push_str(&format!("{}i32.const 32\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, s_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}memory.copy\n", pad));
+            // Result: the `any` pointer.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr));
+            Type::Any
+        }
+        Expr::AnyToString { value } => {
+            // Zero-copy: a CGRF string payload [len:u32][bytes] sits at blob+28,
+            // which is exactly a Wisp string, so return a pointer to it.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}i32.const 28\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            Type::Str
+        }
+        Expr::HeapAlloc { size } => {
+            // Allocate on the compiler's bump heap so byte buffers the interpreter
+            // builds share the same heap as the boundary codec's allocations.
+            gen_expr(
+                size, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}call $__alloc\n", pad));
+            Type::S32
+        }
+        Expr::AnyAddr { value } => {
+            // Pure reinterpret: an `any` is already the i32 address of its blob.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::S32
+        }
+        Expr::AnyFromAddr { value } => {
+            // Pure reinterpret: a blob address is an `any`.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::Any
+        }
+        Expr::StringAddr { value } => {
+            // Pure reinterpret: a string is already the i32 address of [len][bytes].
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::S32
+        }
+        Expr::StringFromAddr { value } => {
+            // Pure reinterpret: an address of [len][bytes] is a string.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::Str
+        }
+        Expr::RawInvoke { import, value } => {
+            // args-any is a len-prefixed CGRF blob [len:u32][cgrf]. Pass its bytes
+            // straight to the import's raw CGRF entry point, then wrap the returned
+            // CGRF (out_ptr,out_len) back into an `any` blob — the same shape the
+            // import wrapper uses for an `any` result.
+            let blob = env.declare_local(Type::S32);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, blob));
+            let slots = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{}i32.const 8\n{}call $__alloc\n{}local.set {}\n",
+                pad, pad, pad, slots
+            ));
+            // $__raw_<import>(blob+4, load(blob), slots, slots+4)
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
+                pad, blob, pad, pad
+            ));
+            out.push_str(&format!("{}local.get {}\n{}i32.load\n", pad, blob, pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slots));
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
+                pad, slots, pad, pad
+            ));
+            out.push_str(&format!("{}call $__raw_{}\n{}drop\n", pad, import, pad)); // ignore status
+            let any_len = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n{}i32.load\n{}local.set {}\n",
+                pad, slots, pad, pad, pad, pad, any_len
+            )); // out_len
+            let res = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n{}call $__alloc\n{}local.set {}\n",
+                pad, any_len, pad, pad, pad, pad, res
+            ));
+            out.push_str(&format!(
+                "{}local.get {}\n{}local.get {}\n{}i32.store\n",
+                pad, res, pad, any_len, pad
+            )); // len prefix
+            // copy cgrf: dest=res+4, src=out_ptr (load slots), len=any_len
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
+                pad, res, pad, pad
+            ));
+            out.push_str(&format!("{}local.get {}\n{}i32.load\n", pad, slots, pad)); // out_ptr
+            out.push_str(&format!(
+                "{}local.get {}\n{}memory.copy\n",
+                pad, any_len, pad
+            ));
+            out.push_str(&format!("{}local.get {}\n", pad, res));
+            Type::Any
+        }
         Expr::StringAppend { left, right } => {
             // Evaluate left string pointer
             let left_local = env.declare_local(Type::S32);
@@ -8772,6 +9310,8 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::F32 => "f32",
         Type::F64 => "f64",
         Type::U8 => "i32",
+        Type::Bool => "i32",
+        Type::U64 => "i64",
         // All compound types are pointer-sized (i32 handles)
         Type::Record(_)
         | Type::Variant(_)
@@ -8779,7 +9319,9 @@ fn wat_type(ty: &Type) -> &'static str {
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
-        | Type::Tuple(_) => "i32",
+        | Type::Tuple(_)
+        // Dynamic value is a pointer to a self-contained CGRF blob
+        | Type::Any => "i32",
         // Resources are i32 handles
         Type::Resource(_) | Type::Borrow(_) => "i32",
     }
@@ -8801,11 +9343,14 @@ fn wit_type(ty: &Type) -> String {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::U8 => "u8".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::U64 => "u64".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
         Type::Option(inner) => format!("option<{}>", wit_type(inner)),
         Type::Result(ok, err) => format!("result<{}, {}>", wit_type(ok), wit_type(err)),
         Type::List(inner) => format!("list<{}>", wit_type(inner)),
         Type::Str => "string".to_string(),
+        Type::Any => "value".to_string(),
         Type::Resource(name) => name.clone(),
         Type::Borrow(inner) => format!("borrow<{}>", wit_type(inner)),
         Type::Tuple(elems) => {
@@ -8885,9 +9430,21 @@ fn flatten_type(
             // Tuple is a pointer
             vec![Type::S32]
         }
+        Type::Any => {
+            // Dynamic value is a pointer to a self-contained CGRF blob
+            vec![Type::S32]
+        }
         Type::U8 => {
             // U8 is stored as i32
             vec![Type::S32]
+        }
+        Type::Bool => {
+            // Bool is stored as i32 (0/1)
+            vec![Type::S32]
+        }
+        Type::U64 => {
+            // U64 is stored as i64
+            vec![Type::S64]
         }
         Type::Resource(_) | Type::Borrow(_) => {
             // Resources and borrows are i32 handles
@@ -9070,6 +9627,7 @@ fn store_instr(ty: &Type) -> &'static str {
     match ty {
         Type::S32 => "i32.store",
         Type::S64 => "i64.store",
+        Type::U64 => "i64.store",
         Type::F32 => "f32.store",
         Type::F64 => "f64.store",
         // Compound types are pointer-sized, resources are i32 handles
@@ -9081,8 +9639,10 @@ fn store_instr(ty: &Type) -> &'static str {
         | Type::Str
         | Type::Tuple(_)
         | Type::U8
+        | Type::Bool
         | Type::Resource(_)
-        | Type::Borrow(_) => "i32.store",
+        | Type::Borrow(_)
+        | Type::Any => "i32.store",
     }
 }
 
@@ -9211,11 +9771,14 @@ fn pact_type(ty: &Type) -> String {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::U8 => "u8".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::U64 => "u64".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
         Type::Option(inner) => format!("option<{}>", pact_type(inner)),
         Type::Result(ok, err) => format!("result<{}, {}>", pact_type(ok), pact_type(err)),
         Type::List(inner) => format!("list<{}>", pact_type(inner)),
         Type::Str => "string".to_string(),
+        Type::Any => "value".to_string(),
         Type::Resource(name) => name.clone(),
         Type::Borrow(inner) => format!("borrow<{}>", pact_type(inner)),
         Type::Tuple(elems) => {
@@ -9549,6 +10112,7 @@ const CGRF_MAGIC: u32 = 0x46524743; // "CGRF" in little-endian
 const CGRF_VERSION: u16 = 3;
 
 /// CGRF node kinds (also used as type tags for v2 encoding)
+const CGRF_BOOL: u8 = 0x01;
 const CGRF_S32: u8 = 0x02;
 const CGRF_S64: u8 = 0x03;
 const CGRF_F32: u8 = 0x04;
@@ -9560,6 +10124,7 @@ const CGRF_RECORD: u8 = 0x09;
 const CGRF_OPTION: u8 = 0x0A;
 const CGRF_TUPLE: u8 = 0x0B;
 const CGRF_U8: u8 = 0x0C;
+const CGRF_U64: u8 = 0x0F;
 const CGRF_RESULT: u8 = 0x14;
 const CGRF_ARRAY: u8 = 0x15;
 
@@ -9575,6 +10140,8 @@ fn type_to_tag(ty: &Type) -> u8 {
         Type::F32 => CGRF_F32,
         Type::F64 => CGRF_F64,
         Type::U8 => CGRF_U8,
+        Type::Bool => CGRF_BOOL,
+        Type::U64 => CGRF_U64,
         Type::Str => CGRF_STRING,
         Type::List(_) => CGRF_LIST,
         Type::Option(_) => CGRF_OPTION,
@@ -9584,6 +10151,9 @@ fn type_to_tag(ty: &Type) -> u8 {
         Type::Variant(_) => CGRF_VARIANT,
         Type::Resource(_) => CGRF_RECORD, // Resources are treated as records for now
         Type::Borrow(inner) => type_to_tag(inner), // Borrow uses inner type's tag
+        // Dynamic value has no single node kind; nesting `any` inside an
+        // aggregate's v2 type tag is deferred (scalar slice uses top-level any).
+        Type::Any => CGRF_VARIANT,
     }
 }
 
@@ -9591,13 +10161,21 @@ fn type_to_tag(ty: &Type) -> u8 {
 /// Simple types are 1 byte, compound types include nested type info
 fn type_tag_size(ty: &Type) -> usize {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => 1,
+        Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::Str
+        | Type::U8
+        | Type::Bool
+        | Type::U64 => 1,
         Type::List(inner) => 1 + type_tag_size(inner),
         Type::Option(inner) => 1 + type_tag_size(inner),
         Type::Result(ok, err) => 1 + type_tag_size(ok) + type_tag_size(err),
         Type::Tuple(elems) => 1 + 4 + elems.iter().map(type_tag_size).sum::<usize>(),
         Type::Record(name) | Type::Variant(name) | Type::Resource(name) => 1 + 4 + name.len(),
         Type::Borrow(inner) => type_tag_size(inner),
+        Type::Any => 1,
     }
 }
 
@@ -9605,6 +10183,8 @@ fn type_tag_size(ty: &Type) -> usize {
 fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
     match ty {
         Type::U8 => pack::types::Type::U8,
+        Type::Bool => pack::types::Type::Bool,
+        Type::U64 => pack::types::Type::U64,
         Type::S32 => pack::types::Type::S32,
         Type::S64 => pack::types::Type::S64,
         Type::F32 => pack::types::Type::F32,
@@ -9632,7 +10212,48 @@ fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
         Type::Variant(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
         Type::Resource(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
         Type::Borrow(inner) => wisp_type_to_pack_type(inner),
+        Type::Any => pack::types::Type::Value,
     }
+}
+
+/// Build the Pack `TypeDef`s for a Program's records and variants.
+///
+/// These are registered on each interface arena so that named references in
+/// import/export signatures (`Type::Ref("runtime-error")`, `actor-info`, ...)
+/// resolve *structurally* when Pack computes interface hashes — making a Wisp
+/// declaration of a foreign type hash-identical to the type declared in the
+/// peer's pact. Pack hashes a variant/record by its (sorted) field/case names
+/// and child hashes, and does not hash the typedef set itself, so registering
+/// extra, unreferenced typedefs is harmless; only referenced ones affect a hash.
+fn program_pack_typedefs(prog: &Program) -> Vec<pack::types::TypeDef> {
+    use pack::types::{Case, Field, Type as PackType, TypeDef};
+    let mut defs = Vec::new();
+    for rec in &prog.records {
+        defs.push(TypeDef::record(
+            rec.name.clone(),
+            rec.fields
+                .iter()
+                .map(|f| Field::new(f.name.clone(), wisp_type_to_pack_type(&f.ty)))
+                .collect(),
+        ));
+    }
+    for var in &prog.variants {
+        defs.push(TypeDef::variant(
+            var.name.clone(),
+            var.cases
+                .iter()
+                .map(|c| match c.payload.as_slice() {
+                    [] => Case::unit(c.name.clone()),
+                    [one] => Case::new(c.name.clone(), wisp_type_to_pack_type(one)),
+                    many => Case::new(
+                        c.name.clone(),
+                        PackType::tuple(many.iter().map(wisp_type_to_pack_type).collect()),
+                    ),
+                })
+                .collect(),
+        ));
+    }
+    defs
 }
 
 /// Encode PackageMetadata for a Program to CGRF bytes with interface hashes.
@@ -9643,6 +10264,10 @@ fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
 fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
     use pack::types::{Arena, Function, Param};
     use std::collections::HashMap;
+
+    // Named-type definitions, registered on every interface arena so that refs in
+    // signatures resolve structurally during hashing (see program_pack_typedefs).
+    let typedefs = program_pack_typedefs(prog);
 
     let mut package = Arena::new("package");
 
@@ -9673,6 +10298,9 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 
     for (interface_name, funcs) in import_by_interface {
         let mut interface_arena = Arena::new(interface_name);
+        for td in &typedefs {
+            interface_arena.add_type(td.clone());
+        }
         for func in funcs {
             interface_arena.add_function(func);
         }
@@ -9711,6 +10339,9 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 
     for (interface_name, funcs) in export_by_interface {
         let mut interface_arena = Arena::new(interface_name);
+        for td in &typedefs {
+            interface_arena.add_type(td.clone());
+        }
         for func in funcs {
             interface_arena.add_function(func);
         }
@@ -10121,6 +10752,14 @@ fn generate_pack_wrapper(
     out.push_str("    (local $dec_list_i i32)\n");
     out.push_str("    (local $dec_list_node_offset i32)\n");
 
+    // Locals for the dynamic `any` boundary codec (len-prefixed CGRF blob)
+    let needs_any = func.params.iter().any(|p| matches!(p.ty, Type::Any))
+        || matches!(func.return_type, Type::Any);
+    if needs_any {
+        out.push_str("    (local $any_ptr i32)\n");
+        out.push_str("    (local $any_len i32)\n");
+    }
+
     // Decode input parameters from CGRF
     if !func.params.is_empty() {
         out.push_str("    ;; Decode input parameters from CGRF\n");
@@ -10221,6 +10860,34 @@ fn generate_pack_wrapper(
     // Only set $value if the function returns a non-unit type
     if !is_unit_type(&func.return_type) {
         out.push_str("    local.set $value\n");
+    }
+
+    // A dynamic `any` result is already a len-prefixed CGRF blob [len:u32][cgrf].
+    // The bytes are self-describing, so the boundary just copies them straight to
+    // a freshly allocated output buffer; no node encoding or header write needed.
+    if matches!(&func.return_type, Type::Any) {
+        out.push_str("    ;; Encode `any`: copy the len-prefixed CGRF blob to output\n");
+        out.push_str("    local.get $value\n");
+        out.push_str("    i32.load\n"); // CGRF byte length
+        out.push_str("    local.set $any_len\n");
+        out.push_str("    local.get $any_len\n");
+        out.push_str("    call $__alloc\n");
+        out.push_str("    local.set $out_ptr\n");
+        out.push_str("    local.get $out_ptr\n"); // dest
+        out.push_str("    local.get $value\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n"); // src = value + 4 (past the length prefix)
+        out.push_str("    local.get $any_len\n"); // len
+        out.push_str("    memory.copy\n");
+        out.push_str("    local.get $out_ptr_ptr\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $out_len_ptr\n");
+        out.push_str("    local.get $any_len\n");
+        out.push_str("    i32.store\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("  )\n");
+        return;
     }
 
     // Allocate output buffer (guest-allocates ABI)
@@ -10385,6 +11052,13 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
         out.push_str("    (local $dec_list_len i32)\n");
         out.push_str("    (local $dec_list_i i32)\n");
         out.push_str("    (local $dec_list_node_offset i32)\n");
+    }
+
+    // Local for the dynamic `any` boundary codec (len-prefixed CGRF blob)
+    let needs_any = matches!(import.return_type, Type::Any)
+        || import.params.iter().any(|p| matches!(p.ty, Type::Any));
+    if needs_any {
+        out.push_str("    (local $any_ptr i32)\n");
     }
 
     // Check if we need encoder locals for complex parameter types
@@ -10971,6 +11645,25 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
                 // Result is in $dec_result
                 out.push_str("    local.get $dec_result\n");
             }
+            Type::Any => {
+                // Wrap the returned CGRF (out_ptr, out_len) into the uniform
+                // len-prefixed blob [len:u32][cgrf bytes] the guest holds for `any`.
+                out.push_str("    local.get $out_len\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    call $__alloc\n");
+                out.push_str("    local.set $any_ptr\n");
+                out.push_str("    local.get $any_ptr\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    local.get $out_len\n");
+                out.push_str("    memory.copy\n");
+                out.push_str("    local.get $any_ptr\n");
+                out.push_str("    local.get $out_len\n");
+                out.push_str("    i32.store\n");
+                out.push_str("    local.get $any_ptr\n");
+            }
             _ => out.push_str("    i32.const 0\n"),
         }
     }
@@ -11045,7 +11738,15 @@ fn generate_import_generic_encode(out: &mut String, param: &Parameter) {
 fn type_tag_bytes(ty: &Type) -> Vec<u8> {
     let mut bytes = vec![type_to_tag(ty)];
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => {}
+        Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::Str
+        | Type::U8
+        | Type::Bool
+        | Type::U64
+        | Type::Any => {}
         Type::List(inner) => bytes.extend(type_tag_bytes(inner)),
         Type::Option(inner) => bytes.extend(type_tag_bytes(inner)),
         Type::Result(ok, err) => {
@@ -11348,11 +12049,13 @@ fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_local: &str
         Type::List(elem_ty) if cgrf_array_width(elem_ty).is_some() => {
             generate_cgrf_encode_array(out, elem_ty, value_local);
         }
-        Type::S32 | Type::U8 | Type::S64 | Type::F32 | Type::F64 => {
+        Type::S32 | Type::U8 | Type::Bool | Type::S64 | Type::U64 | Type::F32 | Type::F64 => {
             let (kind, payload_size, store_instr) = match ty {
                 Type::S32 => (CGRF_S32, 4, "i32.store"),
                 Type::U8 => (CGRF_U8, 1, "i32.store8"),
+                Type::Bool => (CGRF_BOOL, 1, "i32.store8"),
                 Type::S64 => (CGRF_S64, 8, "i64.store"),
+                Type::U64 => (CGRF_U64, 8, "i64.store"),
                 Type::F32 => (CGRF_F32, 4, "f32.store"),
                 Type::F64 => (CGRF_F64, 8, "f64.store"),
                 _ => unreachable!(),
@@ -11952,6 +12655,30 @@ fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             out.push_str("    i32.const 8\n");
             out.push_str("    i32.add\n");
             out.push_str("    i32.load8_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::Bool => {
+            out.push_str("    ;; decode bool (1-byte payload, 0/1)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load8_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::U64 => {
+            // Mirrors S64: load the i64 payload, truncate to i32 in $dec_result
+            // (the typed-wrapper decode's existing simplification; raw-CGRF
+            // capabilities bridge u64 losslessly via unmarshal instead).
+            out.push_str("    ;; decode u64 (store on heap as i64)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i64.load\n");
+            out.push_str("    i32.wrap_i64\n");
             out.push_str("    local.set $dec_result\n");
         }
         Type::S64 => {
@@ -13255,6 +13982,30 @@ fn generate_cgrf_decode_param(
         }
         Type::Result(ok_ty, err_ty) => {
             generate_cgrf_decode_result(out, ok_ty, err_ty, param_name);
+        }
+        Type::Any => {
+            // A top-level `any` param: the whole input CGRF buffer IS the value.
+            // Copy it into a len-prefixed heap blob [len:u32][cgrf bytes], the
+            // uniform in-guest representation shared with constructed values.
+            out.push_str("    ;; Decode `any`: copy input CGRF into a len-prefixed blob\n");
+            out.push_str("    local.get $in_len\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $any_ptr\n");
+            // Copy CGRF bytes to any_ptr+4 before writing the length prefix
+            // (memory.copy is memmove-safe, so any source overlap is fine).
+            out.push_str("    local.get $any_ptr\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $in_len\n");
+            out.push_str("    memory.copy\n");
+            out.push_str("    local.get $any_ptr\n");
+            out.push_str("    local.get $in_len\n");
+            out.push_str("    i32.store\n");
+            out.push_str("    local.get $any_ptr\n");
+            out.push_str(&format!("    local.set $param_{}\n", param_name));
         }
         _ => {
             // For complex types, we'd need more sophisticated decoding
