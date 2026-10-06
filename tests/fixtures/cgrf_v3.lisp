@@ -16,3 +16,23 @@
 (export (fn none-value () (option s32) (none s32)))
 (export (fn ok-value () (result s32 s32) (ok s32 s32 (i32.const 42))))
 (export (fn err-value () (result s32 s32) (err s32 s32 (i32.const -1))))
+; Pack dynamic `value`: a top-level `any` passes straight through the guest.
+(export (fn roundtrip ((value any)) any value))
+; Inspect the s32 inside an `any`, add one, and construct a fresh `any`.
+(export (fn any-inc ((value any)) any (any-s32 (i32.add (any-as-s32 value) (i32.const 1)))))
+; Read the string out of an `any`, append to it, and construct a fresh `any`.
+(export (fn any-shout ((value any)) any (any-string (string-append (any-as-string value) "!"))))
+; Recursive byte copy (the codec's building block).
+(fn blit ((dst s32) (src s32) (n s32)) s32
+  (if (i32.eq n (i32.const 0)) (i32.const 0)
+    (begin
+      (i32.store8 dst (i32.load8_u src))
+      (blit (i32.add dst (i32.const 1)) (i32.add src (i32.const 1)) (i32.sub n (i32.const 1))))))
+; Copy an `any` blob entirely in Wisp via the byte-view primitives: read the
+; blob address, allocate a fresh buffer, copy [len:u32][cgrf] bytes, re-wrap.
+; Proves the marshal/unmarshal codec needs no per-type compiler support.
+(export (fn any-echo ((value any)) any
+  (let (p (any-addr value))
+    (let (total (i32.add (i32.load p) (i32.const 4)))
+      (let (q (heap-alloc total))
+        (begin (blit q p total) (any-from-addr q)))))))

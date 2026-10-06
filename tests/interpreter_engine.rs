@@ -54,6 +54,49 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             }
         }),
     );
+    // The evaluator now imports the Theater rpc bridge (describe/exports/
+    // implements). This preflight never evaluates them, so they only need to exist.
+    for name in ["describe", "exports", "implements", "call"] {
+        imports.define(
+            "theater:simple/rpc",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("rpc not exercised".into())) }),
+        );
+    }
+    // self bridge (packr has no wildcard-trap; stub what the evaluator imports).
+    imports.define(
+        "theater:simple/self",
+        "self",
+        host_fn(|_input| async move { Ok(Value::String("self not exercised".into())) }),
+    );
+    imports.define(
+        "theater:simple/self",
+        "log",
+        host_fn(|_input| async move { Ok(Value::Tuple(vec![])) }),
+    );
+    // store bridge — likewise only needs to exist; this preflight never calls it.
+    for name in [
+        "new",
+        "get",
+        "get-by-label",
+        "list-labels",
+        "exists",
+        "calculate-total-size",
+    ] {
+        imports.define(
+            "theater:simple/store",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("store not exercised".into())) }),
+        );
+    }
+    // runtime bridge — likewise only needs to exist for this preflight.
+    for name in ["list-actors", "get-actor-status", "stop-actor"] {
+        imports.define(
+            "theater:simple/runtime",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("runtime not exercised".into())) }),
+        );
+    }
     imports
 }
 

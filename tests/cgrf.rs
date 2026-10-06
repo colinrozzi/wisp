@@ -316,3 +316,79 @@ fn test_cgrf_cli_and_dependency_bridge() {
     let result = String::from_utf8(output.stdout).unwrap();
     assert!(result.contains("λ") && result.contains("U8"), "{result}");
 }
+
+#[test]
+fn test_cgrf_any_scalar_roundtrips() {
+    let mut guest = Guest::new();
+    // A top-level dynamic `any` must survive the guest boundary unchanged for
+    // each scalar node kind: decode copies the input CGRF into a len-prefixed
+    // blob, and encode copies it straight back out.
+    for value in [
+        Value::S32(42),
+        Value::S32(-1),
+        Value::S64(i64::MIN),
+        Value::Bool(true),
+        Value::U32(7),
+        Value::String("hello, λ".into()),
+    ] {
+        assert_eq!(
+            guest.call("roundtrip", value.clone()),
+            value,
+            "roundtrip {value:?}"
+        );
+    }
+}
+
+#[test]
+fn test_cgrf_any_inspect_and_construct() {
+    let mut guest = Guest::new();
+    // any-as-s32 reads the scalar out of the incoming CGRF value; any-s32 builds
+    // a fresh CGRF S32 node that the boundary encodes back to the host.
+    assert_eq!(guest.call("any-inc", Value::S32(41)), Value::S32(42));
+    assert_eq!(guest.call("any-inc", Value::S32(-1)), Value::S32(0));
+}
+
+#[test]
+fn test_cgrf_any_string_inspect_and_construct() {
+    let mut guest = Guest::new();
+    // any-as-string views the CGRF string payload in place (zero-copy), and
+    // any-string builds a fresh CGRF String node the boundary encodes out.
+    for (input, want) in [("hi", "hi!"), ("", "!"), ("héllo λ", "héllo λ!")] {
+        assert_eq!(
+            guest.call("any-shout", Value::String(input.into())),
+            Value::String(want.into()),
+        );
+    }
+}
+
+#[test]
+fn test_cgrf_any_echo_wisp_codec() {
+    let mut guest = Guest::new();
+    // any-echo copies the whole CGRF blob in pure Wisp using only the byte-view
+    // primitives (any-addr / heap-alloc / any-from-addr). Every value kind must
+    // survive — proving the marshal/unmarshal codec needs no per-type support.
+    let item = Value::Record {
+        type_name: "todo-item".into(),
+        fields: vec![
+            ("id".into(), Value::U32(1)),
+            ("title".into(), Value::String("ship it".into())),
+            ("done".into(), Value::Bool(false)),
+        ],
+    };
+    for value in [
+        Value::S32(42),
+        Value::Bool(true),
+        Value::String("héllo λ".into()),
+        Value::List {
+            elem_type: ValueType::S32,
+            items: vec![Value::S32(1), Value::S32(2), Value::S32(3)],
+        },
+        item,
+    ] {
+        assert_eq!(
+            guest.call("any-echo", value.clone()),
+            value,
+            "echo {value:?}"
+        );
+    }
+}

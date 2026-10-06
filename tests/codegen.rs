@@ -4,6 +4,23 @@ use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Run `f` on a thread with a large stack. These codegen tests compile a sizable
+/// Wisp preamble (`compile-expr` and friends), and the compiler recurses per
+/// expression node, so compilation needs more than the default 2 MiB test stack.
+fn run_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        match std::thread::Builder::new()
+            .stack_size(1 << 30) // 1 GiB
+            .spawn_scoped(s, f)
+            .expect("failed to spawn big-stack thread")
+            .join()
+        {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    })
+}
+
 fn compile_and_run(source: &str) -> i32 {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
@@ -11,8 +28,10 @@ fn compile_and_run(source: &str) -> i32 {
     let out_base = temp_dir.join(format!("test_codegen_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
-    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
-        .expect("failed to compile");
+    run_big_stack(|| {
+        compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+            .expect("failed to compile")
+    });
 
     let wasm_path = out_base.with_extension("wasm");
     let wasm_bytes = std::fs::read(&wasm_path).expect("failed to read wasm");

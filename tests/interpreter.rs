@@ -175,3 +175,27 @@ fn test_interpreter_errors_preserve_existing_definitions() {
     eval(&mut s, &" ".repeat(4097), "error: input exceeds 4096 bytes");
     eval(&mut s, "x", "42");
 }
+
+#[test]
+fn test_interpreter_bool_literals_and_conditionals() {
+    let mut s = session();
+    // Reader -> value -> printer round-trip for the new bool type.
+    eval(&mut s, "true", "true");
+    eval(&mut s, "false", "false");
+    // bool works as an `if` condition (not just s32 truth).
+    eval(&mut s, "(if true 1 2)", "1");
+    eval(&mut s, "(if false 1 2)", "2");
+    // bound and returned like any other value.
+    eval(&mut s, "(define flag true)", "true");
+    eval(&mut s, "(if flag 100 200)", "100");
+}
+
+#[test]
+fn test_interpreter_u64_literals() {
+    let mut s = session();
+    eval(&mut s, "0u64", "0u64");
+    eval(&mut s, "11u64", "11u64");
+    eval(&mut s, "(define timeout 5000u64)", "5000u64");
+    eval(&mut s, "(if 0u64 1 2)", "2");
+    eval(&mut s, "(if 3u64 1 2)", "1");
+}
