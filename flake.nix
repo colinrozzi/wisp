@@ -8,14 +8,9 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-
-    pack = {
-      url = "github:colinrozzi/pack/v0.2.0";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, pack }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -61,23 +56,17 @@
           '';
         };
 
-        packages.default = let
-          combinedSrc = pkgs.runCommand "wisp-combined-src" {} ''
-            mkdir -p $out
-            cp -r ${./.}/. $out/
-            chmod -R u+w $out
-
-            # Put pack as sibling so ../pack paths resolve
-            cp -rL ${pack} $out/../pack || true
-            # Also put it inside for Cargo git dep override
-            mkdir -p $out/pack
-            cp -rL ${pack}/. $out/pack/
-          '';
-        in pkgs.rustPlatform.buildRustPackage {
+        packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "wisp";
           version = "0.1.0";
 
-          src = combinedSrc;
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = path: type:
+              pkgs.lib.cleanSourceFilter path type
+              && !(builtins.elem (builtins.baseNameOf path)
+                [ "target" "compiled" ".direnv" ".jj" ]);
+          };
 
           cargoLock = {
             lockFile = ./Cargo.lock;
@@ -92,43 +81,6 @@
         };
 
         packages.wisp = self.packages.${system}.default;
-
-          packages.update-pack = pkgs.writeShellScriptBin "update-pack" ''
-            set -e
-            VERSION="''${1:?Usage: nix run .#update-pack <version> (e.g. v0.2.1)}"
-
-            echo "Updating pack to $VERSION..."
-
-            # Update all Cargo.toml files
-            find . -name "Cargo.toml" -not -path "*/target/*" \
-              -exec ${pkgs.gnused}/bin/sed -i \
-                "s|colinrozzi/pack\.git\", tag = \"[^\"]*\"|colinrozzi/pack.git\", tag = \"$VERSION\"|g" {} \;
-            echo "  Updated Cargo.toml files"
-
-            # Update flake.nix URL
-            ${pkgs.python3}/bin/python3 -c "
-import re, sys
-with open('flake.nix', 'r') as f:
-    content = f.read()
-content = re.sub(
-    r'(url = \"github:colinrozzi/pack)/[^\"]*',
-    r'\1/' + sys.argv[1],
-    content,
-    count=1
-)
-with open('flake.nix', 'w') as f:
-    f.write(content)
-            " "$VERSION"
-            echo "  Updated flake.nix"
-
-            # Update flake lock
-            nix flake update pack
-            echo "  Updated flake.lock"
-
-            echo ""
-            echo "Pack updated to $VERSION. Changes:"
-            git diff --stat
-          '';
 
           packages.update-theater = pkgs.writeShellScriptBin "update-theater" ''
             set -e

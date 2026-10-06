@@ -17,7 +17,7 @@ fn write_cgrf_string(
 
     // CGRF Header (16 bytes)
     let magic: u32 = 0x46524743; // "CGRF"
-    let version: u16 = 2;
+    let version: u16 = 3;
     let flags: u16 = 0;
     let node_count: u32 = 1;
     let root_index: u32 = 0;

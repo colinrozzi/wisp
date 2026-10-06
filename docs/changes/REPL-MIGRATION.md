@@ -71,6 +71,14 @@ been preserved as inactive `.cargo/theater.local.toml`. They reference crates th
 no longer exist in the sibling checkout, including `theater-handler-supervisor`
 and `val-serde`; do not reactivate them without updating the paths and versions.
 
-The root CLI and `wisp-repl` still pin `pack` v0.2.0 (CGRF v2), whereas compiler
-return values use CGRF v3. The compiler tests pass via direct Wasmtime calls, but
-the old Pack runners need a separate ABI migration.
+The root CLI and `wisp-repl` now use Packr v0.24.1 (aliased as `pack`), pinned in
+the root workspace dependencies. Compiler metadata and value encoding both use
+CGRF v3. Primitive lists use packed Array nodes rather than individual scalar
+nodes, including when nested inside other values. The root runners now decode
+their output successfully; this does not resolve the separate Theater API
+migration above. Recompile old artifacts before using the upgraded runners.
+
+`tests/cgrf.rs` checks v3 metadata, scalar/string/list round trips, all supported
+primitive-array widths, nested lists, options/results, the Packr runtime, and CLI
+dependency bridges. The REPL binary tests cover evaluation and rejection of
+Packr map/set types that Wisp does not yet support.

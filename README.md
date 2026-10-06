@@ -81,12 +81,26 @@ The CLI retains two execution commands:
 - `run-module` loads raw modules. Its Pack path supports no arguments or one
   string via `--input`; positional integers use the raw Wasm calling convention.
 
-There is an outstanding ABI migration: compiler return values use CGRF v3, but
-the pinned `pack` v0.2.0 runner and metadata encoder use v2. Consequently,
-`run-module` can fail with `Unsupported version`, and the interactive
-`cargo run -p wisp-repl` runner also needs migration. Compiler integration tests
-execute generated modules through Wasmtime directly and remain the reliable
-execution checks. See [runtime migration notes](docs/changes/REPL-MIGRATION.md).
+The compiler metadata encoder, `run-module`, and Rust-backed REPL use CGRF v3
+through Packr v0.24.1 (imported as `pack`). The version is pinned once in the root
+`Cargo.toml` under `[workspace.dependencies]`. Recompile older `.wasm` artifacts
+before using them with these runners; changing an old artifact's header alone
+does not update its generated encoding code.
+
+For example, execute a string-returning export or start the REPL:
+
+```sh
+cargo run -p wisp -- compile examples/string-return-test.wisp target/greet
+cargo run -p wisp -- run-module target/greet.wasm greet
+# Hello from wisp!
+cargo run -p wisp-repl
+# wisp> (i32.add 40 2)
+# S32(42)
+```
+
+Primitive lists use packed CGRF Array nodes; lists of compound values use graph
+nodes. Packr map/set values are not yet Wisp language types. The Theater
+integrations remain a separate migration; see the [runtime migration notes](docs/changes/REPL-MIGRATION.md).
 
 ## Project layout
 

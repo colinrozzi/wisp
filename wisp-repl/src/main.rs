@@ -140,9 +140,9 @@ fn eval_expr(expr: &str, state: &ReplState, runtime: &Runtime) -> anyhow::Result
 use wisp::compiler::Type;
 
 /// Convert a Pack ValueType to a wisp Type
-fn pack_type_to_wisp_type(cvt: &pack::abi::ValueType) -> Type {
+fn pack_type_to_wisp_type(cvt: &pack::abi::ValueType) -> anyhow::Result<Type> {
     use pack::abi::ValueType;
-    match cvt {
+    Ok(match cvt {
         ValueType::Bool
         | ValueType::S8
         | ValueType::S16
@@ -154,17 +154,20 @@ fn pack_type_to_wisp_type(cvt: &pack::abi::ValueType) -> Type {
         ValueType::F32 => Type::F32,
         ValueType::F64 => Type::F64,
         ValueType::Char | ValueType::String => Type::Str,
-        ValueType::List(elem) => Type::List(Box::new(pack_type_to_wisp_type(elem))),
-        ValueType::Option(inner) => Type::Option(Box::new(pack_type_to_wisp_type(inner))),
+        ValueType::List(elem) => Type::List(Box::new(pack_type_to_wisp_type(elem)?)),
+        ValueType::Option(inner) => Type::Option(Box::new(pack_type_to_wisp_type(inner)?)),
         ValueType::Result { ok, err } => Type::Result(
-            Box::new(pack_type_to_wisp_type(ok)),
-            Box::new(pack_type_to_wisp_type(err)),
+            Box::new(pack_type_to_wisp_type(ok)?),
+            Box::new(pack_type_to_wisp_type(err)?),
         ),
         ValueType::Record(name) => Type::Record(name.clone()),
         ValueType::Variant(name) => Type::Variant(name.clone()),
         ValueType::Tuple(_) => Type::S32, // Tuple doesn't have a direct mapping
         ValueType::Flags => Type::S64,
-    }
+        ValueType::Map { .. } | ValueType::Set(_) => {
+            anyhow::bail!("Wisp does not support Pack type {cvt}")
+        }
+    })
 }
 
 fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
@@ -175,14 +178,14 @@ fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
         PackValue::F64(n) => Ok(Value::F64(*n)),
         PackValue::String(s) => Ok(Value::Str(s.clone())),
         PackValue::Option { inner_type, value } => Ok(Value::Option {
-            inner_type: pack_type_to_wisp_type(inner_type),
+            inner_type: pack_type_to_wisp_type(inner_type)?,
             value: value
                 .as_ref()
                 .map(|v| pack_to_repl_value(v).map(Box::new))
                 .transpose()?,
         }),
         PackValue::List { elem_type, items } => Ok(Value::List {
-            elem_type: pack_type_to_wisp_type(elem_type),
+            elem_type: pack_type_to_wisp_type(elem_type)?,
             items: items
                 .iter()
                 .map(pack_to_repl_value)
@@ -193,8 +196,8 @@ fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
             err_type,
             value,
         } => Ok(Value::Result {
-            ok_type: pack_type_to_wisp_type(ok_type),
-            err_type: pack_type_to_wisp_type(err_type),
+            ok_type: pack_type_to_wisp_type(ok_type)?,
+            err_type: pack_type_to_wisp_type(err_type)?,
             value: match value {
                 Ok(v) => Ok(Box::new(pack_to_repl_value(v)?)),
                 Err(v) => Err(Box::new(pack_to_repl_value(v)?)),
@@ -224,5 +227,50 @@ fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
                 .collect::<anyhow::Result<Vec<_>>>()?,
         }),
         other => Err(anyhow::anyhow!("Unsupported pack value: {:?}", other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pack::abi::ValueType;
+
+    #[test]
+    fn test_repl_evaluates_with_cgrf_v3_runtime() {
+        let runtime = Runtime::new();
+        let state = ReplState::new();
+        assert!(matches!(
+            eval_expr("(i32.add 40 2)", &state, &runtime).unwrap(),
+            Value::S32(42)
+        ));
+        assert!(
+            matches!(eval_expr("\"hello, λ\"", &state, &runtime).unwrap(), Value::Str(s) if s == "hello, λ")
+        );
+        assert!(
+            matches!(eval_expr("(some s32 42)", &state, &runtime).unwrap(), Value::Option { inner_type: Type::S32, value: Some(v) } if matches!(*v, Value::S32(42)))
+        );
+    }
+
+    #[test]
+    fn test_repl_rejects_unsupported_v3_collection_types() {
+        for inner_type in [
+            ValueType::Set(Box::new(ValueType::S32)),
+            ValueType::Map {
+                key: Box::new(ValueType::String),
+                value: Box::new(ValueType::S32),
+            },
+        ] {
+            // Even an empty outer value must not silently lose its inner type.
+            let value = PackValue::Option {
+                inner_type,
+                value: None,
+            };
+            assert!(
+                pack_to_repl_value(&value)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Wisp does not support Pack type")
+            );
+        }
     }
 }

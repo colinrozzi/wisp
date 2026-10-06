@@ -22,7 +22,8 @@ workspace in `crates/`; see `crates/README.md` before working on them.
 
 The current output is a raw Wasm module using the Pack/Graph ABI, not a component.
 Do not assume `wasmtime --invoke export module.wasm 5` matches source signatures.
-The CLI and interactive REPL still have a CGRF v2/v3 migration gap; see README.md.
+The root compiler and Rust-backed runners use CGRF v3. Recompile older artifacts
+before running them; see README.md for supported CLI argument conventions.
 
 ## Coding Style & Naming Conventions
 Follow idiomatic Rust 2024 style in the root workspace: four-space indentation,
