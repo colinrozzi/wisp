@@ -2,14 +2,19 @@
 (fn integer-type? ((name string)) s32
   (i32.or (string=? name "s32") (string=? name "s64")))
 
-(fn eval-integer-ascription ((items (list value)) (env (list binding)) (depth s32)) value
+(fn eval-numeric-ascription ((items (list value)) (env (list binding)) (depth s32)) value
   (let (name (symbol-name (list-get items 2)))
-    (if (integer-type? name)
+    (if (numeric-type? name)
       (let (v (eval-expected (list-get items 0) env depth 0 name))
-        (if (failed? v) v (apply-integer-conversion name v)))
+        (if (failed? v) v (numeric-cast name v)))
       (failure "unsupported ascription type"))))
 
 (fn resolve-integer ((n s64) (expected string)) value
+  (if (string=? expected "f64") (double (f64.convert_i64_s n))
+    (if (string=? expected "f32") (single (f32.demote_f64 (f64.convert_i64_s n)))
+      (resolve-integer-width n expected))))
+
+(fn resolve-integer-width ((n s64) (expected string)) value
   (if (string=? expected "s64") (wide-integer n)
     (if (i32.or (i64.lt_s n -2147483648) (i64.gt_s n 2147483647))
       (failure "integer out of s32 range") (integer (i32.wrap_i64 n)))))
@@ -53,7 +58,7 @@
       (if (i32.lt_s index (list-len params)) (symbol-name (field-type (list-get params index))) ""))
     ((constructor name id case-name types)
       (if (i32.lt_s index (list-len types)) (symbol-name (list-get types index)) ""))
-    ((builtin name) (integer-operand-type name))
+    ((builtin name) (numeric-operand-type name))
     (else "")))
 
 (fn apply-integer-conversion ((name string) (v value)) value

@@ -131,7 +131,7 @@ fn test_interpreter_errors_preserve_existing_definitions() {
         "\"bad\\q\"",
         "2147483648",
         "-2147483649",
-        "1.5",
+        "1.5.0",
         "123abc",
         "(if 1)",
         "(define)",

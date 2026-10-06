@@ -6,6 +6,8 @@
 (include "matching.lisp")
 (include "primitives.lisp")
 (include "integers.lisp")
+(include "decimal.lisp")
+(include "floats.lisp")
 
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)
@@ -33,7 +35,7 @@
       (let (root (global.get $bindings))
         (let (found (lookup-local name root (i32.sub (list-len root) 1)))
           (if (failed? found)
-            (if (if (builtin? name) 1 (if (string-primitive? name) 1 (integer-primitive? name))) (builtin name)
+            (if (if (builtin? name) 1 (if (string-primitive? name) 1 (numeric-primitive? name))) (builtin name)
               (if (string=? name "nil") (nil) found))
             found)))
       local)))
@@ -69,7 +71,7 @@
 
 (fn eval-form ((items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (if (if (i32.eq (list-len items) 3) (string=? (symbol-name (list-get items 1)) ":") 0)
-    (eval-integer-ascription items env depth)
+    (eval-numeric-ascription items env depth)
     (eval-named-form items env depth top expected)))
 
 (fn eval-named-form ((items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
@@ -89,6 +91,8 @@
   (value-case v
     ((integer n) (i32.ne n 0))
     ((wide-integer n) (i64.ne n 0))
+    ((single n) (f32.ne n 0f32))
+    ((double n) (f64.ne n 0.0))
     ((sequence items) (i32.ne (list-len items) 0))
     (else 1)))
 
@@ -192,7 +196,7 @@
                 (if (i32.ne (list-len params) (list-len args)) (failure "wrong number of arguments")
                   (eval body (bind-args params args 0 (copy-env captured 0 (list-new binding))) depth 0)))
               ((builtin name)
-                (if (integer-primitive? name) (apply-integer-primitive name args)
+                (if (numeric-primitive? name) (apply-numeric-primitive name args)
                   (if (string-primitive? name) (apply-string name args) (apply-builtin name args))))
               ((typed-function params result body) (apply-typed params result body args depth))
               ((constructor name id case-name types) (apply-constructor name id case-name types args))
@@ -230,7 +234,7 @@
           (value-case (list-get args 1)
             ((sequence items) (sequence (copy-list items 0 (list-push (list-new value) (list-get args 0)))))
             (else (failure "cons expects a list as its second argument")))
-          (apply-integer-builtin name (list-get args 0) (list-get args 1)))))))
+          (apply-numeric-builtin name (list-get args 0) (list-get args 1)))))))
 
 ; A minimal local REPL boundary: source in, printed value (or diagnostic) out.
 ; Actual values and closures stay in the session heap. A Theater adapter can

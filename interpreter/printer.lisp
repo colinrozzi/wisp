@@ -44,6 +44,8 @@
     ((integer n) (show-integer n))
     ((wide-integer n) (show-wide n))
     ((integer-literal n) "#<integer-literal>")
+    ((single n) (show-float (f64.promote_f32 n) 9 "f32"))
+    ((double n) (show-float n 17 "f64"))
     ((text s) (string-append "\"" (string-append (escape-text s 0 "") "\"")))
     ((symbol s) s)
     ((sequence items) (show-list items 0 "("))

@@ -46,21 +46,18 @@
             (read-integer s (i32.add pos 1) (i64.sub (i64.mul acc 10) (i64.extend_i32_s d)) negative)))
         (failure "unsupported number literal")))))
 
-(fn read-number ((s string)) value
+(fn read-integer-token ((s string)) value
   (let (size (string-len s))
     (let (wide (if (i32.gt_s size 3) (string=? (substring s (i32.sub size 3) size) "s64") 0))
       (let (base (if wide (substring s 0 (i32.sub size 3)) s))
         (let (negative (i32.eq (string-ref base 0) 45))
-          (let (v (read-integer base (if negative 1 0) 0s64 negative))
+          (let (v (read-integer base (if (i32.or negative (i32.eq (string-ref base 0) 43)) 1 0) 0s64 negative))
             (value-case v
               ((integer-literal n) (if wide (wide-integer n) v))
               (else v))))))))
 
 (fn read-atom ((s string)) value
-  (if (digit? (string-ref s 0)) (read-number s)
-    (if (i32.and (i32.eq (string-ref s 0) 45) (i32.gt_s (string-len s) 1))
-      (if (digit? (string-ref s 1)) (read-number s) (symbol s))
-      (symbol s))))
+  (if (numeric-token? s) (read-number s) (symbol s)))
 
 (fn read-string ((src string) (pos s32) (acc string)) read-result
   (if (i32.ge_s pos (string-len src))

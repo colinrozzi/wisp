@@ -12,7 +12,7 @@
 (fn known-type? ((ty value) (self string)) s32
   (value-case ty
     ((symbol name)
-      (i32.or (i32.or (integer-type? name) (string=? name "string"))
+      (i32.or (i32.or (numeric-type? name) (string=? name "string"))
         (i32.or (string=? name self) (i32.ge_s (type-index name) 0))))
     (else 0)))
 
@@ -21,6 +21,8 @@
     (value-case v
       ((integer n) (string=? name "s32"))
       ((wide-integer n) (string=? name "s64"))
+      ((single n) (string=? name "f32"))
+      ((double n) (string=? name "f64"))
       ((text s) (string=? name "string"))
       ((aggregate type-name id case-name fields)
         (let (index (type-index name))

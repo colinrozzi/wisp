@@ -519,3 +519,389 @@ fn test_s64_reader_round_trips_and_error_recovery() {
         assert_eq!(s.evaluate("(+ wide 2s64)").unwrap(), "4294967298s64");
     }
 }
+
+fn assert_float_output(output: &str, expected: Value, source: &str) {
+    match expected {
+        Value::F32(n) => {
+            let actual = output
+                .strip_suffix("f32")
+                .unwrap_or_else(|| panic!("{source}: {output}"))
+                .parse::<f64>()
+                .unwrap() as f32;
+            if n.is_nan() {
+                assert!(actual.is_nan(), "{source}: {output}");
+            } else {
+                assert_eq!(actual.to_bits(), n.to_bits(), "{source}: {output}");
+            }
+        }
+        Value::F64(n) => {
+            let actual = output
+                .strip_suffix("f64")
+                .unwrap_or_else(|| panic!("{source}: {output}"))
+                .parse::<f64>()
+                .unwrap();
+            if n.is_nan() {
+                assert!(actual.is_nan(), "{source}: {output}");
+            } else {
+                assert_eq!(actual.to_bits(), n.to_bits(), "{source}: {output}");
+            }
+        }
+        Value::S32(n) => assert_eq!(output, n.to_string(), "{source}"),
+        Value::S64(n) => assert_eq!(output, format!("{n}s64"), "{source}"),
+        other => panic!("unexpected result {other:?}"),
+    }
+}
+
+#[test]
+fn test_float_decimal_rounding_and_printed_round_trips() {
+    let mut s = session();
+    for literal in [
+        "0",
+        "-0",
+        "2.5",
+        "0.1",
+        ".5",
+        "1.",
+        "1.25e+2",
+        "1.25E-2",
+        "9007199254740993.0",
+        "16777217.0",
+        "1.00000000000000011102230246251565404236316680908203125",
+        "1.0000000000000001110223024625156540423631668090820312500000001",
+        "1.00000005960464477539062500000000000000000000001",
+        "1.7976931348623157e308",
+        "1.7976931348623159e308",
+        "2.2250738585072014e-308",
+        "2.225073858507201e-308",
+        "4.9406564584124654e-324",
+        "2.4703282292062327e-324",
+        "2.4703282292062328e-324",
+        "1.1754943508222875e-38",
+        "1.401298464324817e-45",
+        "3.4028234663852886e38",
+        "1e10000",
+        "-1e-10000",
+        "inf",
+        "-inf",
+        "nan",
+        "NaN",
+        "+Infinity",
+        "-INF",
+    ] {
+        // The compiler parses decimal text to f64, then demotes f32 literals.
+        let parsed = literal.parse::<f64>().unwrap();
+        for (ty, expected) in [
+            ("f64", Value::F64(parsed)),
+            ("f32", Value::F32(parsed as f32)),
+        ] {
+            let source = format!("{literal}{ty}");
+            let output = s
+                .evaluate(&source)
+                .unwrap_or_else(|e| panic!("{source}: {e:#}"));
+            assert_float_output(&output, expected.clone(), &source);
+            let again = s.evaluate(&output).unwrap();
+            assert_float_output(&again, expected, &output);
+        }
+    }
+}
+
+#[test]
+fn test_float_arithmetic_matrix_matches_compiled_wasm() {
+    let mut interpreted = session();
+    let operations = [
+        "add", "sub", "mul", "div", "eq", "ne", "lt", "gt", "le", "ge",
+    ];
+    let mut source = String::new();
+    for ty in ["f32", "f64"] {
+        for (i, op) in operations.iter().enumerate() {
+            let result = if i < 4 { ty } else { "s32" };
+            source.push_str(&format!(
+                "(export (fn {ty}-{op} ((a {ty}) (b {ty})) {result} ({ty}.{op} a b)))\n"
+            ));
+        }
+    }
+    let loaded = interpreted.evaluate(&source).unwrap();
+    assert!(!loaded.starts_with("error:"), "{loaded}");
+    let path = root().join(format!(
+        "target/interpreter-parity/{}/float-matrix.lisp",
+        std::process::id()
+    ));
+    std::fs::write(&path, source).unwrap();
+    let module = Module::from_file(&cgrf_guest::engine(), compile(&path, "float-matrix")).unwrap();
+    let mut compiled = Guest::new(&module);
+    for ty in ["f32", "f64"] {
+        for op in operations {
+            for (a, b) in [
+                (1.5_f64, 2.25_f64),
+                (-0.0, 0.0),
+                (1.0, 0.0),
+                (-1.0, 0.0),
+                (f64::INFINITY, f64::INFINITY),
+                (f64::NAN, 1.0),
+                (f64::MIN_POSITIVE, 3.0),
+                (f64::MAX, 2.0),
+            ] {
+                let name = format!("{ty}-{op}");
+                let input = if ty == "f32" {
+                    vec![Value::F32(a as f32), Value::F32(b as f32)]
+                } else {
+                    vec![Value::F64(a), Value::F64(b)]
+                };
+                let expected = compiled.call(&name, Value::Tuple(input));
+                let expr = format!(
+                    "({name} {}{ty} {}{ty})",
+                    a.to_string().to_lowercase(),
+                    b.to_string().to_lowercase()
+                );
+                let output = interpreted
+                    .evaluate(&expr)
+                    .unwrap_or_else(|e| panic!("{expr}: {e:#}"));
+                assert_float_output(&output, expected, &expr);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_float_types_casts_and_recoverable_errors() {
+    let mut s = session();
+    for (source, expected) in [
+        ("1.5", "1.5f64"),
+        ("(f32.add 1 2)", "3f32"),
+        ("(f64.const 2)", "2f64"),
+        (
+            "(fn identity-float ((x f64)) f64 x) (identity-float 2)",
+            "2f64",
+        ),
+        (
+            "(record floating (n f32)) (floating.n (floating 2))",
+            "2f32",
+        ),
+        (
+            "(variant floating-result (success f64)) (match (success 2.5) ((success n) n))",
+            "2.5f64",
+        ),
+        ("(let (x : f32 4) (+ x 0.5f32))", "4.5f32"),
+        (
+            "(fn float-tail () f64 (if 1 (let (x 1) 2) 3)) (float-tail)",
+            "2f64",
+        ),
+        ("(2 : f32)", "2f32"),
+        ("(s32 -2.75)", "-2"),
+        ("(s64 4294967296.75)", "4294967296s64"),
+        ("(f32.demote_f64 2.5)", "2.5f32"),
+        ("(f64.promote_f32 2.5f32)", "2.5f64"),
+        ("(i32.trunc_f64_s -2147483648.75)", "-2147483648"),
+        ("(i32.trunc_f64_u -0.75)", "0"),
+        ("(i32.trunc_f64_u 4294967295.75)", "-1"),
+        ("(i64.trunc_f64_u -0.75)", "0s64"),
+        ("(i64.trunc_f64_u 18446744073709549568.0)", "-2048s64"),
+        (
+            "(i64.trunc_f64_s -9223372036854775808.0)",
+            "-9223372036854775808s64",
+        ),
+        ("(f64.convert_i32_u -1)", "4294967295f64"),
+        ("(if -0.0 missing 42)", "42"),
+        ("(if nanf64 42 missing)", "42"),
+        ("'(1.5 2f32)", "(1.5f64 2f32)"),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    for source in [
+        "1.2.3",
+        "1.0e",
+        "1.0e+",
+        "1.0e-",
+        "1.0e1x",
+        "1f32x",
+        "1.0s64",
+        ".f64",
+        "(s32 nanf64)",
+        "(s64 inff64)",
+        "(i32.trunc_f32_u -1f32)",
+        "(i32.trunc_f64_s -2147483649.0)",
+        "(i32.trunc_f64_s 2147483648.0)",
+        "(i32.trunc_f64_u 4294967296.0)",
+        "(i64.trunc_f64_s 9223372036854775808.0)",
+        "(i64.trunc_f64_u 18446744073709551616.0)",
+        "(i64.trunc_f64_u -1.0)",
+        "(f32.add 1.0 2.0)",
+        "(+ 1.0 2f32)",
+        "(f32.add 1f32)",
+        "(f64.add 1 2 3)",
+        "(f32.demote_f64 1f32)",
+        "(f64.promote_f32 1.0)",
+        "(let (x 1) (f32.convert_i64_s x))",
+        "(let (x 1) (f64.add x 2))",
+        "(identity-float '1)",
+        "(floating 1.0)",
+        "(fn wrong-float () f64 1s64) (wrong-float)",
+        "(f32 \"bad\")",
+        "(f64)",
+        "(f64.const)",
+        "(i64.trunc_f64_s)",
+        "(f64xadd 1.0 2.0)",
+    ] {
+        let output = s.evaluate(source).unwrap();
+        assert!(output.starts_with("error:"), "{source}: {output}");
+        assert_eq!(s.evaluate("(identity-float 2.5)").unwrap(), "2.5f64");
+    }
+    assert_eq!(s.evaluate("(define float-sentinel 42)").unwrap(), "42");
+    assert!(
+        s.evaluate("(define float-sentinel 0) 1.0e+")
+            .unwrap()
+            .starts_with("error:")
+    );
+    assert_eq!(s.evaluate("float-sentinel").unwrap(), "42");
+}
+
+#[test]
+fn test_float_round_trips_across_binary_exponents() {
+    let mut s = session();
+    let mut bits = 0x83d2_e7a9_61b0_4c5f_u64;
+    for _ in 0..96 {
+        bits = bits
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        for (source, expected) in [
+            (
+                format!("{:e}f64", f64::from_bits(bits)).to_lowercase(),
+                Value::F64(f64::from_bits(bits)),
+            ),
+            (
+                format!("{:e}f32", f32::from_bits(bits as u32)).to_lowercase(),
+                Value::F32(f32::from_bits(bits as u32)),
+            ),
+        ] {
+            let output = s
+                .evaluate(&source)
+                .unwrap_or_else(|e| panic!("{source}: {e:#}"));
+            assert_float_output(&output, expected.clone(), &source);
+            assert_float_output(&s.evaluate(&output).unwrap(), expected, &output);
+        }
+    }
+}
+
+#[test]
+fn test_float_conversion_matrix_matches_compiled_wasm() {
+    let mut s = session();
+    let mut declarations = String::new();
+    let mut cases = Vec::new();
+    for target in ["f32", "f64"] {
+        for (source, wasm, values) in [
+            (
+                "s32",
+                "i32",
+                vec![
+                    Value::S32(i32::MIN),
+                    Value::S32(-1),
+                    Value::S32(0),
+                    Value::S32(i32::MAX),
+                ],
+            ),
+            (
+                "s64",
+                "i64",
+                vec![
+                    Value::S64(i64::MIN),
+                    Value::S64(-1),
+                    Value::S64(0),
+                    Value::S64(9007199254740993),
+                    Value::S64(i64::MAX),
+                ],
+            ),
+        ] {
+            for sign in ["s", "u"] {
+                let name = format!("{target}.convert_{wasm}_{sign}");
+                declarations.push_str(&format!(
+                    "(export (fn test-{name} ((x {source})) {target} ({name} x)))\n"
+                ));
+                for value in &values {
+                    cases.push((name.clone(), value.clone()));
+                }
+            }
+        }
+    }
+    for source in ["f32", "f64"] {
+        for (target, wasm) in [("s32", "i32"), ("s64", "i64")] {
+            for sign in ["s", "u"] {
+                let name = format!("{wasm}.trunc_{source}_{sign}");
+                declarations.push_str(&format!(
+                    "(export (fn test-{name} ((x {source})) {target} ({name} x)))\n"
+                ));
+                for n in [-0.75, 0.0, 1.75, 16777215.0] {
+                    cases.push((
+                        name.clone(),
+                        if source == "f32" {
+                            Value::F32(n as f32)
+                        } else {
+                            Value::F64(n)
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    for (name, source, target, values) in [
+        (
+            "f32.demote_f64",
+            "f64",
+            "f32",
+            vec![Value::F64(-0.0), Value::F64(0.1), Value::F64(f64::MAX)],
+        ),
+        (
+            "f64.promote_f32",
+            "f32",
+            "f64",
+            vec![
+                Value::F32(-0.0),
+                Value::F32(0.1),
+                Value::F32(f32::from_bits(1)),
+            ],
+        ),
+    ] {
+        declarations.push_str(&format!(
+            "(export (fn test-{name} ((x {source})) {target} ({name} x)))\n"
+        ));
+        for value in values {
+            cases.push((name.into(), value));
+        }
+    }
+    let loaded = s.evaluate(&declarations).unwrap();
+    assert!(!loaded.starts_with("error:"), "{loaded}");
+    let path = root().join(format!(
+        "target/interpreter-parity/{}/float-conversions.lisp",
+        std::process::id()
+    ));
+    std::fs::write(&path, declarations).unwrap();
+    let module =
+        Module::from_file(&cgrf_guest::engine(), compile(&path, "float-conversions")).unwrap();
+    let mut compiled = Guest::new(&module);
+    for (name, input) in cases {
+        let literal = match input {
+            Value::S32(n) => n.to_string(),
+            Value::S64(n) => format!("{n}s64"),
+            Value::F32(n) => format!("{n:e}f32"),
+            Value::F64(n) => format!("{n:e}f64"),
+            _ => unreachable!(),
+        };
+        let expected = compiled.call(&format!("test-{name}"), input);
+        let source = format!("(test-{name} {literal})");
+        assert_float_output(&s.evaluate(&source).unwrap(), expected, &source);
+    }
+}
+
+#[test]
+fn test_parity_float_primitives_across_both_compilers() {
+    compare_example(
+        "tests/fixtures/interpreter_floats.lisp",
+        &[
+            ("double-rounding", &[], 1),
+            ("single-rounding", &[], 1),
+            ("infinity", &[], 1),
+            ("not-a-number", &[], 1),
+            ("truncate", &[], -2),
+        ],
+        true,
+    );
+}
