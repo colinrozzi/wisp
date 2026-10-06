@@ -1,0 +1,12 @@
+; Shared by the interpreter and both compilers.
+(trait (Add T) (fn add ((a T) (b T)) T))
+(instance (Add s32) (fn add ((a s32) (b s32)) s32 (i32.add a b)))
+(instance (Add f64) (fn add ((a f64) (b f64)) f64 (f64.add a b)))
+(fn double ((x T)) T (where (Add T)) (add x x))
+(fn identity ((x T)) T (where T) x)
+(fn first ((a T) (b U)) T (where T U) (identity a))
+(fn singleton ((x T)) (list T) (where T) (list-push (list-new T) x))
+(export (fn twice ((x s32)) s32 (double x)))
+(export (fn float-double () s32 (if (f64.eq (double 1.5) 3.0) 1 0)))
+(export (fn projection () s32 (first 42 2.0)))
+(export (fn boxed () s32 (list-get (singleton 42) 0)))

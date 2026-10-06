@@ -17,24 +17,25 @@
     (value-case ty ((sequence parts) (known-compound-type? parts self)) (else 0))))
 
 (fn value-has-type? ((v value) (ty value)) s32
-  (let (name (symbol-name ty))
-    (value-case v
-      ((integer n) (string=? name "s32"))
-      ((wide-integer n) (string=? name "s64"))
-      ((single n) (string=? name "f32"))
-      ((double n) (string=? name "f64"))
-      ((typed-list element items) (same-type? (unary-type "list" element) ty))
-      ((compound actual case-name fields) (same-type? actual ty))
-      ((text s) (string=? name "string"))
-      ((aggregate type-name id case-name fields)
-        (let (index (type-index name))
-          (if (i32.lt_s index 0) 0
-            (i32.eq id (named-type.id (list-get (global.get $types) index))))))
-      (else 0))))
+  (if (function-type? ty) (callable-compatible? v ty)
+    (let (name (symbol-name ty))
+      (value-case v
+        ((integer n) (string=? name "s32"))
+        ((wide-integer n) (string=? name "s64"))
+        ((single n) (string=? name "f32"))
+        ((double n) (string=? name "f64"))
+        ((typed-list element items) (same-type? (unary-type "list" element) ty))
+        ((compound actual case-name fields) (same-type? actual ty))
+        ((text s) (string=? name "string"))
+        ((aggregate type-name id case-name fields)
+          (let (index (type-index name))
+            (if (i32.lt_s index 0) 0
+              (i32.eq id (named-type.id (list-get (global.get $types) index))))))
+        (else 0)))))
 
 (fn require-type ((v value) (ty value)) value
   (if (failed? v) v
-    (if (value-has-type? v ty) v
+    (if (value-has-type? v ty) (checked-argument v ty)
       (failure (string-append "expected " (show ty))))))
 
 ; Both (name type) and (name : type) declarations normalize to (name type).
@@ -68,25 +69,19 @@
   (begin (global.set $bindings (list-push (global.get $bindings) (binding name v))) v))
 
 (fn eval-fn ((items (list value)) (top s32)) value
-  (if (i32.eq top 0) (failure "fn is only supported at top level")
-    (if (i32.or (i32.eq (list-len items) 5)
-          (if (i32.eq (list-len items) 6) (string=? (symbol-name (list-get items 3)) ":") 0))
-      (let (name (list-get items 1))
-        (let (params (list-get items 2))
-          (let (result (list-get items (i32.sub (list-len items) 2)))
-            (if (i32.and (symbol? name) (i32.and (sequence? params) (known-type? result "")))
-              (let (checked (normalize-fields (items-of params) 0 (list-new value) "" 1))
-                (if (failed? checked) checked
-                  (publish (binding-key name)
-                    (typed-function (items-of checked) result (list-get items (i32.sub (list-len items) 1))))))
-              (failure "invalid function name, parameters, or return type")))))
-      (failure "fn expects name, typed parameters, return type, and body"))))
+  (declare-function items top))
 
 (fn check-arguments ((types (list value)) (args (list value)) (index s32)) value
   (if (i32.ne (list-len types) (list-len args)) (failure "wrong number of arguments")
     (if (i32.ge_s index (list-len args)) (nil)
       (let (checked (require-type (list-get args index) (list-get types index)))
         (if (failed? checked) checked (check-arguments types args (i32.add index 1)))))))
+
+; Preserve function contracts when values enter a record or another function.
+(fn wrap-arguments ((types (list value)) (args (list value)) (index s32) (out (list value))) (list value)
+  (if (i32.ge_s index (list-len args)) out
+    (wrap-arguments types args (i32.add index 1)
+      (list-push out (checked-argument (list-get args index) (list-get types index))))))
 
 (fn schema-types ((fields (list value)) (index s32) (out (list value))) (list value)
   (if (i32.ge_s index (list-len fields)) out
@@ -95,7 +90,7 @@
 (fn typed-bindings ((params (list value)) (args (list value)) (index s32) (env (list binding))) (list binding)
   (if (i32.ge_s index (list-len params)) env
     (typed-bindings params args (i32.add index 1)
-      (list-push env (binding (binding-key (list-get (items-of (list-get params index)) 0)) (list-get args index))))))
+      (list-push env (binding (binding-key (list-get (items-of (list-get params index)) 0)) (checked-argument (list-get args index) (field-type (list-get params index))))))))
 
 (fn apply-typed ((params (list value)) (result value) (body value) (args (list value)) (depth s32)) value
   (let (checked (check-arguments (schema-types params 0 (list-new value)) args 0))
@@ -171,7 +166,7 @@
 
 (fn apply-constructor ((name string) (id s32) (case-name string) (types (list value)) (args (list value))) value
   (let (checked (check-arguments types args 0))
-    (if (failed? checked) checked (aggregate name id case-name args))))
+    (if (failed? checked) checked (aggregate name id case-name (wrap-arguments types args 0 (list-new value))))))
 
 (fn apply-field ((name string) (id s32) (index s32) (args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "field access expects one argument")

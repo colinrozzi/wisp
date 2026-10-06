@@ -57,6 +57,8 @@
   (value-case callee
     ((typed-function params result body)
       (if (i32.lt_s index (list-len params)) (symbol-name (field-type (list-get params index))) ""))
+    ((checked-function target types result)
+      (if (i32.lt_s index (list-len types)) (symbol-name (list-get types index)) ""))
     ((constructor name id case-name types)
       (if (i32.lt_s index (list-len types)) (symbol-name (list-get types index)) ""))
     ((builtin name) (numeric-operand-type name))

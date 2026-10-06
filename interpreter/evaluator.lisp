@@ -14,6 +14,9 @@
 (include "macros.lisp")
 (include "syntax-rules.lisp")
 (include "syntax-case.lisp")
+(include "generics.lisp")
+(include "traits.lisp")
+(include "call-types.lisp")
 
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)
@@ -96,9 +99,9 @@
           (if (string=? name "define") (eval-define items env depth top)
             (if (string=? name "lambda") (eval-lambda items env)
               (if (string=? name "let") (eval-let items env depth expected)
-                (if (string=? name "begin") (eval-body items 1 env depth top (nil))
-                  (eval-declaration-or-call name items env depth top))))))))
-    (eval-call items env depth)))
+                (if (string=? name "begin") (eval-body-expected items 1 env depth top (nil) expected)
+                  (eval-declaration-or-call name items env depth top expected))))))))
+    (eval-call items env depth expected)))
 
 (fn truthy? ((v value)) s32
   (value-case v
@@ -109,23 +112,25 @@
     ((sequence items) (i32.ne (list-len items) 0))
     (else 1)))
 
-(fn eval-declaration-or-call ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
+(fn eval-declaration-or-call ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (if (global-form? name)
     (if (string=? name "global") (declare-global items top) (eval-global-access name items env depth))
     (if (collection-form? name) (eval-collection-form name items env depth)
-      (eval-declaration name items env depth top))))
+      (eval-declaration name items env depth top expected))))
 
-(fn eval-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
+(fn eval-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (if (string=? name "include") (failure "include is only supported as a top-level source directive")
-    (eval-named-declaration name items env depth top)))
+    (eval-named-declaration name items env depth top expected)))
 
-(fn eval-named-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32)) value
-  (if (string=? name "fn") (eval-fn items top)
-    (if (string=? name "record") (eval-record items top)
-      (if (string=? name "variant") (eval-variant items top)
-        (if (string=? name "match") (eval-match items env depth)
-          (if (string=? name "export") (eval-export items env depth top)
-            (eval-call items env depth)))))))
+(fn eval-named-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
+  (if (string=? name "trait") (declare-trait items top)
+    (if (string=? name "instance") (declare-instance items top)
+      (if (string=? name "fn") (eval-fn items top)
+        (if (string=? name "record") (eval-record items top)
+          (if (string=? name "variant") (eval-variant items top)
+            (if (string=? name "match") (eval-match items env depth expected)
+              (if (string=? name "export") (eval-export items env depth top)
+                (eval-call items env depth expected)))))))))
 
 (fn eval-if ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.ne (list-len items) 4) (failure "if expects condition, then, else")
@@ -182,10 +187,14 @@
     (failure "invalid let binding or unsupported type")))
 
 (fn eval-body ((items (list value)) (index s32) (env (list binding)) (depth s32) (top s32) (last value)) value
+  (eval-body-expected items index env depth top last ""))
+
+(fn eval-body-expected ((items (list value)) (index s32) (env (list binding)) (depth s32) (top s32) (last value) (expected string)) value
   (if (i32.ge_s index (list-len items)) last
-    (let (v (eval (list-get items index) env depth top))
+    (let (v (eval-expected (list-get items index) env depth top
+                (if (i32.eq index (i32.sub (list-len items) 1)) expected "")))
       (if (failed? v) v
-        (eval-body items (i32.add index 1) env depth top v)))))
+        (eval-body-expected items (i32.add index 1) env depth top v expected)))))
 
 (fn eval-args ((items (list value)) (index s32) (env (list binding)) (depth s32) (args (list value)) (callee value)) value
   (if (i32.ge_s index (list-len items)) (sequence args)
@@ -198,34 +207,47 @@
     (bind-args params args (i32.add index 1)
       (list-push env (binding (binding-key (list-get params index)) (list-get args index))))))
 
-; Introduced free identifiers resolve at top level, never through caller locals.
+; Introduced free identifiers resolve at top level or through the selected trait
+; dictionary. Ordinary caller locals cannot capture these references.
 (fn lookup-identifier ((name string) (key string) (env (list binding))) value
   (let (local (lookup-local key env (i32.sub (list-len env) 1)))
     (if (failed? local)
       (let (root (lookup-local key (global.get $bindings) (i32.sub (list-len (global.get $bindings)) 1)))
-        (if (failed? root) (lookup name (list-new binding)) root))
+        (if (failed? root)
+          (let (method (lookup-local (string-append " trait:" name) env (i32.sub (list-len env) 1)))
+            (if (failed? method) (lookup name (list-new binding)) method)) root))
       local)))
 
-(fn eval-call ((items (list value)) (env (list binding)) (depth s32)) value
+(fn eval-call ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (let (callee (eval (list-get items 0) env depth 0))
     (if (failed? callee) callee
-      (let (arguments (eval-args items 1 env depth (list-new value) callee))
+      (let (arguments (if (needs-inference? callee)
+              (eval-inferred-args items 1 env depth (list-new value) callee (peek-types items 1 env 0 (list-new value)) expected)
+              (eval-args items 1 env depth (list-new value) callee)))
         (value-case arguments
-          ((failure message) arguments)
-          ((sequence args)
-            (value-case callee
-              ((closure params body captured)
-                (if (i32.ne (list-len params) (list-len args)) (failure "wrong number of arguments")
-                  (eval body (bind-args params args 0 (copy-env captured 0 (list-new binding))) depth 0)))
-              ((builtin name)
-                (if (collection-builtin? name) (apply-collection name args)
-                  (if (numeric-primitive? name) (apply-numeric-primitive name args)
-                    (if (string-primitive? name) (apply-string name args) (apply-builtin name args)))))
-              ((typed-function params result body) (apply-typed params result body args depth))
-              ((constructor name id case-name types) (apply-constructor name id case-name types args))
-              ((field-reader name id index) (apply-field name id index args))
-              (else (failure "value is not callable"))))
-          (else (failure "invalid arguments")))))))
+          ((sequence args) (apply-value callee args depth expected))
+          (else arguments))))))
+(fn apply-value ((callee value) (args (list value)) (depth s32) (expected string)) value
+  (value-case callee
+    ((closure params body captured)
+      (if (i32.ne (list-len params) (list-len args)) (failure "wrong number of arguments")
+        (eval-expected body (bind-args params args 0 (copy-env captured 0 (list-new binding))) depth 0 expected)))
+    ((builtin name)
+      (if (collection-builtin? name) (apply-collection name args)
+        (if (numeric-primitive? name) (apply-numeric-primitive name args)
+          (if (string-primitive? name) (apply-string name args) (apply-builtin name args)))))
+    ((typed-function params result body) (apply-typed params result body args depth))
+    ((generic-function params result body vars constraints) (apply-generic params result body vars constraints args depth expected))
+    ((trait-method trait method)
+      (let (selected (resolve-method trait method (argument-value-types args 0 (list-new value)) expected))
+        (if (failed? selected) selected (apply-value selected args depth expected))))
+    ((checked-function target types result)
+      (let (checked (check-arguments types args 0))
+        (if (failed? checked) checked
+          (require-type (apply-value target (wrap-arguments types args 0 (list-new value)) depth (symbol-name result)) result))))
+    ((constructor name id case-name types) (apply-constructor name id case-name types args))
+    ((field-reader name id index) (apply-field name id index args))
+    (else (failure "value is not callable"))))
 
 (fn numeric-op ((name string) (a s32) (b s32)) value
   (if (string=? name "+") (integer (i32.add a b))
@@ -275,6 +297,8 @@
         (global.set $types (list-new named-type))
         (global.set $session-globals (list-new global-binding))
         (global.set $session-macros (list-new binding))
+        (global.set $traits (list-new trait-definition))
+        (global.set $instances (list-new trait-implementation))
         (global.set $started 1) 0))
     (global.set $steps 0)
     (global.set $include-seen (list-new string))

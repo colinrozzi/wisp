@@ -56,7 +56,7 @@ fn compare_example(file: &str, cases: &[(&str, &[i32], i32)], compare_self_hoste
     let path = root().join(file);
     let source = std::fs::read_to_string(&path).unwrap();
     let mut interpreted = session();
-    let loaded = interpreted.evaluate(&source).unwrap();
+    let loaded = interpreted.load_file(&path).unwrap();
     assert!(!loaded.starts_with("error:"), "{file}: {loaded}");
     let engine = cgrf_guest::engine();
     let module = Module::from_file(
@@ -122,6 +122,238 @@ fn test_parity_existing_typed_factorial() {
         &[("factorial", &[0], 1), ("factorial", &[6], 720)],
         true,
     );
+}
+
+#[test]
+fn test_parity_generic_functions_and_trait_instances() {
+    compare_example(
+        "tests/fixtures/interpreter_generics.lisp",
+        &[
+            ("twice", &[21], 42),
+            ("twice", &[-3], -6),
+            ("float-double", &[], 1),
+            ("projection", &[], 42),
+            ("boxed", &[], 42),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn test_parity_generic_standard_list_library() {
+    compare_example(
+        "tests/fixtures/interpreter_generic_lists.lisp",
+        &[
+            ("mapped", &[], 12),
+            ("filtered", &[], 5),
+            ("reversed", &[], 3),
+            ("found", &[], 1),
+            ("absent", &[], 0),
+            ("folded", &[], 6),
+            ("count", &[], 3),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn test_generic_compound_types_and_runtime_closures() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(fn id ((x T)) T (where T) x) (id 42)", "42"),
+        ("(id 42s64)", "42s64"),
+        (
+            "(fn box ((x T)) (option T) (where T) (some T x)) (box 42s64)",
+            "(some s64 42s64)",
+        ),
+        (
+            "(fn success ((x T)) (result T string) (where T) (ok T string x)) (success 42)",
+            "(ok s32 string 42)",
+        ),
+        (
+            "(fn pair ((x T) (y U)) (tuple T U) (where T U) (tuple x y)) (pair 42 2s64)",
+            "(tuple 42 2s64)",
+        ),
+        (
+            "(fn annotated ((x T)) T (where T) (let (y : T x) y)) (annotated 42s64)",
+            "42s64",
+        ),
+        (
+            "(fn call ((f (-> T U)) (x T)) U (where T U) (f x)) (fn widen ((x s32)) s64 (s64 x)) (call widen 42)",
+            "42s64",
+        ),
+        (
+            "(fn apply-wide ((f (-> s64 s64)) (x s64)) s64 (f x)) (apply-wide (lambda (x) x) 42)",
+            "42s64",
+        ),
+        ("(apply-wide (lambda (x) 42) 0)", "42s64"),
+        (
+            "(fn make ((x T)) (-> T) (where T) (lambda () x)) (define saved (make 42s64)) (make 1) (saved)",
+            "42s64",
+        ),
+        ("(fn keep ((T T)) T (where T) T) (keep 42)", "42"),
+        (
+            "(record callback (f (-> s64 s64))) ((callback.f (callback (lambda (x) x))) 42)",
+            "42s64",
+        ),
+        (
+            "(let (f : (-> (-> s64 s64) s64) (lambda (g) (g 42))) (f (lambda (n) n)))",
+            "42s64",
+        ),
+        (
+            "(fn bindings ((x T)) T (where T) (let (some x) ((lambda (none T) T) 0 some))) (bindings 42)",
+            "42",
+        ),
+        (
+            "(fn matched ((x T)) T (where T) (match (some T x) ((some T) T) ((none) x))) (matched 42s64)",
+            "42s64",
+        ),
+        (
+            "(define-syntax declare (syntax-rules () ((_ name) (fn name ((x T)) (list T) (where T) (list-push (list-new T) x))))) (declare collect) (list-get (collect 42) 0)",
+            "42",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    for source in [
+        "(apply-wide (lambda (x) \"bad\") 1)",
+        "(apply-wide (lambda () 1) 1)",
+        "(call (lambda (x) x) 1)", // No information from which to infer U.
+        "(define narrow 1) (fn same ((x T) (y T)) T (where T) x) (same narrow 2s64)",
+        "(fn bad ((x T)) T (where T) \"bad\") (bad 1)",
+        "(fn broken-closure ((x T)) (-> T) (where T) (lambda () \"bad\")) ((broken-closure 1))",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+    }
+    assert_eq!(s.evaluate("(saved)").unwrap(), "42s64");
+}
+
+#[test]
+fn test_generic_trait_return_inference_and_effect_order() {
+    let mut s = session();
+    assert!(
+        !s.load_file(root().join("std/list.lisp"))
+            .unwrap()
+            .starts_with("error:")
+    );
+    for (source, expected) in [
+        (
+            "(fn z () s64 (begin 1 (match (some s32 1) ((some n) (zero)) ((none) 0)))) (z)",
+            "0s64",
+        ),
+        ("(zero)", "error: ambiguous trait method"),
+        ("(+ 2 40s64)", "42s64"),
+        ("(sum (list-push (list-new f64) 42))", "42f64"),
+        ("(fold + (zero) (list-push (list-new s64) 42))", "42s64"),
+        (
+            "(global $xs (list s64) mut 0) (global.set $xs (list-push (list-new s64) 42)) (fold + (zero) (global.get $xs))",
+            "42s64",
+        ),
+        (
+            "(fn two-types ((a T) (b U)) T (where (Add T) (Add U)) (begin (+ b b) (+ a a))) (two-types 21s64 1.0)",
+            "42s64",
+        ),
+        (
+            "(define-syntax add-self (syntax-rules () ((_ x) (+ x x)))) (fn twice ((x T)) T (where (Add T)) (add-self x)) (twice 21)",
+            "42",
+        ),
+        (
+            "(fn make-add ((x T)) (-> T T) (where (Add T)) (lambda (y) (+ x y))) (define add2 (make-add 2s64)) (add2 40s64)",
+            "42s64",
+        ),
+        (
+            "(global $order s32 mut 0) (fn tick ((n s32)) s32 (begin (global.set $order (i32.add (i32.mul (global.get $order) 10) n)) n)) (fn choose ((a T) (b T)) T (where T) a) (choose (tick 1) (tick 2)) (global.get $order)",
+            "12",
+        ),
+        (
+            "(global.set $order 0) (fn values () (list s32) (begin (tick 2) (list-push (list-new s32) 40))) (fold + (begin (tick 1) (zero)) (values))",
+            "40",
+        ),
+        ("(global.get $order)", "12"),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_generic_multi_parameter_trait_dispatch() {
+    let mut s = session();
+    let setup = r#"
+        (trait (Convert T U) (fn convert ((x T)) U))
+        (instance (Convert s32 s64) (fn convert ((x s32)) s64 (s64 x)))
+        (instance (Convert s32 f64) (fn convert ((x s32)) f64 (f64 x)))
+        (fn widen ((x T)) U (where (Convert T U)) (convert x))
+        (fn wide () s64 (widen 42))
+        (fn floating () f64 (widen 42))
+    "#;
+    assert!(!s.evaluate(setup).unwrap().starts_with("error:"));
+    assert_eq!(s.evaluate("(wide)").unwrap(), "42s64");
+    assert_eq!(s.evaluate("(floating)").unwrap(), "42f64");
+    assert!(s.evaluate("(convert 42)").unwrap().contains("ambiguous"));
+    assert!(s.evaluate("(widen 42)").unwrap().contains("cannot infer"));
+    assert!(session().evaluate("(wide)").unwrap().contains("unbound"));
+}
+
+#[test]
+fn test_generic_declaration_errors_are_atomic_and_recoverable() {
+    let mut s = session();
+    for source in [
+        "(trait (Bad T T) (fn bad ((x T)) T))",
+        "(trait (Bad s32) (fn bad ((x s32)) s32))",
+        "(trait (Bad T) (fn bad ((x T)) T) (fn broken ((x Missing)) T))",
+        "(trait (Bad T) (fn bad ((x T)) T) (fn bad ((y T)) T))",
+        "(fn broken ((x T)) T (where (Unknown T)) x)",
+        "(fn broken ((x T)) T (where) x)",
+        "(instance (Unknown s32) (fn bad ((x s32)) s32 x))",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+        assert!(s.evaluate("bad").unwrap().contains("unbound"));
+    }
+    assert_eq!(
+        s.evaluate("(trait (Bad T) (fn bad ((x T)) T) (fn other () T))")
+            .unwrap(),
+        "()"
+    );
+    for source in [
+        "(instance (Bad s32) (fn bad ((x s32)) s32 x))",
+        "(instance (Bad s32) (fn bad ((x s64)) s32 1) (fn other () s32 1))",
+        "(instance (Bad s32) (fn bad ((x s32)) s32 x) (fn extra () s32 1))",
+        "(instance (Bad s32) (fn bad ((x s32)) s32 x) (fn bad ((x s32)) s32 x))",
+        "(instance (Bad s32 s64) (fn bad ((x s32)) s32 x) (fn other () s32 1))",
+        "(instance (Bad T) (fn bad ((x T)) T x) (fn other () T 1))",
+    ] {
+        let out = s.evaluate(source).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+        assert!(s.evaluate("(bad 1)").unwrap().contains("no matching"));
+    }
+    let instance = "(instance (Bad s32) (fn bad ((x s32)) s32 x) (fn other () s32 1))";
+    assert_eq!(s.evaluate(instance).unwrap(), "()");
+    assert!(s.evaluate(instance).unwrap().contains("already declared"));
+    assert_eq!(s.evaluate("(bad 42)").unwrap(), "42");
+    assert!(
+        s.evaluate("(fn constrained ((x T)) T (where (Bad T)) (bad x)) (constrained 1s64)")
+            .unwrap()
+            .contains("missing required")
+    );
+    assert_eq!(s.evaluate("(constrained 42)").unwrap(), "42");
+}
+
+#[test]
+fn test_generic_traits_introduced_by_hygienic_macros() {
+    let mut s = session();
+    let source = r#"
+        (define-syntax declarations
+          (syntax-rules () ((_)
+            (begin
+              (trait (Identity T) (fn identity ((x T)) T))
+              (instance (Identity s32) (fn identity ((x s32)) s32 x))
+              (fn use ((x T)) T (where (Identity T)) (identity x))
+              (use 42)))))
+        (declarations)
+    "#;
+    assert_eq!(s.evaluate(source).unwrap(), "42");
 }
 #[test]
 fn test_parity_existing_records() {

@@ -10,7 +10,7 @@
         (if (i32.eq (list-len parts) 2) (known-type? (list-get parts 1) self) 0)
         (if (string=? name "result")
           (if (i32.eq (list-len parts) 3) (validate-case-types parts 1 self) 0)
-          (if (string=? name "tuple") (validate-case-types parts 1 self) 0))))))
+          (if (i32.or (string=? name "tuple") (string=? name "->")) (validate-case-types parts 1 self) 0))))))
 (fn same-types? ((left (list value)) (right (list value)) (index s32)) s32
   (if (i32.ne (list-len left) (list-len right)) 0
     (if (i32.ge_s index (list-len left)) 1
@@ -32,6 +32,8 @@
     ((text s) (symbol "string"))
     ((aggregate name id case-name fields) (symbol name))
     ((typed-list element items) (unary-type "list" element))
+    ((typed-function params result body) (callable-type v))
+    ((checked-function target params result) (callable-type v))
     ((compound ty case-name fields) ty)
     (else (failure "value has no supported compiled type"))))
 (fn tuple-types ((items (list value)) (index s32) (out (list value))) value

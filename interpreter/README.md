@@ -33,7 +33,7 @@ The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lis
 named records and variants, typed lists, options, results, tuples, and built-in functions.
 Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
-`global`, `global.get`, `global.set`, `include`, `defmacro`, `define-syntax`, `quasiquote`, and
+`global`, `global.get`, `global.set`, `include`, `trait`, `instance`, `defmacro`, `define-syntax`, `quasiquote`, and
 `export`. Both `(x s32)` and
 `(x : s32)` parameter/field declarations work.
 `let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
@@ -49,7 +49,8 @@ operations are available. Comparisons return s32. String operations are `string-
 Use an `s64` suffix for an explicit wide integer; the printer preserves that suffix.
 Unsuffixed integers default to s32 and must fit its range. A literal can instead
 adopt s64, f32, or f64 from a typed return, parameter, field, annotated let, cast, or instruction
-operand. Expected types flow through `if` branches and `let` bodies. Stored and
+operand. Expected types flow through `if` and `match` branches, `let` bodies, and
+the final expression of `begin`. Stored and
 quoted values keep their types; they do not implicitly widen. Use `(s64 expr)` or
 `(expr : s64)` to convert an s32 value, and `(s32 expr)` to keep the low 32 bits of
 an s64. `i64.extend_i32_s`, `i64.extend_i32_u`, and `i32.wrap_i64` are also available.
@@ -291,6 +292,59 @@ those paths are incomplete in the Rust compiler. It rejects invalid builtin
 arguments instead of silently treating them as zero. Procedure bodies and helper
 functions from the ordinary session are not callable during expansion.
 
+Generic functions use the compiler's `where` syntax. Type parameters are inferred
+from argument values and a known scalar return type. Compound signatures such as
+`(list T)`, `(option T)`, `(result T U)`, tuples, and `(-> T U)` are matched
+structurally. The interpreter substitutes concrete types into type annotations
+and constructors, then evaluates the function body with ordinary local bindings.
+It does not generate additional Wasm.
+
+```lisp
+(trait (Add T) (fn add ((a T) (b T)) T))
+(instance (Add s32) (fn add ((a s32) (b s32)) s32 (i32.add a b)))
+(fn twice ((x T)) T (where (Add T)) (add x x))
+(twice 21)                          ; 42
+(fn singleton ((x T)) (list T) (where T) (list-push (list-new T) x))
+(list-get (singleton 42s64) 0)       ; 42s64
+```
+
+Traits can have several type parameters. Instance signatures must match all of
+the trait's methods; a malformed declaration publishes nothing. Trait and instance
+definitions are immutable within a session, while generic functions can be
+redefined like ordinary functions. Declare a trait before its instances and
+constrained functions. A constrained call checks for the required instances and
+binds their methods locally. These bindings survive in captured closures.
+Direct method calls select an instance from arguments and the expected scalar
+return type; an ambiguous call is a diagnostic.
+
+Function parameters use `(-> argument-types... result-type)`. Typed functions,
+generic functions, trait methods, and lexical closures can be passed as values.
+Function contracts check argument and return types when called. An untyped lambda
+does not itself supply type-inference information: infer its type from other
+arguments or give it a concrete annotated binding. Returned functions and typed
+container/record fields retain their function contracts.
+
+The existing standard library can be loaded unchanged in a fresh session:
+
+```sh
+cargo run --example interpreter -- std/list.lisp
+```
+
+```lisp
+(define xs (list-push (list-push (list-new s32) 20) 21))
+(sum (map (lambda (n) (i32.add n 1)) xs)) ; 43
+(fold + (zero) xs)                       ; 41
+(contains xs 21)                         ; 1
+```
+
+Loading `std/num.lisp` publishes its trait operators, including `+` and `=`.
+Signature lookahead can use a later typed argument to resolve an earlier literal
+or method call, as in `(fold + (zero) xs)`. It only reads type metadata; argument
+expressions still execute once, from left to right. All type parameters must be
+resolved before entering the body. Expected compound return types and arbitrary
+expression analysis are not implemented; provide typed arguments when inference
+has insufficient information. Quoted data keeps its symbols unchanged.
+
 `evaluator.lisp` exports `evaluate(source: string) -> string`: a printed value or
 an `error:` diagnostic. Interpreter values stay in the session. This is a local
 REPL text boundary, not a structured value transport. The module can also be
@@ -311,7 +365,8 @@ cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
 This is a feasibility implementation, not full compiled-Wisp parity: u8/unit values,
-traits/generics and Theater RPC built-ins are not implemented yet.
+derived instances and Theater RPC built-ins are not implemented yet. Type checks
+run during evaluation; unexecuted branches and function bodies are not checked.
 `export` accepts compiled source declarations; interpreted functions remain inside
 the session rather than becoming new Wasm exports.
 There is no garbage collection; the existing bump allocator
@@ -338,8 +393,6 @@ instructions. The Rust compiler currently needs explicit suffixes/casts for ordi
 function and constructor arguments and typed list elements where the interpreter can
 adopt their expected type. The interpreter also accepts compound let annotations;
 the Rust compiler currently accepts only scalar let annotations.
-Expected-type propagation through `begin` and `match` remains incomplete;
-use explicit suffixes in those result positions.
 Float arithmetic and every conversion instruction are compared with compiled
 Wasm. Reader/printer tests cover rounding boundaries, subnormals, signed zero,
 non-finite values, and samples across binary exponents. A shared float fixture
@@ -362,3 +415,8 @@ Procedural macro fixtures compare the existing example, guards, integer folding,
 literal clauses, hygiene, and splicing against the Rust compiler. Additional tests
 cover phase separation, nested quasisyntax, includes, overflow, invalid results,
 and bounded expansion with recovery.
+Generic functions, trait dispatch, nested specialization, and generic list
+construction are compared across both compilers and the interpreter. The standard
+list algorithms, including higher-order calls, are compared with the Rust compiler.
+Interpreter tests cover multi-parameter traits, expected return dispatch, closures,
+hygienic macros, declaration rollback, type errors, and argument effect ordering.

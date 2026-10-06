@@ -18,16 +18,16 @@
                     (if (failed? checked) checked
                       (validate-arms arms (i32.add index 1) cases))))))))))))
 
-(fn match-arms ((arms (list value)) (index s32) (case-name string) (fields (list value)) (env (list binding)) (depth s32)) value
+(fn match-arms ((arms (list value)) (index s32) (case-name string) (fields (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.ge_s index (list-len arms)) (failure "no matching variant case")
     (let (parts (items-of (list-get arms index)))
       (let (pattern (items-of (list-get parts 0)))
         (if (string=? (symbol-name (list-get pattern 0)) case-name)
-          (eval (list-get parts 1)
-            (bind-args (copy-list pattern 1 (list-new value)) fields 0 (copy-env env 0 (list-new binding))) depth 0)
-          (match-arms arms (i32.add index 1) case-name fields env depth))))))
+          (eval-expected (list-get parts 1)
+            (bind-args (copy-list pattern 1 (list-new value)) fields 0 (copy-env env 0 (list-new binding))) depth 0 expected)
+          (match-arms arms (i32.add index 1) case-name fields env depth expected))))))
 
-(fn eval-match ((items (list value)) (env (list binding)) (depth s32)) value
+(fn eval-match ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.lt_s (list-len items) 3) (failure "match expects a value and arms")
     (let (v (eval (list-get items 1) env depth 0))
       (value-case v
@@ -37,12 +37,12 @@
             (if (i32.eq (list-len cases) 0) (failure "match expects an option, result, or variant")
               (let (arms (declaration-tail items))
                 (let (checked (validate-arms arms 0 cases))
-                  (if (failed? checked) checked (match-arms arms 0 case-name fields env depth)))))))
+                  (if (failed? checked) checked (match-arms arms 0 case-name fields env depth expected)))))))
         ((aggregate name id case-name fields)
           (let (ty (list-get (global.get $types) id))
             (if (named-type.variant? ty)
               (let (arms (declaration-tail items))
                 (let (checked (validate-arms arms 0 (named-type.schema ty)))
-                  (if (failed? checked) checked (match-arms arms 0 case-name fields env depth))))
+                  (if (failed? checked) checked (match-arms arms 0 case-name fields env depth expected))))
               (failure "match expects a variant"))))
         (else (failure "match expects a variant"))))))
