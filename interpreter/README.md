@@ -8,6 +8,10 @@ From the repository root, inside `nix develop`:
 
 ```sh
 cargo run --example interpreter
+# Or load an existing source file into the session first:
+cargo run --example interpreter -- examples/factorial-test.lisp
+# wisp> (factorial 6)
+# 720
 ```
 
 ```lisp
@@ -25,13 +29,32 @@ Enter one input per line; an input can contain several expressions. Use `begin`
 for a sequence inside a function body. `:quit`, `:q`, or EOF exits. Piped input
 works too. The reader itself accepts multiline source through `evaluate`.
 
-The initial language has s32 integers, strings, symbols, lists, closures, and
-built-in functions. Forms are `define`, `lambda`, `let`, `if`, `begin`, and
-`quote` (also `'`). `let` uses Wisp's `(let (name expression) body)` syntax.
+The initial language has s32 integers, strings, symbols, lists, closures, named
+records and variants, and built-in functions. Forms include `define`, `lambda`,
+`let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
+and `export`. Both `(x s32)` and `(x : s32)` parameter/field declarations work.
+`let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
 Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<` take two integers; `list`
 takes any number of values, with `cons`, `car`, and `cdr` for list operations.
 Zero and the empty list (`nil` or `'()`) are false; other values are true.
 Arithmetic wraps at 32 bits except division errors, which produce diagnostics.
+The compiler's `i32.const`, arithmetic, bitwise, shift/rotate, and comparison
+operations are available. String operations are `string-len`, `string-ref`,
+`string-append`, `string=?`, and `substring`; positions and lengths count bytes.
+
+Typed functions check arguments and return values at runtime. Constructors check
+field/payload types, field access checks record identity, and `match` checks cases
+and binding counts against the declared variant. Named types cannot currently be
+redefined. Function bodies are checked as they execute; compile-time rejection of
+invalid unexecuted branches and other static checks remain parity work.
+
+```lisp
+(record point (x s32) (y s32))
+(fn sum-point ((p point)) s32 (i32.add (point.x p) (point.y p)))
+(sum-point (point 20 22))              ; 42
+(variant shape (circle s32) (rectangle s32 s32))
+(match (rectangle 6 7) ((circle r) r) ((rectangle w h) (i32.mul w h))) ; 42
+```
 
 Local bindings are lexical. Closures see current top-level definitions, so
 recursive functions and top-level redefinition work. Each call extends a copy
@@ -48,12 +71,20 @@ compiled directly for a host that keeps its Wasm instance alive:
 cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
-This is a feasibility implementation, not full compiled-Wisp parity: typed `fn`,
-other numeric widths, records, macros, mutation, and Theater RPC built-ins are
-not implemented yet. There is no garbage collection; the existing bump allocator
+This is a feasibility implementation, not full compiled-Wisp parity: other numeric
+widths, typed lists/options/results/tuples, macros, traits/generics, globals,
+`include`, and Theater RPC built-ins are not implemented yet. `export` accepts
+compiled source declarations; the module's external entry point remains `evaluate`.
+There is no garbage collection; the existing bump allocator
 retains allocations until the session is discarded. Inputs are limited to 4096
 bytes, reader nesting to 64, evaluator nesting to 128, and evaluation to 10,000
 steps. The local host also applies Wasmtime fuel to reader/printer work. These
 are fixed implementation limits, not an expanded request protocol.
 
-Run the behavioral checks with `cargo test --test interpreter`.
+Run the behavioral checks with `cargo test --test interpreter --test interpreter_parity`.
+The parity suite compares existing factorial and record examples, single-payload
+variants, and arithmetic/string fixtures across the interpreter and both compilers.
+The existing multi-payload variant example is compared against the Rust compiler;
+the self-hosted compiler currently emits an undefined local for its second payload.
+The self-hosted compiler also misprints the minimum s32 literal; the shared fixture
+constructs that value by arithmetic to test operations independently of that bug.

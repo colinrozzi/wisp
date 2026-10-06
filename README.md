@@ -79,9 +79,11 @@ cargo run --example interpreter
 # 42
 ```
 
-It supports lexical closures, persistent definitions, recursion, lists, and
-recoverable errors. This is an initial Lisp subset; Theater calls and full Wisp
-language parity are still ahead. See [interpreter/README.md](interpreter/README.md).
+It supports lexical closures, persistent definitions, typed functions, records,
+variants and pattern matching, recursion, lists, and recoverable errors. Existing
+factorial and record/variant examples can be loaded as command-line arguments.
+This is an initial subset; additional types, static checking, macros, and Theater
+calls remain ahead. See [interpreter/README.md](interpreter/README.md).
 
 ## Execution and ABI status
 

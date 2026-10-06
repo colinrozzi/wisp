@@ -1,27 +1,7 @@
 ; Reader for the interpreted REPL. Adapted from examples/wisp-compiler.lisp.
 ; Syntax and runtime data share the same values; malformed input is a failure.
 
-(variant value
-  (integer s32)
-  (text string)
-  (symbol string)
-  (sequence (list value))
-  (closure (list value) value (list binding))
-  (builtin string)
-  (failure string))
-
-(record binding (name string) (item value))
-(record read-result (item value) (next s32))
-
-(fn failed? ((v value)) s32
-  (match v
-    ((failure message) 1)
-    ((integer ignored-n) 0)
-    ((text ignored-s) 0)
-    ((symbol ignored-name) 0)
-    ((sequence ignored-items) 0)
-    ((closure ignored-params ignored-body ignored-env) 0)
-    ((builtin ignored-builtin) 0)))
+(include "values.lisp")
 
 (fn whitespace? ((c s32)) s32
   (i32.or (i32.or (i32.eq c 32) (i32.eq c 9))

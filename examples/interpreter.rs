@@ -4,7 +4,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use wisp::{compiler, interpreter::Interpreter};
 
 fn main() -> Result<()> {
@@ -15,6 +15,16 @@ fn main() -> Result<()> {
         compiler::EmitOptions::default(),
     )?;
     let mut session = Interpreter::load(artifacts.wasm)?;
+    // Load unchanged compiled-Wisp source before entering the same session.
+    for path in std::env::args_os().skip(1) {
+        let path = Path::new(&path);
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let output = session.evaluate(&source)?;
+        if output.starts_with("error:") {
+            bail!("{}: {output}", path.display());
+        }
+    }
     let input = io::stdin();
     let interactive = input.is_terminal();
     if interactive {

@@ -58,6 +58,19 @@ builtins (`string-len` / `string-ref` / `string-append` / `string=?` / `substrin
 
 ## Missing — grouped by effort
 
+The interpreter differential tests added on 2026-10-05 also exposed two existing
+self-hosted code-generation gaps:
+
+- `examples/variant-test.lisp`: a multi-payload match such as `(rectangle w h)`
+  binds only the first payload. Generated WAT references an undefined `$h` local.
+- The literal `-2147483648` is printed as `-9999999999` by the signed integer
+  formatting helper, producing invalid WAT. Arithmetic can still produce the
+  correct minimum s32 value.
+
+The interpreter tests cover multi-payload variants against the Rust compiler and
+single-payload variants against both compilers. These are outstanding differences,
+not behavior that the interpreter should copy.
+
 | Effort | Feature | Rust ref (src/compiler.rs) | Notes |
 |---|---|---|---|
 | **S** | `string-from-bytes` / `string-to-bytes` | 6791–6816 | Simple builtins; likely needed for self-hosting closure only if the compiler uses them (it does not today). |
