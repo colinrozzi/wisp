@@ -8,9 +8,11 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Current upstream main, verified 2026-10-05. Keep its own build inputs.
+    theater.url = "github:colinrozzi/theater/e2546700e00cb8c4a8050f27c62388bd57646483";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, theater }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -81,6 +83,18 @@
         };
 
         packages.wisp = self.packages.${system}.default;
+
+        packages.theater = theater.packages.${system}.theater;
+
+        apps.theater = {
+          type = "app";
+          program = "${self.packages.${system}.theater}/bin/theater";
+        };
+
+        devShells.theater = pkgs.mkShell {
+          inputsFrom = [ self.devShells.${system}.default ];
+          packages = [ self.packages.${system}.theater ];
+        };
 
           packages.update-theater = pkgs.writeShellScriptBin "update-theater" ''
             set -e

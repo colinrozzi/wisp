@@ -5,6 +5,33 @@ Checked 2026-10-05 against the local Theater checkout at `63cc4294` and the
 published Packr 0.24.1 engine crates. This is a local development target, not a
 deployment plan.
 
+## Pinned runtime
+
+The Wisp flake pins upstream Theater `main` at
+[`e2546700e00cb8c4a8050f27c62388bd57646483`](https://github.com/colinrozzi/theater/commit/e2546700e00cb8c4a8050f27c62388bd57646483),
+verified against upstream HEAD on 2026-10-05. This revision includes RPC export
+and type discovery (`rpc.describe`). Use this pin for the actor integration;
+the sibling checkout and the old integration manifests are not the version
+source of truth. Theater retains its own locked Nix build inputs.
+
+```sh
+nix build .#theater --no-link
+nix run .#theater -- --help
+nix develop .#theater
+```
+
+The default `nix develop` remains the compiler/interpreter shell. The dedicated
+Theater shell adds the pinned runtime CLI. Adding this input does not migrate
+the legacy Cargo workspace below or replace the engine preflight with an actor
+test. When updating Theater, verify upstream HEAD, update the full revision in
+`flake.nix`, run `nix flake lock`, and rebuild before updating this record.
+
+Validation on 2026-10-05: the upstream package built successfully on
+`x86_64-linux`, the CLI help ran through `nix run`, and the interpreter engine
+preflight passed in the default shell. The pinned Theater lockfile uses Packr
+0.24.0; the existing Wisp engine preflight uses 0.24.1. These are separate build
+checks, not yet an end-to-end actor/RPC test.
+
 ## What already works
 
 The evaluator is one compiled Wasm module. Each live instance owns its bindings,

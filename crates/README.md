@@ -22,6 +22,10 @@ The [interpreter integration plan](../docs/changes/INTERPRETER-THEATER.md)
 records the current build mismatch, a passing engine-boundary preflight, and the
 next local actor/RPC acceptance checks.
 
+For new interpreter actor work, the root flake pins current upstream Theater:
+`nix develop .#theater` adds its CLI, and `nix run .#theater -- --help` runs it
+directly. This runtime pin does not update the legacy Cargo dependencies above.
+
 After aligning dependencies, select this workspace explicitly:
 
 ```sh
