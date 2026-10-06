@@ -58,7 +58,8 @@
               (else v))))))))
 
 (fn read-atom ((s string)) value
-  (if (numeric-token? s) (read-number s) (symbol s)))
+  (if (string=? s "...") (symbol s)
+    (if (numeric-token? s) (read-number s) (symbol s))))
 
 (fn read-string ((src string) (pos s32) (acc string)) read-result
   (if (i32.ge_s pos (string-len src))

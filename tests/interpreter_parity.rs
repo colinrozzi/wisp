@@ -1637,14 +1637,219 @@ fn test_macros_collected_across_includes() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("main.lisp"),
-        "(fn answer () s32 (twice 21)) (include \"macros.lisp\") (answer)",
+        "(fn answer () s32 (twice (inc 20))) (include \"macros.lisp\") (answer)",
     )
     .unwrap();
     std::fs::write(
         dir.join("macros.lisp"),
-        "(defmacro twice (x) `(i32.add ,x ,x))",
+        "(defmacro twice (x) `(i32.add ,x ,x)) (define-syntax inc (syntax-rules () ((_ x) (i32.add x 1))))",
     )
     .unwrap();
     assert_eq!(s.load_file(dir.join("main.lisp")).unwrap(), "42");
     assert_eq!(s.evaluate("(twice 21)").unwrap(), "42");
+}
+
+#[test]
+fn test_syntax_rules_examples_and_hygiene_match_rust_compiler() {
+    compare_example(
+        "examples/syntax-rules-test.lisp",
+        &[
+            ("test-simple", &[20, 22], 42),
+            ("test-inc", &[41], 42),
+            ("test-inc-n", &[40, 2], 42),
+            ("test-begin", &[32], 42),
+            ("test-else", &[], 42),
+            ("test-cond", &[1], 100),
+            ("test-cond", &[0], 0),
+        ],
+        false,
+    );
+    compare_example(
+        "tests/fixtures/interpreter_syntax_rules.lisp",
+        &[
+            ("no-capture", &[], 42),
+            ("self-reference", &[], 100),
+            ("nested", &[], 102),
+            ("passed-reference", &[], 42),
+            ("empty", &[], 42),
+            ("many", &[], 42),
+            ("typed", &[], 1),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn test_syntax_rules_nested_repetitions_and_literals() {
+    let mut s = session();
+    for (source, expected) in [
+        (
+            "(define-syntax rows (syntax-rules () ((_ ((x ...) ...)) (list (list x ...) ...))))",
+            "()",
+        ),
+        ("(rows ((1 2) () (3)))", "((1 2) () (3))"),
+        ("(rows ())", "()"),
+        (
+            "(define-syntax pairs (syntax-rules () ((_ (a b) ...) (list (list a b) ...)))) (pairs (1 2) (3 4))",
+            "((1 2) (3 4))",
+        ),
+        ("(pairs)", "()"),
+        (
+            "(define-syntax zip (syntax-rules () ((_ (a ...) (b ...)) (list (list a b) ...)))) (zip (1 2) (3 4))",
+            "((1 3) (2 4))",
+        ),
+        ("(zip () ())", "()"),
+        (
+            "(define-syntax classify (syntax-rules (else) ((_ else) 1) ((_ 42) 2) ((_ \"x\") 3) ((_ _) 4)))",
+            "()",
+        ),
+        ("(classify else)", "1"),
+        ("(classify 42)", "2"),
+        ("(classify \"x\")", "3"),
+        ("(classify anything)", "4"),
+        (
+            "(define-syntax tail (syntax-rules (end) ((_ first more ... (end last)) (list first more ... last)))) (tail 1 2 3 (end 4))",
+            "(1 2 3 4)",
+        ),
+        ("(tail 1 (end 4))", "(1 4)"),
+        (
+            "(define-syntax doubled (syntax-rules () ((_ x ...) (list x ... x ...)))) (doubled 1 2)",
+            "(1 2 1 2)",
+        ),
+        (
+            "(define-syntax datum (syntax-rules () ((_ x) (quote (tmp x))))) (datum hello)",
+            "(tmp hello)",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    assert!(
+        s.evaluate("(zip (1 2) (3))")
+            .unwrap()
+            .contains("inconsistent ellipsis lengths")
+    );
+    assert!(
+        s.evaluate("(pairs (1))")
+            .unwrap()
+            .contains("no matching syntax rule")
+    );
+    assert_eq!(s.evaluate("(pairs (20 22))").unwrap(), "((20 22))");
+}
+
+#[test]
+fn test_syntax_rules_binding_identity_and_persistence() {
+    let mut s = session();
+    for (source, expected) in [
+        (
+            "(define helper (lambda (x) (+ x 1))) (define-syntax use-helper (syntax-rules () ((_ x) (helper x))))",
+            "#<closure>",
+        ),
+        ("(let (helper (lambda (x) 0)) (use-helper 41))", "42"),
+        (
+            "(define-syntax use-missing (syntax-rules () ((_) missing))) (let (missing 42) (use-missing))",
+            "error: unbound symbol: missing",
+        ),
+        (
+            "(define-syntax add (syntax-rules () ((_ x) (let (tmp 1) (+ tmp x))))) (let (tmp 41) (add tmp))",
+            "42",
+        ),
+        ("(define saved (lambda (x) (add x)))", "#<closure>"),
+        (
+            "(define-syntax add (syntax-rules () ((_ x) (+ x 2)))) (saved 41)",
+            "42",
+        ),
+        ("(add 40)", "42"),
+        ("(defmacro add (x) `(i32.add ,x 3)) (add 39)", "42"),
+        (
+            "(define-syntax add (syntax-rules () ((_ x) (+ x 4)))) (add 38)",
+            "42",
+        ),
+        (
+            "(define-syntax make-closure (syntax-rules () ((_ body) (lambda (tmp) (+ tmp body))))) (let (tmp 40) ((make-closure tmp) 2))",
+            "42",
+        ),
+        (
+            "(define-syntax make-fn (syntax-rules () ((_ name) (fn name ((tmp s32)) s32 (+ tmp 1))))) (make-fn increment) (increment 41)",
+            "42",
+        ),
+        (
+            "(define-syntax params (syntax-rules () ((_ param) (lambda (tmp param) (+ tmp param))))) ((params tmp) 1 41)",
+            "42",
+        ),
+        (
+            "(define-syntax typed-params (syntax-rules () ((_ name param) (fn name ((tmp s32) (param s32)) s32 (+ tmp param))))) (typed-params sum tmp) (sum 1 41)",
+            "42",
+        ),
+        (
+            "(define-syntax unpack (syntax-rules () ((_ expr body) (match expr ((some tmp) (+ tmp body)) ((none) 0))))) (let (tmp 40) (unpack (some s32 2) tmp))",
+            "42",
+        ),
+        (
+            "(define-syntax typed-list (syntax-rules () ((_ x) (list-push (list-new s64) x)))) (list-get (typed-list 42s64) 0)",
+            "42s64",
+        ),
+        ("'(add 38)", "(add 38)"),
+        ("`((add 38) ,(add 38))", "((add 38) 42)"),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    assert!(
+        session()
+            .evaluate("(add 38)")
+            .unwrap()
+            .contains("unbound symbol")
+    );
+}
+
+#[test]
+fn test_syntax_rules_invalid_declarations_and_recovery() {
+    let mut s = session();
+    assert_eq!(
+        s.evaluate("(define marker 42) (define-syntax good (syntax-rules () ((_) 42)))")
+            .unwrap(),
+        "42"
+    );
+    for source in [
+        "(define-syntax)",
+        "(define-syntax bad)",
+        "(define-syntax 1 (syntax-rules () ((_) 1)))",
+        "(define-syntax bad (syntax-rules))",
+        "(define-syntax bad (syntax-rules ()))",
+        "(define-syntax bad (syntax-case () ((_) 1)))",
+        "(define-syntax bad (syntax-rules nope ((_) 1)))",
+        "(define-syntax bad (syntax-rules (1) ((_) 1)))",
+        "(define-syntax bad (syntax-rules (a a) ((_) 1)))",
+        "(define-syntax bad (syntax-rules (...) ((_) 1)))",
+        "(define-syntax bad (syntax-rules (_) ((_) 1)))",
+        "(define-syntax bad (syntax-rules () ((_) 1 2)))",
+        "(define-syntax bad (syntax-rules () ((wrong x) x)))",
+        "(define-syntax bad (syntax-rules () ((_ x x) x)))",
+        "(define-syntax bad (syntax-rules () ((_ ... x) x)))",
+        "(define-syntax bad (syntax-rules () ((_ a ... b ...) 1)))",
+        "(define-syntax bad (syntax-rules () ((_ x ...) x)))",
+        "(define-syntax bad (syntax-rules () ((_ x) (list x ...))))",
+        "(define-syntax bad (syntax-rules () ((_) (...))))",
+        "(define-syntax bad (syntax-rules () ((_ x) x))) (bad)",
+        "(define-syntax bad (syntax-rules () ((_) (bad)))) (bad)",
+        "(define-syntax good (syntax-rules () ((_) 99))) (define-syntax bad (syntax-rules () ((_) (bad)))) (bad)",
+        "(begin (define-syntax bad (syntax-rules () ((_) 1))))",
+    ] {
+        let out = s.evaluate(&format!("(define marker 0) {source}")).unwrap();
+        assert!(out.starts_with("error:"), "{source}: {out}");
+        assert_eq!(s.evaluate("marker").unwrap(), "42", "{source}");
+        assert_eq!(s.evaluate("(good)").unwrap(), "42");
+        assert!(s.evaluate("(bad)").unwrap().contains("unbound symbol: bad"));
+    }
+    assert_eq!(
+        s.evaluate("(define-syntax duplicate (syntax-rules () ((_ x) (begin x x))))")
+            .unwrap(),
+        "()"
+    );
+    let mut broad = "1".to_string();
+    for _ in 0..14 {
+        broad = format!("(duplicate {broad})");
+    }
+    let out = s.evaluate(&broad).unwrap();
+    assert!(out.contains("macro expansion step limit"), "{out}");
+    assert_eq!(s.evaluate("(good)").unwrap(), "42");
 }

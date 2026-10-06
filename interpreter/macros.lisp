@@ -23,7 +23,9 @@
   (if (i32.ge_s index (list-len forms)) (nil)
     (let (form (list-get forms index))
       (let (checked (if (string=? (form-head form) "defmacro")
-                       (collect-session-macro (items-of form)) (nil)))
+                       (collect-session-macro (items-of form))
+                       (if (string=? (form-head form) "define-syntax")
+                         (collect-syntax-rules (items-of form)) (nil))))
         (if (failed? checked) checked
           (collect-session-macros forms (i32.add index 1)))))))
 (fn collect-session-macro ((parts (list value))) value
@@ -106,14 +108,16 @@
         (let (name (form-head form))
           (if (string=? name "quote") form
             (if (string=? name "quasiquote") (expand-quoted form depth 0)
-              (if (string=? name "defmacro") (failure "defmacro is only supported as a top-level source directive")
+              (if (macro-declaration? name) (failure "macro declarations are only supported as top-level source directives")
                 (let (definition (lookup-local name (global.get $pending-macros)
                                   (i32.sub (list-len (global.get $pending-macros)) 1)))
                   (if (failed? definition)
                     (value-case form
                       ((sequence items) (expand-macro-items items 0 (i32.add depth 1) (list-new value)))
                       (else form))
-                    (let (expanded (macro-template definition (items-of form)))
+                    (let (expanded (if (i32.eq (list-len (items-of definition)) 3)
+                                      (expand-syntax-rules definition form)
+                                      (macro-template definition (items-of form))))
                       (if (failed? expanded) expanded (expand-macro-form expanded (i32.add depth 1))))))))))))))
 (fn expand-macro-items ((items (list value)) (index s32) (depth s32) (out (list value))) value
   (if (i32.ge_s index (list-len items)) (sequence out)
@@ -144,7 +148,7 @@
 (fn expand-macro-top ((forms (list value)) (index s32) (out (list value))) value
   (if (i32.ge_s index (list-len forms)) (sequence out)
     (let (form (list-get forms index))
-      (if (string=? (form-head form) "defmacro") (expand-macro-top forms (i32.add index 1) out)
+      (if (macro-declaration? (form-head form)) (expand-macro-top forms (i32.add index 1) out)
         (let (v (expand-macro-form form 0))
           (if (failed? v) v
             (expand-macro-top forms (i32.add index 1) (list-push out v))))))))
@@ -157,3 +161,6 @@
         (let (expanded (expand-macro-top forms 0 (list-new value)))
           (if (failed? expanded) expanded
             (begin (global.set $session-macros (global.get $pending-macros)) expanded)))))))
+
+(fn macro-declaration? ((name string)) s32
+  (i32.or (string=? name "defmacro") (string=? name "define-syntax")))

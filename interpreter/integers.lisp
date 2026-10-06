@@ -22,6 +22,7 @@
 ; Quoted data is materialized with default types, never adopted at a later call.
 (fn quote-value ((v value)) value
   (value-case v
+    ((identifier name key) (symbol name))
     ((integer-literal n) (resolve-integer n ""))
     ((sequence items) (quote-items items 0 (list-new value)))
     (else v)))

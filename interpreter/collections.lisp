@@ -17,12 +17,11 @@
       (if (same-type? (list-get left index) (list-get right index))
         (same-types? left right (i32.add index 1)) 0))))
 (fn same-type? ((left value) (right value)) s32
-  (value-case left
-    ((symbol name)
-      (value-case right ((symbol other) (string=? name other)) (else 0)))
-    ((sequence parts)
-      (value-case right ((sequence other) (same-types? parts other 0)) (else 0)))
-    (else 0)))
+  (if (symbol? left) (if (symbol? right) (string=? (symbol-name left) (symbol-name right)) 0)
+    (value-case left
+      ((sequence parts)
+        (value-case right ((sequence other) (same-types? parts other 0)) (else 0)))
+      (else 0))))
 
 (fn value-type ((v value)) value
   (value-case v

@@ -58,6 +58,7 @@
     ((compound ty case-name fields) (show-compound ty case-name fields depth))
     ((text s) (string-append "\"" (string-append (escape-text s 0 "") "\"")))
     ((symbol s) s)
+    ((identifier name key) name)
     ((sequence items) (show-list-at items 0 "(" depth))
     ((closure params body env) "#<closure>")
     ((typed-function params result body) "#<function>")

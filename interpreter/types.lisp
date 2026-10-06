@@ -10,12 +10,11 @@
   (find-type-index name (i32.sub (list-len (global.get $types)) 1)))
 
 (fn known-type? ((ty value) (self string)) s32
-  (value-case ty
-    ((symbol name)
+  (if (symbol? ty)
+    (let (name (symbol-name ty))
       (i32.or (i32.or (numeric-type? name) (string=? name "string"))
         (i32.or (string=? name self) (i32.ge_s (type-index name) 0))))
-    ((sequence parts) (known-compound-type? parts self))
-    (else 0)))
+    (value-case ty ((sequence parts) (known-compound-type? parts self)) (else 0))))
 
 (fn value-has-type? ((v value) (ty value)) s32
   (let (name (symbol-name ty))
@@ -53,17 +52,17 @@
 (fn field-name ((field value)) string (symbol-name (list-get (items-of field) 0)))
 (fn field-type ((field value)) value (list-get (items-of field) 1))
 
-(fn field-present? ((fields (list value)) (name string) (index s32)) s32
+(fn field-present? ((fields (list value)) (name string) (index s32) (keyed s32)) s32
   (if (i32.ge_s index (list-len fields)) 0
-    (if (string=? (field-name (list-get fields index)) name) 1
-      (field-present? fields name (i32.add index 1)))))
+    (if (string=? (declaration-key (list-get fields index) keyed) name) 1
+      (field-present? fields name (i32.add index 1) keyed))))
 
-(fn normalize-fields ((fields (list value)) (index s32) (out (list value)) (self string)) value
+(fn normalize-fields ((fields (list value)) (index s32) (out (list value)) (self string) (keyed s32)) value
   (if (i32.ge_s index (list-len fields)) (sequence out)
     (let (field (normalize-field (list-get fields index) self))
       (if (failed? field) field
-        (if (field-present? out (field-name field) 0) (failure "duplicate field or parameter")
-          (normalize-fields fields (i32.add index 1) (list-push out field) self))))))
+        (if (field-present? out (declaration-key field keyed) 0 keyed) (failure "duplicate field or parameter")
+          (normalize-fields fields (i32.add index 1) (list-push out field) self keyed))))))
 
 (fn publish ((name string) (v value)) value
   (begin (global.set $bindings (list-push (global.get $bindings) (binding name v))) v))
@@ -76,9 +75,9 @@
         (let (params (list-get items 2))
           (let (result (list-get items (i32.sub (list-len items) 2)))
             (if (i32.and (symbol? name) (i32.and (sequence? params) (known-type? result "")))
-              (let (checked (normalize-fields (items-of params) 0 (list-new value) ""))
+              (let (checked (normalize-fields (items-of params) 0 (list-new value) "" 1))
                 (if (failed? checked) checked
-                  (publish (symbol-name name)
+                  (publish (binding-key name)
                     (typed-function (items-of checked) result (list-get items (i32.sub (list-len items) 1))))))
               (failure "invalid function name, parameters, or return type")))))
       (failure "fn expects name, typed parameters, return type, and body"))))
@@ -96,7 +95,7 @@
 (fn typed-bindings ((params (list value)) (args (list value)) (index s32) (env (list binding))) (list binding)
   (if (i32.ge_s index (list-len params)) env
     (typed-bindings params args (i32.add index 1)
-      (list-push env (binding (field-name (list-get params index)) (list-get args index))))))
+      (list-push env (binding (binding-key (list-get (items-of (list-get params index)) 0)) (list-get args index))))))
 
 (fn apply-typed ((params (list value)) (result value) (body value) (args (list value)) (depth s32)) value
   (let (checked (check-arguments (schema-types params 0 (list-new value)) args 0))
@@ -119,7 +118,7 @@
       (let (name (symbol-name (list-get items 1)))
         (if (i32.or (string=? name "") (known-type? (symbol name) ""))
           (failure "invalid or already defined type name")
-          (let (checked (normalize-fields (declaration-tail items) 0 (list-new value) name))
+          (let (checked (normalize-fields (declaration-tail items) 0 (list-new value) name 0))
             (if (failed? checked) checked
               (let (fields (items-of checked))
                 (let (id (list-len (global.get $types)))
@@ -200,3 +199,6 @@
                   (eval-fn parts top) (failure "export expects a function")))))
           (else (failure "export alias must be a string")))
         (failure "invalid export")))))
+
+(fn declaration-key ((field value) (keyed s32)) string
+  (if keyed (binding-key (list-get (items-of field) 0)) (field-name field)))

@@ -33,7 +33,7 @@ The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lis
 named records and variants, typed lists, options, results, tuples, and built-in functions.
 Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
-`global`, `global.get`, `global.set`, `include`, `defmacro`, `quasiquote`, and
+`global`, `global.get`, `global.set`, `include`, `defmacro`, `define-syntax`, `quasiquote`, and
 `export`. Both `(x s32)` and
 `(x : s32)` parameter/field declarations work.
 `let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
@@ -201,12 +201,46 @@ Macros cannot generate new include directives or macro declarations for another
 collection pass. Quotation prefixes, `quote`, `include`, `defmacro`, and
 `define-syntax` are reserved macro names.
 
-These are classic, name-based macros, matching the self-hosted compiler's capture
+`defmacro` uses classic, name-based macros, matching the self-hosted compiler's capture
 behavior. Template-introduced local names can capture names in substituted code;
-the Rust compiler instead tracks hygiene scopes. `define-syntax`, `syntax-rules`,
-`syntax-case`, and hygienic expansion remain parity work. The Rust compiler also
+the Rust compiler instead tracks hygiene scopes. The Rust compiler also
 currently fails to substitute a bare parameter in comma-at; the shared fixture
 uses a spliced literal list containing unquotes to compare all three paths.
+
+For hygienic templates, use `define-syntax` with `syntax-rules`. Rules are tried
+in order. `_` matches anything without binding; listed literal keywords match by
+name, and numeric/string patterns match literal values and their printed type.
+Other pattern identifiers bind syntax. Each pattern list supports one repeated
+group, with fixed elements before and after it. Repeated groups can contain
+compound patterns and nest; zero repetitions preserve empty captures. Templates
+can repeat several groups, but variables used together in one repeated template
+must have matching lengths. Pattern variables must be unique and used under
+enough template ellipses; malformed rules are rejected before publication.
+
+```lisp
+(define-syntax with-temp
+  (syntax-rules () ((_ body) (let (tmp 0) body))))
+(let (tmp 42) (with-temp tmp))        ; 42: caller's tmp stays distinct
+(define-syntax rows
+  (syntax-rules () ((_ ((x ...) ...)) (list (list x ...) ...))))
+(rows ((1 2) () (3)))                ; ((1 2) () (3))
+```
+
+Introduced identifiers have a fresh binding identity for each expansion. This
+applies to `let`, lambda and typed function parameters, and match bindings.
+Substituted syntax preserves its caller identity. Introduced free identifiers
+resolve in the top-level session environment, so a caller's local binding cannot
+capture a macro's helper reference. Top-level redefinition still affects those
+helpers, like ordinary functions. Quotation prints/materializes ordinary symbols;
+private identities do not become user-visible names. Record/variant type names,
+field names, explicit globals, and literal keyword matching remain name-based.
+
+Both macro forms share a persistent namespace: the latest declaration wins,
+including across forms. The existing expansion/publication and recovery rules
+apply to both. Local macro declarations and procedural `syntax-case` are not
+supported. The self-hosted compiler does not implement `syntax-rules`; the Rust
+compiler currently has incomplete nested/compound repetition capture and numeric
+literal pattern matching, so those cases have interpreter-specific tests.
 
 `evaluator.lisp` exports `evaluate(source: string) -> string`: a printed value or
 an `error:` diagnostic. Interpreter values stay in the session. This is a local
@@ -228,7 +262,7 @@ cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
 ```
 
 This is a feasibility implementation, not full compiled-Wisp parity: u8/unit values,
-hygienic macros, traits/generics, and Theater RPC built-ins are not implemented yet.
+procedural macros, traits/generics, and Theater RPC built-ins are not implemented yet.
 `export` accepts compiled source declarations; interpreted functions remain inside
 the session rather than becoming new Wasm exports.
 There is no garbage collection; the existing bump allocator
@@ -272,3 +306,6 @@ Macro fixtures compare the existing macro example, recursive expansion, lazy
 branches, spliced templates, and repeated side effects across both compilers and
 the interpreter. Interpreter tests also cover persistence, redefinition, quoted
 data, nested quasiquotes, invalid declarations, and expansion recovery.
+Syntax-rules tests compare the existing example and introduced-binding hygiene
+with the Rust compiler, and cover nested/empty repetitions, free identifier
+resolution, typed bindings, redefinition, and invalid-rule recovery.

@@ -11,6 +11,7 @@
   (compound value string (list value))
   (text string)
   (symbol string)
+  (identifier string string)
   (sequence (list value))
   (closure (list value) value (list binding))
   (builtin string)
@@ -40,6 +41,7 @@
         ((compound ignored-compound-type ignored-tag ignored-payload) fallback)
         ((text ignored-s) fallback)
         ((symbol ignored-name) fallback)
+        ((identifier ignored-name ignored-key) fallback)
         ((sequence ignored-items) fallback)
         ((closure ignored-params ignored-body ignored-env) fallback)
         ((builtin ignored-builtin) fallback)
@@ -53,13 +55,17 @@
   (value-case v ((failure message) 1) (else 0)))
 
 (fn symbol-name ((v value)) string
-  (value-case v ((symbol name) name) (else "")))
+  (value-case v ((symbol name) name) ((identifier name key) name) (else "")))
 
 (fn items-of ((v value)) (list value)
   (value-case v ((sequence items) items) (else (list-new value))))
 
 (fn symbol? ((v value)) s32
-  (value-case v ((symbol name) 1) (else 0)))
+  (value-case v ((symbol name) 1) ((identifier name key) 1) (else 0)))
 
 (fn sequence? ((v value)) s32
   (value-case v ((sequence items) 1) (else 0)))
+
+; Syntax-rules identifiers retain a private binding key until quotation/evaluation.
+(fn binding-key ((v value)) string
+  (value-case v ((symbol name) name) ((identifier name key) key) (else "")))

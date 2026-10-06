@@ -12,6 +12,7 @@
 (include "globals.lisp")
 (include "loading.lisp")
 (include "macros.lisp")
+(include "syntax-rules.lisp")
 
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)
@@ -68,6 +69,7 @@
         (value-case expr
           ((integer-literal n) (resolve-integer n expected))
           ((symbol name) (lookup name env))
+          ((identifier name key) (lookup-identifier name key env))
           ((sequence items)
             (if (i32.eq (list-len items) 0) expr
               (eval-form items env (i32.add depth 1) top expected)))
@@ -85,8 +87,8 @@
       (eval-named-form items env depth top expected))))
 
 (fn eval-named-form ((items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
-  (value-case (list-get items 0)
-    ((symbol name)
+  (if (symbol? (list-get items 0))
+    (let (name (symbol-name (list-get items 0)))
       (if (string=? name "quote")
         (if (i32.eq (list-len items) 2) (quote-value (list-get items 1)) (failure "quote expects one argument"))
         (if (string=? name "if") (eval-if items env depth expected)
@@ -95,7 +97,7 @@
               (if (string=? name "let") (eval-let items env depth expected)
                 (if (string=? name "begin") (eval-body items 1 env depth top (nil))
                   (eval-declaration-or-call name items env depth top))))))))
-    (else (eval-call items env depth))))
+    (eval-call items env depth)))
 
 (fn truthy? ((v value)) s32
   (value-case v
@@ -133,29 +135,22 @@
 (fn eval-define ((items (list value)) (env (list binding)) (depth s32) (top s32)) value
   (if (i32.eq top 0) (failure "define is only supported at top level")
     (if (i32.ne (list-len items) 3) (failure "define expects name and expression")
-      (value-case (list-get items 1)
-        ((symbol name)
-          (let (v (eval (list-get items 2) env depth 0))
-            (if (failed? v) v
-              (begin
-                (global.set $bindings (list-push (global.get $bindings) (binding name v)))
-                v))))
-        (else (failure "define expects a symbol"))))))
+      (if (symbol? (list-get items 1))
+        (let (v (eval (list-get items 2) env depth 0))
+          (if (failed? v) v
+            (publish (binding-key (list-get items 1)) v)))
+        (failure "define expects a symbol")))))
 
 (fn has-name? ((params (list value)) (end s32) (name string)) s32
   (if (i32.lt_s end 0) 0
-    (value-case (list-get params end)
-      ((symbol previous)
-        (if (string=? name previous) 1 (has-name? params (i32.sub end 1) name)))
-      (else 0))))
-
+    (if (string=? name (binding-key (list-get params end))) 1
+      (has-name? params (i32.sub end 1) name))))
 (fn check-params ((params (list value)) (index s32)) value
   (if (i32.ge_s index (list-len params)) (nil)
-    (value-case (list-get params index)
-      ((symbol name)
-        (if (has-name? params (i32.sub index 1) name) (failure "duplicate parameter")
-          (check-params params (i32.add index 1))))
-      (else (failure "lambda parameters must be symbols")))))
+    (if (symbol? (list-get params index))
+      (if (has-name? params (i32.sub index 1) (binding-key (list-get params index))) (failure "duplicate parameter")
+        (check-params params (i32.add index 1)))
+      (failure "lambda parameters must be symbols"))))
 
 (fn eval-lambda ((items (list value)) (env (list binding))) value
   (if (i32.ne (list-len items) 3) (failure "lambda expects parameters and body")
@@ -176,13 +171,13 @@
   (if (i32.or (i32.eq (list-len pair) 2)
         (if (i32.eq (list-len pair) 4)
           (i32.and (string=? (symbol-name (list-get pair 1)) ":") (known-type? (list-get pair 2) "")) 0))
-    (value-case (list-get pair 0)
-      ((symbol name)
+    (if (symbol? (list-get pair 0))
+      (let (name (binding-key (list-get pair 0)))
         (let (raw (eval-expected (list-get pair (i32.sub (list-len pair) 1)) env depth 0
                     (if (i32.eq (list-len pair) 4) (symbol-name (list-get pair 2)) "")))
           (let (v (if (i32.eq (list-len pair) 4) (require-type raw (list-get pair 2)) raw))
             (if (failed? v) v (eval-expected body (extend-env env (binding name v)) depth 0 expected)))))
-      (else (failure "let expects a symbol")))
+      (failure "let expects a symbol"))
     (failure "invalid let binding or unsupported type")))
 
 (fn eval-body ((items (list value)) (index s32) (env (list binding)) (depth s32) (top s32) (last value)) value
@@ -199,10 +194,16 @@
 
 (fn bind-args ((params (list value)) (args (list value)) (index s32) (env (list binding))) (list binding)
   (if (i32.ge_s index (list-len params)) env
-    (value-case (list-get params index)
-      ((symbol name)
-        (bind-args params args (i32.add index 1) (list-push env (binding name (list-get args index)))))
-      (else env))))
+    (bind-args params args (i32.add index 1)
+      (list-push env (binding (binding-key (list-get params index)) (list-get args index))))))
+
+; Introduced free identifiers resolve at top level, never through caller locals.
+(fn lookup-identifier ((name string) (key string) (env (list binding))) value
+  (let (local (lookup-local key env (i32.sub (list-len env) 1)))
+    (if (failed? local)
+      (let (root (lookup-local key (global.get $bindings) (i32.sub (list-len (global.get $bindings)) 1)))
+        (if (failed? root) (lookup name (list-new binding)) root))
+      local)))
 
 (fn eval-call ((items (list value)) (env (list binding)) (depth s32)) value
   (let (callee (eval (list-get items 0) env depth 0))
