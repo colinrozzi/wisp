@@ -9762,9 +9762,10 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
         ));
     }
 
-    // Memory: 500 pages (32MB) initial, 1000 max (64MB), exported as "memory"
-    // Large initial size needed for bootstrap compilation of the 42KB compiler
-    out.push_str("  (memory (export \"memory\") 16000 16000)\n");
+    // Large fixed memory: the self-hosted compiler never frees its bump heap, so
+    // self-compiling the (now ~130KB) compiler source accumulates well over 1GB of
+    // intermediate strings. 32000 pages = 2GB.
+    out.push_str("  (memory (export \"memory\") 32000 32000)\n");
 
     // Emit data segments
     for seg in &prog.data_segments {
