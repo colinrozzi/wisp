@@ -1937,8 +1937,20 @@ fn test_syntax_rules_nested_repetitions_and_literals() {
         ),
         ("(classify else)", "1"),
         ("(classify 42)", "2"),
+        ("(classify 41)", "4"),
+        ("(classify 42s64)", "4"),
         ("(classify \"x\")", "3"),
         ("(classify anything)", "4"),
+        (
+            "(define-syntax wide-pattern (syntax-rules () ((_ 9223372036854775807) 1) ((_ _) 0))) (wide-pattern 9223372036854775807)",
+            "1",
+        ),
+        ("(wide-pattern 9223372036854775806)", "0"),
+        (
+            "(define-syntax literal-case (syntax-case-lambda (stx) ((_ 42) #'1) ((_ _) #'0))) (literal-case 42)",
+            "1",
+        ),
+        ("(literal-case 41)", "0"),
         (
             "(define-syntax tail (syntax-rules (end) ((_ first more ... (end last)) (list first more ... last)))) (tail 1 2 3 (end 4))",
             "(1 2 3 4)",

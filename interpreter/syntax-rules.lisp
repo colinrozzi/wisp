@@ -117,7 +117,14 @@
       (if (sequence? input)
         (sr-match-items (items-of pattern) (items-of input) 0 0 literals name)
         (sr-match 0 (list-new binding)))
-      (sr-match (string=? (show pattern) (show input)) (list-new binding)))))
+      (sr-match (sr-literal-equal? pattern input) (list-new binding)))))
+; Syntax integers have no printable runtime value until their type is known.
+; Compare their full payload, keeping explicit numeric types distinct.
+(fn sr-literal-equal? ((pattern value) (input value)) s32
+  (value-case pattern
+    ((integer-literal n)
+      (value-case input ((integer-literal other) (i64.eq n other)) (else 0)))
+    (else (string=? (show pattern) (show input)))))
 (fn sr-match-items ((patterns (list value)) (inputs (list value)) (pi s32) (ii s32) (literals (list value)) (name string)) sr-match
   (if (i32.ge_s pi (list-len patterns))
     (sr-match (i32.eq ii (list-len inputs)) (list-new binding))
