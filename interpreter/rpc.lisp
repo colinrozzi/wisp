@@ -114,6 +114,13 @@
 (import theater:simple/filesystem create-dir ((path string)) (result unit filesystem-error))
 (import theater:simple/filesystem remove-dir ((path string)) (result unit filesystem-error))
 
+; terminal: stdio + tty control. Exercises u16 (get-size tuple) and bool (set-raw).
+(import theater:simple/terminal write-stdout ((data (list u8))) (result u64 string))
+(import theater:simple/terminal write-stderr ((data (list u8))) (result u64 string))
+(import theater:simple/terminal set-raw-mode ((enabled bool)) (result unit string))
+(import theater:simple/terminal get-size () (result (tuple u16 u16) string))
+(import theater:simple/terminal enable-input () (result unit string))
+
 ; Names the evaluator routes to the Theater bridge rather than ordinary builtins.
 (fn host-builtin? ((name string)) s32
   (cond
@@ -163,6 +170,11 @@
     ((string=? name "fs-delete") 1)
     ((string=? name "fs-mkdir") 1)
     ((string=? name "fs-rmdir") 1)
+    ((string=? name "term-write") 1)
+    ((string=? name "term-write-err") 1)
+    ((string=? name "term-raw") 1)
+    ((string=? name "term-size") 1)
+    ((string=? name "term-input") 1)
     (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
@@ -453,6 +465,27 @@
       (unmarshal (raw-invoke "theater:simple/filesystem" "append-file" (str-bytes-tuple (list-get args 0) (list-get args 1))))
       (failure "fs-append expects two strings: path and content"))))
 
+; --- terminal --------------------------------------------------------------
+(fn bool-arg? ((v value)) s32 (value-case v ((boolean b) 1) (else 0)))
+(fn apply-term-write ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "term-write expects (term-write text)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/terminal" "write-stdout" (marshal (str-to-bytes (list-get args 0)))))
+      (failure "term-write expects a string"))))
+(fn apply-term-write-err ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "term-write-err expects (term-write-err text)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/terminal" "write-stderr" (marshal (str-to-bytes (list-get args 0)))))
+      (failure "term-write-err expects a string"))))
+(fn apply-term-raw ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "term-raw expects (term-raw true|false)")
+    (if (bool-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/terminal" "set-raw-mode" (marshal (list-get args 0))))
+      (failure "term-raw expects a boolean"))))
+(fn apply-term-size ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "term-size expects no arguments")
+    (unmarshal (raw-invoke "theater:simple/terminal" "get-size" (arg-tuple (list-new value))))))
+(fn apply-term-input ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "term-input expects no arguments")
+    (unmarshal (raw-invoke "theater:simple/terminal" "enable-input" (arg-tuple (list-new value))))))
+
 (fn apply-host-builtin ((name string) (args (list value))) value
   (cond
     ((string=? name "self") (apply-self args))
@@ -501,4 +534,9 @@
     ((string=? name "fs-delete") (apply-fs-delete args))
     ((string=? name "fs-mkdir") (apply-fs-mkdir args))
     ((string=? name "fs-rmdir") (apply-fs-rmdir args))
+    ((string=? name "term-write") (apply-term-write args))
+    ((string=? name "term-write-err") (apply-term-write-err args))
+    ((string=? name "term-raw") (apply-term-raw args))
+    ((string=? name "term-size") (apply-term-size args))
+    ((string=? name "term-input") (apply-term-input args))
     (else (failure (string-append "unknown host builtin: " name)))))

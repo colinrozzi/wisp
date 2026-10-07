@@ -11163,7 +11163,10 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
                 | Type::Variant(_)
                 | Type::Str
         )
-    }) || import.params.len() > 1;
+    }) || import.params.len() > 1
+        // A single non-s32 scalar param (bool/u16/u32/u64/f32/f64/u8) uses the
+        // generic single-arg encoder below, which needs $buf_cursor et al.
+        || (import.params.len() == 1 && !matches!(import.params[0].ty, Type::S32));
     if needs_complex_encode {
         out.push_str("    (local $buf_cursor i32)\n");
         out.push_str("    (local $node_idx i32)\n");

@@ -75,6 +75,10 @@ impl Runtime {
                 allowed_paths: Some(vec!["/".to_string()]),
             }),
         ));
+        // Terminal stdio + tty control.
+        handlers.register(theater_handler_terminal::TerminalHandler::new(
+            theater_handler_terminal::TerminalHandlerConfig::default(),
+        ));
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,

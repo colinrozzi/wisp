@@ -159,6 +159,19 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("filesystem not exercised".into())) }),
         );
     }
+    for name in [
+        "write-stdout",
+        "write-stderr",
+        "set-raw-mode",
+        "get-size",
+        "enable-input",
+    ] {
+        imports.define(
+            "theater:simple/terminal",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("terminal not exercised".into())) }),
+        );
+    }
     imports
 }
 
