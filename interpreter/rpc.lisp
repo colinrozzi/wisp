@@ -96,6 +96,24 @@
 (import theater:simple/timer set-interval ((name string) (interval-ms u64)) (result string string))
 (import theater:simple/timer clear-interval ((name string)) (result unit string))
 
+; filesystem: read/write files and dirs. Named types like runtime; filesystem.exists
+; collides with store.exists by bare name — the raw symbol is now interface-qualified
+; so both coexist (this interface is the proof of that compiler change).
+(variant filesystem-error
+  (not-found string) (permission-denied string) (already-exists string)
+  (not-a-directory string) (is-a-directory string) (invalid-path string) (io-error string))
+(record dir-entry (name string) (is-dir bool))
+(record file-metadata (size u64) (is-dir bool) (read-only bool))
+(import theater:simple/filesystem read-file ((path string)) (result (list u8) filesystem-error))
+(import theater:simple/filesystem exists ((path string)) (result bool filesystem-error))
+(import theater:simple/filesystem list-dir ((path string)) (result (list dir-entry) filesystem-error))
+(import theater:simple/filesystem metadata ((path string)) (result file-metadata filesystem-error))
+(import theater:simple/filesystem write-file ((path string) (content (list u8))) (result unit filesystem-error))
+(import theater:simple/filesystem append-file ((path string) (content (list u8))) (result unit filesystem-error))
+(import theater:simple/filesystem delete-file ((path string)) (result unit filesystem-error))
+(import theater:simple/filesystem create-dir ((path string)) (result unit filesystem-error))
+(import theater:simple/filesystem remove-dir ((path string)) (result unit filesystem-error))
+
 ; Names the evaluator routes to the Theater bridge rather than ordinary builtins.
 (fn host-builtin? ((name string)) s32
   (cond
@@ -136,6 +154,15 @@
     ((string=? name "now") 1)
     ((string=? name "set-interval") 1)
     ((string=? name "clear-interval") 1)
+    ((string=? name "fs-read") 1)
+    ((string=? name "fs-exists") 1)
+    ((string=? name "fs-list") 1)
+    ((string=? name "fs-meta") 1)
+    ((string=? name "fs-write") 1)
+    ((string=? name "fs-append") 1)
+    ((string=? name "fs-delete") 1)
+    ((string=? name "fs-mkdir") 1)
+    ((string=? name "fs-rmdir") 1)
     (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
@@ -211,51 +238,51 @@
 
 (fn apply-store-new ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "store-new expects no arguments")
-    (unmarshal (raw-invoke "new" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/store" "new" (arg-tuple (list-new value))))))
 
 (fn apply-store-get ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "store-get expects (store-get store-id content-ref)")
-    (if (all-strings? args 0) (unmarshal (raw-invoke "get" (arg-tuple args)))
+    (if (all-strings? args 0) (unmarshal (raw-invoke "theater:simple/store" "get" (arg-tuple args)))
       (failure "store-get expects two strings: store id and content ref"))))
 
 (fn apply-store-get-by-label ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "store-get-by-label expects (store-get-by-label store-id label)")
-    (if (all-strings? args 0) (unmarshal (raw-invoke "get-by-label" (arg-tuple args)))
+    (if (all-strings? args 0) (unmarshal (raw-invoke "theater:simple/store" "get-by-label" (arg-tuple args)))
       (failure "store-get-by-label expects two strings: store id and label"))))
 
 (fn apply-store-list-labels ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "store-list-labels expects (store-list-labels store-id)")
-    (if (all-strings? args 0) (unmarshal (raw-invoke "list-labels" (arg-tuple args)))
+    (if (all-strings? args 0) (unmarshal (raw-invoke "theater:simple/store" "list-labels" (arg-tuple args)))
       (failure "store-list-labels expects one string: store id"))))
 
 (fn apply-store-exists ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "store-exists expects (store-exists store-id content-ref)")
-    (if (all-strings? args 0) (unmarshal (raw-invoke "exists" (arg-tuple args)))
+    (if (all-strings? args 0) (unmarshal (raw-invoke "theater:simple/store" "exists" (arg-tuple args)))
       (failure "store-exists expects two strings: store id and content ref"))))
 
 (fn apply-store-size ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "store-size expects (store-size store-id)")
-    (if (all-strings? args 0) (unmarshal (raw-invoke "calculate-total-size" (arg-tuple args)))
+    (if (all-strings? args 0) (unmarshal (raw-invoke "theater:simple/store" "calculate-total-size" (arg-tuple args)))
       (failure "store-size expects one string: store id"))))
 
 ; writers: the content string becomes a list<u8> via str-to-bytes before marshal.
 (fn apply-store-put ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "store-put expects (store-put store-id content)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (unmarshal (raw-invoke "store"
+      (unmarshal (raw-invoke "theater:simple/store" "store"
         (marshal (sequence (list-push (list-push (list-new value)
           (list-get args 0)) (str-to-bytes (list-get args 1)))))))
       (failure "store-put expects two strings: store id and content"))))
 
 (fn apply-store-label ((args (list value))) value
   (if (i32.ne (list-len args) 3) (failure "store-label expects (store-label store-id label content-ref)")
-    (if (all-strings? args 0) (unmarshal (raw-invoke "label" (arg-tuple args)))
+    (if (all-strings? args 0) (unmarshal (raw-invoke "theater:simple/store" "label" (arg-tuple args)))
       (failure "store-label expects three strings: store id, label, content ref"))))
 
 (fn apply-store-put-at ((args (list value))) value
   (if (i32.ne (list-len args) 3) (failure "store-put-at expects (store-put-at store-id label content)")
     (if (all-strings? args 0)
-      (unmarshal (raw-invoke "store-at-label"
+      (unmarshal (raw-invoke "theater:simple/store" "store-at-label"
         (marshal (sequence (list-push (list-push (list-push (list-new value)
           (list-get args 0)) (list-get args 1)) (str-to-bytes (list-get args 2)))))))
       (failure "store-put-at expects three strings: store id, label, content"))))
@@ -267,49 +294,49 @@
 ; runtime-error open-variant on failure).
 (fn apply-runtime-list-actors ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "list-actors expects no arguments")
-    (unmarshal (raw-invoke "list-actors" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/runtime" "list-actors" (arg-tuple (list-new value))))))
 
 (fn apply-runtime-status ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "actor-status expects (actor-status id)")
     (if (string-arg? (list-get args 0))
-      (unmarshal (raw-invoke "get-actor-status" (marshal (list-get args 0))))
+      (unmarshal (raw-invoke "theater:simple/runtime" "get-actor-status" (marshal (list-get args 0))))
       (failure "actor-status expects a string actor id"))))
 
 (fn apply-runtime-stop ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "stop-actor expects (stop-actor id)")
     (if (string-arg? (list-get args 0))
-      (unmarshal (raw-invoke "stop-actor" (marshal (list-get args 0))))
+      (unmarshal (raw-invoke "theater:simple/runtime" "stop-actor" (marshal (list-get args 0))))
       (failure "stop-actor expects a string actor id"))))
 
 (fn apply-runtime-state ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "actor-state expects (actor-state id)")
     (if (string-arg? (list-get args 0))
-      (unmarshal (raw-invoke "get-actor-state" (marshal (list-get args 0))))
+      (unmarshal (raw-invoke "theater:simple/runtime" "get-actor-state" (marshal (list-get args 0))))
       (failure "actor-state expects a string actor id"))))
 
 (fn apply-runtime-manifest ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "actor-manifest expects (actor-manifest id)")
     (if (string-arg? (list-get args 0))
-      (unmarshal (raw-invoke "get-actor-manifest" (marshal (list-get args 0))))
+      (unmarshal (raw-invoke "theater:simple/runtime" "get-actor-manifest" (marshal (list-get args 0))))
       (failure "actor-manifest expects a string actor id"))))
 
 (fn apply-runtime-kill ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "kill-actor expects (kill-actor id)")
     (if (string-arg? (list-get args 0))
-      (unmarshal (raw-invoke "kill-actor" (marshal (list-get args 0))))
+      (unmarshal (raw-invoke "theater:simple/runtime" "kill-actor" (marshal (list-get args 0))))
       (failure "kill-actor expects a string actor id"))))
 
 (fn apply-runtime-subscribe ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "subscribe-spawns expects no arguments")
-    (unmarshal (raw-invoke "subscribe-to-spawns" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/runtime" "subscribe-to-spawns" (arg-tuple (list-new value))))))
 
 (fn apply-runtime-unsubscribe ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "unsubscribe-spawns expects no arguments")
-    (unmarshal (raw-invoke "unsubscribe-from-spawns" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/runtime" "unsubscribe-from-spawns" (arg-tuple (list-new value))))))
 
 (fn apply-runtime-shutdown ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "shutdown-runtime expects no arguments")
-    (unmarshal (raw-invoke "shutdown-runtime" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/runtime" "shutdown-runtime" (arg-tuple (list-new value))))))
 
 ; --- message-server --------------------------------------------------------
 ; Shared shapes: (string, message) -> Tuple(String, list<u8>); a single string
@@ -319,48 +346,48 @@
 
 (fn apply-msg-register ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "msg-register expects no arguments")
-    (unmarshal (raw-invoke "register" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/message-server-host" "register" (arg-tuple (list-new value))))))
 (fn apply-msg-list-requests ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "msg-list-requests expects no arguments")
-    (unmarshal (raw-invoke "list-outstanding-requests" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/message-server-host" "list-outstanding-requests" (arg-tuple (list-new value))))))
 (fn apply-msg-send ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "msg-send expects (msg-send actor-id message)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (unmarshal (raw-invoke "send" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (unmarshal (raw-invoke "theater:simple/message-server-host" "send" (str-bytes-tuple (list-get args 0) (list-get args 1))))
       (failure "msg-send expects two strings: actor id and message"))))
 (fn apply-msg-request ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "msg-request expects (msg-request actor-id message)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (unmarshal (raw-invoke "request" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (unmarshal (raw-invoke "theater:simple/message-server-host" "request" (str-bytes-tuple (list-get args 0) (list-get args 1))))
       (failure "msg-request expects two strings: actor id and message"))))
 (fn apply-msg-respond ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "msg-respond expects (msg-respond request-id response)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (unmarshal (raw-invoke "respond-to-request" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (unmarshal (raw-invoke "theater:simple/message-server-host" "respond-to-request" (str-bytes-tuple (list-get args 0) (list-get args 1))))
       (failure "msg-respond expects two strings: request id and response"))))
 (fn apply-msg-cancel ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "msg-cancel expects (msg-cancel request-id)")
-    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "cancel-request" (marshal (list-get args 0))))
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/message-server-host" "cancel-request" (marshal (list-get args 0))))
       (failure "msg-cancel expects a string request id"))))
 (fn apply-msg-open ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "msg-open expects (msg-open actor-id initial-message)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (unmarshal (raw-invoke "open-channel" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (unmarshal (raw-invoke "theater:simple/message-server-host" "open-channel" (str-bytes-tuple (list-get args 0) (list-get args 1))))
       (failure "msg-open expects two strings: actor id and initial message"))))
 (fn apply-msg-send-channel ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "msg-send-channel expects (msg-send-channel channel-id message)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (unmarshal (raw-invoke "send-on-channel" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (unmarshal (raw-invoke "theater:simple/message-server-host" "send-on-channel" (str-bytes-tuple (list-get args 0) (list-get args 1))))
       (failure "msg-send-channel expects two strings: channel id and message"))))
 (fn apply-msg-close-channel ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "msg-close-channel expects (msg-close-channel channel-id)")
-    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "close-channel" (marshal (list-get args 0))))
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/message-server-host" "close-channel" (marshal (list-get args 0))))
       (failure "msg-close-channel expects a string channel id"))))
 
 ; --- assembler -------------------------------------------------------------
 (fn apply-wat-to-wasm ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "wat-to-wasm expects (wat-to-wasm wat-text)")
-    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "wat-to-wasm" (marshal (list-get args 0))))
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "wisp:assembler/runtime" "wat-to-wasm" (marshal (list-get args 0))))
       (failure "wat-to-wasm expects a string of WAT"))))
 
 ; --- timer -----------------------------------------------------------------
@@ -372,18 +399,59 @@
     (else (u64-value (i64.const 0)))))
 (fn apply-timer-now ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "now expects no arguments")
-    (unmarshal (raw-invoke "now" (arg-tuple (list-new value))))))
+    (unmarshal (raw-invoke "theater:simple/timer" "now" (arg-tuple (list-new value))))))
 (fn apply-timer-set ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "set-interval expects (set-interval name interval-ms)")
     (if (string-arg? (list-get args 0))
-      (unmarshal (raw-invoke "set-interval"
+      (unmarshal (raw-invoke "theater:simple/timer" "set-interval"
         (marshal (sequence (list-push (list-push (list-new value)
           (list-get args 0)) (as-u64 (list-get args 1)))))))
       (failure "set-interval expects a string name and an integer interval"))))
 (fn apply-timer-clear ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "clear-interval expects (clear-interval name)")
-    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "clear-interval" (marshal (list-get args 0))))
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/timer" "clear-interval" (marshal (list-get args 0))))
       (failure "clear-interval expects a string name"))))
+
+; --- filesystem ------------------------------------------------------------
+; Single-path verbs marshal the path bare; write/append send (path, list<u8>).
+(fn apply-fs-read ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-read expects (fs-read path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "read-file" (marshal (list-get args 0))))
+      (failure "fs-read expects a string path"))))
+(fn apply-fs-exists ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-exists expects (fs-exists path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "exists" (marshal (list-get args 0))))
+      (failure "fs-exists expects a string path"))))
+(fn apply-fs-list ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-list expects (fs-list path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "list-dir" (marshal (list-get args 0))))
+      (failure "fs-list expects a string path"))))
+(fn apply-fs-meta ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-meta expects (fs-meta path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "metadata" (marshal (list-get args 0))))
+      (failure "fs-meta expects a string path"))))
+(fn apply-fs-delete ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-delete expects (fs-delete path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "delete-file" (marshal (list-get args 0))))
+      (failure "fs-delete expects a string path"))))
+(fn apply-fs-mkdir ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-mkdir expects (fs-mkdir path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "create-dir" (marshal (list-get args 0))))
+      (failure "fs-mkdir expects a string path"))))
+(fn apply-fs-rmdir ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-rmdir expects (fs-rmdir path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "remove-dir" (marshal (list-get args 0))))
+      (failure "fs-rmdir expects a string path"))))
+(fn apply-fs-write ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "fs-write expects (fs-write path content)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "theater:simple/filesystem" "write-file" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "fs-write expects two strings: path and content"))))
+(fn apply-fs-append ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "fs-append expects (fs-append path content)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "theater:simple/filesystem" "append-file" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "fs-append expects two strings: path and content"))))
 
 (fn apply-host-builtin ((name string) (args (list value))) value
   (cond
@@ -424,4 +492,13 @@
     ((string=? name "now") (apply-timer-now args))
     ((string=? name "set-interval") (apply-timer-set args))
     ((string=? name "clear-interval") (apply-timer-clear args))
+    ((string=? name "fs-read") (apply-fs-read args))
+    ((string=? name "fs-exists") (apply-fs-exists args))
+    ((string=? name "fs-list") (apply-fs-list args))
+    ((string=? name "fs-meta") (apply-fs-meta args))
+    ((string=? name "fs-write") (apply-fs-write args))
+    ((string=? name "fs-append") (apply-fs-append args))
+    ((string=? name "fs-delete") (apply-fs-delete args))
+    ((string=? name "fs-mkdir") (apply-fs-mkdir args))
+    ((string=? name "fs-rmdir") (apply-fs-rmdir args))
     (else (failure (string-append "unknown host builtin: " name)))))

@@ -142,6 +142,23 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("timer not exercised".into())) }),
         );
     }
+    for name in [
+        "read-file",
+        "exists",
+        "list-dir",
+        "metadata",
+        "write-file",
+        "append-file",
+        "delete-file",
+        "create-dir",
+        "remove-dir",
+    ] {
+        imports.define(
+            "theater:simple/filesystem",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("filesystem not exercised".into())) }),
+        );
+    }
     imports
 }
 

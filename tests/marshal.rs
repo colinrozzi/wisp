@@ -252,6 +252,20 @@ impl Guest {
                 value: Ok(Box::new(Value::String("deadbeefhash".into()))),
             },
         );
+        // filesystem.exists -> result<bool, filesystem-error>. Its bare name
+        // collides with store.exists; both must dispatch to their own interface
+        // (proof of the interface-qualified raw symbols). err type is a named
+        // variant, exercising the structural-hash typedef registration too.
+        mock_import(
+            &mut linker,
+            "theater:simple/filesystem",
+            "exists",
+            Value::Result {
+                ok_type: ValueType::Bool,
+                err_type: ValueType::Record("filesystem-error".into()),
+                value: Ok(Box::new(Value::Bool(true))),
+            },
+        );
         // Any other host import the evaluator declares (self/store.get/...) traps.
         linker.define_unknown_imports_as_traps(&module).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -667,6 +681,27 @@ fn test_marshal_string_as_byte_list_args() {
         ]),
         "args blob did not decode to tuple(string, list<u8>): {got:?}"
     );
+}
+
+#[test]
+fn test_repl_interface_qualified_collision() {
+    // store.exists and filesystem.exists share a bare name but live in different
+    // interfaces; the raw symbol is interface-qualified, so each REPL verb reaches
+    // its own host import. store-exists (mock) -> false, fs-exists (mock) -> true.
+    let mut g = Guest::new();
+    let store = match g.call(
+        "evaluate",
+        Value::String("(store-exists \"s\" \"r\")".into()),
+    ) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(store.contains("bool") && store.contains("false"), "{store}");
+    let fs = match g.call("evaluate", Value::String("(fs-exists \"f\")".into())) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(fs.contains("bool") && fs.contains("true"), "{fs}");
 }
 
 #[test]

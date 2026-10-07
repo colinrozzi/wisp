@@ -58,6 +58,23 @@ impl Runtime {
         ));
         // WAT -> wasm assembly (wisp:assembler/runtime).
         handlers.register(theater_handler_assembler::AssemblerHandler::new());
+        // Filesystem access, sandboxed to the directory `serve` runs in, with full
+        // read/write (the REPL is a developer tool).
+        handlers.register(theater_handler_filesystem::FileSystemHandler::new(
+            theater::config::actor_manifest::FileSystemHandlerConfig {
+                path: std::env::current_dir().ok(),
+                new_dir: Some(true),
+                allowed_commands: None,
+            },
+            Some(theater::config::permissions::FileSystemPermissions {
+                read: true,
+                write: true,
+                execute: false,
+                allowed_commands: None,
+                new_dir: Some(true),
+                allowed_paths: Some(vec!["/".to_string()]),
+            }),
+        ));
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,
