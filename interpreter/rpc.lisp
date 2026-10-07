@@ -54,7 +54,13 @@
 
 (import theater:simple/runtime list-actors () (result (list actor-info) runtime-error))
 (import theater:simple/runtime get-actor-status ((id string)) (result string runtime-error))
+(import theater:simple/runtime get-actor-state ((id string)) (result (option (list u8)) runtime-error))
+(import theater:simple/runtime get-actor-manifest ((id string)) (result string runtime-error))
 (import theater:simple/runtime stop-actor ((id string)) (result unit runtime-error))
+(import theater:simple/runtime kill-actor ((id string)) (result unit runtime-error))
+(import theater:simple/runtime subscribe-to-spawns () (result unit runtime-error))
+(import theater:simple/runtime unsubscribe-from-spawns () (result unit runtime-error))
+(import theater:simple/runtime shutdown-runtime () (result unit runtime-error))
 
 ; Names the evaluator routes to the Theater bridge rather than ordinary builtins.
 (fn host-builtin? ((name string)) s32
@@ -71,7 +77,13 @@
                       (i32.or (string=? name "store-size")
                         (i32.or (string=? name "list-actors")
                           (i32.or (string=? name "actor-status")
-                            (string=? name "stop-actor"))))))))))))))))
+                            (i32.or (string=? name "stop-actor")
+                              (i32.or (string=? name "actor-state")
+                                (i32.or (string=? name "actor-manifest")
+                                  (i32.or (string=? name "kill-actor")
+                                    (i32.or (string=? name "subscribe-spawns")
+                                      (i32.or (string=? name "unsubscribe-spawns")
+                                        (string=? name "shutdown-runtime"))))))))))))))))))))))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
 (fn as-string ((v value)) string (value-case v ((text s) s) (else "")))
@@ -179,6 +191,36 @@
       (unmarshal (raw-invoke "stop-actor" (marshal (list-get args 0))))
       (failure "stop-actor expects a string actor id"))))
 
+(fn apply-runtime-state ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "actor-state expects (actor-state id)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "get-actor-state" (marshal (list-get args 0))))
+      (failure "actor-state expects a string actor id"))))
+
+(fn apply-runtime-manifest ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "actor-manifest expects (actor-manifest id)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "get-actor-manifest" (marshal (list-get args 0))))
+      (failure "actor-manifest expects a string actor id"))))
+
+(fn apply-runtime-kill ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "kill-actor expects (kill-actor id)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "kill-actor" (marshal (list-get args 0))))
+      (failure "kill-actor expects a string actor id"))))
+
+(fn apply-runtime-subscribe ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "subscribe-spawns expects no arguments")
+    (unmarshal (raw-invoke "subscribe-to-spawns" (arg-tuple (list-new value))))))
+
+(fn apply-runtime-unsubscribe ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "unsubscribe-spawns expects no arguments")
+    (unmarshal (raw-invoke "unsubscribe-from-spawns" (arg-tuple (list-new value))))))
+
+(fn apply-runtime-shutdown ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "shutdown-runtime expects no arguments")
+    (unmarshal (raw-invoke "shutdown-runtime" (arg-tuple (list-new value))))))
+
 (fn apply-host-builtin ((name string) (args (list value))) value
   (if (string=? name "self") (apply-self args)
     (if (string=? name "log") (apply-log args)
@@ -195,4 +237,10 @@
                           (if (string=? name "list-actors") (apply-runtime-list-actors args)
                             (if (string=? name "actor-status") (apply-runtime-status args)
                               (if (string=? name "stop-actor") (apply-runtime-stop args)
-                                (failure (string-append "unknown host builtin: " name))))))))))))))))))
+                                (if (string=? name "actor-state") (apply-runtime-state args)
+                                  (if (string=? name "actor-manifest") (apply-runtime-manifest args)
+                                    (if (string=? name "kill-actor") (apply-runtime-kill args)
+                                      (if (string=? name "subscribe-spawns") (apply-runtime-subscribe args)
+                                        (if (string=? name "unsubscribe-spawns") (apply-runtime-unsubscribe args)
+                                          (if (string=? name "shutdown-runtime") (apply-runtime-shutdown args)
+                                            (failure (string-append "unknown host builtin: " name))))))))))))))))))))))))
