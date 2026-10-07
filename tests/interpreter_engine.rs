@@ -82,6 +82,9 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
         "list-labels",
         "exists",
         "calculate-total-size",
+        "store",
+        "label",
+        "store-at-label",
     ] {
         imports.define(
             "theater:simple/store",

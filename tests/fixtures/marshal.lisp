@@ -20,3 +20,9 @@
 (export (fn m-bool ((b s32)) any (marshal (boolean b))))
 (export (fn m-u64 ((n s64)) any (marshal (u64-value n))))
 (export (fn u-remarshal ((x any)) any (marshal (unmarshal x))))
+; A tuple whose second element is a list<u8> built from a string via str->bytes —
+; the shape a store/message-server writer sends. Lets the host decode and verify
+; the real args-blob encoding (the element template must be the "u8" symbol so it
+; routes to the packed Array node, not a List of u8 nodes).
+(export (fn m-strbytes ((s string)) any
+  (marshal (sequence (list-push (list-push (list-new value) (text "id")) (str-to-bytes (text s)))))))

@@ -239,6 +239,19 @@ impl Guest {
                 })),
             },
         );
+        // store.store (writer) -> result<string,string>: mock ignores the list<u8>
+        // args (the blob is validated directly by m-strbytes), isolating the guest
+        // result path for the (store-put ...) verb.
+        mock_import(
+            &mut linker,
+            "theater:simple/store",
+            "store",
+            Value::Result {
+                ok_type: ValueType::String,
+                err_type: ValueType::String,
+                value: Ok(Box::new(Value::String("deadbeefhash".into()))),
+            },
+        );
         // Any other host import the evaluator declares (self/store.get/...) traps.
         linker.define_unknown_imports_as_traps(&module).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -632,6 +645,45 @@ fn test_repl_runtime_list_actors_named_types() {
             && out.contains("actor-1")
             && out.contains("counter"),
         "list-actors did not decode as expected: {out}"
+    );
+}
+
+#[test]
+fn test_marshal_string_as_byte_list_args() {
+    // The exact shape a writer sends: tuple(string, list<u8>). Decode it host-side
+    // and confirm str->bytes produced a real list<u8> (packed Array) and the tuple
+    // is well-formed. Regression for the element-template bug (a byte-value template
+    // has symbol-name "" so it fell into a List node and pack rejected the blob).
+    let mut g = Guest::new();
+    let got = g.call("m-strbytes", Value::String("hi".into()));
+    assert_eq!(
+        got,
+        Value::Tuple(vec![
+            Value::String("id".into()),
+            Value::List {
+                elem_type: ValueType::U8,
+                items: vec![Value::U8(b'h'), Value::U8(b'i')],
+            },
+        ]),
+        "args blob did not decode to tuple(string, list<u8>): {got:?}"
+    );
+}
+
+#[test]
+fn test_repl_store_put_writer() {
+    // (store-put id content): content string -> list<u8> via str->bytes, marshalled
+    // as a tuple, result unmarshalled. Mock replies ok("deadbeefhash").
+    let mut g = Guest::new();
+    let out = match g.call(
+        "evaluate",
+        Value::String("(store-put \"s\" \"hi there\")".into()),
+    ) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        out.contains("ok") && out.contains("deadbeefhash"),
+        "store-put did not decode as expected: {out}"
     );
 }
 

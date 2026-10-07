@@ -34,6 +34,10 @@
 ; bool/u64 results — now first-class compiler types, so these hashes match Theater.
 (import theater:simple/store exists ((store-id string) (content-ref string)) (result bool string))
 (import theater:simple/store calculate-total-size ((store-id string)) (result u64 string))
+; writers: content crosses as list<u8>, built from a REPL string via str->bytes.
+(import theater:simple/store store ((store-id string) (content (list u8))) (result string string))
+(import theater:simple/store label ((store-id string) (label-name string) (content-ref string)) (result unit string))
+(import theater:simple/store store-at-label ((store-id string) (label-name string) (content (list u8))) (result string string))
 
 ; runtime: the actor-management control surface. Its results carry NAMED types
 ; (record actor-info, variant runtime-error/spawn-failure). We declare those types
@@ -83,7 +87,10 @@
                                   (i32.or (string=? name "kill-actor")
                                     (i32.or (string=? name "subscribe-spawns")
                                       (i32.or (string=? name "unsubscribe-spawns")
-                                        (string=? name "shutdown-runtime"))))))))))))))))))))))
+                                        (i32.or (string=? name "shutdown-runtime")
+                                          (i32.or (string=? name "store-put")
+                                            (i32.or (string=? name "store-label")
+                                              (string=? name "store-put-at")))))))))))))))))))))))))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
 (fn as-string ((v value)) string (value-case v ((text s) s) (else "")))
@@ -141,6 +148,21 @@
     (if (string-arg? (list-get args i)) (all-strings? args (i32.add i (i32.const 1))) 0)))
 (fn arg-tuple ((args (list value))) any (marshal (sequence args)))
 
+; Convert a REPL string value into a list<u8> value (typed-list of byte-value),
+; so string payloads can cross as list<u8> (store content, message bodies). The
+; element template is (symbol "u8") — the same descriptor unmarshal-array uses —
+; so marshal routes it to the packed Array node (tag-of-type reads symbol-name,
+; which is "" for a bare byte-value, so the template must be the symbol). The
+; string is byte-indexed; length is the u32 at the head of its [len][bytes] buffer.
+(fn str-bytes ((s string) (i s32) (n s32) (acc (list value))) (list value)
+  (if (i32.ge_s i n) acc
+    (str-bytes s (i32.add i (i32.const 1)) n (list-push acc (byte-value (string-ref s i))))))
+(fn str-to-bytes ((v value)) value
+  (value-case v
+    ((text s) (typed-list (symbol "u8")
+                (str-bytes s (i32.const 0) (i32.load (string-addr s)) (list-new value))))
+    (else (typed-list (symbol "u8") (list-new value)))))
+
 (fn apply-store-new ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "store-new expects no arguments")
     (unmarshal (raw-invoke "new" (arg-tuple (list-new value))))))
@@ -169,6 +191,28 @@
   (if (i32.ne (list-len args) 1) (failure "store-size expects (store-size store-id)")
     (if (all-strings? args 0) (unmarshal (raw-invoke "calculate-total-size" (arg-tuple args)))
       (failure "store-size expects one string: store id"))))
+
+; writers: the content string becomes a list<u8> via str-to-bytes before marshal.
+(fn apply-store-put ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "store-put expects (store-put store-id content)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "store"
+        (marshal (sequence (list-push (list-push (list-new value)
+          (list-get args 0)) (str-to-bytes (list-get args 1)))))))
+      (failure "store-put expects two strings: store id and content"))))
+
+(fn apply-store-label ((args (list value))) value
+  (if (i32.ne (list-len args) 3) (failure "store-label expects (store-label store-id label content-ref)")
+    (if (all-strings? args 0) (unmarshal (raw-invoke "label" (arg-tuple args)))
+      (failure "store-label expects three strings: store id, label, content ref"))))
+
+(fn apply-store-put-at ((args (list value))) value
+  (if (i32.ne (list-len args) 3) (failure "store-put-at expects (store-put-at store-id label content)")
+    (if (all-strings? args 0)
+      (unmarshal (raw-invoke "store-at-label"
+        (marshal (sequence (list-push (list-push (list-push (list-new value)
+          (list-get args 0)) (list-get args 1)) (str-to-bytes (list-get args 2)))))))
+      (failure "store-put-at expects three strings: store id, label, content"))))
 
 ; runtime verbs. list-actors takes no args (empty-tuple blob; host ignores input).
 ; The single-id verbs marshal the BARE string (runtime's parse_target wants a
@@ -243,4 +287,7 @@
                                       (if (string=? name "subscribe-spawns") (apply-runtime-subscribe args)
                                         (if (string=? name "unsubscribe-spawns") (apply-runtime-unsubscribe args)
                                           (if (string=? name "shutdown-runtime") (apply-runtime-shutdown args)
-                                            (failure (string-append "unknown host builtin: " name))))))))))))))))))))))))
+                                            (if (string=? name "store-put") (apply-store-put args)
+                                              (if (string=? name "store-label") (apply-store-label args)
+                                                (if (string=? name "store-put-at") (apply-store-put-at args)
+                                                  (failure (string-append "unknown host builtin: " name)))))))))))))))))))))))))))
