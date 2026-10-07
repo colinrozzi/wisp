@@ -121,8 +121,11 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
 | meta | `(help)` · `(poll-events)` |
 
-¹ `(actor-state (self))` deadlocks (an actor can't read its own state mid-call) —
-query *other* actors. ² filesystem paths are relative to the sandbox root (the dir
+¹ Self-targeted blocking calls — `(exports (self))`, `(implements (self) …)`,
+`(call (self) …)`, `(actor-state (self))` — would deadlock (the actor can't
+service its own request mid-eval), so they now return an immediate error instead
+of hanging. Query *other* actors; for your own metadata use `(describe (self))`,
+which Theater serves without calling back into the actor. ² filesystem paths are relative to the sandbox root (the dir
 `serve` runs in). ³ http hosts are an exact-match allowlist set when the host
 registers the handler.
 
