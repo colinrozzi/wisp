@@ -327,6 +327,8 @@
               (if (i32.eq kind (i32.const 4)) (single (f32.load payload))
                 (if (i32.eq kind (i32.const 5)) (double (f64.load payload))
                   (if (i32.eq kind (i32.const 12)) (byte-value (i32.load8_u payload))
+                    (if (i32.eq kind (i32.const 13)) (integer (i32.load16_u payload))
+                    (if (i32.eq kind (i32.const 14)) (integer (i32.load payload))
                     (if (i32.eq kind (i32.const 15)) (u64-value (i64.load payload))
                       ; A CGRF string payload is [len:u32][bytes] — a Wisp string.
                       (if (i32.eq kind (i32.const 6)) (text (string-from-addr payload))
@@ -344,7 +346,7 @@
                                   (if (i32.eq kind (i32.const 9)) (unmarshal-record cgrf payload)
                                     ; Variant payload: [name][case][tag:u32][count:u32][child-indices].
                                     (if (i32.eq kind (i32.const 8)) (unmarshal-variant cgrf payload)
-                                      (failure "unmarshal: unsupported CGRF node kind"))))))))))))))))))))
+                                      (failure "unmarshal: unsupported CGRF node kind"))))))))))))))))))))))
 
 ; Decode a CGRF value-type tag at addr (mirrors pack-abi decode_value_type).
 ; Returns the type descriptor and sets $tag-end to the address just past the tag.

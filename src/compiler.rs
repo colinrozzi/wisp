@@ -24,6 +24,8 @@ pub enum Type {
     Tuple(Vec<Type>),             // tuple<T1, T2, ...> - product type
     U8,                           // unsigned 8-bit integer
     Bool,                         // boolean (i32 in WASM; 1-byte CGRF payload like u8)
+    U16,                          // unsigned 16-bit integer (i32 in WASM; 2-byte CGRF payload)
+    U32,                          // unsigned 32-bit integer (i32 in WASM; 4-byte CGRF payload)
     U64,                          // unsigned 64-bit integer (i64 in WASM; like s64)
     Any,                          // Pack dynamic `value` - self-describing CGRF blob
 }
@@ -949,6 +951,7 @@ fn type_size(ty: &Type) -> usize {
         Type::S64 | Type::F64 => 8,
         Type::U8 => 4, // stored as i32 in Wisp memory; byte-packing only in list<u8> data arrays
         Type::Bool => 4, // i32 in Wisp memory (0/1); 1-byte only in CGRF payload
+        Type::U16 | Type::U32 => 4, // i32 in Wisp memory; narrower only in CGRF payload
         Type::U64 => 8, // i64 in Wisp memory
         // Records, variants, options, results, lists, strings, and tuples are pointer-sized
         Type::Record(_)
@@ -967,7 +970,15 @@ fn type_size(ty: &Type) -> usize {
 /// Check if a type requires heap allocation
 fn type_needs_heap(ty: &Type) -> bool {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::U8 | Type::Bool | Type::U64 => false,
+        Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::U8
+        | Type::Bool
+        | Type::U16
+        | Type::U32
+        | Type::U64 => false,
         Type::Record(_)
         | Type::Variant(_)
         | Type::Option(_)
@@ -986,7 +997,7 @@ fn type_needs_heap(ty: &Type) -> bool {
 fn cgrf_element_node_size(ty: &Type) -> usize {
     match ty {
         // Scalars: node header (8) + payload (4 or 8)
-        Type::S32 | Type::F32 | Type::U8 | Type::Bool => 12,
+        Type::S32 | Type::F32 | Type::U8 | Type::Bool | Type::U16 | Type::U32 => 12,
         Type::S64 | Type::F64 | Type::U64 => 16,
         // Strings: node header (8) + length (4) + average string data (~32)
         Type::Str => 44,
@@ -2202,6 +2213,8 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
         Type::U8 => bail!("{}: expected numeric type, got u8", msg),
         Type::Bool => bail!("{}: expected numeric type, got bool", msg),
+        Type::U16 => bail!("{}: expected numeric type, got u16", msg),
+        Type::U32 => bail!("{}: expected numeric type, got u32", msg),
         Type::U64 => bail!("{}: expected numeric type, got u64", msg),
         Type::Record(name) => bail!("{}: expected numeric type, got record '{}'", msg, name),
         Type::Variant(name) => bail!("{}: expected numeric type, got variant '{}'", msg, name),
@@ -4220,6 +4233,8 @@ fn scalar_type_name(ty: &Type) -> Option<String> {
             Type::F64 => "f64",
             Type::U8 => "u8",
             Type::Bool => "bool",
+            Type::U16 => "u16",
+            Type::U32 => "u32",
             Type::U64 => "u64",
             _ => return None,
         }
@@ -6358,6 +6373,8 @@ fn parse_type_symbol(
         "f64" => Ok(Type::F64),
         "u8" => Ok(Type::U8),
         "bool" => Ok(Type::Bool),
+        "u16" => Ok(Type::U16),
+        "u32" => Ok(Type::U32),
         "u64" => Ok(Type::U64),
         "string" => Ok(Type::Str),
         "any" => Ok(Type::Any),            // Pack dynamic `value`
@@ -6375,7 +6392,18 @@ fn parse_type_symbol(
 fn is_type_symbol(sym: &str) -> bool {
     matches!(
         sym,
-        "s32" | "s64" | "f32" | "f64" | "u8" | "bool" | "u64" | "string" | "any" | "unit"
+        "s32"
+            | "s64"
+            | "f32"
+            | "f64"
+            | "u8"
+            | "bool"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "string"
+            | "any"
+            | "unit"
     )
 }
 
@@ -7751,6 +7779,7 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::U64 => "i64.store",
                     Type::Bool => "i32.store",
+                    Type::U16 | Type::U32 => "i32.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     // All compound types are pointers, resources are i32 handles
@@ -7806,6 +7835,7 @@ fn gen_expr(
                 Type::S64 => "i64.load",
                 Type::U64 => "i64.load",
                 Type::Bool => "i32.load",
+                Type::U16 | Type::U32 => "i32.load",
                 Type::F32 => "f32.load",
                 Type::F64 => "f64.load",
                 // All compound types are pointers, resources are i32 handles
@@ -7878,6 +7908,7 @@ fn gen_expr(
                     Type::S64 => "i64.store",
                     Type::U64 => "i64.store",
                     Type::Bool => "i32.store",
+                    Type::U16 | Type::U32 => "i32.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     Type::Record(_)
@@ -7961,6 +7992,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::U64 => "i64.load",
                                 Type::Bool => "i32.load",
+                                Type::U16 | Type::U32 => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -8064,6 +8096,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::U64 => "i64.load",
                                 Type::Bool => "i32.load",
+                                Type::U16 | Type::U32 => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -8169,6 +8202,7 @@ fn gen_expr(
                                 Type::S64 => "i64.load",
                                 Type::U64 => "i64.load",
                                 Type::Bool => "i32.load",
+                                Type::U16 | Type::U32 => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -9323,6 +9357,8 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::F64 => "f64",
         Type::U8 => "i32",
         Type::Bool => "i32",
+        Type::U16 => "i32",
+        Type::U32 => "i32",
         Type::U64 => "i64",
         // All compound types are pointer-sized (i32 handles)
         Type::Record(_)
@@ -9356,6 +9392,8 @@ fn wit_type(ty: &Type) -> String {
         Type::F64 => "f64".to_string(),
         Type::U8 => "u8".to_string(),
         Type::Bool => "bool".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
         Type::U64 => "u64".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
         Type::Option(inner) => format!("option<{}>", wit_type(inner)),
@@ -9452,6 +9490,10 @@ fn flatten_type(
         }
         Type::Bool => {
             // Bool is stored as i32 (0/1)
+            vec![Type::S32]
+        }
+        Type::U16 | Type::U32 => {
+            // u16/u32 are stored as i32
             vec![Type::S32]
         }
         Type::U64 => {
@@ -9652,6 +9694,8 @@ fn store_instr(ty: &Type) -> &'static str {
         | Type::Tuple(_)
         | Type::U8
         | Type::Bool
+        | Type::U16
+        | Type::U32
         | Type::Resource(_)
         | Type::Borrow(_)
         | Type::Any => "i32.store",
@@ -9784,6 +9828,8 @@ fn pact_type(ty: &Type) -> String {
         Type::F64 => "f64".to_string(),
         Type::U8 => "u8".to_string(),
         Type::Bool => "bool".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
         Type::U64 => "u64".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
         Type::Option(inner) => format!("option<{}>", pact_type(inner)),
@@ -10136,6 +10182,8 @@ const CGRF_RECORD: u8 = 0x09;
 const CGRF_OPTION: u8 = 0x0A;
 const CGRF_TUPLE: u8 = 0x0B;
 const CGRF_U8: u8 = 0x0C;
+const CGRF_U16: u8 = 0x0D;
+const CGRF_U32: u8 = 0x0E;
 const CGRF_U64: u8 = 0x0F;
 const CGRF_RESULT: u8 = 0x14;
 const CGRF_ARRAY: u8 = 0x15;
@@ -10153,6 +10201,8 @@ fn type_to_tag(ty: &Type) -> u8 {
         Type::F64 => CGRF_F64,
         Type::U8 => CGRF_U8,
         Type::Bool => CGRF_BOOL,
+        Type::U16 => CGRF_U16,
+        Type::U32 => CGRF_U32,
         Type::U64 => CGRF_U64,
         Type::Str => CGRF_STRING,
         Type::List(_) => CGRF_LIST,
@@ -10180,6 +10230,8 @@ fn type_tag_size(ty: &Type) -> usize {
         | Type::Str
         | Type::U8
         | Type::Bool
+        | Type::U16
+        | Type::U32
         | Type::U64 => 1,
         Type::List(inner) => 1 + type_tag_size(inner),
         Type::Option(inner) => 1 + type_tag_size(inner),
@@ -10196,6 +10248,8 @@ fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
     match ty {
         Type::U8 => pack::types::Type::U8,
         Type::Bool => pack::types::Type::Bool,
+        Type::U16 => pack::types::Type::U16,
+        Type::U32 => pack::types::Type::U32,
         Type::U64 => pack::types::Type::U64,
         Type::S32 => pack::types::Type::S32,
         Type::S64 => pack::types::Type::S64,
@@ -11656,6 +11710,18 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
                 out.push_str("    i32.add\n");
                 out.push_str("    i32.load8_u\n");
             }
+            Type::U16 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load16_u\n");
+            }
+            Type::U32 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
+            }
             Type::F32 => {
                 out.push_str("    local.get $out_ptr\n");
                 out.push_str("    i32.const 24\n");
@@ -11786,6 +11852,8 @@ fn type_tag_bytes(ty: &Type) -> Vec<u8> {
         | Type::Str
         | Type::U8
         | Type::Bool
+        | Type::U16
+        | Type::U32
         | Type::U64
         | Type::Any => {}
         Type::List(inner) => bytes.extend(type_tag_bytes(inner)),
@@ -12090,11 +12158,21 @@ fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_local: &str
         Type::List(elem_ty) if cgrf_array_width(elem_ty).is_some() => {
             generate_cgrf_encode_array(out, elem_ty, value_local);
         }
-        Type::S32 | Type::U8 | Type::Bool | Type::S64 | Type::U64 | Type::F32 | Type::F64 => {
+        Type::S32
+        | Type::U8
+        | Type::Bool
+        | Type::U16
+        | Type::U32
+        | Type::S64
+        | Type::U64
+        | Type::F32
+        | Type::F64 => {
             let (kind, payload_size, store_instr) = match ty {
                 Type::S32 => (CGRF_S32, 4, "i32.store"),
                 Type::U8 => (CGRF_U8, 1, "i32.store8"),
                 Type::Bool => (CGRF_BOOL, 1, "i32.store8"),
+                Type::U16 => (CGRF_U16, 2, "i32.store16"),
+                Type::U32 => (CGRF_U32, 4, "i32.store"),
                 Type::S64 => (CGRF_S64, 8, "i64.store"),
                 Type::U64 => (CGRF_U64, 8, "i64.store"),
                 Type::F32 => (CGRF_F32, 4, "f32.store"),
@@ -12706,6 +12784,26 @@ fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             out.push_str("    i32.const 8\n");
             out.push_str("    i32.add\n");
             out.push_str("    i32.load8_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::U16 => {
+            out.push_str("    ;; decode u16 (2-byte payload)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load16_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::U32 => {
+            out.push_str("    ;; decode u32 (4-byte payload)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
             out.push_str("    local.set $dec_result\n");
         }
         Type::U64 => {
