@@ -11609,11 +11609,18 @@ fn generate_import_wrapper(out: &mut String, import: &Import) {
                 out.push_str("    i32.add\n");
                 out.push_str("    i32.load\n");
             }
-            Type::S64 => {
+            Type::S64 | Type::U64 => {
                 out.push_str("    local.get $out_ptr\n");
                 out.push_str("    i32.const 24\n");
                 out.push_str("    i32.add\n");
                 out.push_str("    i64.load\n");
+            }
+            Type::U8 | Type::Bool => {
+                // 1-byte payload, returned as i32 (wat_type is i32)
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load8_u\n");
             }
             Type::F32 => {
                 out.push_str("    local.get $out_ptr\n");
