@@ -214,6 +214,7 @@
     ((string=? name "http-get") 1)
     ((string=? name "http-req") 1)
     ((string=? name "poll-events") 1)
+    ((string=? name "help") 1)
     (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
@@ -559,6 +560,18 @@
     (let (evs (global.get $events))
       (begin (global.set $events (list-new value)) (sequence evs)))))
 
+; Live catalog of the Theater host verbs, so a session can discover them cold.
+(fn apply-help ((args (list value))) value
+  (text (string-append "Wisp REPL — a live session that drives and observes Theater.\nDefinitions accumulate: (define x ...) / (define f (lambda ...)) persist.\n\n"
+    (string-append "self/rpc:  (self) (log msg) (describe id) (exports id) (implements id iface) (call id fn arg...)\n"
+      (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
+        (string-append "runtime:   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\n"
+          (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
+            (string-append "files:     (fs-read p) (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
+              (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
+                (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
+                  "triggers:  define on-tick / on-spawn / on-message (lambda (e) ...); then (poll-events) to see what fired + results"))))))))))
+
 (fn apply-host-builtin ((name string) (args (list value))) value
   (cond
     ((string=? name "self") (apply-self args))
@@ -615,4 +628,5 @@
     ((string=? name "http-get") (apply-http-get args))
     ((string=? name "http-req") (apply-http-req args))
     ((string=? name "poll-events") (apply-poll-events args))
+    ((string=? name "help") (apply-help args))
     (else (failure (string-append "unknown host builtin: " name)))))

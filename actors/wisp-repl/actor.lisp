@@ -20,10 +20,20 @@
   (fn actor-evaluate ((source string)) string
     (evaluate source)))
 
-; Inbound trigger: Theater calls this when a timer interval fires. We dispatch to
-; a user-defined `on-tick` in the live session (define it from the REPL); the
-; firing + the handler's result are buffered for (poll-events). The return is
-; ignored by the runtime, so a trap-free "ok" suffices.
+; Inbound triggers: Theater calls these exports when events occur; each dispatches
+; to a user-defined handler in the live session (define it from the REPL), buffering
+; the firing + result for (poll-events). handle-tick's arg is a bare timer-name
+; string; the others arrive as a Tuple of args, so we take the raw CGRF as `any` and
+; unmarshal it (the handler receives a (sequence ...) of the args). Returns are
+; ignored by the runtime (handle-request's reply is a future refinement).
 (export "theater:simple/timer.handle-tick"
   (fn handle-tick ((name string)) string
     (begin (dispatch-event "on-tick" (text name)) "ok")))
+; After (subscribe-spawns): on-spawn receives (sequence id name parent-option).
+(export "theater:simple/runtime-handlers.handle-actor-spawn"
+  (fn handle-actor-spawn ((raw any)) string
+    (begin (dispatch-event "on-spawn" (unmarshal raw)) "ok")))
+; After (msg-register): on-message receives (sequence message-bytes).
+(export "theater:simple/message-server-client.handle-send"
+  (fn handle-send ((raw any)) string
+    (begin (dispatch-event "on-message" (unmarshal raw)) "ok")))
