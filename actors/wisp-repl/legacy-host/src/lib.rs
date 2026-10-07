@@ -160,8 +160,8 @@ pub struct Session {
 
 impl Session {
     pub async fn evaluate(&self, source: &str) -> Result<String> {
-        if source.len() > 4096 {
-            return Ok("error: input exceeds 4096 bytes".into());
+        if source.len() > 65536 {
+            return Ok("error: input exceeds 65536 bytes".into());
         }
         match self
             .handle
@@ -173,6 +173,12 @@ impl Session {
         }
     }
     pub async fn shutdown(self) -> Result<()> {
+        self.stop().await
+    }
+
+    /// Stop the session's actor by reference. The daemon holds sessions in a shared
+    /// registry (`Arc<Session>`), so it cannot consume `self` to shut one down.
+    pub async fn stop(&self) -> Result<()> {
         // Ask the runtime to remove the actor as well as stop its task loops.
         let (response_tx, response_rx) = oneshot::channel();
         self.commands.send(TheaterCommand::StopActor {

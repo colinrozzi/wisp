@@ -1,0 +1,51 @@
+name: release theater-repl
+
+# The supported path for publishing a theater-repl binary. Push a tag like
+# v0.1.0 and this builds the self-contained binary and attaches it to a GitHub
+# release, which is where install.sh (/releases/latest/download) fetches it.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    # Build on a glibc base old enough to run on the distros agents use. aws-lc-sys
+    # is in the tree, so a static musl build is avoided in favour of plain glibc.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (cmake for aws-lc-sys)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            actors/wisp-repl/legacy-host
+
+      - name: Build the actor (embeds into the binary)
+        run: cargo run --release -- compile actors/wisp-repl/actor.lisp actors/wisp-repl/actor
+
+      - name: Build theater-repl
+        working-directory: actors/wisp-repl/legacy-host
+        run: cargo build --release
+
+      - name: Stage asset
+        run: |
+          install -m755 actors/wisp-repl/legacy-host/target/release/theater-repl theater-repl-linux-x86_64
+          strip theater-repl-linux-x86_64 || true
+          ./theater-repl-linux-x86_64 --help
+
+      - name: Publish to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: theater-repl-linux-x86_64
+          fail_on_unmatched_files: true

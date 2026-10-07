@@ -12,37 +12,85 @@ the working code into an actor.
 bridge `rpc.lisp`) and declares the Theater ABI in Wisp. The stock compiler emits
 `actor.wasm`.
 
-## Run it (the live socket REPL)
+## Install and run (zero to a live REPL)
 
-The REPL runs inside a small local Theater runtime that registers all the host
-handlers and exposes the actor over a socket. From the repo root:
-
-```sh
-# 1. Build the actor (writes actor.wasm in place)
-cargo run -- compile actors/wisp-repl/actor.lisp actors/wisp-repl/actor
-
-# 2. Build + run the host (registers rpc/self/store/runtime/message-server/
-#    timer/assembler/filesystem/terminal/http-client, then serves on 127.0.0.1:7777)
-cd actors/wisp-repl/legacy-host && cargo build && ./target/debug/wisp-interpreter-actor serve
-```
-
-It prints `rpc target actor id: <uuid>` (the session's own actor id) and listens on
-`127.0.0.1:7777`. The wire protocol is **one JSON string per line**: send a
-JSON-encoded source string, read a JSON-encoded result string.
+You do **not** need to know Theater first. Install the self-contained binary — it
+carries its own actor + Theater runtime:
 
 ```sh
-# Minimal client (bash): send "(…)", read the printed value
-exec 3<>/dev/tcp/127.0.0.1/7777
-printf '%s\n' '"(i32.add (i32.const 40) (i32.const 2))"' >&3; IFS= read -r line <&3; echo "$line"   # => "42"
+curl -fsSL https://raw.githubusercontent.com/colinrozzi/wisp/main/install.sh | sh
 ```
 
-Type `(help)` in the REPL for a live catalog of host verbs. (`cargo run -p
+`theater-repl serve` runs a **daemon**: a long-running Theater runtime that holds
+**sessions**. Each session is a persistent live image — bindings, closures, types,
+macros, and any actors you spawn survive between commands, because the daemon keeps
+the session alive. You create sessions and talk to them by id:
+
+```sh
+theater-repl serve &                 # daemon on 127.0.0.1:7777 (holds sessions)
+id=$(theater-repl new)               # create a session, capture its id
+theater-repl eval $id '(define double (lambda (x) (i32.mul x (i32.const 2))))'
+theater-repl eval $id '(double (i32.const 21))'        # => 42  (same live image)
+theater-repl list                    # sessions on the daemon
+theater-repl eval $id '(help)'       # catalog of Theater host verbs
+```
+
+Each command is one clean line — no socket syntax, no JSON escaping. A form with
+awkward characters (or many lines) goes on **stdin**, which the shell leaves
+untouched:
+
+```sh
+theater-repl eval $id - <<'LISP'
+(define greet (lambda (who) (string-append "hi " who)))
+(greet "theater")
+LISP
+```
+
+### The command surface
+
+| Command | Does |
+| --- | --- |
+| `serve` | run the daemon (default when no subcommand is given) |
+| `new [name]` | create a session, print its id |
+| `list` | list the daemon's sessions |
+| `eval <id> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result |
+| `read <id>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …) |
+| `follow <id>` | stream a session's events live until Ctrl-C |
+| `status [id]` | show a session (with id) or the daemon (without) |
+| `stop <id>` | end a session and reclaim its heap |
+| `repl` | interactive stdin/stdout prompt against a private session (for a human) |
+
+Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
+`$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated
+runtime and pass `-p 3333` to the others — nothing is remembered between commands,
+so the port (or the default) is how a command finds its daemon.
+
+### Build from source (for hacking on the REPL itself)
+
+Needs a Rust toolchain and network access (crates.io for the compiler; GitHub for
+the host's pinned Theater deps):
+
+```sh
+# 1. Build the actor -> actors/wisp-repl/actor.wasm (embedded into the binary).
+#    Re-run after editing actor.lisp or any interpreter/*.lisp it includes.
+actors/wisp-repl/build.sh
+
+# 2. Build + run the host. First build pulls Theater from git (pinned rev) and is
+#    slow (~minutes); later builds are fast. --actor-dir loads the just-built actor
+#    from disk instead of the copy embedded at compile time.
+cd actors/wisp-repl/legacy-host && cargo build
+./target/debug/theater-repl --actor-dir .. serve
+```
+
+Releases are published by `.github/workflows/release.yml` on a `v*` tag (the
+supported path); `install.sh` pulls the latest release asset. (`cargo run -p
 test-runtime -- --repl` gives a pure-language REPL, but it traps the Theater host
-imports — use the `serve` host above for the full surface.)
+imports — use `theater-repl` above for the full surface.)
 
 ## It's a live image — build up behavior interactively
 
-Definitions accumulate in the session, so you grow an environment as you go:
+Definitions accumulate in the session (each line below is a `theater-repl eval
+$id '…'`), so you grow an environment as you go:
 
 ```lisp
 (define double (lambda (x) (i32.mul x (i32.const 2))))
@@ -95,10 +143,20 @@ literally a `(define …)`:
 (poll-events)                  ; => (("on-tick" "beat" "tick: beat") …) — what fired + each result
 ```
 
-Each firing is buffered as `(handler-name event result)`; `(poll-events)` drains
-the buffer so you see what happened on the frontend. Redefine a handler any time to
-change behavior mid-stream. Triggers wired today: `on-tick` (timer),
-`on-spawn` (after `(subscribe-spawns)`), `on-message` (after `(msg-register)`).
+Each firing is buffered as `(handler-name event result)`. `(poll-events)` drains
+the buffer — and that is exactly what **`theater-repl read <id>`** calls, with
+**`theater-repl follow <id>`** polling it in a loop to stream firings live. So from
+the shell:
+
+```sh
+theater-repl eval $id '(define on-tick (lambda (n) (string-append "fired: " n)))'
+theater-repl eval $id '(set-interval "beat" 1000)'
+theater-repl follow $id        # fired: beat … (Ctrl-C to stop)
+```
+
+Redefine a handler any time to change behavior mid-stream. Triggers wired today:
+`on-tick` (timer), `on-spawn` (after `(subscribe-spawns)`), `on-message` (after
+`(msg-register)`).
 
 ## Extending — add a host verb
 
