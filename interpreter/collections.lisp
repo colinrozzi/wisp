@@ -35,6 +35,7 @@
     ((byte-value n) (symbol "u8"))
     ((boolean b) (symbol "bool"))
     ((u64-value n) (symbol "u64"))
+    ((u32-value n) (symbol "u32"))
     ((open-variant tn cn tag fields) (symbol tn))
     ((wide-integer n) (symbol "s64"))
     ((single n) (symbol "f32"))

@@ -26,6 +26,7 @@
   (field-reader string s32 s32)
   (boolean s32)
   (u64-value s64)
+  (u32-value s32)
   (open-variant string string s32 (list value)))
 
 (record binding (name string) (item value))
@@ -63,6 +64,7 @@
         ((field-reader ignored-type ignored-id ignored-index) fallback)
         ((boolean ignored-bool) fallback)
         ((u64-value ignored-u64) fallback)
+        ((u32-value ignored-u32) fallback)
         ((open-variant ignored-tn ignored-cn ignored-tag ignored-fields) fallback)))))
 
 (fn failed? ((v value)) s32
