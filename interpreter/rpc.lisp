@@ -269,6 +269,14 @@
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
 (fn as-string ((v value)) string (value-case v ((text s) s) (else "")))
 
+; Self-targeted blocking RPC wedges the session: exports/implements/call and
+; get-actor-state round-trip a request into the target actor and wait for its
+; reply, but this actor is busy in the current eval and can never service its
+; own inbound request — it hangs forever, and every later eval queues behind it.
+; Guard those verbs on self with a clear error. describe and actor-status are
+; served from runtime metadata (no call into the actor), so they are safe.
+(fn self? ((aid string)) s32 (string=? aid (self)))
+
 (fn apply-describe ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "describe expects (describe actor-id)")
     (if (string-arg? (list-get args 0)) (unmarshal (describe (as-string (list-get args 0))))
@@ -276,13 +284,18 @@
 
 (fn apply-exports ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "exports expects (exports actor-id)")
-    (if (string-arg? (list-get args 0)) (unmarshal (exports (as-string (list-get args 0))))
+    (if (string-arg? (list-get args 0))
+      (if (self? (as-string (list-get args 0)))
+        (failure "exports on self deadlocks (self-RPC); use (describe (self)) for your own exports")
+        (unmarshal (exports (as-string (list-get args 0)))))
       (failure "exports expects a string actor id"))))
 
 (fn apply-implements ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "implements expects (implements actor-id interface)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (unmarshal (implements (as-string (list-get args 0)) (as-string (list-get args 1))))
+      (if (self? (as-string (list-get args 0)))
+        (failure "implements on self deadlocks (self-RPC); use (describe (self))")
+        (unmarshal (implements (as-string (list-get args 0)) (as-string (list-get args 1)))))
       (failure "implements expects two strings: actor id and interface"))))
 
 ; (call actor-id function arg...) -> calls function on actor-id with the args as
@@ -296,10 +309,12 @@
 (fn apply-call ((args (list value))) value
   (if (i32.lt_s (list-len args) (i32.const 2)) (failure "call expects (call actor-id function arg ...)")
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
-      (let (params (sequence (args-from args (i32.const 2) (list-new value))))
-        (let (full (sequence (list-push (list-push (list-push (list-push (list-new value)
-                     (list-get args 0)) (list-get args 1)) params) (sequence (list-new value)))))
-          (unmarshal (call-raw (marshal full)))))
+      (if (self? (as-string (list-get args 0)))
+        (failure "call on self deadlocks (an actor cannot call itself mid-eval); target another actor")
+        (let (params (sequence (args-from args (i32.const 2) (list-new value))))
+          (let (full (sequence (list-push (list-push (list-push (list-push (list-new value)
+                       (list-get args 0)) (list-get args 1)) params) (sequence (list-new value)))))
+            (unmarshal (call-raw (marshal full))))))
       (failure "call expects actor-id and function as strings"))))
 
 ; Simple-typed host bindings: the typed wrapper's result is already an interp
@@ -412,7 +427,9 @@
 (fn apply-runtime-state ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "actor-state expects (actor-state id)")
     (if (string-arg? (list-get args 0))
-      (unmarshal (raw-invoke "theater:simple/runtime" "get-actor-state" (marshal (list-get args 0))))
+      (if (self? (as-string (list-get args 0)))
+        (failure "actor-state on self deadlocks (an actor cannot read its own state mid-eval); query another actor")
+        (unmarshal (raw-invoke "theater:simple/runtime" "get-actor-state" (marshal (list-get args 0)))))
       (failure "actor-state expects a string actor id"))))
 
 (fn apply-runtime-manifest ((args (list value))) value
