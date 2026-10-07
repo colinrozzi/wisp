@@ -22,6 +22,8 @@ jobs:
     env:
       TARGET: x86_64-unknown-linux-musl
       CC_x86_64_unknown_linux_musl: musl-gcc
+      # Stamp the release tag (e.g. v0.1.3) into the binary for `theater-repl version`.
+      THEATER_REPL_VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
