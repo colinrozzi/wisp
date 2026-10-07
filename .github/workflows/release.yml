@@ -14,16 +14,23 @@ permissions:
 
 jobs:
   linux-x86_64:
-    # Build on a glibc base old enough to run on the distros agents use. aws-lc-sys
-    # is in the tree, so a static musl build is avoided in favour of plain glibc.
+    # Build a fully-static musl binary: no dynamic loader, so one asset runs on
+    # every Linux — glibc distros, Alpine, AND NixOS (which ships no generic
+    # /lib64 loader). aws-lc-sys is in the tree, so install musl-tools + cmake and
+    # point its C compiler at musl-gcc.
     runs-on: ubuntu-22.04
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      CC_x86_64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools (cmake for aws-lc-sys)
-        run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Install build tools (musl toolchain + cmake for aws-lc-sys)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cmake
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -32,16 +39,18 @@ jobs:
             actors/wisp-repl/legacy-host
 
       - name: Build the actor (embeds into the binary)
+        # The compiler is a host tool; build it for the native (glibc) target.
         run: cargo run --release -- compile actors/wisp-repl/actor.lisp actors/wisp-repl/actor
 
-      - name: Build theater-repl
+      - name: Build theater-repl (static musl)
         working-directory: actors/wisp-repl/legacy-host
-        run: cargo build --release
+        run: cargo build --release --target "$TARGET"
 
       - name: Stage asset
         run: |
-          install -m755 actors/wisp-repl/legacy-host/target/release/theater-repl theater-repl-linux-x86_64
+          install -m755 "actors/wisp-repl/legacy-host/target/$TARGET/release/theater-repl" theater-repl-linux-x86_64
           strip theater-repl-linux-x86_64 || true
+          file theater-repl-linux-x86_64
           ./theater-repl-linux-x86_64 --help
 
       - name: Publish to the release
