@@ -157,6 +157,36 @@
 (record http-response (status u16) (headers (list http-header)) (body (option (list u8))))
 (import theater:simple/http-client request ((req http-request)) (result http-response string))
 
+; tcp: raw sockets. Mechanical string/list<u8>/u64/bool shapes (receive's max-bytes
+; is a u32 arg). tcp.send collides with message-server.send by bare name — the
+; qualified raw symbols keep them distinct.
+(import theater:simple/tcp connect ((address string)) (result string string))
+(import theater:simple/tcp listen ((address string)) (result string string))
+(import theater:simple/tcp accept ((listener-id string)) (result string string))
+(import theater:simple/tcp activate ((connection-id string)) (result unit string))
+(import theater:simple/tcp set-active ((connection-id string) (mode string)) (result unit string))
+(import theater:simple/tcp transfer ((connection-id string) (target-actor string)) (result unit string))
+(import theater:simple/tcp transfer-async ((connection-id string) (target-actor string)) (result unit string))
+(import theater:simple/tcp peer-address ((connection-id string)) (result string string))
+(import theater:simple/tcp is-tls ((connection-id string)) (result bool string))
+(import theater:simple/tcp send ((connection-id string) (data (list u8))) (result u64 string))
+(import theater:simple/tcp receive ((connection-id string) (max-bytes u32)) (result (list u8) string))
+(import theater:simple/tcp close ((connection-id string)) (result unit string))
+(import theater:simple/tcp close-listener ((listener-id string)) (result unit string))
+(import theater:simple/tcp upgrade-to-tls-server ((connection-id string)) (result unit string))
+(import theater:simple/tcp upgrade-to-tls-client ((connection-id string) (server-name string)) (result unit string))
+
+; podman: container management. run takes a container-spec record (built via
+; marshal-record); list returns container-info records.
+(record mount-spec (source string) (target string) (read-only bool))
+(record container-spec (image string) (name string) (env (list (tuple string string)))
+  (mounts (list mount-spec)) (cmd (list string)) (tty bool) (interactive bool))
+(record container-info (id string) (name string) (image string) (status string) (exit-code s32))
+(import theater:simple/podman run ((spec container-spec)) (result string string))
+(import theater:simple/podman stop ((name string)) (result unit string))
+(import theater:simple/podman rm ((name string) (force bool)) (result unit string))
+(import theater:simple/podman list () (result (list container-info) string))
+
 ; Names the evaluator routes to the Theater bridge rather than ordinary builtins.
 (fn host-builtin? ((name string)) s32
   (cond
@@ -215,6 +245,25 @@
     ((string=? name "http-req") 1)
     ((string=? name "poll-events") 1)
     ((string=? name "help") 1)
+    ((string=? name "tcp-connect") 1)
+    ((string=? name "tcp-listen") 1)
+    ((string=? name "tcp-accept") 1)
+    ((string=? name "tcp-activate") 1)
+    ((string=? name "tcp-set-active") 1)
+    ((string=? name "tcp-transfer") 1)
+    ((string=? name "tcp-transfer-async") 1)
+    ((string=? name "tcp-peer") 1)
+    ((string=? name "tcp-is-tls") 1)
+    ((string=? name "tcp-send") 1)
+    ((string=? name "tcp-receive") 1)
+    ((string=? name "tcp-close") 1)
+    ((string=? name "tcp-close-listener") 1)
+    ((string=? name "tcp-tls-server") 1)
+    ((string=? name "tcp-tls-client") 1)
+    ((string=? name "podman-run") 1)
+    ((string=? name "podman-stop") 1)
+    ((string=? name "podman-rm") 1)
+    ((string=? name "podman-list") 1)
     (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
@@ -552,6 +601,81 @@
         (http-request-blob "GET" (as-string (list-get args 0)))))
       (failure "http-get expects a string url"))))
 
+; --- tcp -------------------------------------------------------------------
+; raw-invoke needs a literal import name, so one verb per import. one-str? and
+; two-str? guard the common arg shapes; send/receive handle list<u8> / u32.
+(fn one-str? ((args (list value))) s32 (i32.and (i32.eq (list-len args) 1) (string-arg? (list-get args 0))))
+(fn two-str? ((args (list value))) s32 (i32.and (i32.eq (list-len args) 2) (all-strings? args 0)))
+(fn apply-tcp-connect ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "connect" (marshal (list-get args 0)))) (failure "tcp-connect expects an address")))
+(fn apply-tcp-listen ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "listen" (marshal (list-get args 0)))) (failure "tcp-listen expects an address")))
+(fn apply-tcp-accept ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "accept" (marshal (list-get args 0)))) (failure "tcp-accept expects a listener id")))
+(fn apply-tcp-activate ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "activate" (marshal (list-get args 0)))) (failure "tcp-activate expects a connection id")))
+(fn apply-tcp-peer ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "peer-address" (marshal (list-get args 0)))) (failure "tcp-peer expects a connection id")))
+(fn apply-tcp-is-tls ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "is-tls" (marshal (list-get args 0)))) (failure "tcp-is-tls expects a connection id")))
+(fn apply-tcp-close ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "close" (marshal (list-get args 0)))) (failure "tcp-close expects a connection id")))
+(fn apply-tcp-close-listener ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "close-listener" (marshal (list-get args 0)))) (failure "tcp-close-listener expects a listener id")))
+(fn apply-tcp-tls-server ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "upgrade-to-tls-server" (marshal (list-get args 0)))) (failure "tcp-tls-server expects a connection id")))
+(fn apply-tcp-set-active ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "set-active" (arg-tuple args))) (failure "tcp-set-active expects connection id and mode")))
+(fn apply-tcp-transfer ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "transfer" (arg-tuple args))) (failure "tcp-transfer expects connection id and target actor")))
+(fn apply-tcp-transfer-async ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "transfer-async" (arg-tuple args))) (failure "tcp-transfer-async expects connection id and target actor")))
+(fn apply-tcp-tls-client ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "upgrade-to-tls-client" (arg-tuple args))) (failure "tcp-tls-client expects connection id and server name")))
+(fn apply-tcp-send ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "tcp-send expects (tcp-send conn-id data)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "theater:simple/tcp" "send" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "tcp-send expects two strings: connection id and data"))))
+(fn apply-tcp-receive ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "tcp-receive expects (tcp-receive conn-id max-bytes)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "theater:simple/tcp" "receive"
+        (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1))))))
+      (failure "tcp-receive expects a connection id and an integer max-bytes"))))
+
+; --- podman ----------------------------------------------------------------
+; A minimal container-spec: image + name, empty env/mounts/cmd, tty/interactive
+; off. The empty collections carry their element type descriptors.
+(fn container-spec-blob ((image string) (nm string)) any
+  (marshal-record "container-spec"
+    (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+      (symbol "image")) (symbol "name")) (symbol "env")) (symbol "mounts")) (symbol "cmd")) (symbol "tty")) (symbol "interactive"))
+    (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+      (text image)) (text nm))
+      (typed-list (sequence (list-push (list-push (list-push (list-new value) (symbol "tuple")) (symbol "string")) (symbol "string"))) (list-new value)))
+      (typed-list (symbol "mount-spec") (list-new value)))
+      (typed-list (symbol "string") (list-new value)))
+      (boolean (i32.const 0)))
+      (boolean (i32.const 0)))))
+(fn apply-podman-run ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "podman-run expects (podman-run image name)")
+    (if (all-strings? args 0)
+      (unmarshal (raw-invoke "theater:simple/podman" "run"
+        (container-spec-blob (as-string (list-get args 0)) (as-string (list-get args 1)))))
+      (failure "podman-run expects image and name strings"))))
+(fn apply-podman-stop ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/podman" "stop" (marshal (list-get args 0)))) (failure "podman-stop expects a name")))
+(fn apply-podman-rm ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "podman-rm expects (podman-rm name force)")
+    (if (i32.and (string-arg? (list-get args 0)) (bool-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "theater:simple/podman" "rm"
+        (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1))))))
+      (failure "podman-rm expects a name string and a boolean force"))))
+(fn apply-podman-list ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "podman-list expects no arguments")
+    (unmarshal (raw-invoke "theater:simple/podman" "list" (arg-tuple (list-new value))))))
+
 ; --- inbound events --------------------------------------------------------
 ; Drain the buffered triggers: each is (handler-name event result). Clears the
 ; buffer so you see only what fired since the last poll.
@@ -629,4 +753,23 @@
     ((string=? name "http-req") (apply-http-req args))
     ((string=? name "poll-events") (apply-poll-events args))
     ((string=? name "help") (apply-help args))
+    ((string=? name "tcp-connect") (apply-tcp-connect args))
+    ((string=? name "tcp-listen") (apply-tcp-listen args))
+    ((string=? name "tcp-accept") (apply-tcp-accept args))
+    ((string=? name "tcp-activate") (apply-tcp-activate args))
+    ((string=? name "tcp-set-active") (apply-tcp-set-active args))
+    ((string=? name "tcp-transfer") (apply-tcp-transfer args))
+    ((string=? name "tcp-transfer-async") (apply-tcp-transfer-async args))
+    ((string=? name "tcp-peer") (apply-tcp-peer args))
+    ((string=? name "tcp-is-tls") (apply-tcp-is-tls args))
+    ((string=? name "tcp-send") (apply-tcp-send args))
+    ((string=? name "tcp-receive") (apply-tcp-receive args))
+    ((string=? name "tcp-close") (apply-tcp-close args))
+    ((string=? name "tcp-close-listener") (apply-tcp-close-listener args))
+    ((string=? name "tcp-tls-server") (apply-tcp-tls-server args))
+    ((string=? name "tcp-tls-client") (apply-tcp-tls-client args))
+    ((string=? name "podman-run") (apply-podman-run args))
+    ((string=? name "podman-stop") (apply-podman-stop args))
+    ((string=? name "podman-rm") (apply-podman-rm args))
+    ((string=? name "podman-list") (apply-podman-list args))
     (else (failure (string-append "unknown host builtin: " name)))))

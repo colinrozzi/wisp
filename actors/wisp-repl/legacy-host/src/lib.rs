@@ -91,6 +91,13 @@ impl Runtime {
                 ],
             },
         ));
+        // Raw TCP sockets and Podman container control.
+        handlers.register(theater_handler_tcp::TcpHandler::new(
+            theater_handler_tcp::TcpHandlerConfig::default(),
+        ));
+        handlers.register(theater_handler_podman::PodmanHandler::new(
+            theater_handler_podman::PodmanHandlerConfig {},
+        ));
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,

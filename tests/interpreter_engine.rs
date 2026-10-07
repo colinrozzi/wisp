@@ -177,6 +177,36 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
         "request",
         host_fn(|_input| async move { Ok(Value::String("http-client not exercised".into())) }),
     );
+    for name in [
+        "connect",
+        "listen",
+        "accept",
+        "activate",
+        "set-active",
+        "transfer",
+        "transfer-async",
+        "peer-address",
+        "is-tls",
+        "send",
+        "receive",
+        "close",
+        "close-listener",
+        "upgrade-to-tls-server",
+        "upgrade-to-tls-client",
+    ] {
+        imports.define(
+            "theater:simple/tcp",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("tcp not exercised".into())) }),
+        );
+    }
+    for name in ["run", "stop", "rm", "list"] {
+        imports.define(
+            "theater:simple/podman",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("podman not exercised".into())) }),
+        );
+    }
     imports
 }
 

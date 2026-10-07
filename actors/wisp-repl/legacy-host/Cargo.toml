@@ -24,6 +24,8 @@ theater-handler-assembler = { git = "https://github.com/colinrozzi/theater.git",
 theater-handler-filesystem = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
 theater-handler-terminal = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
 theater-handler-http-client = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-tcp = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-podman = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
 tokio = { version = "1", features = ["full"] }
 
 [profile.dev]
