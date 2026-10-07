@@ -326,26 +326,42 @@ wisp> (factorial (i32.const 5))
 ---
 
 ### M8: Full Bootstrap
-**Status**: Partial (blocked by tokenizer recursion)
+**Status**: ✅ COMPLETE — fixpoint reached (gen-2 == gen-3, byte-identical)
 
 Compile the Wisp compiler with itself.
 
 **Goal**:
-1. Use Rust compiler to compile Wisp compiler → `wisp-v1.wasm`
-2. Use `wisp-v1.wasm` to compile Wisp compiler → `wisp-v2.wasm`
-3. Use `wisp-v2.wasm` to compile Wisp compiler → `wisp-v3.wasm`
-4. Verify: `wisp-v2.wasm` == `wisp-v3.wasm` (fixed point)
+1. Use Rust compiler to compile Wisp compiler → gen-1
+2. Use gen-1 to compile Wisp compiler → gen-2
+3. Use gen-2 to compile Wisp compiler → gen-3
+4. Verify: gen-2 == gen-3 (fixed point) ✓
 
-**Current State**:
+**Current State** (2026-09-24):
 
-The self-hosted compiler can successfully compile programs up to ~5KB. Full bootstrap
-of the 42KB compiler source is blocked by the recursive tokenizer design:
-- The tokenizer calls `tokenize-acc` once per character position
-- A 42KB file requires ~40,000+ recursive calls
-- Each call allocates tokens via `list-push`
-- This exhausts the module's 6.4MB memory limit
+The fixpoint is closed. gen-1 (Rust-compiled) compiles the full ~94 KB source into a
+valid gen-2; gen-2 compiles the same source into a gen-3 that is **byte-identical** to
+gen-2 (837,692 chars). Guarded by `test_bootstrap_fixpoint` in `tests/self_hosted.rs`.
+
+**How it was closed** (the docs above described two stale blockers; here is what was
+actually true):
+- The *recursive tokenizer / memory-exhaustion* blocker was already resolved earlier by
+  the O(N²)→O(N log N) codegen fix (divide-and-conquer `string-append`) and the deep-
+  stack test harness. gen-1 compiling the full source produces a valid module today.
+- The *last* real blocker was a compiler bug: the self-hosted tokenizer did not **decode
+  string escapes**. `read-string-lit` stored the raw source substring, so `\n`/`\"`/`\\`
+  survived verbatim into emitted string literals. gen-1 (Rust) decodes escapes, so gen-2
+  had real newlines; gen-2 did *not* decode, so gen-3 kept literal `\n` — the sole
+  divergence. Adding `escape-char` + `decode-str-lit` to the tokenizer (matching the Rust
+  tokenizer: `\n \t \r \" \\`) made gen-2 and gen-3 identical.
+- A red herring surfaced during debugging: feeding gen-2 an input placed at a low address
+  (0x1000) let its bump heap (base 0xC000) grow over the unread tail of the 94 KB input,
+  truncating the output into repeated `(error: not list)`. That was a *test-harness*
+  layout bug, not a compiler bug — gen-1 avoids it because its CGRF export wrapper copies
+  the input onto the heap first. The fixpoint test places the input high (512 MB) to give
+  gen-2 a clean input buffer.
 
 **Verified Working**:
+- ✓ `test_bootstrap_fixpoint`: gen-2 == gen-3 on the full compiler source
 - ✓ `test_bootstrap_compile_simple`: Compiles identity function
 - ✓ `test_bootstrap_compile_medium`: Compiles factorial, fibonacci, is-even/is-odd
 - ✓ `test_bootstrap_compile_large`: Compiles ~3KB of tokenizer helpers + math functions
@@ -367,10 +383,9 @@ The self-hosted compiler currently supports:
 - ✓ Record field access: `token-result.tok`, `token-result.new-pos`, `parse-result.expr`, `parse-result.new-pos`
 - ✓ Variant/record definitions (skipped in compilation - constructors are hardcoded)
 
-**To Achieve Full Bootstrap**:
-1. Rewrite tokenizer to use iteration instead of recursion, OR
-2. Implement WASM tail call optimization in the Wisp compiler, OR
-3. Increase WASM module memory limits significantly
+**Full Bootstrap achieved** (2026-09-24) via string-escape decoding in the tokenizer; see
+"How it was closed" above. The tokenizer is still recursive (one call per character) and
+runs on a large stack — that was never the actual blocker for the current source size.
 
 **Implementation Notes**:
 - String/list operations are inlined as simple WAT expressions or use runtime helpers

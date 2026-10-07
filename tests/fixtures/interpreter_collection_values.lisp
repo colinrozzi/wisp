@@ -1,0 +1,8 @@
+(export (fn make-list () (list s64) (list-push (list-new s64) 4294967296s64)))
+(export (fn make-some () (option f64) (some f64 2.5)))
+(export (fn make-none () (option string) (none string)))
+(export (fn make-ok () (result s64 string) (ok s64 string 4294967296s64)))
+(export (fn make-err () (result s64 string) (err s64 string "oops")))
+(export (fn make-tuple () (tuple s32 f64 (option string)) (tuple 42 2.5 (some string "x"))))
+(export (fn make-nested () (list (option s32))
+  (list-push (list-push (list-new (option s32)) (some s32 42)) (none s32))))

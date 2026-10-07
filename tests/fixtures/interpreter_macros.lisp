@@ -1,0 +1,12 @@
+; Definitions are collected before expanding function bodies.
+(export (fn answer () s32 (twice (inc 20))))
+(defmacro inc (x) `(i32.add ,x 1))
+(defmacro twice (x) `(i32.add ,x ,x))
+(defmacro choose (condition yes no) `(if ,condition ,yes ,no))
+(defmacro add-pair (a b) `(i32.add ,@(,a ,b)))
+(export (fn sum () s32 (add-pair 15 27)))
+(export (fn lazy () s32 (choose 1 42 (i32.div_s 1 0))))
+(global $calls s32 mut 0)
+(fn tick () s32 (begin (global.set $calls (i32.add (global.get $calls) 1)) (global.get $calls)))
+(export (fn duplicate () s32 (twice (tick))))
+(export (fn calls () s32 (global.get $calls)))

@@ -14,7 +14,8 @@ fn compile_and_run(source: &str) -> i32 {
     std::fs::write(&source_path, source).expect("failed to write temp source");
 
     // Compile
-    compiler::compile(&source_path, &out_base).expect("failed to compile");
+    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        .expect("failed to compile");
 
     // Read the WASM file
     let wasm_path = out_base.with_extension("wasm");
@@ -38,12 +39,13 @@ fn compile_and_run(source: &str) -> i32 {
         .get_memory(&mut store, "memory")
         .expect("memory not found");
 
-    // Allocate buffers in WASM linear memory
-    // Use addresses that won't conflict with the heap (heap starts at 49152)
-    let in_ptr: i32 = 0x1000; // input buffer at 4096
-    let in_len: i32 = 0; // no input params
-    let out_ptr: i32 = 0x2000; // output buffer at 8192
-    let out_cap: i32 = 256; // 256 bytes capacity
+    // Pack CGRF ABI: (in_ptr, in_len, out_ptr_ptr, out_len_ptr). The callee
+    // allocates the output buffer and writes its address into the out_ptr_ptr slot
+    // and the byte length into the out_len_ptr slot.
+    let in_ptr: i32 = 0x1000;
+    let in_len: i32 = 0;
+    let out_ptr_ptr: i32 = 0x2000;
+    let out_len_ptr: i32 = 0x2004;
 
     // Call the CGRF wrapper
     let mut results = [wasmtime::Val::I32(0)];
@@ -52,17 +54,21 @@ fn compile_and_run(source: &str) -> i32 {
         &[
             wasmtime::Val::I32(in_ptr),
             wasmtime::Val::I32(in_len),
-            wasmtime::Val::I32(out_ptr),
-            wasmtime::Val::I32(out_cap),
+            wasmtime::Val::I32(out_ptr_ptr),
+            wasmtime::Val::I32(out_len_ptr),
         ],
         &mut results,
     )
     .expect("call failed");
 
-    // Read the result from output buffer
-    // CGRF format: 4 bytes magic + header + type info + value
-    // For s32: magic(4) + version(2) + flags(2) + num_values(4) + padding(4) + type_tag(1) + padding(3) + value(4)
-    // The value is at offset 24 from out_ptr
+    // Read the allocated output pointer, then the s32 payload of the CGRF result
+    // node (16-byte CGRF header + 8-byte node header, so the value sits at +24).
+    let mut ptr_buf = [0u8; 4];
+    memory
+        .read(&store, out_ptr_ptr as usize, &mut ptr_buf)
+        .expect("failed to read output pointer");
+    let out_ptr = i32::from_le_bytes(ptr_buf);
+
     let mut buf = [0u8; 4];
     memory
         .read(&store, (out_ptr + 24) as usize, &mut buf)

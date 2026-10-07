@@ -62,9 +62,11 @@ The project uses a two-tier documentation system:
 
 ### Build and Run
 ```bash
-# Compile a Lisp source file to WAT/WASM/WIT
+# Compile a Lisp source file to a .wasm package (written to <dir>/compiled/<stem>.wasm)
 cargo run -- compile <source.lisp> [out-stem]
-# Example: cargo run -- compile examples/prog.lisp examples/prog
+# Example: cargo run -- compile examples/prog.lisp    # -> examples/compiled/prog.wasm
+# Also write the readable views (off by default; both are derivable from the wasm):
+cargo run -- compile <source.lisp> --emit-wat --emit-pact
 
 # Run an exported function from a compiled component
 cargo run -- run <component.wasm> <function-name> <args...>
@@ -193,8 +195,12 @@ Key: Separate *what* to import (interface) from *where* (source).
 ## Language Features
 
 Functions: `(fn name ((param type) ...) return-type body)`
+Generics: a `fn` with a `(where (Trait T) ...)` clause is a template, monomorphized per concrete type. A bare `(where T)` declares an unconstrained type parameter. Multiple type parameters are allowed: `(where T U)`, `(where (Ord T) (Convert T U))`.
+Higher-order functions: a parameter typed `(-> arg... ret)` is a function parameter. The argument is a function *name*, resolved at compile time — `(map f xs)` specializes to `map--f--T` with `f` inlined (defunctionalization; no runtime function values or closures).
 Imports: `(import module func ((param type) ...) return-type)`
 Exports: `(export name)` or `(export (fn ...))`
+**Traits/instances:** `(trait (Name T ...) (fn method (params) : ret) ...)` declares an interface over one or more type parameters; `(instance (Name Type ...) (fn method ... body) ...)` implements it. Methods resolve at compile time (monomorphized); the expected type disambiguates return-typed methods.
+**Deriving:** `(derive Trait Type)` reflects on a record's fields to generate a trait instance at compile time (e.g. `(derive Eq point)`). The first type-aware macro; per-trait generators, `Eq` supported. See docs/changes/DERIVING.md.
 **Macros:** `(defmacro name (params...) template)` - define syntactic abstractions
 **Quasiquote:** `` `expr `` - quote template, `,expr` - unquote, `,@expr` - splice
 **Globals:** `(global $name type mut|const init-value)` - module-level mutable/immutable state
@@ -207,20 +213,27 @@ Exports: `(export name)` or `(export (fn ...))`
 Conditionals: `(if cond then else)` - condition must be s32 (0=false, 1=true)
 Let bindings: `(let (name value) body)` - introduces lexically scoped local
 Type casts: `(s32 expr)`, `(s64 expr)`, `(f32 expr)`, `(f64 expr)`
+Includes: `(include "path.lisp")` - splice another file's forms (path relative to this file); pulls in the stdlib, e.g. `(include "std/num.lisp")`
 Comments: `; comment to end of line`
 
 ## Testing
 
-Currently no automated tests. Test fixtures in `tests/fixtures/`:
-- `s64_factorial.lisp` - recursive factorial with s64
-- `f64_math.lisp` - f64 arithmetic and typed casts
+Automated integration tests live in `tests/*.rs` (run with `cargo test -p wisp`):
+`tokenizer`, `parser`, `pattern_match`, `codegen`, `string_ops`, and `self_hosted`.
+Each compiles Wisp source to a `.wasm`, runs it under wasmtime, and checks the result.
+159 tests pass; 2 self-hosted bootstrap tests are `#[ignore]`d (they recurse past
+memory limits on a 42 KB file).
 
-Manual testing workflow:
-1. Compile fixture: `cargo run -- compile tests/fixtures/foo.lisp tests/fixtures/foo`
-2. Run exports: `cargo run -- run tests/fixtures/foo.wasm function-name args...`
-3. Verify output matches expected behavior
+- **Output ABI**: an exported function is called as `(in_ptr, in_len, out_ptr_ptr,
+  out_len_ptr)`. The callee allocates the output buffer and writes its address into
+  the `out_ptr_ptr` slot and the length into the `out_len_ptr` slot. The result is
+  CGRF-encoded: after reading the pointer, an s32 payload sits at `+24` (16-byte CGRF
+  header + 8-byte node header); a string has its length at `+24` and bytes at `+28`.
+- **Big stack**: the self-hosted compiler recurses deeply (the tokenizer recurses per
+  character), so `self_hosted` tests run their body on a 1 GiB thread via
+  `run_big_stack` rather than the default 2 MiB test stack.
 
-Future: Golden tests that diff generated WAT/WIT against expected snapshots.
+Test fixtures also live in `tests/fixtures/` for manual `cargo run -- compile` checks.
 
 ## Coding Style
 
@@ -232,7 +245,18 @@ Future: Golden tests that diff generated WAT/WIT against expected snapshots.
 
 ## Output Files
 
-For input `examples/prog.lisp` with out-stem `examples/prog`:
-- `examples/prog.wat` - WebAssembly text format (module with imports, functions, exports)
-- `examples/prog.wasm` - WebAssembly component binary (encoded with embedded WIT)
-- `examples/prog.wit` - WIT world declaration (package example:wisp with imports/exports)
+By default, compiling `examples/prog.lisp` writes just one file, in a `compiled/`
+subfolder next to the source (Racket-style), so source directories stay clean:
+- `examples/compiled/prog.wasm` - the Pack package. It embeds the interface metadata
+  (CGRF), so it is the one true artifact.
+
+The other two are optional, human-readable **views** of information the wasm already
+holds; nothing consumes them, so they are off by default:
+- `--emit-wat` -> `examples/compiled/prog.wat` - readable WAT disassembly (the wasm is
+  built from this; any wasm tool regenerates it).
+- `--emit-pact` -> `examples/compiled/prog.pact` - text interface (also embedded in the
+  wasm as CGRF metadata).
+
+An explicit out-stem (`compile prog.lisp path/name`) is used verbatim (relative to the
+current directory), bypassing the `compiled/` default. The output directory is created
+if missing. `compiled/` is gitignored.

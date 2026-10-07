@@ -1,102 +1,174 @@
-# wisp
+# Wisp
 
-`wisp` is a deliberately tiny Lisp-like compiler that lowers a handful of S-expression forms to WebAssembly text/binary plus a matching WIT world. It is meant as an educational scaffold for experimenting with WebAssembly components and compiler pipelines.
+Wisp is a typed Lisp that compiles to WebAssembly. It has a Rust reference
+compiler, a compiler written in Wisp, hygienic macros, traits and generics,
+and experimental REPL and Theater actor integrations.
 
-## Workflow
+## Getting started
 
+Enter the development environment with [Nix](https://nixos.org/):
+
+```sh
+nix develop
+cargo build --workspace
+cargo test --workspace
 ```
-$ cargo run -- compile examples/prog.lisp examples/prog
-Wrote:
-  examples/prog.wat
-  examples/prog.wasm
-  examples/prog.wit
 
-$ cargo run -- run examples/prog.wasm double 7
-14
+The Nix shell provides Rust, Wasmtime, and native build dependencies. With an
+existing recent stable Rust toolchain, Cargo can also be used directly;
+native dependencies include a C/C++ toolchain, pkg-config, and OpenSSL.
+
+Compile the sample program:
+
+```sh
+cargo run -p wisp -- compile examples/prog.lisp
 ```
 
-1. **Compile** – `cargo run -- compile <source.lisp> [out-stem]` tokenizes/parses the input, builds an AST, emits `out-stem.wat/.wit`, and encodes `out-stem.wasm` as a WebAssembly component (with embedded WIT). If `out-stem` is omitted, it defaults to the source filename stem (e.g., `examples/prog` for `examples/prog.lisp`), and artifacts are placed next to the source.
-2. **Run** – `cargo run -- run out-stem.wasm <export> <args…> [--dep mod=dep.wasm]` instantiates the component via Wasmtime and calls the chosen export. The optional `--dep` registers a single dependency component under the given module name to satisfy imports.
+This writes `examples/compiled/prog.wasm`. The compiler embeds interface metadata
+in the module. Request readable output explicitly:
 
-## Language Features
+```sh
+cargo run -p wisp -- compile examples/prog.lisp target/prog --emit-wat --emit-pact
+```
 
-Scalar types: `s32`, `s64`, `f32`, `f64`.
+An explicit output stem is relative to the current working directory. Without
+one, outputs go into `compiled/` beside the source. Both `.lisp` and `.wisp`
+examples use the same compiler.
 
-| Form | Description |
-| ---- | ----------- |
-| `(fn name ((p1 t1) …) ret body)` | Function definition with explicit param/return types. |
-| `(import mod fn ((p1 t1) …) ret)` | Declare an imported function with explicit types. |
-| `(export name)` / `(export (fn ...))` | Mark a function for export; list form defines and exports in one go. |
-| Literals (`42`, `3.14f32`) | Numeric literals default to `s32`/`f64`; suffixes allowed. |
-| Variables | Function parameters and `let` bindings (lexically scoped). |
-| Arithmetic | `(+ a b)`, `(- a b)`, `(* a b)` with type unification/widening. |
-| Comparisons | `(= a b)` (also `==`), `(< a b)`, `(<= a b)`, `(> a b)`, `(>= a b)` – all return `s32` 0/1. |
-| Conditionals | `(if cond then else)` – condition must be `s32` 0/1; branches must match. |
-| Let bindings | `(let (name value) body)` – introduces a new local binding. |
-| Function calls | `(foo arg1 arg2 …)` with arity checked at compile time. Recursion is supported. |
-| Type ascription/cast | `(s32 expr)`, `(s64 expr)`, `(f32 expr)`, `(f64 expr)` to assert or convert types. |
+## Language
 
-## Example
-
-`examples/prog.lisp` exercises most forms:
+Functions declare parameter and return types; Wasm instructions are directly
+available as expressions:
 
 ```lisp
 (export
-  (fn double (x)
-    (* x 2)))
+  (fn double ((x s32)) s32
+    (i32.mul x (i32.const 2))))
 
-(export factorial)
-
-(fn factorial (n)
-  (if (= n 0)
-      1
-      (* n (factorial (- n 1)))))
-
-(fn main (x)
-  (factorial (double x)))
+(export
+  (fn factorial ((n s32)) s32
+    (if (i32.eq n (i32.const 0))
+      (i32.const 1)
+      (i32.mul n (factorial (i32.sub n (i32.const 1)))))))
 ```
 
-Compiling it yields WAT/WIT with `double` and `factorial` exported (based on the explicit `export` forms). You can then call any export with the built-in runner:
+The Rust compiler supports:
 
-```
-$ cargo run -- run examples/prog.wasm factorial 5
-120
-```
+- Numeric types (`s32`, `s64`, `f32`, `f64`, `u8`), strings, lists, tuples,
+  records, variants, options, and results.
+- Lexical bindings, conditionals, pattern matching, recursion, memory operations,
+  globals, and function imports/exports.
+- `defmacro`, hygienic `syntax-rules`, and procedural `syntax-case` macros.
+- Traits, instances, generic specialization, and derived record equality.
+- `(include "relative/path.lisp")` for source inclusion. The numeric standard
+  library in `std/num.lisp` supplies operators such as `+` through traits.
 
-To link two components, declare imports and supply a dependency at runtime:
+See [examples/](examples/), [test fixtures](tests/fixtures/), and the
+[standard library](std/) for executable examples. Features in the Rust and
+self-hosted compilers are tested separately; support is not identical.
 
-```lisp
-; examples/math.lisp
-(export (fn double (x) (* x 2)))
+## Interpreted REPL
 
-; examples/user.lisp
-(import math double (x) s32)
-(export (fn run (x) (double x)))
-```
+A small interpreter written in Wisp now runs inside one persistent Wasm instance:
 
-```
-$ cargo run -- compile examples/math.lisp examples/math
-$ cargo run -- compile examples/user.lisp examples/user
-$ cargo run -- run examples/user.wasm run 5 --dep math=examples/math.wasm
-10
-```
-
-Typed scalars beyond `s32` are supported; build and run `typed.lisp` with:
-
-```
-$ cargo run -- compile examples/typed.lisp examples/typed
-$ cargo run -- run examples/typed.wasm add64 40 2
-42
-$ cargo run -- run examples/typed.wasm mul-f64 3.5
-8.75
+```sh
+cargo run --example interpreter
+# wisp> (define add-two (lambda (x) (+ x 2)))
+# #<closure>
+# wisp> (add-two 40)
+# 42
 ```
 
-Typed fixtures live under `tests/fixtures/`:
+It supports lexical closures, persistent definitions, typed functions, records,
+variants and pattern matching, s32/s64/f32/f64 arithmetic and casts, u8 values, unit, recursion,
+typed lists/options/results/tuples, Lisp lists, typed globals, and recoverable errors.
+Generic functions, trait instances, and higher-order arguments run directly in the
+interpreter, including the algorithms in `std/list.lisp`. Record equality can be
+derived with `(derive Eq Type)`.
+Persistent `defmacro` templates support quasiquotation and splicing; hygienic
+`syntax-rules` supports literal patterns and nested ellipses. Procedural
+`syntax-case-lambda` adds guards and computation during expansion.
+Source files can be loaded as command-line arguments, with relative `include`
+directives resolved from each file's directory.
+The [Theater interpreter actor](actors/wisp-repl/README.md) runs the same
+evaluator through a real actor mailbox, with a local socket REPL and RPC
+discovery. General Theater effects from interpreted programs, resource handles,
+and static checking remain ahead. See [interpreter/README.md](interpreter/README.md).
 
-- `s64_factorial.lisp` – recursive factorial using `s64`
-- `f64_math.lisp` – `f64` addition/scaling, a small `f32` dot product, and typed casts (`s64`/`f64`/`s32`)
+## Execution and ABI status
 
-## Next Ideas
+The current compiler emits **raw Wasm modules using the Pack/Graph ABI**.
+Exported functions exchange encoded values through memory using four pointer/
+length parameters; they do not expose their source-language signatures directly
+to `wasmtime --invoke`.
 
-- Broaden the surface language (multiple `let` bindings, boolean ops, structured types).
-- Add regression tests (e.g., compile golden programs and diff the output) so new features don’t regress existing codegen.
+The CLI retains two execution commands:
+
+- `run` loads WebAssembly components from the older component pipeline. It cannot
+  load the raw modules produced by the current `compile` command.
+- `run-module` loads raw modules. Its Pack path supports no arguments or one
+  string via `--input`; positional integers use the raw Wasm calling convention.
+
+The compiler metadata encoder, `run-module`, and Rust-backed REPL use CGRF v3
+through Packr v0.24.1 (imported as `pack`). The version is pinned once in the root
+`Cargo.toml` under `[workspace.dependencies]`. Recompile older `.wasm` artifacts
+before using them with these runners; changing an old artifact's header alone
+does not update its generated encoding code.
+
+For example, execute a string-returning export or start the REPL:
+
+```sh
+cargo run -p wisp -- compile examples/string-return-test.wisp target/greet
+cargo run -p wisp -- run-module target/greet.wasm greet
+# Hello from wisp!
+cargo run -p wisp-repl
+# wisp> (i32.add 40 2)
+# S32(42)
+```
+
+Primitive lists use packed CGRF Array nodes; lists of compound values use graph
+nodes. Packr map/set values are not yet Wisp language types. The Theater
+integrations remain a separate migration; see the [runtime migration notes](docs/changes/REPL-MIGRATION.md).
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/compiler.rs` | Rust compiler pipeline and Wasm/interface emission |
+| `src/lib.rs` | Public compiler library |
+| `src/interpreter.rs` | Local host for the Wisp-written interpreter |
+| `src/main.rs` | Compile and execution CLI |
+| `examples/wisp-compiler.lisp` | Self-hosted compiler |
+| `interpreter/` | Interpreter, reader, and printer written in Wisp |
+| `std/` | Wisp standard library sources |
+| `tests/` | Compiler, language, and self-hosting integration tests |
+| `wisp-repl/` | Rust-backed REPL library and experimental interactive runner |
+| `crates/` | Separate workspace for experimental Theater integrations |
+| `wisp-actor/` | Standalone guest actor experiment |
+| `docs/changes/` | Implementation and migration notes |
+| `docs/proposals/` | Design proposals |
+
+The root workspace contains `wisp` and `wisp-repl`. Theater integrations have
+their own [workspace and build notes](crates/README.md), so their dependencies
+do not prevent building or testing the compiler.
+
+## Development checks
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+```
+
+Run a focused suite with `cargo test -p wisp --test generics`. The self-hosting
+suite includes `test_bootstrap_fixpoint`, which checks that two successive
+generations of the self-hosted compiler produce byte-identical WAT:
+
+```sh
+cargo test -p wisp --test self_hosted test_bootstrap_fixpoint -- --nocapture
+```
+
+Self-hosting tests need substantially more memory and stack than ordinary
+language tests. Build and scratch outputs belong under `target/`; generated
+`compiled/` directories and local `.direnv/` state are ignored. Keep intentional
+WAT/WIT snapshots under `tests/fixtures/`.

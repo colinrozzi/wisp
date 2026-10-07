@@ -1,0 +1,22 @@
+name = "wisp-interpreter"
+version = "0.1.0"
+package = "./actor.wasm"
+
+# Standard Theater lifecycle (actor.init).
+[[handler]]
+type = "runtime"
+
+# Exposes theater:simple/wisp.evaluate for rpc.call / rpc.describe.
+[[handler]]
+type = "rpc"
+
+# The evaluator imports the custom wisp-source interface (see source.pact). The
+# embedding host must register it before spawning; stock `theater spawn` does
+# not provide it. Construct the bundle from the adjacent sources.json.
+
+# Grant the REPL full runtime control (inspect + mutate) so it can manage other
+# actors. The runtime control capability default-denies, so it must be granted
+# by an explicit `restrict` policy here (not just by registering the handler).
+[permission_policy.runtime]
+type = "restrict"
+config = { inspect = true, mutate = true }

@@ -1,0 +1,3 @@
+{
+  "lib/math.lisp": "(fn increment ((x s32)) s32 (i32.add x 1))"
+}

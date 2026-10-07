@@ -1,0 +1,32 @@
+[package]
+name = "wisp-interpreter-actor"
+version = "0.1.0"
+edition = "2024"
+
+# Keep the current actor independent of the legacy integration workspace.
+[workspace]
+
+# The host loads a prebuilt actor.wasm and runs it under a local Theater runtime;
+# it no longer compiles Wisp or does ABI surgery, so wisp/wat/pack are gone.
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+theater = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-native = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-rpc = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-self = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-store = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-runtime = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-message-server = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-timer = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-assembler = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-filesystem = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-terminal = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-http-client = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-tcp = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+theater-handler-podman = { git = "https://github.com/colinrozzi/theater.git", rev = "e2546700e00cb8c4a8050f27c62388bd57646483" }
+tokio = { version = "1", features = ["full"] }
+
+[profile.dev]
+debug = 0

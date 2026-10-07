@@ -23,6 +23,11 @@ pub enum Type {
     Borrow(Box<Type>),            // borrow<T> - borrowed reference
     Tuple(Vec<Type>),             // tuple<T1, T2, ...> - product type
     U8,                           // unsigned 8-bit integer
+    Bool,                         // boolean (i32 in WASM; 1-byte CGRF payload like u8)
+    U16,                          // unsigned 16-bit integer (i32 in WASM; 2-byte CGRF payload)
+    U32,                          // unsigned 32-bit integer (i32 in WASM; 4-byte CGRF payload)
+    U64,                          // unsigned 64-bit integer (i64 in WASM; like s64)
+    Any,                          // Pack dynamic `value` - self-describing CGRF blob
 }
 
 /// A value that can be inlined during REPL compilation
@@ -102,12 +107,6 @@ struct ScopeSet {
 }
 
 impl ScopeSet {
-    fn new() -> Self {
-        Self {
-            scopes: HashSet::new(),
-        }
-    }
-
     /// Create a scope set with the base scope (scope 0)
     fn base() -> Self {
         let mut scopes = HashSet::new();
@@ -293,12 +292,86 @@ impl CompileContext {
 
 #[derive(Debug)]
 pub struct CompileArtifacts {
-    pub wat: PathBuf,
     pub wasm: PathBuf,
-    pub pact: PathBuf,
+    /// Written only when requested (`--emit-wat`); a readable disassembly of the wasm.
+    pub wat: Option<PathBuf>,
+    /// Written only when requested (`--emit-pact`); a text view of the interface that
+    /// is also embedded in the wasm.
+    pub pact: Option<PathBuf>,
 }
 
-pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> {
+/// Which optional, human-readable views to write alongside the `.wasm`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmitOptions {
+    pub wat: bool,
+    pub pact: bool,
+}
+
+/// Splice `(include "path")` top-level forms in place, reading each referenced
+/// file relative to the including file's directory. Runs before macro/generic
+/// expansion, so included traits, macros, and functions are all visible. A file
+/// is included at most once (keyed by canonical path), which also breaks cycles.
+fn expand_includes(
+    forms: Vec<SExpr>,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    ctx: &CompileContext,
+) -> Result<Vec<SExpr>> {
+    let mut out = Vec::new();
+    for form in forms {
+        let is_include = matches!(&form,
+            SExpr::List(items, _) if head_sym(items) == Some("include"));
+        if !is_include {
+            out.push(form);
+            continue;
+        }
+        let (items, span) = match &form {
+            SExpr::List(items, span) => (items, span),
+            _ => unreachable!(),
+        };
+        let rel = match items.get(1) {
+            Some(SExpr::Str(s, _)) if items.len() == 2 => s,
+            _ => {
+                return Err(ctx.error(
+                    "include expects a string path: (include \"file.lisp\")",
+                    span,
+                ));
+            }
+        };
+        let path = base_dir.join(rel);
+        let canon = path.canonicalize().map_err(|e| {
+            ctx.error(
+                format!("include: cannot open '{}': {}", path.display(), e),
+                span,
+            )
+        })?;
+        if !visited.insert(canon.clone()) {
+            continue; // already included
+        }
+        let inc_src = fs::read_to_string(&canon).map_err(|e| {
+            ctx.error(
+                format!("include: cannot read '{}': {}", canon.display(), e),
+                span,
+            )
+        })?;
+        let toks = tokenize(&inc_src);
+        let mut inc_forms = Vec::new();
+        let mut pos = 0;
+        while pos < toks.len() {
+            let (s, next) = parse_sexpr(&toks, pos);
+            inc_forms.push(s);
+            pos = next;
+        }
+        let inc_dir = canon
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| base_dir.to_path_buf());
+        out.extend(expand_includes(inc_forms, &inc_dir, visited, ctx)?);
+    }
+    Ok(out)
+}
+
+pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result<CompileArtifacts> {
     let src = fs::read_to_string(source_path)
         .with_context(|| format!("failed to read source file {}", source_path.display()))?;
 
@@ -317,45 +390,78 @@ pub fn compile(source_path: &Path, out_base: &Path) -> Result<CompileArtifacts> 
         bail!("no function definitions found in source");
     }
 
+    // Splice any `(include "...")` files before macro/generic expansion.
+    let base_dir = source_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut visited = HashSet::new();
+    if let Ok(c) = source_path.canonicalize() {
+        visited.insert(c);
+    }
+    let forms = expand_includes(forms, &base_dir, &mut visited, &ctx)?;
+
     // Collect macro definitions (both defmacro and define-syntax) and expand macros
     let macros = collect_macros(&forms);
     let expanded_forms = expand_all_macros(forms, &macros);
+
+    // Compile-time deriving: `(derive Trait Type)` -> a generated trait instance.
+    let expanded_forms = expand_derives(expanded_forms, &ctx)?;
+
+    // Lower traits / instances / generics to plain monomorphic forms.
+    let expanded_forms = expand_generics(expanded_forms, &ctx)?;
 
     let prog = parse_program(expanded_forms, &ctx)?;
     let signatures = collect_signatures(&prog)?;
     type_check(&prog, &signatures, &ctx)?;
 
-    // Generate Pack-compatible WAT (raw module with Pack/Graph ABI)
+    // Generate Pack-compatible WAT (raw module with Pack/Graph ABI). This text is
+    // always produced because the wasm is built from it, but it is only *written*
+    // when requested — it is a readable disassembly the wasm can regenerate.
     let wat = generate_wat_pack(&prog, &signatures);
 
-    let mut wat_path = out_base.to_path_buf();
-    wat_path.set_extension("wat");
+    // Ensure the output directory (e.g. `compiled/`) exists.
+    if let Some(dir) = out_base.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create output directory {}", dir.display()))?;
+    }
+
     let mut wasm_path = out_base.to_path_buf();
     wasm_path.set_extension("wasm");
-    let mut pact_path = out_base.to_path_buf();
-    pact_path.set_extension("pact");
 
-    fs::write(&wat_path, &wat)
-        .with_context(|| format!("failed to write {}", wat_path.display()))?;
-
-    // Convert WAT to raw WASM module (not a component)
+    // The wasm is the one true artifact; it also embeds the interface metadata.
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
     fs::write(&wasm_path, &wasm_bytes)
         .with_context(|| format!("failed to write {}", wasm_path.display()))?;
 
-    // Generate Pact interface definition
-    // Use source file name as interface name
-    let interface_name = source_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("wisp");
-    let pact = generate_pact(&prog, interface_name);
-    fs::write(&pact_path, &pact)
-        .with_context(|| format!("failed to write {}", pact_path.display()))?;
+    // Optional view: the readable WAT disassembly.
+    let wat_path = if emit.wat {
+        let mut p = out_base.to_path_buf();
+        p.set_extension("wat");
+        fs::write(&p, &wat).with_context(|| format!("failed to write {}", p.display()))?;
+        Some(p)
+    } else {
+        None
+    };
+
+    // Optional view: the text interface (also embedded in the wasm as CGRF metadata).
+    let pact_path = if emit.pact {
+        let interface_name = source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("wisp");
+        let pact = generate_pact(&prog, interface_name);
+        let mut p = out_base.to_path_buf();
+        p.set_extension("pact");
+        fs::write(&p, &pact).with_context(|| format!("failed to write {}", p.display()))?;
+        Some(p)
+    } else {
+        None
+    };
 
     Ok(CompileArtifacts {
-        wat: wat_path,
         wasm: wasm_path,
+        wat: wat_path,
         pact: pact_path,
     })
 }
@@ -369,26 +475,26 @@ fn encode_component(
     let mut resolve = Resolve::new();
 
     // If we have external WIT dependencies, load them first
-    if let Some(config) = world_config {
-        if let Some(wit_deps) = &config.wit_deps {
-            // Resolve wit_deps path relative to the source file
-            let deps_path = if wit_deps.is_absolute() {
-                wit_deps.clone()
-            } else {
-                source_path
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join(wit_deps)
-            };
+    if let Some(config) = world_config
+        && let Some(wit_deps) = &config.wit_deps
+    {
+        // Resolve wit_deps path relative to the source file
+        let deps_path = if wit_deps.is_absolute() {
+            wit_deps.clone()
+        } else {
+            source_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(wit_deps)
+        };
 
-            if deps_path.exists() {
-                // Load all WIT packages from the deps directory
-                resolve.push_path(&deps_path).with_context(|| {
-                    format!("failed to load WIT deps from {}", deps_path.display())
-                })?;
-            } else {
-                bail!("WIT deps path not found: {}", deps_path.display());
-            }
+        if deps_path.exists() {
+            // Load all WIT packages from the deps directory
+            resolve
+                .push_path(&deps_path)
+                .with_context(|| format!("failed to load WIT deps from {}", deps_path.display()))?;
+        } else {
+            bail!("WIT deps path not found: {}", deps_path.display());
         }
     }
 
@@ -612,6 +718,61 @@ pub enum Expr {
     StringFromBytes {
         bytes: Box<Expr>,
     },
+    /// Construct a dynamic `any` from an s32: (any-s32 n) -> any
+    AnyFromS32 {
+        value: Box<Expr>,
+    },
+    /// Read the s32 payload of a dynamic `any`: (any-as-s32 x) -> s32
+    AnyToS32 {
+        value: Box<Expr>,
+    },
+    /// Construct a dynamic `any` from a string: (any-string s) -> any
+    AnyFromString {
+        value: Box<Expr>,
+    },
+    /// Read the string payload of a dynamic `any`: (any-as-string x) -> string
+    AnyToString {
+        value: Box<Expr>,
+    },
+    /// Allocate n bytes on the compiler heap: (heap-alloc n) -> s32 (pointer).
+    HeapAlloc {
+        size: Box<Expr>,
+    },
+    /// Reinterpret an `any` as the address of its [len:u32][cgrf] blob:
+    /// (any-addr x) -> s32. The inverse of any-from-addr.
+    AnyAddr {
+        value: Box<Expr>,
+    },
+    /// Reinterpret a blob address as an `any`: (any-from-addr p) -> any. The
+    /// address must point to a [len:u32][cgrf] buffer (e.g. built via heap-alloc).
+    AnyFromAddr {
+        value: Box<Expr>,
+    },
+    /// Reinterpret a string as the address of its [len:u32][bytes] buffer:
+    /// (string-addr s) -> s32. Lets Wisp copy string bytes into a CGRF buffer.
+    StringAddr {
+        value: Box<Expr>,
+    },
+    /// Reinterpret an address as a string: (string-from-addr p) -> string. The
+    /// address must point to a [len:u32][bytes] buffer (e.g. a CGRF string payload).
+    StringFromAddr {
+        value: Box<Expr>,
+    },
+    /// Invoke a host import's raw CGRF entry point with a pre-encoded args blob:
+    /// `args-any` is a len-prefixed CGRF blob (built by `marshal`), passed straight
+    /// to the import's raw symbol, and the returned CGRF is wrapped into an `any`.
+    /// `module`+`import` name the import (e.g. "theater:simple/store"+"get"); the raw
+    /// symbol is qualified by interface so same-named functions in different
+    /// interfaces (store.exists vs filesystem.exists) don't collide.
+    /// `(call-raw args)` is sugar for rpc.call; `(raw-invoke "iface" "name" args)`
+    /// targets any declared import. This is the raw-CGRF calling convention: the
+    /// import is declared with its real typed signature (so the interface hash
+    /// matches Theater), but values cross as CGRF and are bridged by marshal/unmarshal.
+    RawInvoke {
+        module: String,
+        import: String,
+        value: Box<Expr>,
+    },
     /// Convert string to bytes: (string-to-bytes string) -> list<u8>
     StringToBytes {
         string: Box<Expr>,
@@ -624,7 +785,7 @@ pub enum Expr {
 
 /// A single arm in a match expression
 #[derive(Debug, Clone)]
-struct MatchArm {
+pub struct MatchArm {
     case_name: String,
     bindings: Vec<String>, // Variable names to bind payload values
     body: Expr,
@@ -700,7 +861,6 @@ pub struct Import {
     pub name: String,
     pub params: Vec<Parameter>,
     pub return_type: Type,
-    span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -790,6 +950,9 @@ fn type_size(ty: &Type) -> usize {
         Type::S32 | Type::F32 => 4,
         Type::S64 | Type::F64 => 8,
         Type::U8 => 4, // stored as i32 in Wisp memory; byte-packing only in list<u8> data arrays
+        Type::Bool => 4, // i32 in Wisp memory (0/1); 1-byte only in CGRF payload
+        Type::U16 | Type::U32 => 4, // i32 in Wisp memory; narrower only in CGRF payload
+        Type::U64 => 8, // i64 in Wisp memory
         // Records, variants, options, results, lists, strings, and tuples are pointer-sized
         Type::Record(_)
         | Type::Variant(_)
@@ -797,7 +960,8 @@ fn type_size(ty: &Type) -> usize {
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
-        | Type::Tuple(_) => 4,
+        | Type::Tuple(_)
+        | Type::Any => 4,
         // Resources and borrows are i32 handles
         Type::Resource(_) | Type::Borrow(_) => 4,
     }
@@ -806,14 +970,23 @@ fn type_size(ty: &Type) -> usize {
 /// Check if a type requires heap allocation
 fn type_needs_heap(ty: &Type) -> bool {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::U8 => false,
+        Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::U8
+        | Type::Bool
+        | Type::U16
+        | Type::U32
+        | Type::U64 => false,
         Type::Record(_)
         | Type::Variant(_)
         | Type::Option(_)
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
-        | Type::Tuple(_) => true,
+        | Type::Tuple(_)
+        | Type::Any => true,
         // Resources don't need heap - they're opaque handles managed externally
         Type::Resource(_) | Type::Borrow(_) => false,
     }
@@ -824,8 +997,8 @@ fn type_needs_heap(ty: &Type) -> bool {
 fn cgrf_element_node_size(ty: &Type) -> usize {
     match ty {
         // Scalars: node header (8) + payload (4 or 8)
-        Type::S32 | Type::F32 | Type::U8 => 12,
-        Type::S64 | Type::F64 => 16,
+        Type::S32 | Type::F32 | Type::U8 | Type::Bool | Type::U16 | Type::U32 => 12,
+        Type::S64 | Type::F64 | Type::U64 => 16,
         // Strings: node header (8) + length (4) + average string data (~32)
         Type::Str => 44,
         // Lists: node header (8) + child indices (~16) + nested elements
@@ -833,9 +1006,13 @@ fn cgrf_element_node_size(ty: &Type) -> usize {
         // Options: node header (8) + presence (1) + optional child
         Type::Option(inner) => 16 + cgrf_element_node_size(inner),
         // Tuples: node header (8) + child indices
-        Type::Tuple(elems) => 8 + 4 * elems.len() + elems.iter().map(cgrf_element_node_size).sum::<usize>(),
+        Type::Tuple(elems) => {
+            8 + 4 * elems.len() + elems.iter().map(cgrf_element_node_size).sum::<usize>()
+        }
         // Records, variants, results: estimate conservatively
         Type::Record(_) | Type::Variant(_) | Type::Result(_, _) => 64,
+        // Dynamic value: a self-contained CGRF blob; estimate conservatively
+        Type::Any => 64,
         // Resources/borrows: just a handle
         Type::Resource(_) | Type::Borrow(_) => 12,
     }
@@ -857,7 +1034,7 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::Begin { exprs } => exprs.iter().any(expr_uses_heap),
         Expr::WasmInstr { args, .. } => args.iter().any(expr_uses_heap),
         Expr::GlobalSet { value, .. } => expr_uses_heap(value),
-        Expr::RecordConstruct { fields, .. } => true, // records need heap
+        Expr::RecordConstruct { .. } => true, // records need heap
         Expr::RecordAccess { expr, .. } => expr_uses_heap(expr),
         Expr::VariantConstruct { .. } => true, // variants need heap
         Expr::Match { expr, cases } => {
@@ -870,7 +1047,18 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::ListLen { list } => expr_uses_heap(list),
         Expr::StringLen { string } => expr_uses_heap(string),
         Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
-        Expr::Substring { .. } | Expr::StringAppend { .. } | Expr::StringFromBytes { .. } | Expr::StringToBytes { .. } => true, // allocate new strings/lists
+        Expr::AnyFromS32 { .. } | Expr::AnyFromString { .. } => true, // allocate a CGRF blob
+        Expr::AnyToS32 { value } | Expr::AnyToString { value } => expr_uses_heap(value),
+        Expr::HeapAlloc { .. } => true, // allocates
+        Expr::AnyAddr { value }
+        | Expr::AnyFromAddr { value }
+        | Expr::StringAddr { value }
+        | Expr::StringFromAddr { value } => expr_uses_heap(value),
+        Expr::RawInvoke { .. } => true, // allocates the result blob
+        Expr::Substring { .. }
+        | Expr::StringAppend { .. }
+        | Expr::StringFromBytes { .. }
+        | Expr::StringToBytes { .. } => true, // allocate new strings/lists
         Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
         Expr::TupleConstruct { .. } => true,
     }
@@ -955,7 +1143,7 @@ struct SyntaxCaseClause {
 #[derive(Debug, Clone)]
 struct SyntaxCaseMacro {
     name: String,
-    param: String, // The stx parameter name
+    _param: String, // Reserved for the syntax-case input binding
     literals: Vec<String>,
     clauses: Vec<SyntaxCaseClause>,
 }
@@ -1389,9 +1577,11 @@ fn collect_signatures(prog: &Program) -> Result<HashMap<String, Signature>> {
             params,
             result: import.return_type.clone(),
         };
-        if signatures.insert(import.name.clone(), sig).is_some() {
-            bail!("Duplicate function '{}'", import.name);
-        }
+        // Imports are keyed by bare name only for typed-call resolution, which
+        // raw-invoked imports never use. Same-named functions in different
+        // interfaces (store.exists / filesystem.exists) are allowed; keep the
+        // first signature (its typed wrapper is the one that survives dedup).
+        signatures.entry(import.name.clone()).or_insert(sig);
     }
     Ok(signatures)
 }
@@ -1504,8 +1694,8 @@ fn check_expr(
             for (arg, expected_ty) in args.iter().zip(instr_info.params.iter()) {
                 let ty = check_expr(arg, env, signatures, globals, records, variants)?;
                 // Allow u8 -> s32 coercion since u8 is stored as i32
-                let types_compatible = ty == *expected_ty
-                    || (*expected_ty == Type::S32 && ty == Type::U8);
+                let types_compatible =
+                    ty == *expected_ty || (*expected_ty == Type::S32 && ty == Type::U8);
                 if !types_compatible {
                     bail!(
                         "argument type mismatch in '{}': expected {:?}, got {:?}",
@@ -1676,8 +1866,7 @@ fn check_expr(
                             }
                         }
                     }
-                    return result_ty
-                        .ok_or_else(|| anyhow!("match expression must have at least one case"));
+                    result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
                 }
                 Type::Result(ok_ty, err_ty) => {
                     // Result can match on 'ok' and 'err'
@@ -1723,8 +1912,7 @@ fn check_expr(
                             }
                         }
                     }
-                    return result_ty
-                        .ok_or_else(|| anyhow!("match expression must have at least one case"));
+                    result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
                 }
                 Type::Variant(variant_name) => {
                     // User-defined variant
@@ -1769,8 +1957,7 @@ fn check_expr(
                             }
                         }
                     }
-                    return result_ty
-                        .ok_or_else(|| anyhow!("match expression must have at least one case"));
+                    result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
                 }
                 _ => bail!(
                     "match expression must be a variant, option, or result type, got {:?}",
@@ -1846,8 +2033,8 @@ fn check_expr(
             };
             let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
             // Allow s32 -> u8 coercion since u8 is stored as i32 internally
-            let types_compatible = value_ty == elem_type
-                || (elem_type == Type::U8 && value_ty == Type::S32);
+            let types_compatible =
+                value_ty == elem_type || (elem_type == Type::U8 && value_ty == Type::S32);
             if !types_compatible {
                 bail!(
                     "list-push value type mismatch: expected {:?}, got {:?}",
@@ -1909,6 +2096,79 @@ fn check_expr(
             }
             Ok(Type::Str)
         }
+        Expr::AnyFromS32 { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("any-s32 expects an s32, got {:?}", ty);
+            }
+            Ok(Type::Any)
+        }
+        Expr::AnyToS32 { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!("any-as-s32 expects an any, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::AnyFromString { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Str {
+                bail!("any-string expects a string, got {:?}", ty);
+            }
+            Ok(Type::Any)
+        }
+        Expr::AnyToString { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!("any-as-string expects an any, got {:?}", ty);
+            }
+            Ok(Type::Str)
+        }
+        Expr::HeapAlloc { size } => {
+            let ty = check_expr(size, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("heap-alloc expects an s32 size, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::AnyAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!("any-addr expects an any, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::AnyFromAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("any-from-addr expects an s32 address, got {:?}", ty);
+            }
+            Ok(Type::Any)
+        }
+        Expr::StringAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Str {
+                bail!("string-addr expects a string, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::StringFromAddr { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("string-from-addr expects an s32 address, got {:?}", ty);
+            }
+            Ok(Type::Str)
+        }
+        Expr::RawInvoke { value, .. } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if ty != Type::Any {
+                bail!(
+                    "raw-invoke expects an any (encoded args tuple), got {:?}",
+                    ty
+                );
+            }
+            Ok(Type::Any)
+        }
         Expr::StringAppend { left, right } => {
             let left_ty = check_expr(left, env, signatures, globals, records, variants)?;
             if left_ty != Type::Str {
@@ -1952,6 +2212,10 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
     match ty {
         Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
         Type::U8 => bail!("{}: expected numeric type, got u8", msg),
+        Type::Bool => bail!("{}: expected numeric type, got bool", msg),
+        Type::U16 => bail!("{}: expected numeric type, got u16", msg),
+        Type::U32 => bail!("{}: expected numeric type, got u32", msg),
+        Type::U64 => bail!("{}: expected numeric type, got u64", msg),
         Type::Record(name) => bail!("{}: expected numeric type, got record '{}'", msg, name),
         Type::Variant(name) => bail!("{}: expected numeric type, got variant '{}'", msg, name),
         Type::Option(_) => bail!("{}: expected numeric type, got option", msg),
@@ -1959,6 +2223,7 @@ fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
         Type::List(_) => bail!("{}: expected numeric type, got list", msg),
         Type::Str => bail!("{}: expected numeric type, got string", msg),
         Type::Tuple(_) => bail!("{}: expected numeric type, got tuple", msg),
+        Type::Any => bail!("{}: expected numeric type, got any", msg),
         Type::Resource(name) => bail!("{}: expected numeric type, got resource '{}'", msg, name),
         Type::Borrow(_) => bail!("{}: expected numeric type, got borrow", msg),
     }
@@ -2116,12 +2381,12 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                                     // \xHH hex escape
                                     let mut hex = String::new();
                                     for _ in 0..2 {
-                                        if let Some(&h) = chars.peek() {
-                                            if h.is_ascii_hexdigit() {
-                                                hex.push(h);
-                                                chars.next();
-                                                column += 1;
-                                            }
+                                        if let Some(&h) = chars.peek()
+                                            && h.is_ascii_hexdigit()
+                                        {
+                                            hex.push(h);
+                                            chars.next();
+                                            column += 1;
                                         }
                                     }
                                     if hex.len() == 2 {
@@ -2328,25 +2593,25 @@ fn collect_macros(forms: &[SExpr]) -> CollectedMacros {
     let mut syntax_case = HashMap::new();
 
     for form in forms {
-        if let SExpr::List(items, _) = form {
-            if let Some(SExpr::Sym(sym, _)) = items.first() {
-                if sym == "defmacro" && items.len() >= 4 {
-                    let mac = parse_defmacro_form(items);
-                    defmacros.insert(mac.name.clone(), mac);
-                } else if sym == "define-syntax" && items.len() >= 3 {
-                    // Check if it's syntax-rules or syntax-case-lambda
-                    if let SExpr::List(body_items, _) = &items[2] {
-                        if let Some(SExpr::Sym(body_sym, _)) = body_items.first() {
-                            if body_sym == "syntax-rules" {
-                                if let Some(mac) = parse_define_syntax_form(items) {
-                                    syntax_rules.insert(mac.name.clone(), mac);
-                                }
-                            } else if body_sym == "syntax-case-lambda" {
-                                if let Some(mac) = parse_syntax_case_form(items) {
-                                    syntax_case.insert(mac.name.clone(), mac);
-                                }
-                            }
+        if let SExpr::List(items, _) = form
+            && let Some(SExpr::Sym(sym, _)) = items.first()
+        {
+            if sym == "defmacro" && items.len() >= 4 {
+                let mac = parse_defmacro_form(items);
+                defmacros.insert(mac.name.clone(), mac);
+            } else if sym == "define-syntax" && items.len() >= 3 {
+                // Check if it's syntax-rules or syntax-case-lambda
+                if let SExpr::List(body_items, _) = &items[2]
+                    && let Some(SExpr::Sym(body_sym, _)) = body_items.first()
+                {
+                    if body_sym == "syntax-rules" {
+                        if let Some(mac) = parse_define_syntax_form(items) {
+                            syntax_rules.insert(mac.name.clone(), mac);
                         }
+                    } else if body_sym == "syntax-case-lambda"
+                        && let Some(mac) = parse_syntax_case_form(items)
+                    {
+                        syntax_case.insert(mac.name.clone(), mac);
                     }
                 }
             }
@@ -2567,7 +2832,7 @@ fn parse_syntax_case_form(items: &[SExpr]) -> Option<SyntaxCaseMacro> {
 
     Some(SyntaxCaseMacro {
         name,
-        param,
+        _param: param,
         literals,
         clauses,
     })
@@ -2654,20 +2919,19 @@ fn parse_compile_time_expr(
                         });
                     }
                     "let" if items.len() == 3 => {
-                        if let SExpr::List(binding, _) = &items[1] {
-                            if binding.len() == 2 {
-                                if let SExpr::Sym(var_name, _) = &binding[0] {
-                                    let value = parse_compile_time_expr(&binding[1], pattern_vars)?;
-                                    let mut extended_vars = pattern_vars.clone();
-                                    extended_vars.insert(var_name.clone());
-                                    let body = parse_compile_time_expr(&items[2], &extended_vars)?;
-                                    return Some(CompileTimeExpr::Let {
-                                        name: var_name.clone(),
-                                        value: Box::new(value),
-                                        body: Box::new(body),
-                                    });
-                                }
-                            }
+                        if let SExpr::List(binding, _) = &items[1]
+                            && binding.len() == 2
+                            && let SExpr::Sym(var_name, _) = &binding[0]
+                        {
+                            let value = parse_compile_time_expr(&binding[1], pattern_vars)?;
+                            let mut extended_vars = pattern_vars.clone();
+                            extended_vars.insert(var_name.clone());
+                            let body = parse_compile_time_expr(&items[2], &extended_vars)?;
+                            return Some(CompileTimeExpr::Let {
+                                name: var_name.clone(),
+                                value: Box::new(value),
+                                body: Box::new(body),
+                            });
                         }
                     }
                     _ => {}
@@ -2817,16 +3081,15 @@ fn parse_template(sexpr: &SExpr, pattern_vars: &HashSet<String>) -> Option<Templ
             let mut i = 0;
             while i < items.len() {
                 // Check if next item is ellipsis
-                if i + 1 < items.len() {
-                    if let SExpr::Sym(s, _) = &items[i + 1] {
-                        if s == "..." {
-                            // This element is repeated
-                            let inner = parse_template(&items[i], pattern_vars)?;
-                            templates.push(Template::Ellipsis(Box::new(inner)));
-                            i += 2; // Skip both element and ellipsis
-                            continue;
-                        }
-                    }
+                if i + 1 < items.len()
+                    && let SExpr::Sym(s, _) = &items[i + 1]
+                    && s == "..."
+                {
+                    // This element is repeated
+                    let inner = parse_template(&items[i], pattern_vars)?;
+                    templates.push(Template::Ellipsis(Box::new(inner)));
+                    i += 2; // Skip both element and ellipsis
+                    continue;
                 }
                 // Regular element
                 templates.push(parse_template(&items[i], pattern_vars)?);
@@ -2847,10 +3110,10 @@ fn expand_all_macros(forms: Vec<SExpr>, macros: &CollectedMacros) -> Vec<SExpr> 
         .into_iter()
         .filter(|form| {
             // Filter out defmacro and define-syntax forms (they're already collected)
-            if let SExpr::List(items, _) = form {
-                if let Some(SExpr::Sym(sym, _)) = items.first() {
-                    return sym != "defmacro" && sym != "define-syntax";
-                }
+            if let SExpr::List(items, _) = form
+                && let Some(SExpr::Sym(sym, _)) = items.first()
+            {
+                return sym != "defmacro" && sym != "define-syntax";
             }
             true
         })
@@ -3019,6 +3282,7 @@ fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
 /// Substitute pattern variables in a syntax template
 /// Pattern variables bound in the environment are replaced with their values
 /// Other symbols get the macro scope added for hygiene
+#[allow(clippy::only_used_in_recursion)]
 fn substitute_pattern_vars_in_syntax(
     sexpr: &SExpr,
     env: &HashMap<String, CompileTimeValue>,
@@ -3329,7 +3593,7 @@ fn eval_quasisyntax(
                 other => eval_quasisyntax(other, env, span, macro_scope),
             }
         }
-        SExpr::UnsyntaxSplice(inner, _) => {
+        SExpr::UnsyntaxSplice(_inner, _) => {
             // #,@ should only appear inside lists
             panic!("Unsyntax-splice (#,@) can only appear inside a list");
         }
@@ -3403,6 +3667,7 @@ fn match_pattern(
     }
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn match_pattern_impl(
     pattern: &Pattern,
     input: &SExpr,
@@ -3680,6 +3945,7 @@ fn add_scope_to_sexpr(sexpr: &SExpr, scope: ScopeId) -> SExpr {
 
 // Evaluate quasiquoted template with substitutions
 // macro_scope: Optional scope to add to template-introduced identifiers (for hygiene)
+#[allow(clippy::only_used_in_recursion)]
 fn eval_quasiquote(
     template: &SExpr,
     subs: &HashMap<String, SExpr>,
@@ -3796,6 +4062,1442 @@ fn add_scope_to_span(span: &Span, scope: Option<ScopeId>) -> Span {
     }
 }
 
+// ===========================================================================
+// Generics + traits pre-pass (monomorphization / dictionary erasure)
+//
+// Lowers `trait`, `instance`, and generic `fn` (those with a `where` clause)
+// into plain monomorphic `fn` forms. Runs after macro expansion and before
+// `parse_program`, so the rest of the typed pipeline is untouched.
+//   - Each instance method becomes a concrete top-level fn.
+//   - Each use of a generic fn at a concrete type is specialized to a copy.
+//   - Inside a copy, trait-method calls resolve to the concrete instance fn.
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+struct GenericFnDef {
+    name: String,
+    tparams: Vec<String>,               // type parameters (declaration order)
+    constraints: Vec<(String, String)>, // (trait, type parameter it constrains)
+    func_params: Vec<usize>,            // argument positions of function-typed parameters
+    params: SExpr,                      // ((name type) ...) with type params still symbolic
+    ret: SExpr,                         // return type expr with type params still symbolic
+    body: SExpr,
+}
+
+/// One monomorphization request: a template specialized at concrete types (one binding
+/// per type parameter, in declaration order) and function-name arguments.
+#[derive(Debug, Clone)]
+struct SpecKey {
+    name: String,
+    bindings: Vec<(String, String)>, // (type parameter, concrete type)
+    func_args: Vec<String>,
+}
+
+/// True when a parameter's type expr is a function type `(-> arg... ret)`.
+fn is_func_type(ty: &SExpr) -> bool {
+    matches!(ty, SExpr::List(items, _) if head_sym(items) == Some("->"))
+}
+
+/// Argument positions of the function-typed parameters in a param list.
+fn func_param_indices(params: &SExpr) -> Vec<usize> {
+    let mut out = Vec::new();
+    if let SExpr::List(items, _) = params {
+        for (i, p) in items.iter().enumerate() {
+            if let Some((_, ty)) = param_name_and_type(p)
+                && is_func_type(ty)
+            {
+                out.push(i);
+            }
+        }
+    }
+    out
+}
+
+/// The parameter name at a given position in a param list.
+fn param_name_at(params: &SExpr, idx: usize) -> Option<String> {
+    if let SExpr::List(items, _) = params {
+        param_name_and_type(items.get(idx)?).map(|(n, _)| n.to_string())
+    } else {
+        None
+    }
+}
+
+/// The mangled name of a specialized template: base, then each function argument,
+/// then the concrete type (if any). e.g. `map--double--s32`, `apply-twice--inc`.
+fn template_fn_name(base: &str, func_args: &[String], concretes: &[String]) -> String {
+    let mut s = base.to_string();
+    for fa in func_args {
+        s.push_str("--");
+        s.push_str(&sanitize_method(fa));
+    }
+    for c in concretes {
+        s.push_str("--");
+        s.push_str(c);
+    }
+    s
+}
+
+/// A trait method's declared signature (the type parameter is still symbolic).
+#[derive(Debug, Clone)]
+struct TraitMethodSig {
+    name: String,
+    params: SExpr,
+    ret: SExpr,
+}
+
+/// A declared trait: its type parameters and its method signatures.
+#[derive(Debug, Clone)]
+struct TraitDef {
+    tparams: Vec<String>,
+    methods: Vec<TraitMethodSig>,
+}
+
+/// Parse a bodyless trait method signature: `(fn name params [:] ret)`.
+fn parse_method_sig(mi: &[SExpr]) -> Option<TraitMethodSig> {
+    let name = match mi.get(1)? {
+        SExpr::Sym(s, _) => s.clone(),
+        _ => return None,
+    };
+    let params = mi.get(2)?.clone();
+    let mut idx = 3;
+    if mi.get(idx).is_some_and(is_colon) {
+        idx += 1;
+    }
+    let ret = mi.get(idx)?.clone();
+    if idx != mi.len() - 1 {
+        return None; // a trait method has no body
+    }
+    Some(TraitMethodSig { name, params, ret })
+}
+
+/// Structural equality of two type expressions, ignoring spans.
+fn type_expr_eq(a: &SExpr, b: &SExpr) -> bool {
+    match (a, b) {
+        (SExpr::Sym(x, _), SExpr::Sym(y, _)) => x == y,
+        (SExpr::List(xs, _), SExpr::List(ys, _)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(p, q)| type_expr_eq(p, q))
+        }
+        _ => false,
+    }
+}
+
+/// The type expr of each parameter in a param list (colon or bare form).
+fn param_type_exprs(params: &SExpr) -> Vec<&SExpr> {
+    let mut out = Vec::new();
+    if let SExpr::List(items, _) = params {
+        for p in items {
+            if let Some((_, ty)) = param_name_and_type(p) {
+                out.push(ty);
+            }
+        }
+    }
+    out
+}
+
+/// Context for resolving trait-method calls inside a specialized body.
+struct MethodCtx {
+    constraints: Vec<(String, String)>, // (trait, type parameter it constrains)
+    bindings: Vec<(String, String)>,    // (type parameter, concrete type)
+}
+
+struct Lowering<'a> {
+    ctx: &'a CompileContext,
+    generics: HashMap<String, GenericFnDef>,
+    traits: HashMap<String, TraitDef>, // trait name -> declaration (type params + sigs)
+    method_to_trait: HashMap<String, String>,
+    monofn_returns: HashMap<String, String>, // fn name -> scalar return type string
+    fn_params: HashMap<String, Vec<Option<String>>>, // concrete fn name -> per-param type strings
+    instances: HashMap<(String, String), HashMap<String, String>>, // (trait, type-key)->method->fn
+    instance_defs: HashMap<String, SExpr>,   // instance fn name -> its (renamed) fn form
+    used_instances: HashSet<String>,         // instance fn names actually referenced
+    instance_worklist: Vec<String>,          // instance fns awaiting emission
+    worklist: Vec<SpecKey>,                  // template specializations awaiting emission
+    emitted: HashSet<String>,                // mangled names already emitted
+}
+
+/// The scalar type name for a type-expr that is a bare symbol (e.g. `s32`).
+fn type_expr_string(e: &SExpr) -> Option<String> {
+    match e {
+        SExpr::Sym(s, _) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Map a literal's attached `Type` to its surface name.
+fn scalar_type_name(ty: &Type) -> Option<String> {
+    Some(
+        match ty {
+            Type::S32 => "s32",
+            Type::S64 => "s64",
+            Type::F32 => "f32",
+            Type::F64 => "f64",
+            Type::U8 => "u8",
+            Type::Bool => "bool",
+            Type::U16 => "u16",
+            Type::U32 => "u32",
+            Type::U64 => "u64",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// A canonical string for a concrete type expr, supporting nesting:
+/// `s32`, `(list s32)`, `(option (list s32))`, `(tuple s32 f64)`, ...
+fn canonical_type(e: &SExpr) -> Option<String> {
+    match e {
+        SExpr::Sym(s, _) => Some(s.clone()),
+        SExpr::List(items, _) => {
+            let parts = items
+                .iter()
+                .map(canonical_type)
+                .collect::<Option<Vec<_>>>()?;
+            Some(format!("({})", parts.join(" ")))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a canonical type string (e.g. `(list s32)`) back into a type expr.
+fn type_str_to_expr(s: &str) -> Option<SExpr> {
+    let toks = tokenize(s);
+    if toks.is_empty() {
+        return None;
+    }
+    let (e, _) = parse_sexpr(&toks, 0);
+    Some(e)
+}
+
+/// The element type of a canonical list type string, e.g. `(list s32)` -> `s32`.
+fn list_elem_type(s: &str) -> Option<String> {
+    match type_str_to_expr(s)? {
+        SExpr::List(items, _) if items.len() == 2 && head_sym(&items) == Some("list") => {
+            canonical_type(&items[1])
+        }
+        _ => None,
+    }
+}
+
+/// Structurally unify a parameter type pattern against a concrete type expr,
+/// accumulating a binding for each of `tparams` it can determine (first wins).
+/// e.g. pattern `(-> T U)` vs concrete `(-> s32 f64)` binds `T=s32`, `U=f64`.
+fn unify_types(pat: &SExpr, concrete: &SExpr, tparams: &[String], out: &mut Vec<(String, String)>) {
+    match (pat, concrete) {
+        (SExpr::Sym(s, _), _) if tparams.iter().any(|t| t == s) => {
+            if !out.iter().any(|(k, _)| k == s)
+                && let Some(c) = canonical_type(concrete)
+            {
+                out.push((s.clone(), c));
+            }
+        }
+        (SExpr::List(ps, _), SExpr::List(cs, _)) if ps.len() == cs.len() => {
+            for (p, c) in ps.iter().zip(cs) {
+                unify_types(p, c, tparams, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply every `(type parameter, concrete)` substitution to a type expr.
+fn subst_types(e: &SExpr, bindings: &[(String, String)]) -> SExpr {
+    let mut out = e.clone();
+    for (tp, concrete) in bindings {
+        out = subst_type(&out, tp, concrete);
+    }
+    out
+}
+
+/// Substitute a type parameter symbol with a concrete type throughout a type expr.
+/// The concrete type may itself be compound (e.g. `(list s32)`).
+fn subst_type(e: &SExpr, tparam: &str, concrete: &str) -> SExpr {
+    match e {
+        SExpr::Sym(s, span) if s == tparam => {
+            if concrete.contains('(') {
+                type_str_to_expr(concrete)
+                    .unwrap_or_else(|| SExpr::Sym(concrete.to_string(), span.clone()))
+            } else {
+                SExpr::Sym(concrete.to_string(), span.clone())
+            }
+        }
+        SExpr::List(items, span) => SExpr::List(
+            items
+                .iter()
+                .map(|i| subst_type(i, tparam, concrete))
+                .collect(),
+            span.clone(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Extract the name symbol and type expr from one param, for either
+/// `(name type)` or `(name : type)`.
+fn param_name_and_type(p: &SExpr) -> Option<(&str, &SExpr)> {
+    if let SExpr::List(pp, _) = p {
+        let name = match pp.first() {
+            Some(SExpr::Sym(n, _)) => n.as_str(),
+            _ => return None,
+        };
+        let ty = match pp.len() {
+            2 => &pp[1],
+            3 if matches!(&pp[1], SExpr::Sym(s, _) if s == ":") => &pp[2],
+            _ => return None,
+        };
+        return Some((name, ty));
+    }
+    None
+}
+
+/// Build a name->canonical-type environment from a param list SExpr. Compound
+/// types (e.g. `(list s32)`) are included, so structural inference can use them.
+fn param_env(params: &SExpr) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let SExpr::List(items, _) = params {
+        for p in items {
+            if let Some((n, ty)) = param_name_and_type(p)
+                && let Some(ts) = canonical_type(ty)
+            {
+                env.push((n.to_string(), ts));
+            }
+        }
+    }
+    env
+}
+
+/// Per-parameter declared canonical type strings (None where absent).
+fn param_type_strings(params: &SExpr) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    if let SExpr::List(items, _) = params {
+        for p in items {
+            match param_name_and_type(p) {
+                Some((_, ty)) => out.push(canonical_type(ty)),
+                None => out.push(None),
+            }
+        }
+    }
+    out
+}
+
+fn head_sym(items: &[SExpr]) -> Option<&str> {
+    match items.first() {
+        Some(SExpr::Sym(s, _)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// True when an SExpr is the bare `:` symbol used for type annotations.
+fn is_colon(e: &SExpr) -> bool {
+    matches!(e, SExpr::Sym(s, _) if s == ":")
+}
+
+/// True for the built-in scalar type names.
+fn is_scalar_name(s: &str) -> bool {
+    matches!(s, "s32" | "s64" | "f32" | "f64" | "u8")
+}
+
+/// Structural view of a `fn` form. Tolerates an optional `:` before the return
+/// type and an optional `(where ...)` clause:
+///   (fn name (params) [:] ret [(where ...)] body)
+struct FnShape<'a> {
+    name: &'a SExpr,
+    params: &'a SExpr,
+    ret: &'a SExpr,
+    where_clause: Option<&'a SExpr>,
+    body: &'a SExpr,
+}
+
+fn fn_shape(items: &[SExpr]) -> Option<FnShape<'_>> {
+    // items[0] == "fn" is checked by the caller.
+    let name = items.get(1)?;
+    let params = items.get(2)?;
+    let mut idx = 3;
+    if items.get(idx).is_some_and(is_colon) {
+        idx += 1;
+    }
+    let ret = items.get(idx)?;
+    idx += 1;
+    let where_clause = if idx + 1 < items.len()
+        && matches!(items.get(idx), Some(SExpr::List(w, _)) if head_sym(w) == Some("where"))
+    {
+        let w = items.get(idx);
+        idx += 1;
+        w
+    } else {
+        None
+    };
+    let body = items.get(idx)?;
+    if idx != items.len() - 1 {
+        return None; // trailing junk after the body
+    }
+    Some(FnShape {
+        name,
+        params,
+        ret,
+        where_clause,
+        body,
+    })
+}
+
+fn sanitize_method(m: &str) -> String {
+    m.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c.to_string()
+            } else {
+                format!("c{}", c as u32)
+            }
+        })
+        .collect()
+}
+
+fn instance_fn_name(trait_name: &str, types: &[String], method: &str) -> String {
+    format!(
+        "{}--{}--{}",
+        trait_name,
+        sanitize_method(method),
+        types.join("--")
+    )
+}
+
+/// The internal map key for an instance: the trait's type arguments, joined.
+fn instance_key(types: &[String]) -> String {
+    types.join(",")
+}
+
+impl<'a> Lowering<'a> {
+    /// Infer the surface type name of an expression (literals, params, known calls).
+    fn infer_type(&self, e: &SExpr, env: &[(String, String)]) -> Option<String> {
+        match e {
+            SExpr::Int { ty, .. } => scalar_type_name(ty),
+            SExpr::Float { ty, .. } => scalar_type_name(ty),
+            SExpr::Sym(name, _) => env.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone()),
+            SExpr::List(items, _) => {
+                let head = head_sym(items)?;
+                if let Some(info) = lookup_wasm_instr(head) {
+                    return scalar_type_name(&info.result);
+                }
+                // Built-in list/string operations with a known result type.
+                match head {
+                    "list-new" => {
+                        return Some(format!("(list {})", canonical_type(items.get(1)?)?));
+                    }
+                    "list-len" | "string-len" | "string-ref" => return Some("s32".to_string()),
+                    "list-push" => return self.infer_type(items.get(1)?, env),
+                    "list-get" => {
+                        let lt = self.infer_type(items.get(1)?, env)?;
+                        return list_elem_type(&lt);
+                    }
+                    _ => {}
+                }
+                // A call to a template (generic and/or higher-order): its result type
+                // is the return type with the type parameters replaced by the inferred
+                // type arguments. Function arguments do not affect the return.
+                if let Some(genfn) = self.generics.get(head) {
+                    let bindings = self.infer_bindings(genfn, &items[1..], env);
+                    let ret = subst_types(&genfn.ret, &bindings);
+                    return canonical_type(&ret);
+                }
+                self.monofn_returns.get(head).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// The signature of a known monomorphic function as a `(-> arg... ret)` type expr,
+    /// used to unify a function parameter's declared type against the actual function.
+    fn func_signature_expr(&self, fname: &str) -> Option<SExpr> {
+        let params = self.fn_params.get(fname)?;
+        let ret = self.monofn_returns.get(fname)?;
+        let mut parts = vec!["->".to_string()];
+        for p in params {
+            parts.push(p.clone()?);
+        }
+        parts.push(ret.clone());
+        type_str_to_expr(&format!("({})", parts.join(" ")))
+    }
+
+    /// Infer a concrete binding for each type parameter of a template call. A value
+    /// parameter's type pattern is unified against the argument's inferred type; a
+    /// function parameter's `(-> ...)` is unified against the function argument's
+    /// signature. Bindings are returned in type-parameter declaration order.
+    fn infer_bindings(
+        &self,
+        genfn: &GenericFnDef,
+        args: &[SExpr],
+        env: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = Vec::new();
+        let ptypes = param_type_exprs(&genfn.params);
+        for (i, pexpr) in ptypes.iter().enumerate() {
+            let Some(a) = args.get(i) else { continue };
+            if genfn.func_params.contains(&i) {
+                if let SExpr::Sym(fname, _) = a
+                    && let Some(sig) = self.func_signature_expr(fname)
+                {
+                    unify_types(pexpr, &sig, &genfn.tparams, &mut found);
+                }
+            } else if let Some(cstr) = self.infer_type(a, env)
+                && let Some(cexpr) = type_str_to_expr(&cstr)
+            {
+                unify_types(pexpr, &cexpr, &genfn.tparams, &mut found);
+            }
+        }
+        // Return in declaration order, keeping only parameters that got a binding.
+        genfn
+            .tparams
+            .iter()
+            .filter_map(|tp| {
+                found
+                    .iter()
+                    .find(|(k, _)| k == tp)
+                    .map(|(_, c)| (tp.clone(), c.clone()))
+            })
+            .collect()
+    }
+
+    /// Resolve which concrete types a trait-method call uses, one per trait type
+    /// parameter (in declaration order). Bindings come from the argument types, the
+    /// expected type (return-position dispatch), and the enclosing generic's bindings.
+    /// Returns None if any type parameter is left unbound.
+    fn resolve_trait_types(
+        &self,
+        trait_name: &str,
+        method: &str,
+        args: &[SExpr],
+        env: &[(String, String)],
+        expected: Option<&str>,
+        mrc: Option<&MethodCtx>,
+    ) -> Option<Vec<String>> {
+        let tdef = self.traits.get(trait_name)?;
+        let sig = tdef.methods.iter().find(|m| m.name == method)?;
+        let mut bindings: Vec<(String, String)> = Vec::new();
+
+        // From the argument types.
+        for (i, pexpr) in param_type_exprs(&sig.params).iter().enumerate() {
+            if let Some(a) = args.get(i)
+                && let Some(cs) = self.infer_type(a, env)
+                && let Some(ce) = type_str_to_expr(&cs)
+            {
+                unify_types(pexpr, &ce, &tdef.tparams, &mut bindings);
+            }
+        }
+        // From the expected type, against the return type (return-position dispatch).
+        if let Some(exp) = expected
+            && let Some(ee) = type_str_to_expr(exp)
+        {
+            unify_types(&sig.ret, &ee, &tdef.tparams, &mut bindings);
+        }
+        // From the enclosing generic body: a `(where (Trait G) ...)` constraint maps
+        // the generic's type parameter `G` to this (single-parameter) trait's own type
+        // parameter, so we can use `G`'s binding when arguments don't fix it.
+        if let Some(mc) = mrc
+            && tdef.tparams.len() == 1
+            && !bindings.iter().any(|(k, _)| k == &tdef.tparams[0])
+        {
+            for (tn, gtp) in &mc.constraints {
+                if tn == trait_name
+                    && let Some((_, gc)) = mc.bindings.iter().find(|(k, _)| k == gtp)
+                {
+                    bindings.push((tdef.tparams[0].clone(), gc.clone()));
+                    break;
+                }
+            }
+        }
+
+        let types: Vec<String> = tdef
+            .tparams
+            .iter()
+            .filter_map(|tp| {
+                bindings
+                    .iter()
+                    .find(|(k, _)| k == tp)
+                    .map(|(_, c)| c.clone())
+            })
+            .collect();
+        (types.len() == tdef.tparams.len()).then_some(types)
+    }
+
+    /// Rewrite a body: resolve trait methods (when `mrc` is set) and generic calls.
+    ///
+    /// `expected` is the type this expression is used at, flowing *down* from
+    /// context (a return annotation, an ascription, an `if`/`let` tail, or a
+    /// sibling argument). It supplies the missing type for return-type dispatch
+    /// (methods like `zero : T` whose type parameter is only in the return).
+    fn walk(
+        &mut self,
+        e: &SExpr,
+        env: &[(String, String)],
+        mrc: Option<&MethodCtx>,
+        expected: Option<String>,
+    ) -> Result<SExpr> {
+        match e {
+            SExpr::List(items, span) => {
+                // Colon ascription `(expr : type)`: steer the expected type into `expr`.
+                if items.len() == 3
+                    && is_colon(&items[1])
+                    && let Some(t) = type_expr_string(&items[2])
+                {
+                    let inner = self.walk(&items[0], env, mrc, Some(t))?;
+                    return Ok(SExpr::List(
+                        vec![inner, items[1].clone(), items[2].clone()],
+                        span.clone(),
+                    ));
+                }
+
+                if let Some(head) = head_sym(items) {
+                    // Trait-method call: resolve to a concrete instance function.
+                    // Works anywhere, not only inside a generic body — the dispatch
+                    // type comes from the arguments, the expected type, or (inside a
+                    // generic) the type-parameter binding.
+                    if let Some(trait_name) = self.method_to_trait.get(head).cloned() {
+                        // Bind the trait's type parameters from the argument types, the
+                        // expected type, and (inside a generic) the enclosing bindings.
+                        let types = self
+                            .resolve_trait_types(
+                                &trait_name,
+                                head,
+                                &items[1..],
+                                env,
+                                expected.as_deref(),
+                                mrc,
+                            )
+                            .ok_or_else(|| {
+                                self.ctx.error(
+                                    format!(
+                                        "cannot resolve trait method '{}': no instance matches the argument types or the expected type",
+                                        head
+                                    ),
+                                    span,
+                                )
+                            })?;
+                        let fname = self
+                            .instances
+                            .get(&(trait_name.clone(), instance_key(&types)))
+                            .and_then(|m| m.get(head))
+                            .cloned()
+                            .ok_or_else(|| {
+                                self.ctx.error(
+                                    format!(
+                                        "no instance of trait '{}' for {:?} (method '{}')",
+                                        trait_name, types, head
+                                    ),
+                                    span,
+                                )
+                            })?;
+                        // Mark this instance for emission (instances are emitted on
+                        // demand, so an unused stdlib costs nothing).
+                        self.mark_instance(&fname);
+                        // Each argument is expected at the instance method's param type.
+                        let arg_exp = self.fn_params.get(&fname).cloned().unwrap_or_default();
+                        let mut new_items = Vec::with_capacity(items.len());
+                        new_items.push(SExpr::Sym(fname, items[0].span().clone()));
+                        for (i, a) in items[1..].iter().enumerate() {
+                            let exp = arg_exp.get(i).cloned().flatten();
+                            new_items.push(self.walk(a, env, mrc, exp)?);
+                        }
+                        return Ok(SExpr::List(new_items, span.clone()));
+                    }
+
+                    // Template call (generic and/or higher-order)?
+                    if let Some(genfn) = self.generics.get(head).cloned() {
+                        let args = &items[1..];
+                        // Collect the function-name argument at each function parameter.
+                        let mut func_args: Vec<String> = Vec::new();
+                        for &fi in &genfn.func_params {
+                            match args.get(fi) {
+                                Some(SExpr::Sym(fname, _)) => func_args.push(fname.clone()),
+                                _ => {
+                                    return Err(self.ctx.error(
+                                        format!(
+                                            "higher-order argument {} to '{}' must be a function name",
+                                            fi + 1,
+                                            genfn.name
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                        }
+                        // Infer a binding for each type parameter from the arguments.
+                        let mut bindings = self.infer_bindings(&genfn, args, env);
+                        // Any parameter still unbound (e.g. one appearing only in the
+                        // return type) is taken from the expected type, by unifying the
+                        // return type against it.
+                        if bindings.len() < genfn.tparams.len()
+                            && let Some(exp) = expected.as_deref()
+                            && let Some(ee) = type_str_to_expr(exp)
+                        {
+                            unify_types(&genfn.ret, &ee, &genfn.tparams, &mut bindings);
+                            bindings = genfn
+                                .tparams
+                                .iter()
+                                .filter_map(|tp| {
+                                    bindings
+                                        .iter()
+                                        .find(|(k, _)| k == tp)
+                                        .map(|(_, c)| (tp.clone(), c.clone()))
+                                })
+                                .collect();
+                        }
+                        if bindings.len() < genfn.tparams.len() {
+                            return Err(self.ctx.error(
+                                format!(
+                                    "cannot infer type argument(s) for generic '{}'",
+                                    genfn.name
+                                ),
+                                span,
+                            ));
+                        }
+                        let concretes: Vec<String> =
+                            bindings.iter().map(|(_, c)| c.clone()).collect();
+                        self.worklist.push(SpecKey {
+                            name: genfn.name.clone(),
+                            bindings: bindings.clone(),
+                            func_args: func_args.clone(),
+                        });
+                        let mname = template_fn_name(&genfn.name, &func_args, &concretes);
+                        let gptypes = param_type_strings(&genfn.params);
+                        let mut new_items = Vec::with_capacity(items.len());
+                        new_items.push(SExpr::Sym(mname, items[0].span().clone()));
+                        for (i, a) in args.iter().enumerate() {
+                            // Function arguments are compile-time; drop them from the call.
+                            if genfn.func_params.contains(&i) {
+                                continue;
+                            }
+                            // A parameter typed as a bare type parameter is expected at
+                            // that parameter's concrete binding.
+                            let exp = gptypes.get(i).cloned().flatten().map(|s| {
+                                bindings
+                                    .iter()
+                                    .find(|(tp, _)| *tp == s)
+                                    .map(|(_, c)| c.clone())
+                                    .unwrap_or(s)
+                            });
+                            new_items.push(self.walk(a, env, mrc, exp)?);
+                        }
+                        return Ok(SExpr::List(new_items, span.clone()));
+                    }
+
+                    // Forms that carry the expected type into their tail positions.
+                    match head {
+                        "if" if items.len() == 4 => {
+                            let c = self.walk(&items[1], env, mrc, None)?;
+                            let t = self.walk(&items[2], env, mrc, expected.clone())?;
+                            let f = self.walk(&items[3], env, mrc, expected)?;
+                            return Ok(SExpr::List(vec![items[0].clone(), c, t, f], span.clone()));
+                        }
+                        "let" if items.len() == 3 => {
+                            // (let (name value) body) or (let (name : type value) body)
+                            if let SExpr::List(bind, bspan) = &items[1] {
+                                let (val_idx, val_exp) = if bind.len() == 4 && is_colon(&bind[1]) {
+                                    (3, type_expr_string(&bind[2]))
+                                } else if bind.len() == 2 {
+                                    (1, None)
+                                } else {
+                                    (usize::MAX, None)
+                                };
+                                if val_idx != usize::MAX {
+                                    let bound_ty = val_exp
+                                        .clone()
+                                        .or_else(|| self.infer_type(&bind[val_idx], env));
+                                    let new_val = self.walk(&bind[val_idx], env, mrc, val_exp)?;
+                                    let mut new_bind = bind.clone();
+                                    new_bind[val_idx] = new_val;
+                                    // The body may reference the bound name; record its type.
+                                    let mut body_env = env.to_vec();
+                                    if let (Some(SExpr::Sym(n, _)), Some(bt)) =
+                                        (bind.first(), bound_ty)
+                                    {
+                                        body_env.push((n.clone(), bt));
+                                    }
+                                    let body = self.walk(&items[2], &body_env, mrc, expected)?;
+                                    return Ok(SExpr::List(
+                                        vec![
+                                            items[0].clone(),
+                                            SExpr::List(new_bind, bspan.clone()),
+                                            body,
+                                        ],
+                                        span.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                        s if is_scalar_name(s) && items.len() == 2 => {
+                            // scalar cast / ascription `(type expr)`
+                            let x = self.walk(&items[1], env, mrc, Some(s.to_string()))?;
+                            return Ok(SExpr::List(vec![items[0].clone(), x], span.clone()));
+                        }
+                        s if lookup_wasm_instr(s).is_some() => {
+                            // A raw wasm instruction expects each argument at its
+                            // operand type (e.g. `i32.add` wants two `s32`s).
+                            let ptypes: Vec<Option<String>> = lookup_wasm_instr(s)
+                                .unwrap()
+                                .params
+                                .iter()
+                                .map(scalar_type_name)
+                                .collect();
+                            let mut new_items = Vec::with_capacity(items.len());
+                            new_items.push(items[0].clone());
+                            for (i, a) in items[1..].iter().enumerate() {
+                                let exp = ptypes.get(i).cloned().flatten();
+                                new_items.push(self.walk(a, env, mrc, exp)?);
+                            }
+                            return Ok(SExpr::List(new_items, span.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                // Plain list: recurse into every element (no expected type).
+                let mut new_items = Vec::with_capacity(items.len());
+                for i in items {
+                    new_items.push(self.walk(i, env, mrc, None)?);
+                }
+                Ok(SExpr::List(new_items, span.clone()))
+            }
+            // A default integer literal (there is no `s32` suffix, so `ty == S32`
+            // is always a default) adopts the expected type: it widens to `s64`, or
+            // promotes to a float. An explicit suffix (`s64`, `f32`, `f64`) is left
+            // untouched, as is a literal with no expected type.
+            SExpr::Int {
+                value,
+                ty: Type::S32,
+                span,
+            } if expected.is_some() => Ok(match expected.as_deref().unwrap() {
+                "s64" => SExpr::Int {
+                    value: *value,
+                    ty: Type::S64,
+                    span: span.clone(),
+                },
+                "f32" => SExpr::Float {
+                    value: *value as f64,
+                    ty: Type::F32,
+                    span: span.clone(),
+                },
+                "f64" => SExpr::Float {
+                    value: *value as f64,
+                    ty: Type::F64,
+                    span: span.clone(),
+                },
+                _ => e.clone(),
+            }),
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Record that an instance method is used, queuing it for emission once.
+    fn mark_instance(&mut self, fname: &str) {
+        if self.used_instances.insert(fname.to_string()) {
+            self.instance_worklist.push(fname.to_string());
+        }
+    }
+
+    /// Produce the specialized `fn` form for one monomorphization request:
+    /// the type parameter is substituted, each function parameter's name is replaced
+    /// by its function argument (and the parameter is dropped from the signature),
+    /// and generic/trait calls in the body are then resolved.
+    fn specialize(&mut self, key: &SpecKey) -> Result<SExpr> {
+        let genfn = self
+            .generics
+            .get(&key.name)
+            .cloned()
+            .expect("generic exists");
+        let concretes: Vec<String> = key.bindings.iter().map(|(_, c)| c.clone()).collect();
+        let mname = template_fn_name(&key.name, &key.func_args, &concretes);
+
+        // 1. Substitute the type parameters throughout params, return, and body. Type
+        //    positions like `(list-new T)` become concrete; safe because a type
+        //    parameter is uppercase by convention and never names a value.
+        let mut params = subst_types(&genfn.params, &key.bindings);
+        let ret = subst_types(&genfn.ret, &key.bindings);
+        let mut body = subst_types(&genfn.body, &key.bindings);
+
+        // 2. Substitute each function parameter's name with its function argument, so
+        //    `(f x)` becomes `(double x)`. Reuses `subst_type` (a bare symbol swap).
+        for (fp_idx, fname) in genfn.func_params.iter().zip(&key.func_args) {
+            if let Some(pname) = param_name_at(&genfn.params, *fp_idx) {
+                body = subst_type(&body, &pname, fname);
+            }
+        }
+
+        // 3. Drop the function parameters from the signature — they are compile-time.
+        if !genfn.func_params.is_empty()
+            && let SExpr::List(pitems, pspan) = &params
+        {
+            let kept: Vec<SExpr> = pitems
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !genfn.func_params.contains(i))
+                .map(|(_, p)| p.clone())
+                .collect();
+            params = SExpr::List(kept, pspan.clone());
+        }
+
+        let env = param_env(&params);
+        self.fn_params
+            .insert(mname.clone(), param_type_strings(&params));
+        let mc = MethodCtx {
+            constraints: genfn.constraints.clone(),
+            bindings: key.bindings.clone(),
+        };
+        // The body is in return position, so it is expected at the return type.
+        let ret_exp = canonical_type(&ret);
+        let body = self.walk(&body, &env, Some(&mc), ret_exp)?;
+        let span = genfn.body.span().clone();
+        Ok(SExpr::List(
+            vec![
+                SExpr::Sym("fn".to_string(), span.clone()),
+                SExpr::Sym(mname, span.clone()),
+                params,
+                ret,
+                body,
+            ],
+            span,
+        ))
+    }
+
+    /// Rewrite the body of a retained `fn` form (generic calls -> specialized names).
+    /// The body is always the last element, whatever the annotation shape.
+    fn process_fn_form(&mut self, items: &[SExpr], span: &Span) -> Result<SExpr> {
+        let shape =
+            fn_shape(items).ok_or_else(|| self.ctx.error("malformed function definition", span))?;
+        let env = param_env(shape.params);
+        // The body is in return position, so it is expected at the return type.
+        let ret_exp = canonical_type(shape.ret);
+        let new_body = self.walk(shape.body, &env, None, ret_exp)?;
+        let mut new_items = items.to_vec();
+        if let Some(last) = new_items.last_mut() {
+            *last = new_body;
+        }
+        Ok(SExpr::List(new_items, span.clone()))
+    }
+
+    /// Rewrite any `fn` bodies reachable from a retained top-level form.
+    fn process_form(&mut self, form: &SExpr) -> Result<SExpr> {
+        if let SExpr::List(items, span) = form {
+            match head_sym(items) {
+                Some("fn") => return self.process_fn_form(items, span),
+                Some("export") => {
+                    // Rewrite an inner (fn ...) if present, leaving the wrapper shape intact.
+                    let mut new_items = Vec::with_capacity(items.len());
+                    for it in items {
+                        match it {
+                            SExpr::List(inner, ispan) if head_sym(inner) == Some("fn") => {
+                                new_items.push(self.process_fn_form(inner, ispan)?);
+                            }
+                            other => new_items.push(other.clone()),
+                        }
+                    }
+                    return Ok(SExpr::List(new_items, span.clone()));
+                }
+                _ => {}
+            }
+        }
+        Ok(form.clone())
+    }
+}
+
+/// Lower traits/instances/generics to plain monomorphic forms.
+/// The primitive equality instruction for a scalar type, or None if not scalar.
+fn scalar_eq_instr(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "s32" | "u8" => "i32.eq",
+        "s64" => "i64.eq",
+        "f32" => "f32.eq",
+        "f64" => "f64.eq",
+        _ => return None,
+    })
+}
+
+/// Generate an `(instance (Eq Type) ...)` that compares a record field by field.
+fn derive_eq_record(
+    trait_name: &str,
+    type_name: &str,
+    fields: &[(String, String)],
+    span: &Span,
+    ctx: &CompileContext,
+) -> Result<SExpr> {
+    let sym = |s: &str| SExpr::Sym(s.to_string(), span.clone());
+    let list = |v: Vec<SExpr>| SExpr::List(v, span.clone());
+
+    // One comparison per field: (<eq> (Type.field a) (Type.field b)).
+    let mut cmps = Vec::new();
+    for (fname, fty) in fields {
+        let eq = scalar_eq_instr(fty).ok_or_else(|| {
+            ctx.error(
+                format!(
+                    "cannot derive Eq for '{}': field '{}' has non-scalar type '{}'",
+                    type_name, fname, fty
+                ),
+                span,
+            )
+        })?;
+        let accessor = format!("{}.{}", type_name, fname);
+        cmps.push(list(vec![
+            sym(eq),
+            list(vec![sym(&accessor), sym("a")]),
+            list(vec![sym(&accessor), sym("b")]),
+        ]));
+    }
+    // Combine with i32.and (an empty record is always equal).
+    let body = cmps
+        .into_iter()
+        .reduce(|acc, c| list(vec![sym("i32.and"), acc, c]))
+        .unwrap_or_else(|| SExpr::Int {
+            value: 1,
+            ty: Type::S32,
+            span: span.clone(),
+        });
+
+    let param = |n: &str| list(vec![sym(n), sym(":"), sym(type_name)]);
+    let method = list(vec![
+        sym("fn"),
+        sym("="),
+        list(vec![param("a"), param("b")]),
+        sym(":"),
+        sym("s32"),
+        body,
+    ]);
+    Ok(list(vec![
+        sym("instance"),
+        list(vec![sym(trait_name), sym(type_name)]),
+        method,
+    ]))
+}
+
+/// Compile-time deriving: `(derive Trait Type)` inspects Type's definition and emits a
+/// trait instance. Runs after macro expansion and before the generics pre-pass, so the
+/// generated instance flows through the normal trait pipeline. This is the first
+/// "type-aware macro": it reflects on a type's structure to generate code.
+fn expand_derives(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>> {
+    // Collect record shapes: name -> [(field, canonical type)].
+    let mut records: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for form in &forms {
+        if let SExpr::List(items, _) = form
+            && head_sym(items) == Some("record")
+            && let Some(SExpr::Sym(name, _)) = items.get(1)
+        {
+            let mut fields = Vec::new();
+            for f in &items[2..] {
+                if let SExpr::List(fd, _) = f
+                    && let Some(SExpr::Sym(fname, _)) = fd.first()
+                    && let Some(fty) = fd.get(1).and_then(canonical_type)
+                {
+                    fields.push((fname.clone(), fty));
+                }
+            }
+            records.insert(name.clone(), fields);
+        }
+    }
+
+    let mut out = Vec::new();
+    for form in forms {
+        let is_derive = matches!(&form, SExpr::List(items, _) if head_sym(items) == Some("derive"));
+        if !is_derive {
+            out.push(form);
+            continue;
+        }
+        let (items, span) = match &form {
+            SExpr::List(i, s) => (i, s),
+            _ => unreachable!(),
+        };
+        let trait_name = match items.get(1) {
+            Some(SExpr::Sym(s, _)) => s.clone(),
+            _ => return Err(ctx.error("derive expects (derive Trait Type)", span)),
+        };
+        let type_name = match items.get(2) {
+            Some(SExpr::Sym(s, _)) => s.clone(),
+            _ => return Err(ctx.error("derive expects (derive Trait Type)", span)),
+        };
+        match trait_name.as_str() {
+            "Eq" => {
+                let fields = records.get(&type_name).ok_or_else(|| {
+                    ctx.error(
+                        format!(
+                            "cannot derive Eq for '{}': not a record (variant deriving is not yet supported)",
+                            type_name
+                        ),
+                        span,
+                    )
+                })?;
+                out.push(derive_eq_record(
+                    &trait_name,
+                    &type_name,
+                    fields,
+                    span,
+                    ctx,
+                )?);
+            }
+            other => {
+                return Err(ctx.error(format!("cannot derive '{}' (supported: Eq)", other), span));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>> {
+    let mut low = Lowering {
+        ctx,
+        generics: HashMap::new(),
+        traits: HashMap::new(),
+        method_to_trait: HashMap::new(),
+        monofn_returns: HashMap::new(),
+        fn_params: HashMap::new(),
+        instances: HashMap::new(),
+        instance_defs: HashMap::new(),
+        used_instances: HashSet::new(),
+        instance_worklist: Vec::new(),
+        worklist: Vec::new(),
+        emitted: HashSet::new(),
+    };
+
+    let mut retained: Vec<SExpr> = Vec::new();
+
+    // Pass 0: collect trait declarations (name, type parameter, method signatures)
+    // so instances and `where` clauses can be checked regardless of source order.
+    let mut traits: HashMap<String, TraitDef> = HashMap::new();
+    let mut seen_instances: HashSet<(String, String)> = HashSet::new();
+    for form in &forms {
+        let (items, span) = match form {
+            SExpr::List(items, span) if !items.is_empty() => (items, span),
+            _ => continue,
+        };
+        if head_sym(items) != Some("trait") {
+            continue;
+        }
+        // (trait (Name T U ...) methods...)
+        let (name, tparams) = match items.get(1) {
+            Some(SExpr::List(head, _)) if head.len() >= 2 => {
+                let name = match &head[0] {
+                    SExpr::Sym(n, _) => n.clone(),
+                    _ => return Err(ctx.error("trait name must be a symbol", span)),
+                };
+                let mut tparams = Vec::new();
+                for t in &head[1..] {
+                    match t {
+                        SExpr::Sym(tp, _) => tparams.push(tp.clone()),
+                        _ => return Err(ctx.error("trait type parameter must be a symbol", span)),
+                    }
+                }
+                (name, tparams)
+            }
+            _ => return Err(ctx.error("trait expects (trait (Name T ...) methods...)", span)),
+        };
+        let mut methods = Vec::new();
+        for m in &items[2..] {
+            let mi = match m {
+                SExpr::List(mi, _) if head_sym(mi) == Some("fn") => mi,
+                _ => return Err(ctx.error("trait method must be (fn name params : ret)", span)),
+            };
+            let sig = parse_method_sig(mi)
+                .ok_or_else(|| ctx.error("malformed trait method signature", span))?;
+            low.method_to_trait.insert(sig.name.clone(), name.clone());
+            methods.push(sig);
+        }
+        if traits
+            .insert(name.clone(), TraitDef { tparams, methods })
+            .is_some()
+        {
+            return Err(ctx.error(format!("duplicate trait '{}'", name), span));
+        }
+    }
+    // Make the trait declarations available during body rewriting (Pass 2/3).
+    low.traits = traits.clone();
+
+    // Pass 1: classify every top-level form.
+    for form in &forms {
+        let (items, span) = match form {
+            SExpr::List(items, span) if !items.is_empty() => (items, span),
+            _ => {
+                retained.push(form.clone());
+                continue;
+            }
+        };
+        match head_sym(items) {
+            Some("trait") => {} // collected in Pass 0
+            Some("instance") => {
+                // (instance (Trait Type ...) (fn method params [:] ret body) ...)
+                let (trait_name, types) = match items.get(1) {
+                    Some(SExpr::List(head, _)) if head.len() >= 2 => {
+                        let tn = match &head[0] {
+                            SExpr::Sym(s, _) => s.clone(),
+                            _ => return Err(ctx.error("instance trait must be a symbol", span)),
+                        };
+                        let mut types = Vec::new();
+                        for t in &head[1..] {
+                            types.push(canonical_type(t).ok_or_else(|| {
+                                ctx.error("instance type must be a type name", span)
+                            })?);
+                        }
+                        (tn, types)
+                    }
+                    _ => {
+                        return Err(
+                            ctx.error("instance expects (instance (Trait Type ...) ...)", span)
+                        );
+                    }
+                };
+                let trait_def = traits.get(&trait_name).ok_or_else(|| {
+                    ctx.error(format!("unknown trait '{}' in instance", trait_name), span)
+                })?;
+                if trait_def.tparams.len() != types.len() {
+                    return Err(ctx.error(
+                        format!(
+                            "instance of '{}' has {} type argument(s) but the trait declares {}",
+                            trait_name,
+                            types.len(),
+                            trait_def.tparams.len()
+                        ),
+                        span,
+                    ));
+                }
+                // (type parameter -> instance type) bindings for substitution.
+                let tbindings: Vec<(String, String)> = trait_def
+                    .tparams
+                    .iter()
+                    .cloned()
+                    .zip(types.iter().cloned())
+                    .collect();
+                if !seen_instances.insert((trait_name.clone(), instance_key(&types))) {
+                    return Err(ctx.error(
+                        format!(
+                            "duplicate instance for ({} {})",
+                            trait_name,
+                            types.join(" ")
+                        ),
+                        span,
+                    ));
+                }
+                let mut provided: HashSet<String> = HashSet::new();
+                for m in &items[2..] {
+                    let mi = match m {
+                        SExpr::List(mi, _) if head_sym(mi) == Some("fn") => mi,
+                        _ => return Err(ctx.error("instance method must be (fn ...)", span)),
+                    };
+                    let shape =
+                        fn_shape(mi).ok_or_else(|| ctx.error("malformed instance method", span))?;
+                    let method = match shape.name {
+                        SExpr::Sym(s, _) => s.clone(),
+                        _ => return Err(ctx.error("method name must be a symbol", span)),
+                    };
+                    // The method must be declared by the trait.
+                    let tsig = trait_def
+                        .methods
+                        .iter()
+                        .find(|s| s.name == method)
+                        .ok_or_else(|| {
+                            ctx.error(
+                                format!("trait '{}' has no method '{}'", trait_name, method),
+                                span,
+                            )
+                        })?;
+                    // Its signature must match the trait's, with the type parameters
+                    // substituted by this instance's types.
+                    let want_params = subst_types(&tsig.params, &tbindings);
+                    let want_ret = subst_types(&tsig.ret, &tbindings);
+                    let want_pt = param_type_exprs(&want_params);
+                    let got_pt = param_type_exprs(shape.params);
+                    if want_pt.len() != got_pt.len()
+                        || !want_pt.iter().zip(&got_pt).all(|(a, b)| type_expr_eq(a, b))
+                    {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) method '{}' has parameter types that do not match trait '{}'",
+                                trait_name, types.join(" "), method, trait_name
+                            ),
+                            span,
+                        ));
+                    }
+                    if !type_expr_eq(&want_ret, shape.ret) {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) method '{}' has a return type that does not match trait '{}'",
+                                trait_name, types.join(" "), method, trait_name
+                            ),
+                            span,
+                        ));
+                    }
+                    if !provided.insert(method.clone()) {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) defines method '{}' more than once",
+                                trait_name,
+                                types.join(" "),
+                                method
+                            ),
+                            span,
+                        ));
+                    }
+                    let fname = instance_fn_name(&trait_name, &types, &method);
+                    // Emit the instance method as a plain concrete fn (same shape, renamed).
+                    if let Some(rt) = canonical_type(shape.ret) {
+                        low.monofn_returns.insert(fname.clone(), rt);
+                    }
+                    low.fn_params
+                        .insert(fname.clone(), param_type_strings(shape.params));
+                    let mut new_mi = mi.clone();
+                    new_mi[1] = SExpr::Sym(fname.clone(), mi[1].span().clone());
+                    // Store the instance fn; it is emitted only if it is referenced.
+                    low.instance_defs
+                        .insert(fname.clone(), SExpr::List(new_mi, span.clone()));
+                    low.instances
+                        .entry((trait_name.clone(), instance_key(&types)))
+                        .or_default()
+                        .insert(method, fname);
+                }
+                // Every trait method must be implemented.
+                for s in &trait_def.methods {
+                    if !provided.contains(&s.name) {
+                        return Err(ctx.error(
+                            format!(
+                                "instance ({} {}) is missing method '{}'",
+                                trait_name,
+                                types.join(" "),
+                                s.name
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+            Some("fn") => {
+                let shape = fn_shape(items)
+                    .ok_or_else(|| ctx.error("malformed function definition", span))?;
+                let name = match shape.name {
+                    SExpr::Sym(s, _) => s.clone(),
+                    _ => return Err(ctx.error("function name must be a symbol", span)),
+                };
+                // A function is a template (specialized on demand) if it has a `where`
+                // clause (a type parameter) and/or a function-typed parameter.
+                let func_params = func_param_indices(shape.params);
+                let is_template = shape.where_clause.is_some() || !func_params.is_empty();
+                if is_template {
+                    let mut constraints: Vec<(String, String)> = Vec::new();
+                    let mut tparams: Vec<String> = Vec::new();
+                    let note_tparam = |tp: &str, list: &mut Vec<String>| {
+                        if !list.iter().any(|t| t == tp) {
+                            list.push(tp.to_string());
+                        }
+                    };
+                    if let Some(SExpr::List(where_items, _)) = shape.where_clause {
+                        for c in &where_items[1..] {
+                            // A bare type parameter with no constraint: (where T).
+                            if let SExpr::Sym(tp, _) = c {
+                                note_tparam(tp, &mut tparams);
+                            } else if let SExpr::List(cc, _) = c
+                                && cc.len() >= 2
+                                && let SExpr::Sym(tn, _) = &cc[0]
+                                && cc[1..].iter().all(|x| matches!(x, SExpr::Sym(..)))
+                            {
+                                // A trait bound: (Trait T ...). All named type
+                                // parameters are declared; the constraint is recorded
+                                // against the first (used for single-parameter dispatch).
+                                for x in &cc[1..] {
+                                    if let SExpr::Sym(tp, _) = x {
+                                        note_tparam(tp, &mut tparams);
+                                    }
+                                }
+                                if let SExpr::Sym(tp, _) = &cc[1] {
+                                    constraints.push((tn.clone(), tp.clone()));
+                                }
+                            } else {
+                                return Err(ctx.error(
+                                    "where clause entry must be a type parameter or (Trait TypeParam ...)",
+                                    span,
+                                ));
+                            }
+                        }
+                        if tparams.is_empty() {
+                            return Err(ctx.error(
+                                "generic fn needs a type parameter in its where clause",
+                                span,
+                            ));
+                        }
+                    }
+                    for (tn, _) in &constraints {
+                        if !traits.contains_key(tn) {
+                            return Err(
+                                ctx.error(format!("unknown trait '{}' in where clause", tn), span)
+                            );
+                        }
+                    }
+                    low.generics.insert(
+                        name.clone(),
+                        GenericFnDef {
+                            name,
+                            tparams,
+                            constraints,
+                            func_params,
+                            params: shape.params.clone(),
+                            ret: shape.ret.clone(),
+                            body: shape.body.clone(),
+                        },
+                    );
+                } else {
+                    low.fn_params
+                        .insert(name.clone(), param_type_strings(shape.params));
+                    if let Some(rt) = canonical_type(shape.ret) {
+                        low.monofn_returns.insert(name, rt);
+                    }
+                    retained.push(form.clone());
+                }
+            }
+            Some("export") => {
+                // Record the signature of an inner (fn ...) so calls to it propagate
+                // types, then retain the export unchanged for Pass 2.
+                for it in &items[1..] {
+                    if let SExpr::List(inner, _) = it
+                        && head_sym(inner) == Some("fn")
+                        && let Some(shape) = fn_shape(inner)
+                        && let SExpr::Sym(n, _) = shape.name
+                    {
+                        low.fn_params
+                            .insert(n.clone(), param_type_strings(shape.params));
+                        if let Some(rt) = canonical_type(shape.ret) {
+                            low.monofn_returns.insert(n.clone(), rt);
+                        }
+                    }
+                }
+                retained.push(form.clone());
+            }
+            _ => retained.push(form.clone()),
+        }
+    }
+
+    // Pass 2: rewrite retained forms. This marks the instances they use and seeds
+    // the generic worklist.
+    let mut output: Vec<SExpr> = Vec::new();
+    for form in &retained {
+        let rewritten = low.process_form(form)?;
+        output.push(rewritten);
+    }
+
+    // Pass 3: drain both worklists, emitting one copy per specialized generic and
+    // one copy per referenced instance. Each emitted body may reference further
+    // generics or instances, so we loop until both are empty. Unused instances
+    // (e.g. most of an included stdlib) are never emitted.
+    loop {
+        if let Some(key) = low.worklist.pop() {
+            let concretes: Vec<String> = key.bindings.iter().map(|(_, c)| c.clone()).collect();
+            let mname = template_fn_name(&key.name, &key.func_args, &concretes);
+            if low.emitted.insert(mname) {
+                let fn_form = low.specialize(&key)?;
+                output.push(fn_form);
+            }
+        } else if let Some(fname) = low.instance_worklist.pop() {
+            if let Some(SExpr::List(items, span)) = low.instance_defs.get(&fname).cloned() {
+                let rewritten = low.process_fn_form(&items, &span)?;
+                output.push(rewritten);
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(output)
+}
+
 fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut pending = Vec::new();
     let mut defined = HashSet::new();
@@ -3822,36 +5524,27 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
             }
             match &items[0] {
                 SExpr::Sym(sym, _) if sym == "record" => {
-                    if items.len() >= 2 {
-                        if let SExpr::Sym(name, _) = &items[1] {
-                            if !record_names.insert(name.clone()) {
-                                return Err(
-                                    ctx.error(format!("duplicate record type '{}'", name), span)
-                                );
-                            }
-                        }
+                    if items.len() >= 2
+                        && let SExpr::Sym(name, _) = &items[1]
+                        && !record_names.insert(name.clone())
+                    {
+                        return Err(ctx.error(format!("duplicate record type '{}'", name), span));
                     }
                 }
                 SExpr::Sym(sym, _) if sym == "variant" => {
-                    if items.len() >= 2 {
-                        if let SExpr::Sym(name, _) = &items[1] {
-                            if !variant_names.insert(name.clone()) {
-                                return Err(
-                                    ctx.error(format!("duplicate variant type '{}'", name), span)
-                                );
-                            }
-                        }
+                    if items.len() >= 2
+                        && let SExpr::Sym(name, _) = &items[1]
+                        && !variant_names.insert(name.clone())
+                    {
+                        return Err(ctx.error(format!("duplicate variant type '{}'", name), span));
                     }
                 }
                 SExpr::Sym(sym, _) if sym == "resource" => {
-                    if items.len() >= 2 {
-                        if let SExpr::Sym(name, _) = &items[1] {
-                            if !resource_names.insert(name.clone()) {
-                                return Err(
-                                    ctx.error(format!("duplicate resource type '{}'", name), span)
-                                );
-                            }
-                        }
+                    if items.len() >= 2
+                        && let SExpr::Sym(name, _) = &items[1]
+                        && !resource_names.insert(name.clone())
+                    {
+                        return Err(ctx.error(format!("duplicate resource type '{}'", name), span));
                     }
                 }
                 _ => {}
@@ -3961,10 +5654,11 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                                 &span,
                             ));
                         }
-                        if !imported.insert(import.name.clone()) {
-                            return Err(
-                                ctx.error(format!("duplicate import '{}'", import.name), &span)
-                            );
+                        if !imported.insert((import.module.clone(), import.name.clone())) {
+                            return Err(ctx.error(
+                                format!("duplicate import '{}/{}'", import.module, import.name),
+                                &span,
+                            ));
                         }
                         imports.push(import);
                     }
@@ -4058,12 +5752,10 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
             params,
             result: import.return_type.clone(),
         };
-        if signatures.insert(import.name.clone(), sig).is_some() {
-            return Err(ctx.error(
-                format!("duplicate function '{}'", import.name),
-                &import.span,
-            ));
-        }
+        // Same-named imports across interfaces are allowed (keyed by bare name
+        // only for typed-call resolution, which raw-invoked imports don't use);
+        // keep the first, matching the typed-wrapper dedup.
+        signatures.entry(import.name.clone()).or_insert(sig);
     }
 
     for export in exports.iter() {
@@ -4073,7 +5765,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                 &Span::dummy(),
             ));
         }
-        if imported.contains(&export.func_name) {
+        if imported.iter().any(|(_, name)| name == &export.func_name) {
             return Err(ctx.error(
                 format!("cannot export imported function '{}'", export.func_name),
                 &Span::dummy(),
@@ -4250,28 +5942,35 @@ fn parse_fn_form(
         SExpr::List(items, span) => (items, span),
         other => return Err(ctx.error("function definition must be a list", other.span())),
     };
-    if items.len() != 5 {
-        return Err(ctx.error_with_note(
+    match items.first() {
+        Some(SExpr::Sym(s, _)) if s == "fn" => {}
+        _ => return Err(ctx.error("function definition must start with 'fn'", &span)),
+    }
+    let shape = fn_shape(&items).ok_or_else(|| {
+        ctx.error_with_note(
             "invalid function definition",
             &span,
-            "expected: (fn name ((param type) ...) return-type body)",
+            "expected: (fn name ((param : type) ...) [:] return-type body)",
+        )
+    })?;
+    if shape.where_clause.is_some() {
+        return Err(ctx.error(
+            "generic functions (with a `where` clause) are not valid here",
+            &span,
         ));
     }
-    match &items[0] {
-        SExpr::Sym(s, _) if s == "fn" => {}
-        other => return Err(ctx.error("function definition must start with 'fn'", other.span())),
-    }
-    let name = match &items[1] {
+    let name = match shape.name {
         SExpr::Sym(name, _) => name.clone(),
         other => return Err(ctx.error("function name must be a symbol", other.span())),
     };
-    let params = parse_typed_params(&items[2], variant_names, resource_names, ctx)?;
-    let return_type = parse_type_expr(&items[3], variant_names, resource_names, ctx)?;
+    let params = parse_typed_params(shape.params, variant_names, resource_names, ctx)?;
+    let return_type = parse_type_expr(shape.ret, variant_names, resource_names, ctx)?;
+    let body = shape.body.clone();
     Ok(PendingFunction {
         name,
         params,
         return_type,
-        body: items[4].clone(),
+        body,
         span,
     })
 }
@@ -4283,13 +5982,18 @@ fn parse_import_form(
     ctx: &CompileContext,
 ) -> Result<Import> {
     let span = items[0].span().clone();
-    if items.len() != 5 {
-        return Err(ctx.error_with_note(
-            "invalid import declaration",
-            &span,
-            "expected: (import module name ((param type) ...) return-type)",
-        ));
-    }
+    // (import module name (params) [:] return-type)
+    let ret_idx = match items.len() {
+        5 => 4,
+        6 if is_colon(&items[4]) => 5,
+        _ => {
+            return Err(ctx.error_with_note(
+                "invalid import declaration",
+                &span,
+                "expected: (import module name ((param : type) ...) [:] return-type)",
+            ));
+        }
+    };
 
     let module = match &items[1] {
         SExpr::Sym(s, _) => s.clone(),
@@ -4300,14 +6004,13 @@ fn parse_import_form(
         other => return Err(ctx.error("import name must be a symbol", other.span())),
     };
     let params = parse_typed_params(&items[3], variant_names, resource_names, ctx)?;
-    let return_type = parse_type_expr(&items[4], variant_names, resource_names, ctx)?;
+    let return_type = parse_type_expr(&items[ret_idx], variant_names, resource_names, ctx)?;
 
     Ok(Import {
         module,
         name,
         params,
         return_type,
-        span,
     })
 }
 
@@ -4318,13 +6021,20 @@ fn parse_global_form(
     ctx: &CompileContext,
 ) -> Result<Global> {
     let span = items[0].span().clone();
-    if items.len() != 5 {
-        return Err(ctx.error_with_note(
-            "invalid global declaration",
-            &span,
-            "expected: (global $name type mutability init-value)",
-        ));
-    }
+    // (global $name [:] type mutability init-value)
+    let type_idx = match items.len() {
+        5 => 2,
+        6 if is_colon(&items[2]) => 3,
+        _ => {
+            return Err(ctx.error_with_note(
+                "invalid global declaration",
+                &span,
+                "expected: (global $name [:] type mutability init-value)",
+            ));
+        }
+    };
+    let mut_idx = type_idx + 1;
+    let init_idx = type_idx + 2;
 
     let name = match &items[1] {
         SExpr::Sym(s, sym_span) => {
@@ -4342,9 +6052,9 @@ fn parse_global_form(
         }
     };
 
-    let ty = parse_type_expr(&items[2], variant_names, resource_names, ctx)?;
+    let ty = parse_type_expr(&items[type_idx], variant_names, resource_names, ctx)?;
 
-    let mutable = match &items[3] {
+    let mutable = match &items[mut_idx] {
         SExpr::Sym(s, sym_span) => match s.as_str() {
             "mut" => true,
             "const" => false,
@@ -4359,7 +6069,7 @@ fn parse_global_form(
         other => return Err(ctx.error("mutability must be 'mut' or 'const'", other.span())),
     };
 
-    let init_value = match &items[4] {
+    let init_value = match &items[init_idx] {
         SExpr::Int { value, .. } => *value,
         other => {
             return Err(ctx.error(
@@ -4532,13 +6242,18 @@ fn parse_typed_params(
             for p in params {
                 match p {
                     SExpr::List(parts, param_span) => {
-                        if parts.len() != 2 {
-                            return Err(ctx.error_with_note(
-                                "invalid parameter",
-                                param_span,
-                                "expected: (name type)",
-                            ));
-                        }
+                        // Accept both `(name type)` and `(name : type)`.
+                        let type_expr = match parts.len() {
+                            2 => &parts[1],
+                            3 if matches!(&parts[1], SExpr::Sym(s, _) if s == ":") => &parts[2],
+                            _ => {
+                                return Err(ctx.error_with_note(
+                                    "invalid parameter",
+                                    param_span,
+                                    "expected: (name type) or (name : type)",
+                                ));
+                            }
+                        };
                         let (name, scopes) = match &parts[0] {
                             SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                             other => {
@@ -4547,7 +6262,7 @@ fn parse_typed_params(
                                 );
                             }
                         };
-                        let ty = parse_type_expr(&parts[1], variant_names, resource_names, ctx)?;
+                        let ty = parse_type_expr(type_expr, variant_names, resource_names, ctx)?;
                         result.push(Parameter { name, ty, scopes });
                     }
                     other => {
@@ -4657,7 +6372,12 @@ fn parse_type_symbol(
         "f32" => Ok(Type::F32),
         "f64" => Ok(Type::F64),
         "u8" => Ok(Type::U8),
+        "bool" => Ok(Type::Bool),
+        "u16" => Ok(Type::U16),
+        "u32" => Ok(Type::U32),
+        "u64" => Ok(Type::U64),
         "string" => Ok(Type::Str),
+        "any" => Ok(Type::Any),            // Pack dynamic `value`
         "unit" => Ok(Type::Tuple(vec![])), // unit type is empty tuple
         // Check if this is a variant type name
         other if variant_names.contains(other) => Ok(Type::Variant(other.to_string())),
@@ -4670,7 +6390,21 @@ fn parse_type_symbol(
 }
 
 fn is_type_symbol(sym: &str) -> bool {
-    matches!(sym, "s32" | "s64" | "f32" | "f64" | "u8" | "string" | "unit")
+    matches!(
+        sym,
+        "s32"
+            | "s64"
+            | "f32"
+            | "f64"
+            | "u8"
+            | "bool"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "string"
+            | "any"
+            | "unit"
+    )
 }
 
 fn parse_expr(
@@ -4722,6 +6456,25 @@ fn parse_expr(
         SExpr::List(items, list_span) => {
             if items.is_empty() {
                 return Err(ctx.error("empty list is not a valid expression", list_span));
+            }
+            // Ascription in colon form: (expr : type), mirroring the head form (type expr).
+            if items.len() == 3
+                && is_colon(&items[1])
+                && let SExpr::Sym(tsym, _) = &items[2]
+                && is_type_symbol(tsym)
+            {
+                let ty = match tsym.as_str() {
+                    "s32" => Type::S32,
+                    "s64" => Type::S64,
+                    "f32" => Type::F32,
+                    "f64" => Type::F64,
+                    _ => unreachable!(),
+                };
+                let inner = parse_expr(&items[0], vars, functions, records, variants, ctx)?;
+                return Ok(Expr::Ascribe {
+                    expr: Box::new(inner),
+                    ty,
+                });
             }
             // Create variant name set for type parsing
             let variant_names: HashSet<String> = variants.keys().cloned().collect();
@@ -4826,18 +6579,41 @@ fn parse_expr(
                             return Err(ctx.error_with_note(
                                 "let binding must be a list",
                                 other.span(),
-                                "expected: (name value)",
+                                "expected: (name value) or (name : type value)",
                             ));
                         }
                     };
-                    if binding.len() != 2 {
-                        return Err(ctx.error_with_note(
-                            "invalid let binding",
-                            items[1].span(),
-                            "expected: (name value)",
-                        ));
-                    }
-                    let (name, name_scopes) = match &binding[0] {
+                    // Accept `(name value)` and `(name : type value)`.
+                    let (name_sexpr, value_sexpr, annotation) = match binding.len() {
+                        2 => (&binding[0], &binding[1], None),
+                        4 if is_colon(&binding[1]) => {
+                            let ty = match &binding[2] {
+                                SExpr::Sym(t, _) if is_type_symbol(t) => match t.as_str() {
+                                    "s32" => Type::S32,
+                                    "s64" => Type::S64,
+                                    "f32" => Type::F32,
+                                    "f64" => Type::F64,
+                                    _ => unreachable!(),
+                                },
+                                other => {
+                                    return Err(ctx.error_with_note(
+                                        "let type annotation must be a scalar type",
+                                        other.span(),
+                                        "e.g. (name : s32 value)",
+                                    ));
+                                }
+                            };
+                            (&binding[0], &binding[3], Some(ty))
+                        }
+                        _ => {
+                            return Err(ctx.error_with_note(
+                                "invalid let binding",
+                                items[1].span(),
+                                "expected: (name value) or (name : type value)",
+                            ));
+                        }
+                    };
+                    let (name, name_scopes) = match name_sexpr {
                         SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
                         other => {
                             return Err(
@@ -4845,8 +6621,15 @@ fn parse_expr(
                             );
                         }
                     };
-                    let value_expr =
-                        parse_expr(&binding[1], vars, functions, records, variants, ctx)?;
+                    let mut value_expr =
+                        parse_expr(value_sexpr, vars, functions, records, variants, ctx)?;
+                    // A colon annotation ascribes the value to the declared type.
+                    if let Some(ty) = annotation {
+                        value_expr = Expr::Ascribe {
+                            expr: Box::new(value_expr),
+                            ty,
+                        };
+                    }
                     // Create a new binding with the name and its scopes for hygienic resolution
                     let new_binding = Binding::new(name, name_scopes);
                     let mangled_name = new_binding.mangled_name();
@@ -5142,6 +6925,165 @@ fn parse_expr(
                         string: Box::new(string),
                         start: Box::new(start),
                         end: Box::new(end),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-s32" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-s32' expression",
+                            list_span,
+                            "expected: (any-s32 s32-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyFromS32 {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-as-s32" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-as-s32' expression",
+                            list_span,
+                            "expected: (any-as-s32 any-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyToS32 {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-string" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-string' expression",
+                            list_span,
+                            "expected: (any-string string-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyFromString {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-as-string" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-as-string' expression",
+                            list_span,
+                            "expected: (any-as-string any-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyToString {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "heap-alloc" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'heap-alloc' expression",
+                            list_span,
+                            "expected: (heap-alloc size-expr)",
+                        ));
+                    }
+                    let size = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::HeapAlloc {
+                        size: Box::new(size),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-addr' expression",
+                            list_span,
+                            "expected: (any-addr any-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "any-from-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'any-from-addr' expression",
+                            list_span,
+                            "expected: (any-from-addr addr-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::AnyFromAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-addr' expression",
+                            list_span,
+                            "expected: (string-addr string-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "string-from-addr" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'string-from-addr' expression",
+                            list_span,
+                            "expected: (string-from-addr addr-expr)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::StringFromAddr {
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "call-raw" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'call-raw' expression",
+                            list_span,
+                            "expected: (call-raw args-any)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::RawInvoke {
+                        module: "theater:simple/rpc".to_string(),
+                        import: "call".to_string(),
+                        value: Box::new(value),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "raw-invoke" => {
+                    // (raw-invoke "iface" "name" args-any) -> any. Generic raw-CGRF
+                    // call to any declared host import; args-any is a marshalled blob.
+                    // The interface qualifies the raw symbol (so same-named functions
+                    // in different interfaces don't collide).
+                    if items.len() != 4 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'raw-invoke' expression",
+                            list_span,
+                            "expected: (raw-invoke \"iface\" \"name\" args-any)",
+                        ));
+                    }
+                    let (SExpr::Str(module, _), SExpr::Str(import, _)) = (&items[1], &items[2])
+                    else {
+                        return Err(ctx.error_with_note(
+                            "raw-invoke interface and name must be string literals",
+                            list_span,
+                            "expected: (raw-invoke \"iface\" \"name\" args-any)",
+                        ));
+                    };
+                    let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::RawInvoke {
+                        module: module.clone(),
+                        import: import.clone(),
+                        value: Box::new(value),
                     })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "string-append" => {
@@ -5460,7 +7402,7 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
         }
         let result_clause = emit_wat_result(&func.return_type);
         if result_clause.is_empty() {
-            out.push_str("\n");
+            out.push('\n');
         } else {
             out.push_str(&format!("{}\n", result_clause));
         }
@@ -5523,6 +7465,8 @@ fn generate_wat(prog: &Program, signatures: &HashMap<String, Signature>) -> Stri
     out
 }
 
+// Expression emission threads distinct lexical and type environments recursively.
+#[allow(clippy::too_many_arguments)]
 fn gen_expr(
     expr: &Expr,
     out: &mut String,
@@ -5692,7 +7636,14 @@ fn gen_expr(
             for (i, expr) in exprs.iter().enumerate() {
                 let is_last = i == exprs.len() - 1;
                 last_ty = gen_expr(
-                    expr, out, indent, env, signatures, globals, records, variants,
+                    expr,
+                    out,
+                    indent,
+                    env,
+                    signatures,
+                    globals,
+                    records,
+                    variants,
                     is_last && is_tail,
                 );
                 if !is_last && !is_unit_type(&last_ty) {
@@ -5826,6 +7777,9 @@ fn gen_expr(
                 let store_instr = match &field_def.ty {
                     Type::S32 => "i32.store",
                     Type::S64 => "i64.store",
+                    Type::U64 => "i64.store",
+                    Type::Bool => "i32.store",
+                    Type::U16 | Type::U32 => "i32.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     // All compound types are pointers, resources are i32 handles
@@ -5838,7 +7792,8 @@ fn gen_expr(
                     | Type::Tuple(_)
                     | Type::U8
                     | Type::Resource(_)
-                    | Type::Borrow(_) => "i32.store",
+                    | Type::Borrow(_)
+                    | Type::Any => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
             }
@@ -5878,6 +7833,9 @@ fn gen_expr(
             let load_instr = match &field_def.ty {
                 Type::S32 => "i32.load",
                 Type::S64 => "i64.load",
+                Type::U64 => "i64.load",
+                Type::Bool => "i32.load",
+                Type::U16 | Type::U32 => "i32.load",
                 Type::F32 => "f32.load",
                 Type::F64 => "f64.load",
                 // All compound types are pointers, resources are i32 handles
@@ -5890,7 +7848,8 @@ fn gen_expr(
                 | Type::Tuple(_)
                 | Type::U8
                 | Type::Resource(_)
-                | Type::Borrow(_) => "i32.load",
+                | Type::Borrow(_)
+                | Type::Any => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
             field_def.ty.clone()
@@ -5947,6 +7906,9 @@ fn gen_expr(
                 let store_instr = match payload_ty {
                     Type::S32 => "i32.store",
                     Type::S64 => "i64.store",
+                    Type::U64 => "i64.store",
+                    Type::Bool => "i32.store",
+                    Type::U16 | Type::U32 => "i32.store",
                     Type::F32 => "f32.store",
                     Type::F64 => "f64.store",
                     Type::Record(_)
@@ -5958,7 +7920,8 @@ fn gen_expr(
                     | Type::Tuple(_)
                     | Type::U8
                     | Type::Resource(_)
-                    | Type::Borrow(_) => "i32.store",
+                    | Type::Borrow(_)
+                    | Type::Any => "i32.store",
                 };
                 out.push_str(&format!("{}{}\n", pad, store_instr));
                 payload_offset += type_size(payload_ty);
@@ -5968,10 +7931,15 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             Type::Variant(variant_name.clone())
         }
-        Expr::Match { expr, cases } => {
+        Expr::Match {
+            expr: scrutinee,
+            cases,
+        } => {
+            // Keep the checked language type, including pointer-backed values.
+            let result_ty = expr_type(expr, env, signatures, globals, records, variants);
             // Evaluate the expression to get the pointer
             let expr_ty = gen_expr(
-                expr, out, indent, env, signatures, globals, records, variants, false,
+                scrutinee, out, indent, env, signatures, globals, records, variants, false,
             );
 
             // Save the pointer to a local
@@ -5985,9 +7953,6 @@ fn gen_expr(
                     // Load discriminant
                     out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
                     out.push_str(&format!("{}i32.load\n", pad));
-
-                    // Determine result type (simplified)
-                    let result_ty = Type::S32; // Will be overridden by actual arm body type
 
                     let num_cases = cases.len();
                     for (i, arm) in cases.iter().enumerate() {
@@ -6006,7 +7971,7 @@ fn gen_expr(
                         out.push_str(&format!("{}i32.eq\n", pad));
 
                         let is_last = i == num_cases - 1;
-                        if !is_last || (is_last && num_cases > 1) {
+                        if !is_last || num_cases > 1 {
                             out.push_str(&format!(
                                 "{}(if (result {})\n",
                                 pad,
@@ -6025,6 +7990,9 @@ fn gen_expr(
                             let load_instr = match **inner_ty {
                                 Type::S32 => "i32.load",
                                 Type::S64 => "i64.load",
+                                Type::U64 => "i64.load",
+                                Type::Bool => "i32.load",
+                                Type::U16 | Type::U32 => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -6036,7 +8004,8 @@ fn gen_expr(
                                 | Type::Tuple(_)
                                 | Type::U8
                                 | Type::Resource(_)
-                                | Type::Borrow(_) => "i32.load",
+                                | Type::Borrow(_)
+                                | Type::Any => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -6089,9 +8058,6 @@ fn gen_expr(
                     out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
                     out.push_str(&format!("{}i32.load\n", pad));
 
-                    // Determine result type (simplified)
-                    let result_ty = Type::S32;
-
                     let num_cases = cases.len();
                     for (i, arm) in cases.iter().enumerate() {
                         let (case_idx, payload_ty) = match arm.case_name.as_str() {
@@ -6109,7 +8075,7 @@ fn gen_expr(
                         out.push_str(&format!("{}i32.eq\n", pad));
 
                         let is_last = i == num_cases - 1;
-                        if !is_last || (is_last && num_cases > 1) {
+                        if !is_last || num_cases > 1 {
                             out.push_str(&format!(
                                 "{}(if (result {})\n",
                                 pad,
@@ -6128,6 +8094,9 @@ fn gen_expr(
                             let load_instr = match payload_ty {
                                 Type::S32 => "i32.load",
                                 Type::S64 => "i64.load",
+                                Type::U64 => "i64.load",
+                                Type::Bool => "i32.load",
+                                Type::U16 | Type::U32 => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -6139,7 +8108,8 @@ fn gen_expr(
                                 | Type::Tuple(_)
                                 | Type::U8
                                 | Type::Resource(_)
-                                | Type::Borrow(_) => "i32.load",
+                                | Type::Borrow(_)
+                                | Type::Any => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -6193,29 +8163,6 @@ fn gen_expr(
                     out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
                     out.push_str(&format!("{}i32.load\n", pad));
 
-                    // Determine result type from first arm
-                    let result_ty = if let Some(first_arm) = cases.first() {
-                        // Build environment for first arm to get its type
-                        let (_, first_case) = variant_def
-                            .find_case(&first_arm.case_name)
-                            .expect("case should exist");
-                        let mut arm_env = HashMap::new();
-                        for (binding, ty) in
-                            first_arm.bindings.iter().zip(first_case.payload.iter())
-                        {
-                            arm_env.insert(binding.clone(), ty.clone());
-                        }
-                        // Get type from body - simplified, assumes type checking passed
-                        match &first_arm.body {
-                            Expr::Int { ty, .. } => ty.clone(),
-                            Expr::Float { ty, .. } => ty.clone(),
-                            Expr::Var(name) => arm_env.get(name).cloned().unwrap_or(Type::S32),
-                            _ => Type::S32, // Default fallback
-                        }
-                    } else {
-                        Type::S32
-                    };
-
                     // For simplicity, use nested if-else for now
                     let num_cases = cases.len();
                     for (i, arm) in cases.iter().enumerate() {
@@ -6232,14 +8179,7 @@ fn gen_expr(
                         out.push_str(&format!("{}i32.eq\n", pad));
 
                         let is_last = i == num_cases - 1;
-                        if is_last && num_cases > 1 {
-                            out.push_str(&format!(
-                                "{}(if (result {})\n",
-                                pad,
-                                wat_type(&result_ty)
-                            ));
-                            out.push_str(&format!("{}  (then\n", pad));
-                        } else if !is_last {
+                        if num_cases > 1 {
                             out.push_str(&format!(
                                 "{}(if (result {})\n",
                                 pad,
@@ -6260,6 +8200,9 @@ fn gen_expr(
                             let load_instr = match payload_ty {
                                 Type::S32 => "i32.load",
                                 Type::S64 => "i64.load",
+                                Type::U64 => "i64.load",
+                                Type::Bool => "i32.load",
+                                Type::U16 | Type::U32 => "i32.load",
                                 Type::F32 => "f32.load",
                                 Type::F64 => "f64.load",
                                 Type::Record(_)
@@ -6271,7 +8214,8 @@ fn gen_expr(
                                 | Type::Tuple(_)
                                 | Type::U8
                                 | Type::Resource(_)
-                                | Type::Borrow(_) => "i32.load",
+                                | Type::Borrow(_)
+                                | Type::Any => "i32.load",
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
@@ -6494,7 +8438,7 @@ fn gen_expr(
             }
 
             // Allocate tuple on heap
-            let total_size: usize = value_types.iter().map(|t| type_size(t)).sum();
+            let total_size: usize = value_types.iter().map(type_size).sum();
             let ptr_local = env.declare_local(Type::S32);
 
             out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
@@ -6579,6 +8523,14 @@ fn gen_expr(
             let list_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.set {}\n", pad, list_local));
 
+            // Evaluate both operands before reading or changing the list header.
+            // The value expression can itself push into this same list.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            let value_local = env.declare_local(elem_type.clone());
+            out.push_str(&format!("{}local.set {}\n", pad, value_local));
+
             // Get current len
             let len_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.get {}\n", pad, list_local));
@@ -6631,9 +8583,7 @@ fn gen_expr(
             out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
             out.push_str(&format!("{}i32.mul\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
-            gen_expr(
-                value, out, indent, env, signatures, globals, records, variants, false,
-            );
+            out.push_str(&format!("{}local.get {}\n", pad, value_local));
             let store_instr = match &elem_type {
                 Type::S32 => "i32.store",
                 Type::S64 => "i64.store",
@@ -6804,6 +8754,227 @@ fn gen_expr(
             Type::Str
         }
         // String: append - concatenate two strings
+        Expr::AnyFromS32 { value } => {
+            // Build a len-prefixed CGRF blob [len:u32][16B header][S32 node] for n.
+            // The payload S32 node sits at cgrf offset 16 (header) + 8 (node header).
+            let n_local = env.declare_local(Type::S32);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, n_local));
+            let ptr = env.declare_local(Type::S32);
+            // Bump the shared heap by 32 bytes (4 len prefix + 28 CGRF scalar value).
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr));
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 32\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            // A little helper writes `local.get ptr; i32.const v; <instr> offset=o`.
+            {
+                let mut w = |v: String, instr: &str, o: u32| {
+                    out.push_str(&format!("{}local.get {}\n", pad, ptr));
+                    out.push_str(&format!("{}{}\n", pad, v));
+                    out.push_str(&format!("{}{} offset={}\n", pad, instr, o));
+                };
+                w("i32.const 28".into(), "i32.store", 0); // len prefix = CGRF byte length
+                w(format!("i32.const {}", CGRF_MAGIC), "i32.store", 4);
+                w(format!("i32.const {}", CGRF_VERSION), "i32.store16", 8);
+                w("i32.const 0".into(), "i32.store16", 10); // flags
+                w("i32.const 1".into(), "i32.store", 12); // node_count
+                w("i32.const 0".into(), "i32.store", 16); // root index
+                w(format!("i32.const {}", CGRF_S32), "i32.store8", 20); // node kind
+                w("i32.const 0".into(), "i32.store8", 21); // node flags
+                w("i32.const 0".into(), "i32.store16", 22); // reserved
+                w("i32.const 4".into(), "i32.store", 24); // payload_len
+                w(format!("local.get {}", n_local), "i32.store", 28); // payload value
+            }
+            // Result: the `any` pointer.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr));
+            Type::Any
+        }
+        Expr::AnyToS32 { value } => {
+            // The S32 payload sits at blob+28 (4 len prefix + 16 header + 8 node header).
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}i32.load offset=28\n", pad));
+            Type::S32
+        }
+        Expr::AnyFromString { value } => {
+            // Build a len-prefixed CGRF String node blob [len:u32][16B header][node]
+            // for s. A Wisp string is a pointer to [len:u32][bytes], and the CGRF
+            // string payload (at cgrf offset 24) is the same [len:u32][bytes]
+            // layout, so the byte copy is a straight memcpy of the string body.
+            let s_local = env.declare_local(Type::S32);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, s_local));
+            let slen = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.get {}\n", pad, s_local));
+            out.push_str(&format!("{}i32.load\n", pad)); // string byte length
+            out.push_str(&format!("{}local.set {}\n", pad, slen));
+            let ptr = env.declare_local(Type::S32);
+            // Bump the heap by 32 + slen (4 len prefix + 28 CGRF fixed + bytes).
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr));
+            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}i32.const 32\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            // Fixed header fields.
+            {
+                let mut w = |v: String, instr: &str, o: u32| {
+                    out.push_str(&format!("{}local.get {}\n", pad, ptr));
+                    out.push_str(&format!("{}{}\n", pad, v));
+                    out.push_str(&format!("{}{} offset={}\n", pad, instr, o));
+                };
+                w(format!("i32.const {}", CGRF_MAGIC), "i32.store", 4);
+                w(format!("i32.const {}", CGRF_VERSION), "i32.store16", 8);
+                w("i32.const 0".into(), "i32.store16", 10); // flags
+                w("i32.const 1".into(), "i32.store", 12); // node_count
+                w("i32.const 0".into(), "i32.store", 16); // root index
+                w(format!("i32.const {}", CGRF_STRING), "i32.store8", 20); // node kind
+                w("i32.const 0".into(), "i32.store8", 21); // node flags
+                w("i32.const 0".into(), "i32.store16", 22); // reserved
+            }
+            // Dynamic fields: len prefix (28 + slen), payload_len (4 + slen),
+            // and the CGRF string length field.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr)); // len prefix @0
+            out.push_str(&format!("{}i32.const 28\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.store\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, ptr)); // payload_len @24
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}i32.store offset=24\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, ptr)); // string length @28
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}i32.store offset=28\n", pad));
+            // Copy the string bytes: dest = ptr+32, src = s+4, len = slen.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr));
+            out.push_str(&format!("{}i32.const 32\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, s_local));
+            out.push_str(&format!("{}i32.const 4\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slen));
+            out.push_str(&format!("{}memory.copy\n", pad));
+            // Result: the `any` pointer.
+            out.push_str(&format!("{}local.get {}\n", pad, ptr));
+            Type::Any
+        }
+        Expr::AnyToString { value } => {
+            // Zero-copy: a CGRF string payload [len:u32][bytes] sits at blob+28,
+            // which is exactly a Wisp string, so return a pointer to it.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}i32.const 28\n", pad));
+            out.push_str(&format!("{}i32.add\n", pad));
+            Type::Str
+        }
+        Expr::HeapAlloc { size } => {
+            // Allocate on the compiler's bump heap so byte buffers the interpreter
+            // builds share the same heap as the boundary codec's allocations.
+            gen_expr(
+                size, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}call $__alloc\n", pad));
+            Type::S32
+        }
+        Expr::AnyAddr { value } => {
+            // Pure reinterpret: an `any` is already the i32 address of its blob.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::S32
+        }
+        Expr::AnyFromAddr { value } => {
+            // Pure reinterpret: a blob address is an `any`.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::Any
+        }
+        Expr::StringAddr { value } => {
+            // Pure reinterpret: a string is already the i32 address of [len][bytes].
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::S32
+        }
+        Expr::StringFromAddr { value } => {
+            // Pure reinterpret: an address of [len][bytes] is a string.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            Type::Str
+        }
+        Expr::RawInvoke {
+            module,
+            import,
+            value,
+        } => {
+            // args-any is a len-prefixed CGRF blob [len:u32][cgrf]. Pass its bytes
+            // straight to the import's raw CGRF entry point, then wrap the returned
+            // CGRF (out_ptr,out_len) back into an `any` blob — the same shape the
+            // import wrapper uses for an `any` result.
+            let raw_sym = raw_import_symbol(module, import);
+            let blob = env.declare_local(Type::S32);
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}local.set {}\n", pad, blob));
+            let slots = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{}i32.const 8\n{}call $__alloc\n{}local.set {}\n",
+                pad, pad, pad, slots
+            ));
+            // $__raw_<import>(blob+4, load(blob), slots, slots+4)
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
+                pad, blob, pad, pad
+            ));
+            out.push_str(&format!("{}local.get {}\n{}i32.load\n", pad, blob, pad));
+            out.push_str(&format!("{}local.get {}\n", pad, slots));
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
+                pad, slots, pad, pad
+            ));
+            out.push_str(&format!("{}call ${}\n{}drop\n", pad, raw_sym, pad)); // ignore status
+            let any_len = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n{}i32.load\n{}local.set {}\n",
+                pad, slots, pad, pad, pad, pad, any_len
+            )); // out_len
+            let res = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n{}call $__alloc\n{}local.set {}\n",
+                pad, any_len, pad, pad, pad, pad, res
+            ));
+            out.push_str(&format!(
+                "{}local.get {}\n{}local.get {}\n{}i32.store\n",
+                pad, res, pad, any_len, pad
+            )); // len prefix
+            // copy cgrf: dest=res+4, src=out_ptr (load slots), len=any_len
+            out.push_str(&format!(
+                "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
+                pad, res, pad, pad
+            ));
+            out.push_str(&format!("{}local.get {}\n{}i32.load\n", pad, slots, pad)); // out_ptr
+            out.push_str(&format!(
+                "{}local.get {}\n{}memory.copy\n",
+                pad, any_len, pad
+            ));
+            out.push_str(&format!("{}local.get {}\n", pad, res));
+            Type::Any
+        }
         Expr::StringAppend { left, right } => {
             // Evaluate left string pointer
             let left_local = env.declare_local(Type::S32);
@@ -7185,6 +9356,10 @@ fn wat_type(ty: &Type) -> &'static str {
         Type::F32 => "f32",
         Type::F64 => "f64",
         Type::U8 => "i32",
+        Type::Bool => "i32",
+        Type::U16 => "i32",
+        Type::U32 => "i32",
+        Type::U64 => "i64",
         // All compound types are pointer-sized (i32 handles)
         Type::Record(_)
         | Type::Variant(_)
@@ -7192,7 +9367,9 @@ fn wat_type(ty: &Type) -> &'static str {
         | Type::Result(_, _)
         | Type::List(_)
         | Type::Str
-        | Type::Tuple(_) => "i32",
+        | Type::Tuple(_)
+        // Dynamic value is a pointer to a self-contained CGRF blob
+        | Type::Any => "i32",
         // Resources are i32 handles
         Type::Resource(_) | Type::Borrow(_) => "i32",
     }
@@ -7214,15 +9391,20 @@ fn wit_type(ty: &Type) -> String {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::U8 => "u8".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
         Type::Option(inner) => format!("option<{}>", wit_type(inner)),
         Type::Result(ok, err) => format!("result<{}, {}>", wit_type(ok), wit_type(err)),
         Type::List(inner) => format!("list<{}>", wit_type(inner)),
         Type::Str => "string".to_string(),
+        Type::Any => "value".to_string(),
         Type::Resource(name) => name.clone(),
         Type::Borrow(inner) => format!("borrow<{}>", wit_type(inner)),
         Type::Tuple(elems) => {
-            let inner: Vec<String> = elems.iter().map(|t| wit_type(t)).collect();
+            let inner: Vec<String> = elems.iter().map(wit_type).collect();
             format!("tuple<{}>", inner.join(", "))
         }
     }
@@ -7298,9 +9480,25 @@ fn flatten_type(
             // Tuple is a pointer
             vec![Type::S32]
         }
+        Type::Any => {
+            // Dynamic value is a pointer to a self-contained CGRF blob
+            vec![Type::S32]
+        }
         Type::U8 => {
             // U8 is stored as i32
             vec![Type::S32]
+        }
+        Type::Bool => {
+            // Bool is stored as i32 (0/1)
+            vec![Type::S32]
+        }
+        Type::U16 | Type::U32 => {
+            // u16/u32 are stored as i32
+            vec![Type::S32]
+        }
+        Type::U64 => {
+            // U64 is stored as i64
+            vec![Type::S64]
         }
         Type::Resource(_) | Type::Borrow(_) => {
             // Resources and borrows are i32 handles
@@ -7461,7 +9659,7 @@ fn generate_abi_wrapper(
                     flat_param_idx += 1;
                 }
                 // TODO: properly handle options/results
-                internal_call_args.push(format!("i32.const 0"));
+                internal_call_args.push("i32.const 0".to_string());
             }
         }
     }
@@ -7483,6 +9681,7 @@ fn store_instr(ty: &Type) -> &'static str {
     match ty {
         Type::S32 => "i32.store",
         Type::S64 => "i64.store",
+        Type::U64 => "i64.store",
         Type::F32 => "f32.store",
         Type::F64 => "f64.store",
         // Compound types are pointer-sized, resources are i32 handles
@@ -7494,29 +9693,12 @@ fn store_instr(ty: &Type) -> &'static str {
         | Type::Str
         | Type::Tuple(_)
         | Type::U8
+        | Type::Bool
+        | Type::U16
+        | Type::U32
         | Type::Resource(_)
-        | Type::Borrow(_) => "i32.store",
-    }
-}
-
-/// Get the load instruction for a type
-fn load_instr(ty: &Type) -> &'static str {
-    match ty {
-        Type::S32 => "i32.load",
-        Type::S64 => "i64.load",
-        Type::F32 => "f32.load",
-        Type::F64 => "f64.load",
-        // Compound types are pointer-sized, resources are i32 handles
-        Type::Record(_)
-        | Type::Variant(_)
-        | Type::Option(_)
-        | Type::Result(_, _)
-        | Type::List(_)
-        | Type::Str
-        | Type::Tuple(_)
-        | Type::U8
-        | Type::Resource(_)
-        | Type::Borrow(_) => "i32.load",
+        | Type::Borrow(_)
+        | Type::Any => "i32.store",
     }
 }
 
@@ -7645,15 +9827,20 @@ fn pact_type(ty: &Type) -> String {
         Type::F32 => "f32".to_string(),
         Type::F64 => "f64".to_string(),
         Type::U8 => "u8".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
         Type::Record(name) | Type::Variant(name) => name.clone(),
         Type::Option(inner) => format!("option<{}>", pact_type(inner)),
         Type::Result(ok, err) => format!("result<{}, {}>", pact_type(ok), pact_type(err)),
         Type::List(inner) => format!("list<{}>", pact_type(inner)),
         Type::Str => "string".to_string(),
+        Type::Any => "value".to_string(),
         Type::Resource(name) => name.clone(),
         Type::Borrow(inner) => format!("borrow<{}>", pact_type(inner)),
         Type::Tuple(elems) => {
-            let inner: Vec<String> = elems.iter().map(|t| pact_type(t)).collect();
+            let inner: Vec<String> = elems.iter().map(pact_type).collect();
             format!("tuple<{}>", inner.join(", "))
         }
     }
@@ -7679,7 +9866,11 @@ pub fn generate_pact(prog: &Program, default_name: &str) -> String {
     for record in &prog.records {
         out.push_str(&format!("    record {} {{\n", record.name));
         for field in &record.fields {
-            out.push_str(&format!("        {}: {},\n", field.name, pact_type(&field.ty)));
+            out.push_str(&format!(
+                "        {}: {},\n",
+                field.name,
+                pact_type(&field.ty)
+            ));
         }
         out.push_str("    }\n\n");
     }
@@ -7976,7 +10167,7 @@ fn value_to_sexpr(value: &InlineValue, span: &Span) -> SExpr {
 
 /// CGRF format constants
 const CGRF_MAGIC: u32 = 0x46524743; // "CGRF" in little-endian
-const CGRF_VERSION: u16 = 2;
+const CGRF_VERSION: u16 = 3;
 
 /// CGRF node kinds (also used as type tags for v2 encoding)
 const CGRF_BOOL: u8 = 0x01;
@@ -7994,15 +10185,10 @@ const CGRF_U8: u8 = 0x0C;
 const CGRF_U16: u8 = 0x0D;
 const CGRF_U32: u8 = 0x0E;
 const CGRF_U64: u8 = 0x0F;
-const CGRF_S8: u8 = 0x10;
-const CGRF_S16: u8 = 0x11;
-const CGRF_CHAR: u8 = 0x12;
-const CGRF_FLAGS: u8 = 0x13;
 const CGRF_RESULT: u8 = 0x14;
+const CGRF_ARRAY: u8 = 0x15;
 
 /// Memory layout for Pack packages
-const INPUT_BUFFER_OFFSET: i32 = 0x0000;
-const OUTPUT_BUFFER_OFFSET: i32 = 0x4000;
 const METADATA_OFFSET: i32 = 0xA000; // Pack metadata segment (8KB reserved)
 const HEAP_START_OFFSET: i32 = 0xC000;
 
@@ -8014,6 +10200,10 @@ fn type_to_tag(ty: &Type) -> u8 {
         Type::F32 => CGRF_F32,
         Type::F64 => CGRF_F64,
         Type::U8 => CGRF_U8,
+        Type::Bool => CGRF_BOOL,
+        Type::U16 => CGRF_U16,
+        Type::U32 => CGRF_U32,
+        Type::U64 => CGRF_U64,
         Type::Str => CGRF_STRING,
         Type::List(_) => CGRF_LIST,
         Type::Option(_) => CGRF_OPTION,
@@ -8023,6 +10213,9 @@ fn type_to_tag(ty: &Type) -> u8 {
         Type::Variant(_) => CGRF_VARIANT,
         Type::Resource(_) => CGRF_RECORD, // Resources are treated as records for now
         Type::Borrow(inner) => type_to_tag(inner), // Borrow uses inner type's tag
+        // Dynamic value has no single node kind; nesting `any` inside an
+        // aggregate's v2 type tag is deferred (scalar slice uses top-level any).
+        Type::Any => CGRF_VARIANT,
     }
 }
 
@@ -8030,201 +10223,23 @@ fn type_to_tag(ty: &Type) -> u8 {
 /// Simple types are 1 byte, compound types include nested type info
 fn type_tag_size(ty: &Type) -> usize {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => 1,
+        Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::Str
+        | Type::U8
+        | Type::Bool
+        | Type::U16
+        | Type::U32
+        | Type::U64 => 1,
         Type::List(inner) => 1 + type_tag_size(inner),
         Type::Option(inner) => 1 + type_tag_size(inner),
         Type::Result(ok, err) => 1 + type_tag_size(ok) + type_tag_size(err),
-        Type::Tuple(elems) => 1 + 4 + elems.iter().map(|t| type_tag_size(t)).sum::<usize>(),
+        Type::Tuple(elems) => 1 + 4 + elems.iter().map(type_tag_size).sum::<usize>(),
         Type::Record(name) | Type::Variant(name) | Type::Resource(name) => 1 + 4 + name.len(),
         Type::Borrow(inner) => type_tag_size(inner),
-    }
-}
-
-/// Generate WAT code to write a type tag at the given offset
-/// Returns the number of bytes written
-fn generate_write_type_tag(out: &mut String, ty: &Type, base_local: &str, offset: i32) -> usize {
-    let tag = type_to_tag(ty);
-    out.push_str(&format!("    local.get {}\n", base_local));
-    if offset != 0 {
-        out.push_str(&format!("    i32.const {}\n", offset));
-        out.push_str("    i32.add\n");
-    }
-    out.push_str(&format!("    i32.const {}\n", tag));
-    out.push_str("    i32.store8\n");
-
-    match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => 1,
-        Type::List(inner) => 1 + generate_write_type_tag(out, inner, base_local, offset + 1),
-        Type::Option(inner) => 1 + generate_write_type_tag(out, inner, base_local, offset + 1),
-        Type::Result(ok, err) => {
-            let ok_size = generate_write_type_tag(out, ok, base_local, offset + 1);
-            let err_size =
-                generate_write_type_tag(out, err, base_local, offset + 1 + ok_size as i32);
-            1 + ok_size + err_size
-        }
-        Type::Tuple(elems) => {
-            // Write element count (u32)
-            out.push_str(&format!("    local.get {}\n", base_local));
-            out.push_str(&format!("    i32.const {}\n", offset + 1));
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", elems.len()));
-            out.push_str("    i32.store\n");
-            // Write each element type tag
-            let mut elem_offset = offset + 5; // 1 (tag) + 4 (count)
-            for elem in elems {
-                let sz = generate_write_type_tag(out, elem, base_local, elem_offset);
-                elem_offset += sz as i32;
-            }
-            (elem_offset - offset) as usize
-        }
-        Type::Record(name) | Type::Variant(name) | Type::Resource(name) => {
-            // Write name length
-            out.push_str(&format!("    local.get {}\n", base_local));
-            out.push_str(&format!("    i32.const {}\n", offset + 1));
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", name.len()));
-            out.push_str("    i32.store\n");
-            // Write name bytes
-            for (i, byte) in name.bytes().enumerate() {
-                out.push_str(&format!("    local.get {}\n", base_local));
-                out.push_str(&format!("    i32.const {}\n", offset + 5 + i as i32));
-                out.push_str("    i32.add\n");
-                out.push_str(&format!("    i32.const {}\n", byte));
-                out.push_str("    i32.store8\n");
-            }
-            1 + 4 + name.len()
-        }
-        Type::Borrow(inner) => generate_write_type_tag(out, inner, base_local, offset),
-    }
-}
-
-// ============================================================================
-// CGRF Encoder for Pack Metadata
-// ============================================================================
-
-/// A CGRF node during encoding - stores payload bytes directly
-#[derive(Debug, Clone)]
-struct CgrfNode {
-    kind: u8,
-    payload: Vec<u8>,
-}
-
-/// Encoder for building CGRF-encoded metadata
-/// Matches Pack's CGRF v2 format exactly
-struct CgrfEncoder {
-    nodes: Vec<CgrfNode>,
-}
-
-impl CgrfEncoder {
-    fn new() -> Self {
-        Self { nodes: Vec::new() }
-    }
-
-    /// Add a string node, returns node index
-    /// Payload format: len:u32 + utf8_bytes
-    fn add_string(&mut self, s: &str) -> u32 {
-        let idx = self.nodes.len() as u32;
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        payload.extend_from_slice(s.as_bytes());
-        self.nodes.push(CgrfNode { kind: CGRF_STRING, payload });
-        idx
-    }
-
-    /// Add a list node with given element type bytes and children indices
-    /// Payload format: elem_type:type_bytes + count:u32 + child_indices:u32*
-    fn add_list(&mut self, elem_type_bytes: Vec<u8>, children: Vec<u32>) -> u32 {
-        let idx = self.nodes.len() as u32;
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&elem_type_bytes);
-        payload.extend_from_slice(&(children.len() as u32).to_le_bytes());
-        for child_idx in children {
-            payload.extend_from_slice(&child_idx.to_le_bytes());
-        }
-        self.nodes.push(CgrfNode { kind: CGRF_LIST, payload });
-        idx
-    }
-
-    /// Encode a named type (Record or Variant) for use in List element types
-    fn encode_named_type(tag: u8, name: &str) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.push(tag);
-        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name.as_bytes());
-        bytes
-    }
-
-    /// Add a record node with name and field (name, value_idx) pairs
-    /// Payload format: type_name_len:u32 + type_name:utf8 + field_count:u32 +
-    ///                 (field_name_len:u32 + field_name:utf8)* + child_indices:u32*
-    fn add_record(&mut self, name: &str, fields: Vec<(&str, u32)>) -> u32 {
-        let idx = self.nodes.len() as u32;
-        let mut payload = Vec::new();
-        // type_name_len + type_name
-        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        payload.extend_from_slice(name.as_bytes());
-        // field_count
-        payload.extend_from_slice(&(fields.len() as u32).to_le_bytes());
-        // field names first
-        for (fname, _) in &fields {
-            payload.extend_from_slice(&(fname.len() as u32).to_le_bytes());
-            payload.extend_from_slice(fname.as_bytes());
-        }
-        // then child indices
-        for (_, value_idx) in &fields {
-            payload.extend_from_slice(&value_idx.to_le_bytes());
-        }
-        self.nodes.push(CgrfNode { kind: CGRF_RECORD, payload });
-        idx
-    }
-
-    /// Add a variant node
-    /// Payload format: type_name_len:u32 + type_name:utf8 + case_name_len:u32 + case_name:utf8 +
-    ///                 tag:u32 + payload_count:u32 + child_indices:u32*
-    fn add_variant(&mut self, name: &str, case: &str, tag: u32, children: Vec<u32>) -> u32 {
-        let idx = self.nodes.len() as u32;
-        let mut payload = Vec::new();
-        // type_name_len + type_name
-        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        payload.extend_from_slice(name.as_bytes());
-        // case_name_len + case_name
-        payload.extend_from_slice(&(case.len() as u32).to_le_bytes());
-        payload.extend_from_slice(case.as_bytes());
-        // tag
-        payload.extend_from_slice(&tag.to_le_bytes());
-        // payload_count + child indices
-        payload.extend_from_slice(&(children.len() as u32).to_le_bytes());
-        for child_idx in children {
-            payload.extend_from_slice(&child_idx.to_le_bytes());
-        }
-        self.nodes.push(CgrfNode { kind: CGRF_VARIANT, payload });
-        idx
-    }
-
-    /// Encode all nodes to CGRF v2 bytes with the given root index
-    /// Format: Header (16 bytes) + Nodes (8 + payload_len each)
-    fn encode(&self, root: u32) -> Vec<u8> {
-        let mut bytes = Vec::new();
-
-        // CGRF v2 Header (16 bytes):
-        // [MAGIC:u32][VERSION:u16][FLAGS:u16][NODE_COUNT:u32][ROOT_INDEX:u32]
-        bytes.extend_from_slice(&CGRF_MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&CGRF_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
-        bytes.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&root.to_le_bytes());
-
-        // Nodes: each node has 8-byte header + payload
-        // [KIND:u8][FLAGS:u8][RESERVED:u16][PAYLOAD_LEN:u32][PAYLOAD...]
-        for node in &self.nodes {
-            bytes.push(node.kind);           // kind (1 byte)
-            bytes.push(0u8);                  // flags (1 byte)
-            bytes.extend_from_slice(&0u16.to_le_bytes()); // reserved (2 bytes)
-            bytes.extend_from_slice(&(node.payload.len() as u32).to_le_bytes()); // payload_len (4 bytes)
-            bytes.extend_from_slice(&node.payload); // payload
-        }
-
-        bytes
+        Type::Any => 1,
     }
 }
 
@@ -8232,6 +10247,10 @@ impl CgrfEncoder {
 fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
     match ty {
         Type::U8 => pack::types::Type::U8,
+        Type::Bool => pack::types::Type::Bool,
+        Type::U16 => pack::types::Type::U16,
+        Type::U32 => pack::types::Type::U32,
+        Type::U64 => pack::types::Type::U64,
         Type::S32 => pack::types::Type::S32,
         Type::S64 => pack::types::Type::S64,
         Type::F32 => pack::types::Type::F32,
@@ -8252,14 +10271,55 @@ fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
                 err: Box::new(wisp_type_to_pack_type(err)),
             }
         }
-        Type::Tuple(elems) => pack::types::Type::Tuple(
-            elems.iter().map(wisp_type_to_pack_type).collect()
-        ),
+        Type::Tuple(elems) => {
+            pack::types::Type::Tuple(elems.iter().map(wisp_type_to_pack_type).collect())
+        }
         Type::Record(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
         Type::Variant(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
         Type::Resource(name) => pack::types::Type::Ref(pack::types::TypePath::simple(name.clone())),
         Type::Borrow(inner) => wisp_type_to_pack_type(inner),
+        Type::Any => pack::types::Type::Value,
     }
+}
+
+/// Build the Pack `TypeDef`s for a Program's records and variants.
+///
+/// These are registered on each interface arena so that named references in
+/// import/export signatures (`Type::Ref("runtime-error")`, `actor-info`, ...)
+/// resolve *structurally* when Pack computes interface hashes — making a Wisp
+/// declaration of a foreign type hash-identical to the type declared in the
+/// peer's pact. Pack hashes a variant/record by its (sorted) field/case names
+/// and child hashes, and does not hash the typedef set itself, so registering
+/// extra, unreferenced typedefs is harmless; only referenced ones affect a hash.
+fn program_pack_typedefs(prog: &Program) -> Vec<pack::types::TypeDef> {
+    use pack::types::{Case, Field, Type as PackType, TypeDef};
+    let mut defs = Vec::new();
+    for rec in &prog.records {
+        defs.push(TypeDef::record(
+            rec.name.clone(),
+            rec.fields
+                .iter()
+                .map(|f| Field::new(f.name.clone(), wisp_type_to_pack_type(&f.ty)))
+                .collect(),
+        ));
+    }
+    for var in &prog.variants {
+        defs.push(TypeDef::variant(
+            var.name.clone(),
+            var.cases
+                .iter()
+                .map(|c| match c.payload.as_slice() {
+                    [] => Case::unit(c.name.clone()),
+                    [one] => Case::new(c.name.clone(), wisp_type_to_pack_type(one)),
+                    many => Case::new(
+                        c.name.clone(),
+                        PackType::tuple(many.iter().map(wisp_type_to_pack_type).collect()),
+                    ),
+                })
+                .collect(),
+        ));
+    }
+    defs
 }
 
 /// Encode PackageMetadata for a Program to CGRF bytes with interface hashes.
@@ -8270,6 +10330,10 @@ fn wisp_type_to_pack_type(ty: &Type) -> pack::types::Type {
 fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
     use pack::types::{Arena, Function, Param};
     use std::collections::HashMap;
+
+    // Named-type definitions, registered on every interface arena so that refs in
+    // signatures resolve structurally during hashing (see program_pack_typedefs).
+    let typedefs = program_pack_typedefs(prog);
 
     let mut package = Arena::new("package");
 
@@ -8286,9 +10350,10 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
         };
         let func = Function::with_signature(
             imp.name.clone(),
-            imp.params.iter().map(|p| {
-                Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty))
-            }).collect(),
+            imp.params
+                .iter()
+                .map(|p| Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty)))
+                .collect(),
             results,
         );
         import_by_interface
@@ -8299,6 +10364,9 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 
     for (interface_name, funcs) in import_by_interface {
         let mut interface_arena = Arena::new(interface_name);
+        for td in &typedefs {
+            interface_arena.add_type(td.clone());
+        }
         for func in funcs {
             interface_arena.add_function(func);
         }
@@ -8321,9 +10389,10 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
             };
             let pack_func = Function::with_signature(
                 exp.export_name.clone(),
-                func.params.iter().map(|p| {
-                    Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty))
-                }).collect(),
+                func.params
+                    .iter()
+                    .map(|p| Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty)))
+                    .collect(),
                 results,
             );
             // Use "exports" as the default interface for exports
@@ -8336,6 +10405,9 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 
     for (interface_name, funcs) in export_by_interface {
         let mut interface_arena = Arena::new(interface_name);
+        for td in &typedefs {
+            interface_arena.add_type(td.clone());
+        }
         for func in funcs {
             interface_arena.add_function(func);
         }
@@ -8362,16 +10434,20 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
     // Generate import declarations with Pack/Graph ABI signature
     // Each import is declared as (i32, i32, i32, i32) -> i32
     for import in &prog.imports {
-        // Raw import with Pack/Graph ABI calling convention
+        // Raw import with Pack/Graph ABI calling convention. The internal symbol
+        // is qualified by interface to avoid collisions across interfaces.
         out.push_str(&format!(
-            "  (import \"{}\" \"{}\" (func $__raw_{} (param i32 i32 i32 i32) (result i32)))\n",
-            import.module, import.name, import.name
+            "  (import \"{}\" \"{}\" (func ${} (param i32 i32 i32 i32) (result i32)))\n",
+            import.module,
+            import.name,
+            raw_import_symbol(&import.module, &import.name)
         ));
     }
 
-    // Memory: 500 pages (32MB) initial, 1000 max (64MB), exported as "memory"
-    // Large initial size needed for bootstrap compilation of the 42KB compiler
-    out.push_str("  (memory (export \"memory\") 16000 16000)\n");
+    // Large fixed memory: the self-hosted compiler never frees its bump heap, so
+    // self-compiling the (now ~130KB) compiler source accumulates well over 1GB of
+    // intermediate strings. 32000 pages = 2GB.
+    out.push_str("  (memory (export \"memory\") 32000 32000)\n");
 
     // Emit data segments
     for seg in &prog.data_segments {
@@ -8525,10 +10601,17 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
 "#,
     );
 
-    // Generate import wrapper functions
-    // These have the original wisp signature but internally encode args and call the raw import
+    // Generate import wrapper functions. These have the original wisp signature
+    // and are called by bare name (describe/self/...); raw-invoked imports call the
+    // qualified raw symbol instead, leaving their wrapper as dead code. The wrapper
+    // is named by the bare import name, so dedup by name: two interfaces exposing
+    // the same function name (store.exists / filesystem.exists) would otherwise emit
+    // two `$exists` wrappers. The bare-name-called wrappers all have unique names.
+    let mut wrapped = std::collections::HashSet::new();
     for import in &prog.imports {
-        generate_import_wrapper(&mut out, import, &records_map, &variants_map);
+        if wrapped.insert(import.name.clone()) {
+            generate_import_wrapper(&mut out, import);
+        }
     }
 
     // Generate internal functions
@@ -8554,7 +10637,7 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
         }
         let result_clause = emit_wat_result(&func.return_type);
         if result_clause.is_empty() {
-            out.push_str("\n");
+            out.push('\n');
         } else {
             out.push_str(&format!("{}\n", result_clause));
         }
@@ -8568,7 +10651,13 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
     // Generate Pack wrappers for exported functions
     for export in &prog.exports {
         let func = find_function(prog, &export.func_name);
-        generate_pack_wrapper(&mut out, func, &export.export_name, &records_map, &variants_map);
+        generate_pack_wrapper(
+            &mut out,
+            func,
+            &export.export_name,
+            &records_map,
+            &variants_map,
+        );
     }
 
     out.push_str(")\n");
@@ -8700,6 +10789,7 @@ fn generate_pack_wrapper(
     }
 
     // Locals for recursive CGRF encoding of return value
+    generate_cgrf_array_locals(out);
     out.push_str("    (local $buf_cursor i32)\n");
     out.push_str("    (local $node_idx i32)\n");
     out.push_str("    (local $enc_root_idx i32)\n");
@@ -8738,6 +10828,14 @@ fn generate_pack_wrapper(
     out.push_str("    (local $dec_list_i i32)\n");
     out.push_str("    (local $dec_list_node_offset i32)\n");
 
+    // Locals for the dynamic `any` boundary codec (len-prefixed CGRF blob)
+    let needs_any = func.params.iter().any(|p| matches!(p.ty, Type::Any))
+        || matches!(func.return_type, Type::Any);
+    if needs_any {
+        out.push_str("    (local $any_ptr i32)\n");
+        out.push_str("    (local $any_len i32)\n");
+    }
+
     // Decode input parameters from CGRF
     if !func.params.is_empty() {
         out.push_str("    ;; Decode input parameters from CGRF\n");
@@ -8759,39 +10857,48 @@ fn generate_pack_wrapper(
                 out.push_str("    local.set $dec_child_idx\n");
                 // Find root node offset
                 generate_dec_find_node_by_index(out);
-                // Check if root is a Tuple wrapper (e.g. Theater sends Tuple(state, params))
-                // If so, unwrap by following child_indices[0] to the actual parameter node
-                // Node tag byte: Tuple = 0x0B
-                out.push_str("    ;; Check if root is a Tuple wrapper and unwrap if so\n");
-                out.push_str("    local.get $in_ptr\n");
-                out.push_str("    local.get $dec_node_offset\n");
-                out.push_str("    i32.add\n");
-                out.push_str("    i32.load8_u\n");
-                out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE));
-                out.push_str("    i32.eq\n");
-                out.push_str("    (if\n");
-                out.push_str("      (then\n");
-                // Tuple node: [tag:4][payload_len:4][child_count:4][child_indices:4*N]
-                // child_indices[0] is at node_offset + 12
-                out.push_str("        local.get $in_ptr\n");
-                out.push_str("        local.get $dec_node_offset\n");
-                out.push_str("        i32.add\n");
-                out.push_str("        i32.const 12\n");
-                out.push_str("        i32.add\n");
-                out.push_str("        i32.load\n");
-                out.push_str("        local.set $dec_child_idx\n");
-                // Find the actual parameter node
-                generate_dec_find_node_by_index(out);
-                out.push_str("      )\n");
-                out.push_str("    )\n");
-                // Decode recursively (now pointing at the actual parameter node)
-                generate_cgrf_decode_recursive(out, &param.ty, records, variants);
+                // A declared tuple is the value itself, not an argument wrapper.
+                if !matches!(param.ty, Type::Tuple(_)) {
+                    // Check if root is a Tuple wrapper (e.g. Theater sends Tuple(state, params))
+                    // If so, unwrap by following child_indices[0] to the actual parameter node
+                    // Node tag byte: Tuple = 0x0B
+                    out.push_str("    ;; Check if root is a Tuple wrapper and unwrap if so\n");
+                    out.push_str("    local.get $in_ptr\n");
+                    out.push_str("    local.get $dec_node_offset\n");
+                    out.push_str("    i32.add\n");
+                    out.push_str("    i32.load8_u\n");
+                    out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE));
+                    out.push_str("    i32.eq\n");
+                    out.push_str("    (if\n");
+                    out.push_str("      (then\n");
+                    // Tuple node: [tag:4][payload_len:4][child_count:4][child_indices:4*N]
+                    // child_indices[0] is at node_offset + 12
+                    out.push_str("        local.get $in_ptr\n");
+                    out.push_str("        local.get $dec_node_offset\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.const 12\n");
+                    out.push_str("        i32.add\n");
+                    out.push_str("        i32.load\n");
+                    out.push_str("        local.set $dec_child_idx\n");
+                    // Find the actual parameter node
+                    generate_dec_find_node_by_index(out);
+                    out.push_str("      )\n");
+                    out.push_str("    )\n");
+                    // Decode recursively (now pointing at the actual parameter node)
+                }
+                generate_cgrf_decode_recursive(out, &param.ty);
                 // Store result
                 out.push_str("    local.get $dec_result\n");
                 out.push_str(&format!("    local.set $param_{}\n", param.name));
             } else {
                 generate_cgrf_decode_param(
-                    out, &param.ty, &param.name, 0, false, records, variants,
+                    out,
+                    &param.ty,
+                    &param.name,
+                    0,
+                    false,
+                    records,
+                    variants,
                 );
             }
         } else {
@@ -8829,6 +10936,34 @@ fn generate_pack_wrapper(
     // Only set $value if the function returns a non-unit type
     if !is_unit_type(&func.return_type) {
         out.push_str("    local.set $value\n");
+    }
+
+    // A dynamic `any` result is already a len-prefixed CGRF blob [len:u32][cgrf].
+    // The bytes are self-describing, so the boundary just copies them straight to
+    // a freshly allocated output buffer; no node encoding or header write needed.
+    if matches!(&func.return_type, Type::Any) {
+        out.push_str("    ;; Encode `any`: copy the len-prefixed CGRF blob to output\n");
+        out.push_str("    local.get $value\n");
+        out.push_str("    i32.load\n"); // CGRF byte length
+        out.push_str("    local.set $any_len\n");
+        out.push_str("    local.get $any_len\n");
+        out.push_str("    call $__alloc\n");
+        out.push_str("    local.set $out_ptr\n");
+        out.push_str("    local.get $out_ptr\n"); // dest
+        out.push_str("    local.get $value\n");
+        out.push_str("    i32.const 4\n");
+        out.push_str("    i32.add\n"); // src = value + 4 (past the length prefix)
+        out.push_str("    local.get $any_len\n"); // len
+        out.push_str("    memory.copy\n");
+        out.push_str("    local.get $out_ptr_ptr\n");
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    i32.store\n");
+        out.push_str("    local.get $out_len_ptr\n");
+        out.push_str("    local.get $any_len\n");
+        out.push_str("    i32.store\n");
+        out.push_str("    i32.const 0\n");
+        out.push_str("  )\n");
+        return;
     }
 
     // Allocate output buffer (guest-allocates ABI)
@@ -8887,7 +11022,7 @@ fn generate_pack_wrapper(
     out.push_str("    local.set $buf_cursor\n");
     out.push_str("    i32.const 0\n");
     out.push_str("    local.set $node_idx\n");
-    generate_cgrf_encode_recursive(out, &func.return_type, "$value", records, variants);
+    generate_cgrf_encode_recursive(out, &func.return_type, "$value");
     // Write CGRF header at offset 0
     out.push_str("    ;; Write CGRF header\n");
     // Magic
@@ -8937,20 +11072,27 @@ fn generate_pack_wrapper(
     out.push_str("  )\n");
 }
 
+/// The internal symbol for an import's raw CGRF entry point, qualified by
+/// interface so same-named functions in different interfaces don't collide
+/// (e.g. store.exists vs filesystem.exists). The WASM import's module/name are
+/// unchanged; only this internal func symbol is disambiguated.
+fn raw_import_symbol(module: &str, name: &str) -> String {
+    let iface: String = module
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("__raw_{}_{}", iface, name)
+}
+
 /// Generate an import wrapper function.
 ///
 /// The wrapper has the original wisp signature but internally:
 /// 1. Encodes arguments to CGRF in a buffer
 /// 2. Calls the raw import (which has Pack/Graph ABI signature)
 /// 3. Decodes the result (if any)
-fn generate_import_wrapper(
-    out: &mut String,
-    import: &Import,
-    records: &HashMap<String, RecordDef>,
-    variants: &HashMap<String, VariantDef>,
-) {
+fn generate_import_wrapper(out: &mut String, import: &Import) {
     let wrapper_name = &import.name;
-    let raw_name = format!("$__raw_{}", import.name);
+    let raw_name = format!("${}", raw_import_symbol(&import.module, &import.name));
 
     // Start function with original signature
     out.push_str(&format!("  (func ${} ", wrapper_name));
@@ -8961,7 +11103,7 @@ fn generate_import_wrapper(
     // Handle result type - unit (empty tuple) means no return value
     let result_clause = emit_wat_result(&import.return_type);
     if result_clause.is_empty() {
-        out.push_str("\n");
+        out.push('\n');
     } else {
         out.push_str(&format!("{}\n", result_clause));
     }
@@ -8973,25 +11115,7 @@ fn generate_import_wrapper(
     out.push_str("    (local $out_len i32)\n");
     out.push_str("    (local $status i32)\n");
     out.push_str("    (local $result_slots i32)\n");
-
-    // Check if we need extra locals for tuple encoding (must declare all locals upfront)
-    if import.params.len() == 1 {
-        if let Type::Tuple(field_types) = &import.params[0].ty {
-            let all_encodable = field_types.iter().all(|ty| match ty {
-                Type::Str => true,
-                Type::List(inner) => matches!(inner.as_ref(), Type::U8),
-                _ => false,
-            });
-            if all_encodable {
-                out.push_str("    (local $write_offset i32)\n");
-                out.push_str("    (local $i i32)\n");
-                for i in 0..field_types.len() {
-                    out.push_str(&format!("    (local $field{}_ptr i32)\n", i));
-                    out.push_str(&format!("    (local $field{}_len i32)\n", i));
-                }
-            }
-        }
-    }
+    generate_cgrf_array_locals(out);
 
     // Check if we need decoder locals for complex return types
     let needs_complex_decode = matches!(
@@ -9018,15 +11142,31 @@ fn generate_import_wrapper(
         out.push_str("    (local $dec_list_node_offset i32)\n");
     }
 
+    // Local for the dynamic `any` boundary codec (len-prefixed CGRF blob)
+    let needs_any = matches!(import.return_type, Type::Any)
+        || import.params.iter().any(|p| matches!(p.ty, Type::Any));
+    if needs_any {
+        out.push_str("    (local $any_ptr i32)\n");
+    }
+
     // Check if we need encoder locals for complex parameter types
     // Also need encoder locals when we have multiple params (including strings) since they
     // get wrapped in a tuple using the recursive encoder
     let needs_complex_encode = import.params.iter().any(|p| {
         matches!(
             &p.ty,
-            Type::Tuple(_) | Type::Option(_) | Type::List(_) | Type::Result(_, _) | Type::Record(_) | Type::Variant(_) | Type::Str
+            Type::Tuple(_)
+                | Type::Option(_)
+                | Type::List(_)
+                | Type::Result(_, _)
+                | Type::Record(_)
+                | Type::Variant(_)
+                | Type::Str
         )
-    }) || import.params.len() > 1;
+    }) || import.params.len() > 1
+        // A single non-s32 scalar param (bool/u16/u32/u64/f32/f64/u8) uses the
+        // generic single-arg encoder below, which needs $buf_cursor et al.
+        || (import.params.len() == 1 && !matches!(import.params[0].ty, Type::S32));
     if needs_complex_encode {
         out.push_str("    (local $buf_cursor i32)\n");
         out.push_str("    (local $node_idx i32)\n");
@@ -9385,389 +11525,8 @@ fn generate_import_wrapper(
         out.push_str(&format!("    i32.const {}\n", total_len));
         out.push_str("    local.set $in_len\n");
     } else if import.params.len() == 1 {
-        // Single complex parameter - check if it's a tuple we can encode
-        if let Type::Tuple(field_types) = &import.params[0].ty {
-            // We can encode tuples containing strings and list<u8>
-            let param_name = &import.params[0].name;
-            let n = field_types.len();
-
-            // Check if all fields are encodable (string or list<u8>)
-            let all_encodable = field_types.iter().all(|ty| match ty {
-                Type::Str => true,
-                Type::List(inner) => matches!(inner.as_ref(), Type::U8),
-                _ => false,
-            });
-
-            if all_encodable {
-                // For tuple(string, list<u8>), we need to create nodes in the right order:
-                // - U8 nodes for list elements first (dynamic count based on list length)
-                // - List node (pointing to U8 nodes)
-                // - String node
-                // - Tuple node (root)
-                //
-                // Node indices:
-                // - Nodes 0 to L-1: U8 element nodes (L = list length)
-                // - Node L: list node
-                // - Node L+1: string node
-                // - Node L+2: tuple node (root)
-                //
-                // For tuple(string, list<u8>), the tuple children are [L+1, L] (string, list)
-
-                out.push_str(&format!(
-                    "    ;; Encode tuple({}) parameter with {} fields (with proper list encoding)\n",
-                    field_types
-                        .iter()
-                        .map(|t| format!("{:?}", t))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    n
-                ));
-
-                // Extract field pointers and lengths first
-                for (i, _field_ty) in field_types.iter().enumerate() {
-                    out.push_str(&format!("    ;; Extract field {} from tuple\n", i));
-                    out.push_str(&format!("    local.get ${}\n", param_name));
-                    out.push_str(&format!("    i32.const {}\n", i * 4));
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.load\n");
-                    out.push_str(&format!("    local.set $field{}_ptr\n", i));
-                    // Load length (both string and list<u8> have length at offset 0)
-                    out.push_str(&format!("    local.get $field{}_ptr\n", i));
-                    out.push_str("    i32.load\n");
-                    out.push_str(&format!("    local.set $field{}_len\n", i));
-                }
-
-                // For simplicity, handle the specific case of tuple(string, list<u8>)
-                // Field 0 = string, Field 1 = list<u8>
-                if n == 2
-                    && matches!(field_types[0], Type::Str)
-                    && matches!(&field_types[1], Type::List(inner) if matches!(inner.as_ref(), Type::U8))
-                {
-                    // Write CGRF header (will patch node_count and root_index later)
-                    out.push_str("    ;; CGRF header (node_count and root_index patched later)\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-                    out.push_str("    i32.store\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-                    out.push_str("    i32.store16\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    i32.const 6\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    i32.store16\n");
-                    // node_count = list_len + 3 (U8 nodes + list + string + tuple)
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    i32.const 8\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field1_len\n");
-                    out.push_str("    i32.const 3\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.store\n");
-                    // root_index = list_len + 2 (tuple is last)
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    i32.const 12\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field1_len\n");
-                    out.push_str("    i32.const 2\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.store\n");
-
-                    // Start writing nodes after header
-                    out.push_str("    i32.const 16\n");
-                    out.push_str("    local.set $write_offset\n");
-
-                    // Write U8 nodes for list elements (nodes 0 to L-1)
-                    // Each U8 node: kind(1) + flags(1) + reserved(2) + payload_len(4) + value(1) = 9 bytes
-                    out.push_str("    ;; Write U8 nodes for list elements\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    local.set $i\n");
-                    out.push_str("    (block $u8_done\n");
-                    out.push_str("      (loop $u8_loop\n");
-                    out.push_str("        local.get $i\n");
-                    out.push_str("        local.get $field1_len\n");
-                    out.push_str("        i32.ge_u\n");
-                    out.push_str("        br_if $u8_done\n");
-                    // Write U8 node header
-                    out.push_str("        ;; U8 node header\n");
-                    out.push_str("        local.get $in_buf\n");
-                    out.push_str("        local.get $write_offset\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str(&format!("        i32.const {}\n", CGRF_U8 as i32));
-                    out.push_str("        i32.store8\n");
-                    out.push_str("        local.get $in_buf\n");
-                    out.push_str("        local.get $write_offset\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 1\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 0\n");
-                    out.push_str("        i32.store8\n");
-                    out.push_str("        local.get $in_buf\n");
-                    out.push_str("        local.get $write_offset\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 2\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 0\n");
-                    out.push_str("        i32.store16\n");
-                    out.push_str("        local.get $in_buf\n");
-                    out.push_str("        local.get $write_offset\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 4\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 1\n"); // payload_len = 1
-                    out.push_str("        i32.store\n");
-                    // Write U8 value
-                    // Wisp list layout: {len, cap, data_ptr} - data is at offset 8
-                    // Each element in list<u8> is stored as i32 (4 bytes) per type_size()
-                    out.push_str("        local.get $in_buf\n");
-                    out.push_str("        local.get $write_offset\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 8\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        local.get $field1_ptr\n");
-                    out.push_str("        i32.const 8\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.load\n"); // load data_ptr
-                    out.push_str("        local.get $i\n");
-                    out.push_str("        i32.const 4\n"); // each element is 4 bytes
-                    out.push_str("        i32.mul\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.load8_u\n"); // load low byte of the i32 element
-                    out.push_str("        i32.store8\n");
-                    // Advance
-                    out.push_str("        local.get $write_offset\n");
-                    out.push_str("        i32.const 9\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        local.set $write_offset\n");
-                    out.push_str("        local.get $i\n");
-                    out.push_str("        i32.const 1\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        local.set $i\n");
-                    out.push_str("        br $u8_loop\n");
-                    out.push_str("      )\n");
-                    out.push_str("    )\n");
-
-                    // Write list node (node L)
-                    // payload = elem_type(1) + count(4) + child_indices(4*L)
-                    out.push_str("    ;; Write list node\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str(&format!("    i32.const {}\n", CGRF_LIST as i32));
-                    out.push_str("    i32.store8\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 1\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    i32.store8\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 2\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    i32.store16\n");
-                    // payload_len = 1 + 4 + 4*L
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field1_len\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.mul\n");
-                    out.push_str("    i32.const 5\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.store\n");
-                    // elem_type = U8
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 8\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str(&format!("    i32.const {}\n", CGRF_U8 as i32));
-                    out.push_str("    i32.store8\n");
-                    // count
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 9\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field1_len\n");
-                    out.push_str("    i32.store\n");
-                    // child indices (0, 1, 2, ...)
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    local.set $i\n");
-                    out.push_str("    (block $idx_done\n");
-                    out.push_str("      (loop $idx_loop\n");
-                    out.push_str("        local.get $i\n");
-                    out.push_str("        local.get $field1_len\n");
-                    out.push_str("        i32.ge_u\n");
-                    out.push_str("        br_if $idx_done\n");
-                    out.push_str("        local.get $in_buf\n");
-                    out.push_str("        local.get $write_offset\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        i32.const 13\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        local.get $i\n");
-                    out.push_str("        i32.const 4\n");
-                    out.push_str("        i32.mul\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        local.get $i\n");
-                    out.push_str("        i32.store\n");
-                    out.push_str("        local.get $i\n");
-                    out.push_str("        i32.const 1\n");
-                    out.push_str("        i32.add\n");
-                    out.push_str("        local.set $i\n");
-                    out.push_str("        br $idx_loop\n");
-                    out.push_str("      )\n");
-                    out.push_str("    )\n");
-                    // Advance offset: 8 + 1 + 4 + 4*L
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.const 13\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field1_len\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.mul\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.set $write_offset\n");
-
-                    // Write string node (node L+1)
-                    out.push_str("    ;; Write string node\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str(&format!("    i32.const {}\n", CGRF_STRING as i32));
-                    out.push_str("    i32.store8\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 1\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    i32.store8\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 2\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    i32.store16\n");
-                    // payload_len = 4 + string_len
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field0_len\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.store\n");
-                    // string length prefix
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 8\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field0_len\n");
-                    out.push_str("    i32.store\n");
-                    // copy string data
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 12\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field0_ptr\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field0_len\n");
-                    out.push_str("    memory.copy\n");
-                    // Advance offset
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.const 12\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field0_len\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.set $write_offset\n");
-
-                    // Write tuple node (node L+2, root)
-                    // Children are [L+1, L] (string at L+1, list at L)
-                    out.push_str("    ;; Write tuple node (root)\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str(&format!("    i32.const {}\n", CGRF_TUPLE as i32));
-                    out.push_str("    i32.store8\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 1\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    i32.store8\n");
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 2\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 0\n");
-                    out.push_str("    i32.store16\n");
-                    // payload_len = 4 (count) + 8 (2 child indices)
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 4\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 12\n");
-                    out.push_str("    i32.store\n");
-                    // count = 2
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 8\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 2\n");
-                    out.push_str("    i32.store\n");
-                    // child[0] = L+1 (string node index)
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 12\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field1_len\n");
-                    out.push_str("    i32.const 1\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.store\n");
-                    // child[1] = L (list node index)
-                    out.push_str("    local.get $in_buf\n");
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    i32.const 16\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.get $field1_len\n");
-                    out.push_str("    i32.store\n");
-
-                    // total length = write_offset + 20 (tuple node: 8 header + 12 payload)
-                    out.push_str("    local.get $write_offset\n");
-                    out.push_str("    i32.const 20\n");
-                    out.push_str("    i32.add\n");
-                    out.push_str("    local.set $in_len\n");
-                } else {
-                    // Generic tuple encoding - use recursive encoder
-                    generate_import_generic_encode(out, &import.params[0], records, variants);
-                }
-            } else {
-                // Tuple with complex field types - use recursive encoder
-                generate_import_generic_encode(out, &import.params[0], records, variants);
-            }
-        } else {
-            // Non-tuple complex parameter - use recursive encoder
-            generate_import_generic_encode(out, &import.params[0], records, variants);
-        }
+        // Use the shared encoder so primitive lists always use v3 Array nodes.
+        generate_import_generic_encode(out, &import.params[0]);
     } else {
         // Multiple complex arguments - wrap in a CGRF tuple
         // Each param is already a local pointing to its value.
@@ -9853,7 +11612,7 @@ fn generate_import_wrapper(
         for (i, param) in import.params.iter().enumerate() {
             out.push_str(&format!("    ;; Encode param {} ({})\n", i, param.name));
             let param_local = format!("${}", param.name);
-            generate_cgrf_encode_recursive(out, &param.ty, &param_local, records, variants);
+            generate_cgrf_encode_recursive(out, &param.ty, &param_local);
 
             // Write child's node index to child_indices[i]
             out.push_str("    local.get $out_ptr\n");
@@ -9941,11 +11700,30 @@ fn generate_import_wrapper(
                 out.push_str("    i32.add\n");
                 out.push_str("    i32.load\n");
             }
-            Type::S64 => {
+            Type::S64 | Type::U64 => {
                 out.push_str("    local.get $out_ptr\n");
                 out.push_str("    i32.const 24\n");
                 out.push_str("    i32.add\n");
                 out.push_str("    i64.load\n");
+            }
+            Type::U8 | Type::Bool => {
+                // 1-byte payload, returned as i32 (wat_type is i32)
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load8_u\n");
+            }
+            Type::U16 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load16_u\n");
+            }
+            Type::U32 => {
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    i32.const 24\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    i32.load\n");
             }
             Type::F32 => {
                 out.push_str("    local.get $out_ptr\n");
@@ -9973,9 +11751,28 @@ fn generate_import_wrapper(
                 // Scan to find the root node
                 generate_dec_find_node_by_index(out);
                 // Decode the value recursively from the root node
-                generate_cgrf_decode_recursive(out, &import.return_type, records, variants);
+                generate_cgrf_decode_recursive(out, &import.return_type);
                 // Result is in $dec_result
                 out.push_str("    local.get $dec_result\n");
+            }
+            Type::Any => {
+                // Wrap the returned CGRF (out_ptr, out_len) into the uniform
+                // len-prefixed blob [len:u32][cgrf bytes] the guest holds for `any`.
+                out.push_str("    local.get $out_len\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    call $__alloc\n");
+                out.push_str("    local.set $any_ptr\n");
+                out.push_str("    local.get $any_ptr\n");
+                out.push_str("    i32.const 4\n");
+                out.push_str("    i32.add\n");
+                out.push_str("    local.get $out_ptr\n");
+                out.push_str("    local.get $out_len\n");
+                out.push_str("    memory.copy\n");
+                out.push_str("    local.get $any_ptr\n");
+                out.push_str("    local.get $out_len\n");
+                out.push_str("    i32.store\n");
+                out.push_str("    local.get $any_ptr\n");
             }
             _ => out.push_str("    i32.const 0\n"),
         }
@@ -9986,12 +11783,7 @@ fn generate_import_wrapper(
 
 /// Generate WAT to encode a single complex parameter to CGRF using the recursive encoder.
 /// Uses $in_buf as the output buffer and sets $in_len to the final encoded length.
-fn generate_import_generic_encode(
-    out: &mut String,
-    param: &Parameter,
-    records: &HashMap<String, RecordDef>,
-    variants: &HashMap<String, VariantDef>,
-) {
+fn generate_import_generic_encode(out: &mut String, param: &Parameter) {
     let param_name = &param.name;
     let param_ty = &param.ty;
 
@@ -10010,7 +11802,7 @@ fn generate_import_generic_encode(
 
     // Encode the parameter value
     let value_local = format!("${}", param_name);
-    generate_cgrf_encode_recursive(out, param_ty, &value_local, records, variants);
+    generate_cgrf_encode_recursive(out, param_ty, &value_local);
 
     // Write CGRF header at offset 0
     out.push_str("    ;; Write CGRF header\n");
@@ -10056,7 +11848,17 @@ fn generate_import_generic_encode(
 fn type_tag_bytes(ty: &Type) -> Vec<u8> {
     let mut bytes = vec![type_to_tag(ty)];
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 | Type::Str | Type::U8 => {}
+        Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::Str
+        | Type::U8
+        | Type::Bool
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Any => {}
         Type::List(inner) => bytes.extend(type_tag_bytes(inner)),
         Type::Option(inner) => bytes.extend(type_tag_bytes(inner)),
         Type::Result(ok, err) => {
@@ -10198,35 +12000,184 @@ fn enc_local_for_type(ty: &Type) -> &'static str {
     }
 }
 
-/// Recursively encode a Wisp value as CGRF nodes.
-///
-/// Required locals in the wrapper function:
-///   $out_ptr, $buf_cursor, $node_idx, $enc_root_idx,
-///   $enc_header_start, $enc_tmp (i32), $enc_tmp_i64 (i64),
-///   $enc_tmp_f32 (f32), $enc_tmp_f64 (f64),
-///   $enc_save_child (i32), $enc_save_root (i32),
-///   $enc_tuple_header (i32), $enc_tuple_ci_pos (i32),
-///   $enc_list_header (i32), $enc_list_ci_pos (i32),
-///   $enc_list_i (i32), $enc_list_len (i32),
-///   $enc_list_data (i32), $enc_list_root_idx (i32)
-///
-/// After return:
-///   - $buf_cursor advanced past all written nodes
-///   - $node_idx incremented
-///   - $enc_root_idx = node index of the root of this subtree
-fn generate_cgrf_encode_recursive(
-    out: &mut String,
-    ty: &Type,
-    value_local: &str,
-    records: &HashMap<String, RecordDef>,
-    variants: &HashMap<String, VariantDef>,
-) {
+/// Width of a primitive element in a packed CGRF Array node.
+fn cgrf_array_width(ty: &Type) -> Option<usize> {
     match ty {
-        Type::S32 | Type::U8 | Type::S64 | Type::F32 | Type::F64 => {
+        Type::U8 => Some(1),
+        Type::S32 | Type::F32 => Some(4),
+        Type::S64 | Type::F64 => Some(8),
+        _ => None,
+    }
+}
+
+// Dedicated scratch locals keep array processing from overwriting enclosing
+// option, tuple, or non-primitive list encoder/decoder state.
+fn generate_cgrf_array_locals(out: &mut String) {
+    for name in ["array_ptr", "array_len", "array_data", "array_i"] {
+        out.push_str(&format!("    (local ${name} i32)\n"));
+    }
+}
+
+/// Primitive lists use one Array node: [element tag:u8, count:u32, packed data].
+/// Wisp stores u8 list elements in four-byte slots, so those need repacking.
+fn generate_cgrf_encode_array(out: &mut String, elem_ty: &Type, value_local: &str) {
+    let width = cgrf_array_width(elem_ty).expect("primitive array element");
+    let stride = type_size(elem_ty);
+    let (load, store) = match width {
+        1 => ("i32.load8_u", "i32.store8"),
+        4 => ("i32.load", "i32.store"),
+        8 => ("i64.load", "i64.store"),
+        _ => unreachable!(),
+    };
+    out.push_str(&format!(
+        "    local.get {value_local}\n    local.set $array_ptr\n"
+    ));
+    out.push_str(
+        "    local.get $array_ptr\n    i32.load\n    local.set $array_len\n\
+         local.get $array_ptr\n    i32.load offset=8\n    local.set $array_data\n\
+         local.get $node_idx\n    local.set $enc_root_idx\n",
+    );
+    generate_write_node_header(out, CGRF_ARRAY);
+    generate_write_type_tag_at_cursor(out, elem_ty);
+    out.push_str(&format!(
+        r#"    local.get $out_ptr
+    local.get $buf_cursor
+    i32.add
+    local.get $array_len
+    i32.store
+    local.get $buf_cursor
+    i32.const 4
+    i32.add
+    local.set $buf_cursor
+    i32.const 0
+    local.set $array_i
+    block $array_done
+      loop $array_next
+        local.get $array_i
+        local.get $array_len
+        i32.ge_u
+        br_if $array_done
+        local.get $out_ptr
+        local.get $buf_cursor
+        i32.add
+        local.get $array_data
+        local.get $array_i
+        i32.const {stride}
+        i32.mul
+        i32.add
+        {load}
+        {store}
+        local.get $buf_cursor
+        i32.const {width}
+        i32.add
+        local.set $buf_cursor
+        local.get $array_i
+        i32.const 1
+        i32.add
+        local.set $array_i
+        br $array_next
+      end
+    end
+"#
+    ));
+    generate_patch_payload_len(out);
+    out.push_str(
+        "    local.get $node_idx\n    i32.const 1\n    i32.add\n    local.set $node_idx\n",
+    );
+}
+
+fn generate_cgrf_decode_array(out: &mut String, elem_ty: &Type) {
+    let width = cgrf_array_width(elem_ty).expect("primitive array element");
+    let stride = type_size(elem_ty);
+    let (load, store) = match width {
+        1 => ("i32.load8_u", "i32.store"),
+        4 => ("i32.load", "i32.store"),
+        8 => ("i64.load", "i64.store"),
+        _ => unreachable!(),
+    };
+    out.push_str(&format!(
+        r#"    local.get $in_ptr
+    local.get $dec_node_offset
+    i32.add
+    i32.load offset=9
+    local.set $array_len
+    i32.const 12
+    call $__alloc
+    local.set $array_ptr
+    local.get $array_len
+    i32.const {stride}
+    i32.mul
+    call $__alloc
+    local.set $array_data
+    local.get $array_ptr
+    local.get $array_len
+    i32.store
+    local.get $array_ptr
+    local.get $array_len
+    i32.store offset=4
+    local.get $array_ptr
+    local.get $array_data
+    i32.store offset=8
+    i32.const 0
+    local.set $array_i
+    block $array_done
+      loop $array_next
+        local.get $array_i
+        local.get $array_len
+        i32.ge_u
+        br_if $array_done
+        local.get $array_data
+        local.get $array_i
+        i32.const {stride}
+        i32.mul
+        i32.add
+        local.get $in_ptr
+        local.get $dec_node_offset
+        i32.add
+        local.get $array_i
+        i32.const {width}
+        i32.mul
+        i32.add
+        {load} offset=13
+        {store}
+        local.get $array_i
+        i32.const 1
+        i32.add
+        local.set $array_i
+        br $array_next
+      end
+    end
+    local.get $array_ptr
+    local.set $dec_result
+"#
+    ));
+}
+
+/// Recursively encode a Wisp value as CGRF nodes using the wrapper's encoder
+/// and array scratch locals. Advances $buf_cursor and $node_idx and leaves the
+/// encoded subtree's root index in $enc_root_idx.
+fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_local: &str) {
+    match ty {
+        Type::List(elem_ty) if cgrf_array_width(elem_ty).is_some() => {
+            generate_cgrf_encode_array(out, elem_ty, value_local);
+        }
+        Type::S32
+        | Type::U8
+        | Type::Bool
+        | Type::U16
+        | Type::U32
+        | Type::S64
+        | Type::U64
+        | Type::F32
+        | Type::F64 => {
             let (kind, payload_size, store_instr) = match ty {
                 Type::S32 => (CGRF_S32, 4, "i32.store"),
                 Type::U8 => (CGRF_U8, 1, "i32.store8"),
+                Type::Bool => (CGRF_BOOL, 1, "i32.store8"),
+                Type::U16 => (CGRF_U16, 2, "i32.store16"),
+                Type::U32 => (CGRF_U32, 4, "i32.store"),
                 Type::S64 => (CGRF_S64, 8, "i64.store"),
+                Type::U64 => (CGRF_U64, 8, "i64.store"),
                 Type::F32 => (CGRF_F32, 4, "f32.store"),
                 Type::F64 => (CGRF_F64, 8, "f64.store"),
                 _ => unreachable!(),
@@ -10310,7 +12261,7 @@ fn generate_cgrf_encode_recursive(
             out.push_str("        ;; Some: encode child first\n");
             generate_load_inner_value(out, inner_ty, value_local, 4);
             let child_local = enc_local_for_type(inner_ty);
-            generate_cgrf_encode_recursive(out, inner_ty, child_local, records, variants);
+            generate_cgrf_encode_recursive(out, inner_ty, child_local);
             // Save child's node index
             out.push_str("        local.get $enc_root_idx\n");
             out.push_str("        local.set $enc_save_child\n");
@@ -10390,13 +12341,13 @@ fn generate_cgrf_encode_recursive(
             out.push_str("        ;; Err branch: encode err value\n");
             generate_load_inner_value(out, err_ty, "$enc_result_ptr", 4);
             let err_local = enc_local_for_type(err_ty);
-            generate_cgrf_encode_recursive(out, err_ty, err_local, records, variants);
+            generate_cgrf_encode_recursive(out, err_ty, err_local);
             out.push_str("      )\n");
             out.push_str("      (else\n");
             out.push_str("        ;; Ok branch: encode ok value\n");
             generate_load_inner_value(out, ok_ty, "$enc_result_ptr", 4);
             let ok_local = enc_local_for_type(ok_ty);
-            generate_cgrf_encode_recursive(out, ok_ty, ok_local, records, variants);
+            generate_cgrf_encode_recursive(out, ok_ty, ok_local);
             out.push_str("      )\n");
             out.push_str("    )\n");
             // Save child index
@@ -10530,7 +12481,7 @@ fn generate_cgrf_encode_recursive(
                 out.push_str(&format!("    ;; encode tuple element {}\n", i));
                 generate_load_inner_value(out, elem_ty, value_local, field_offset);
                 let child_local = enc_local_for_type(elem_ty);
-                generate_cgrf_encode_recursive(out, elem_ty, child_local, records, variants);
+                generate_cgrf_encode_recursive(out, elem_ty, child_local);
 
                 // Restore tuple encoder state from stack (peek, not pop)
                 out.push_str("    ;; restore tuple encoder state\n");
@@ -10697,7 +12648,7 @@ fn generate_cgrf_encode_recursive(
             }
 
             let child_local = enc_local_for_type(elem_ty);
-            generate_cgrf_encode_recursive(out, elem_ty, child_local, records, variants);
+            generate_cgrf_encode_recursive(out, elem_ty, child_local);
 
             // Write child's node index to child_indices[$enc_list_i]
             out.push_str("        local.get $out_ptr\n");
@@ -10803,13 +12754,11 @@ fn generate_dec_find_node_by_index(out: &mut String) {
 ///
 /// Input: $dec_node_offset = byte offset of the node in the CGRF buffer
 /// Output: $dec_result = decoded value (i32 pointer or scalar)
-fn generate_cgrf_decode_recursive(
-    out: &mut String,
-    ty: &Type,
-    records: &HashMap<String, RecordDef>,
-    variants: &HashMap<String, VariantDef>,
-) {
+fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
     match ty {
+        Type::List(elem_ty) if cgrf_array_width(elem_ty).is_some() => {
+            generate_cgrf_decode_array(out, elem_ty);
+        }
         Type::S32 => {
             out.push_str("    ;; decode s32\n");
             out.push_str("    local.get $in_ptr\n");
@@ -10828,6 +12777,50 @@ fn generate_cgrf_decode_recursive(
             out.push_str("    i32.const 8\n");
             out.push_str("    i32.add\n");
             out.push_str("    i32.load8_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::Bool => {
+            out.push_str("    ;; decode bool (1-byte payload, 0/1)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load8_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::U16 => {
+            out.push_str("    ;; decode u16 (2-byte payload)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load16_u\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::U32 => {
+            out.push_str("    ;; decode u32 (4-byte payload)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.load\n");
+            out.push_str("    local.set $dec_result\n");
+        }
+        Type::U64 => {
+            // Mirrors S64: load the i64 payload, truncate to i32 in $dec_result
+            // (the typed-wrapper decode's existing simplification; raw-CGRF
+            // capabilities bridge u64 losslessly via unmarshal instead).
+            out.push_str("    ;; decode u64 (store on heap as i64)\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $dec_node_offset\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i32.const 8\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    i64.load\n");
+            out.push_str("    i32.wrap_i64\n");
             out.push_str("    local.set $dec_result\n");
         }
         Type::S64 => {
@@ -10955,7 +12948,7 @@ fn generate_cgrf_decode_recursive(
             generate_dec_find_node_by_index(out);
 
             // Recursively decode child
-            generate_cgrf_decode_recursive(out, inner_ty, records, variants);
+            generate_cgrf_decode_recursive(out, inner_ty);
 
             // Store decoded value at $dec_opt_ptr + 4
             out.push_str("        local.get $dec_opt_ptr\n");
@@ -11050,10 +13043,7 @@ fn generate_cgrf_decode_recursive(
             out.push_str("        local.get $in_ptr\n");
             out.push_str("        local.get $dec_list_node_offset\n");
             out.push_str("        i32.add\n");
-            out.push_str(&format!(
-                "        i32.const {}\n",
-                child_indices_offset
-            ));
+            out.push_str(&format!("        i32.const {}\n", child_indices_offset));
             out.push_str("        i32.add\n");
             out.push_str("        local.get $dec_list_i\n");
             out.push_str("        i32.const 4\n");
@@ -11066,7 +13056,7 @@ fn generate_cgrf_decode_recursive(
             generate_dec_find_node_by_index(out);
 
             // Decode child
-            generate_cgrf_decode_recursive(out, elem_ty, records, variants);
+            generate_cgrf_decode_recursive(out, elem_ty);
 
             // Store decoded value in data array
             out.push_str("        local.get $dec_list_data\n");
@@ -11102,7 +13092,7 @@ fn generate_cgrf_decode_recursive(
             out.push_str("    local.set $dec_tuple_node_offset\n");
 
             // Allocate tuple: sum of type_size for each field
-            let tuple_size: usize = elem_types.iter().map(|t| type_size(t)).sum();
+            let tuple_size: usize = elem_types.iter().map(type_size).sum();
             out.push_str("    global.get $__heap_ptr\n");
             out.push_str("    local.set $dec_tuple_ptr\n");
             out.push_str("    global.get $__heap_ptr\n");
@@ -11119,10 +13109,7 @@ fn generate_cgrf_decode_recursive(
                 out.push_str("    local.get $in_ptr\n");
                 out.push_str("    local.get $dec_tuple_node_offset\n");
                 out.push_str("    i32.add\n");
-                out.push_str(&format!(
-                    "    i32.const {}\n",
-                    child_indices_offset + i * 4
-                ));
+                out.push_str(&format!("    i32.const {}\n", child_indices_offset + i * 4));
                 out.push_str("    i32.add\n");
                 out.push_str("    i32.load\n");
                 out.push_str("    local.set $dec_child_idx\n");
@@ -11131,7 +13118,7 @@ fn generate_cgrf_decode_recursive(
                 generate_dec_find_node_by_index(out);
 
                 // Decode child
-                generate_cgrf_decode_recursive(out, elem_ty, records, variants);
+                generate_cgrf_decode_recursive(out, elem_ty);
 
                 // Store decoded value at tuple_ptr + field_offset
                 out.push_str("    local.get $dec_tuple_ptr\n");
@@ -11220,11 +13207,11 @@ fn generate_cgrf_decode_recursive(
             out.push_str("        (if\n");
             out.push_str("          (then\n");
             out.push_str("            ;; err payload\n");
-            generate_cgrf_decode_recursive(out, err_ty, records, variants);
+            generate_cgrf_decode_recursive(out, err_ty);
             out.push_str("          )\n");
             out.push_str("          (else\n");
             out.push_str("            ;; ok payload\n");
-            generate_cgrf_decode_recursive(out, ok_ty, records, variants);
+            generate_cgrf_decode_recursive(out, ok_ty);
             out.push_str("          )\n");
             out.push_str("        )\n");
 
@@ -11243,1635 +13230,11 @@ fn generate_cgrf_decode_recursive(
             out.push_str("    local.set $dec_result\n");
         }
         _ => {
-            out.push_str(&format!(
-                "    ;; TODO: recursive decode for {:?}\n",
-                ty
-            ));
+            out.push_str(&format!("    ;; TODO: recursive decode for {:?}\n", ty));
             out.push_str("    i32.const 0\n");
             out.push_str("    local.set $dec_result\n");
         }
     }
-}
-
-/// Generate WAT code to encode an i32 value on the stack to CGRF at $out_ptr.
-/// Leaves bytes_written (i32) on the stack.
-fn generate_cgrf_encode_s32(out: &mut String) {
-    // Assumes $value local is already declared and contains the value to encode
-    // Assumes $out_ptr contains the output buffer pointer
-
-    // Write CGRF header (16 bytes)
-    // Magic: "CGRF" = 0x46524743
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    // Version (u16) + Flags (u16) = 0x00000001
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // flags
-    out.push_str("    i32.store16\n");
-
-    // Node count: 1
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store\n");
-
-    // Root index: 0
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store\n");
-
-    // Write node (8 bytes header + 4 bytes payload = 12 bytes)
-    // Kind: S32 = 0x02, flags: 0, reserved: 0
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_S32 as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // flags
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // reserved
-    out.push_str("    i32.store16\n");
-
-    // Payload length: 4
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.store\n");
-
-    // Payload: the i32 value
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.store\n");
-
-    // Return bytes written: 16 (header) + 8 (node header) + 4 (payload) = 28
-    out.push_str("    i32.const 28\n");
-}
-
-/// Generate WAT code to encode an i64 value on the stack to CGRF at $out_ptr.
-fn generate_cgrf_encode_s64(out: &mut String) {
-    // Assumes $value local is already declared and contains the value to encode
-    // Assumes $out_ptr contains the output buffer pointer
-
-    // Write CGRF header (16 bytes)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store\n");
-
-    // Write node - kind S64 = 0x03
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_S64 as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Payload length: 8
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.store\n");
-
-    // Payload: the i64 value
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i64.store\n");
-
-    // Return bytes written: 16 + 8 + 8 = 32
-    out.push_str("    i32.const 32\n");
-}
-
-/// Generate WAT code to encode an f32 value on the stack to CGRF at $out_ptr.
-fn generate_cgrf_encode_f32(out: &mut String) {
-    // Assumes $value local is already declared and contains the value to encode
-    // Assumes $out_ptr contains the output buffer pointer
-
-    // Write CGRF header
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store\n");
-
-    // Write node - kind F32 = 0x04
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_F32 as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Payload length: 4
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.store\n");
-
-    // Payload: the f32 value
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    f32.store\n");
-
-    // Return bytes written: 16 + 8 + 4 = 28
-    out.push_str("    i32.const 28\n");
-}
-
-/// Generate WAT code to encode an f64 value on the stack to CGRF at $out_ptr.
-fn generate_cgrf_encode_f64(out: &mut String) {
-    // Assumes $value local is already declared and contains the value to encode
-    // Assumes $out_ptr contains the output buffer pointer
-
-    // Write CGRF header
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store\n");
-
-    // Write node - kind F64 = 0x05
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_F64 as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Payload length: 8
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.store\n");
-
-    // Payload: the f64 value
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    f64.store\n");
-
-    // Return bytes written: 16 + 8 + 8 = 32
-    out.push_str("    i32.const 32\n");
-}
-
-/// Generate WAT code to encode a string value to CGRF at $out_ptr.
-/// Input: $value contains i32 pointer to (len: i32, data: bytes)
-/// Output: bytes written left on stack
-///
-/// CGRF String format:
-/// - Header: 16 bytes (magic, version, flags, node_count=1, root=0)
-/// - Node header: 8 bytes (kind=0x06, flags=0, reserved=0, payload_len)
-/// - Payload: 4 bytes (string length) + string bytes
-fn generate_cgrf_encode_string(out: &mut String) {
-    // Write CGRF header (16 bytes)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n"); // node_count
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // root_index
-    out.push_str("    i32.store\n");
-
-    // Write node header - kind String = 0x06
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_STRING as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // flags
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // reserved
-    out.push_str("    i32.store16\n");
-
-    // Payload length = 4 (string length field) + string length
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n"); // load string length
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n"); // payload_len = 4 + str_len
-    out.push_str("    i32.store\n");
-
-    // Write string length in payload (offset 24)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 24\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n"); // string length
-    out.push_str("    i32.store\n");
-
-    // Copy string data to payload (offset 28)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 28\n");
-    out.push_str("    i32.add\n"); // destination
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n"); // source = string ptr + 4 (skip length prefix)
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n"); // length
-    out.push_str("    memory.copy\n");
-
-    // Return bytes written: 16 (header) + 8 (node header) + 4 (str_len) + string_length
-    // = 28 + string_length
-    out.push_str("    i32.const 28\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n");
-    out.push_str("    i32.add\n");
-}
-
-/// Generate WAT code to encode an option value to CGRF at $out_ptr.
-/// Input: $value contains i32 pointer to option (tag: u8, value: T if some)
-/// Wisp option layout: byte 0 = tag (0=none, 1=some), bytes 4+ = payload if some
-/// CGRF v2 option payload: [inner_type:type_tag*, presence:u8, child_index?:u32]
-fn generate_cgrf_encode_option(out: &mut String, inner_ty: &Type) {
-    let type_tag_sz = type_tag_size(inner_ty);
-    // v2 payload: type_tag + presence(1) + optional child_index(4)
-    let payload_none = type_tag_sz + 1;
-    let payload_some = type_tag_sz + 1 + 4;
-
-    out.push_str("    ;; Encode option value (CGRF v2)\n");
-
-    // Write CGRF header (16 bytes)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Check if we have some or none to determine node count
-    // For none: 1 node (just option)
-    // For some: 2 nodes (option + inner value)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load8_u\n"); // load tag
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.add\n"); // node_count = 1 + tag (1 for none, 2 for some)
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // root_index = 0 (the option node)
-    out.push_str("    i32.store\n");
-
-    // Write option node at offset 16
-    // Node header: kind(1) + flags(1) + reserved(2) + payload_len(4) = 8 bytes
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_OPTION as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Payload length: type_tag + 1 (has_value) + 4 (child index) if some
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load8_u\n");
-    out.push_str("    if (result i32)\n");
-    out.push_str(&format!("      i32.const {}\n", payload_some)); // some
-    out.push_str("    else\n");
-    out.push_str(&format!("      i32.const {}\n", payload_none)); // none
-    out.push_str("    end\n");
-    out.push_str("    i32.store\n");
-
-    // Write inner_type tag at offset 24 (start of payload)
-    generate_write_type_tag(out, inner_ty, "$out_ptr", 24);
-
-    // Write has_value byte after type tag
-    let has_value_offset = 24 + type_tag_sz as i32;
-    out.push_str(&format!("    local.get $out_ptr\n"));
-    out.push_str(&format!("    i32.const {}\n", has_value_offset));
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load8_u\n");
-    out.push_str("    i32.store8\n");
-
-    // If some, write child index (1) and the inner value node
-    let child_index_offset = has_value_offset + 1;
-    let inner_node_offset = 24 + payload_some as i32; // right after option payload
-
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load8_u\n");
-    out.push_str("    if\n");
-    // Write child index
-    out.push_str(&format!("      local.get $out_ptr\n"));
-    out.push_str(&format!("      i32.const {}\n", child_index_offset));
-    out.push_str("      i32.add\n");
-    out.push_str("      i32.const 1\n"); // child index = 1
-    out.push_str("      i32.store\n");
-
-    // Write inner value node
-    match inner_ty {
-        Type::S32 => {
-            out.push_str("      ;; Write s32 inner node\n");
-            // Node kind
-            out.push_str(&format!("      local.get $out_ptr\n"));
-            out.push_str(&format!("      i32.const {}\n", inner_node_offset));
-            out.push_str("      i32.add\n");
-            out.push_str(&format!("      i32.const {}\n", CGRF_S32 as i32));
-            out.push_str("      i32.store8\n");
-            // Node flags
-            out.push_str(&format!("      local.get $out_ptr\n"));
-            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 1));
-            out.push_str("      i32.add\n");
-            out.push_str("      i32.const 0\n");
-            out.push_str("      i32.store8\n");
-            // Reserved
-            out.push_str(&format!("      local.get $out_ptr\n"));
-            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 2));
-            out.push_str("      i32.add\n");
-            out.push_str("      i32.const 0\n");
-            out.push_str("      i32.store16\n");
-            // Payload length
-            out.push_str(&format!("      local.get $out_ptr\n"));
-            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 4));
-            out.push_str("      i32.add\n");
-            out.push_str("      i32.const 4\n"); // payload_len for s32
-            out.push_str("      i32.store\n");
-            // Payload (the s32 value)
-            out.push_str(&format!("      local.get $out_ptr\n"));
-            out.push_str(&format!("      i32.const {}\n", inner_node_offset + 8));
-            out.push_str("      i32.add\n");
-            out.push_str("      local.get $value\n");
-            out.push_str("      i32.const 4\n");
-            out.push_str("      i32.add\n");
-            out.push_str("      i32.load\n"); // load inner s32 value
-            out.push_str("      i32.store\n");
-        }
-        _ => {
-            out.push_str("      ;; TODO: handle other inner types\n");
-        }
-    }
-    out.push_str("    end\n");
-
-    // Return bytes written
-    // For s32: header(16) + option_node(8 + payload_some) + inner_node(8 + 4)
-    let inner_node_size = match inner_ty {
-        Type::S32 => 8 + 4, // node header + s32 payload
-        _ => 8,             // just node header as placeholder
-    };
-    let total_some = 16 + 8 + payload_some + inner_node_size;
-    let total_none = 16 + 8 + payload_none;
-
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load8_u\n");
-    out.push_str("    if (result i32)\n");
-    out.push_str(&format!("      i32.const {}\n", total_some));
-    out.push_str("    else\n");
-    out.push_str(&format!("      i32.const {}\n", total_none));
-    out.push_str("    end\n");
-}
-
-/// Generate WAT code to encode a list value to CGRF at $out_ptr.
-/// List layout in wisp: [len: i32, cap: i32, data_ptr: i32]
-/// CGRF v2 List payload: [elem_type:type_tag*, count:u32, child_indices:u32*]
-fn generate_cgrf_encode_list(
-    out: &mut String,
-    elem_ty: &Type,
-    _records: &HashMap<String, RecordDef>,
-    _variants: &HashMap<String, VariantDef>,
-) {
-    // For now, only support list<s32>
-    if !matches!(elem_ty, Type::S32) {
-        out.push_str("    ;; TODO: encode list of non-s32 elements\n");
-        out.push_str("    i32.const -1\n");
-        return;
-    }
-
-    let type_tag_sz = type_tag_size(elem_ty);
-    // v2 payload: type_tag + count(4) + child_indices(4 * len)
-    let payload_base = type_tag_sz + 4; // type_tag + count
-
-    out.push_str("    ;; Encode list<s32> value (CGRF v2)\n");
-
-    // Write CGRF header
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Node count = 1 (list node) + len (element nodes)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n"); // list.len
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.add\n"); // 1 + len
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // root = list node
-    out.push_str("    i32.store\n");
-
-    // Write list node at offset 16
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_LIST as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Payload length = type_tag + count(4) + child_indices(4*len)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n"); // len
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.mul\n");
-    out.push_str(&format!("    i32.const {}\n", payload_base)); // type_tag + count
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.store\n");
-
-    // Write elem_type tag at offset 24 (start of payload)
-    generate_write_type_tag(out, elem_ty, "$out_ptr", 24);
-
-    // Write element count after type tag
-    let count_offset = 24 + type_tag_sz as i32;
-    out.push_str(&format!("    local.get $out_ptr\n"));
-    out.push_str(&format!("    i32.const {}\n", count_offset));
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n");
-    out.push_str("    i32.store\n");
-
-    // Write child indices after count
-    let child_indices_offset = count_offset + 4;
-    // Use a loop to write each child index
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n");
-    out.push_str("    local.set $len\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.load\n"); // data_ptr
-    out.push_str("    local.set $data_ptr\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    local.set $i\n");
-
-    // Calculate where element nodes start: header(16) + node_header(8) + payload_base + 4*len
-    // = 24 + type_tag_sz + 4 + 4*len
-    out.push_str(&format!("    i32.const {}\n", child_indices_offset));
-    out.push_str("    local.get $len\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.mul\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    local.set $node_offset\n");
-
-    out.push_str("    block $break\n");
-    out.push_str("      loop $loop\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        local.get $len\n");
-    out.push_str("        i32.ge_u\n");
-    out.push_str("        br_if $break\n");
-
-    // Write child index (1 + i) at child_indices_offset + 4*i
-    out.push_str("        local.get $out_ptr\n");
-    out.push_str(&format!("        i32.const {}\n", child_indices_offset));
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 4\n");
-    out.push_str("        i32.mul\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 1\n");
-    out.push_str("        i32.add\n"); // child index = 1 + i
-    out.push_str("        i32.store\n");
-
-    // Write s32 node at node_offset + 12*i
-    out.push_str("        local.get $out_ptr\n");
-    out.push_str("        local.get $node_offset\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 12\n");
-    out.push_str("        i32.mul\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.add\n");
-    out.push_str(&format!("        i32.const {}\n", CGRF_S32 as i32));
-    out.push_str("        i32.store8\n");
-
-    // Write node flags, reserved, payload_len
-    out.push_str("        local.get $out_ptr\n");
-    out.push_str("        local.get $node_offset\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 12\n");
-    out.push_str("        i32.mul\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.const 1\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.const 0\n");
-    out.push_str("        i32.store8\n");
-
-    out.push_str("        local.get $out_ptr\n");
-    out.push_str("        local.get $node_offset\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 12\n");
-    out.push_str("        i32.mul\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.const 2\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.const 0\n");
-    out.push_str("        i32.store16\n");
-
-    out.push_str("        local.get $out_ptr\n");
-    out.push_str("        local.get $node_offset\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 12\n");
-    out.push_str("        i32.mul\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.const 4\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.const 4\n"); // payload_len = 4
-    out.push_str("        i32.store\n");
-
-    // Write s32 value
-    out.push_str("        local.get $out_ptr\n");
-    out.push_str("        local.get $node_offset\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 12\n");
-    out.push_str("        i32.mul\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.const 8\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        local.get $data_ptr\n");
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 4\n");
-    out.push_str("        i32.mul\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        i32.load\n"); // load element value
-    out.push_str("        i32.store\n");
-
-    out.push_str("        local.get $i\n");
-    out.push_str("        i32.const 1\n");
-    out.push_str("        i32.add\n");
-    out.push_str("        local.set $i\n");
-    out.push_str("        br $loop\n");
-    out.push_str("      end\n");
-    out.push_str("    end\n");
-
-    // Return bytes written: header(16) + node_header(8) + payload_base + 4*len + element_nodes(12*len)
-    // = 24 + type_tag_sz + 4 + 4*len + 12*len = child_indices_offset + 16*len
-    out.push_str(&format!("    i32.const {}\n", child_indices_offset));
-    out.push_str("    local.get $len\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.mul\n");
-    out.push_str("    i32.add\n");
-}
-
-/// Generate WAT code to encode a record value to CGRF at $out_ptr.
-/// Record layout in wisp: fields stored sequentially at known offsets
-/// CGRF v2 Record payload: [type_name_len:u32, type_name:utf8, field_count:u32,
-///                          field_names:(len:u32, name:utf8)*, child_indices:u32*]
-fn generate_cgrf_encode_record(
-    out: &mut String,
-    name: &str,
-    records: &HashMap<String, RecordDef>,
-    _variants: &HashMap<String, VariantDef>,
-) {
-    let record_def = match records.get(name) {
-        Some(r) => r,
-        None => {
-            out.push_str(&format!("    ;; ERROR: unknown record '{}'\n", name));
-            out.push_str("    i32.const -1\n");
-            return;
-        }
-    };
-
-    // For simplicity, only support records with scalar fields for now
-    for field in &record_def.fields {
-        if !matches!(field.ty, Type::S32 | Type::S64 | Type::F32 | Type::F64) {
-            out.push_str("    ;; TODO: encode record with non-scalar fields\n");
-            out.push_str("    i32.const -1\n");
-            return;
-        }
-    }
-
-    let field_count = record_def.fields.len();
-
-    // Calculate field names size
-    let field_names_size: usize = record_def.fields.iter().map(|f| 4 + f.name.len()).sum();
-
-    // CGRF v2 Record payload layout:
-    // - type_name_len: 4 bytes
-    // - type_name: N bytes
-    // - field_count: 4 bytes
-    // - field_names: (len:u32 + name:utf8) for each field
-    // - child_indices: 4 * field_count bytes
-    let payload_len = 4 + name.len() + 4 + field_names_size + 4 * field_count;
-
-    out.push_str(&format!(
-        "    ;; Encode record '{}' with {} fields (CGRF v2)\n",
-        name, field_count
-    ));
-
-    // Write CGRF header
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Node count = 1 (record) + field_count
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", 1 + field_count));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // root = record node
-    out.push_str("    i32.store\n");
-
-    // Write record node at offset 16
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_RECORD as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Payload length
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", payload_len));
-    out.push_str("    i32.store\n");
-
-    // Payload starts at offset 24
-    let mut payload_offset = 24;
-
-    // Write type_name_len
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset));
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", name.len()));
-    out.push_str("    i32.store\n");
-    payload_offset += 4;
-
-    // Write type_name bytes
-    for (i, byte) in name.bytes().enumerate() {
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset + i));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", byte));
-        out.push_str("    i32.store8\n");
-    }
-    payload_offset += name.len();
-
-    // Write field_count
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset));
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", field_count));
-    out.push_str("    i32.store\n");
-    payload_offset += 4;
-
-    // Write field names
-    for field in &record_def.fields {
-        // Write field name length
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", field.name.len()));
-        out.push_str("    i32.store\n");
-        payload_offset += 4;
-
-        // Write field name bytes
-        for (i, byte) in field.name.bytes().enumerate() {
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", payload_offset + i));
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", byte));
-            out.push_str("    i32.store8\n");
-        }
-        payload_offset += field.name.len();
-    }
-
-    // Write child indices (1, 2, 3, ...)
-    for i in 0..field_count {
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset + 4 * i));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", 1 + i)); // child index
-        out.push_str("    i32.store\n");
-    }
-    payload_offset += 4 * field_count;
-
-    // Write field nodes starting after the record node payload
-    let mut node_offset = payload_offset;
-    for (i, field) in record_def.fields.iter().enumerate() {
-        let field_offset = record_def.field_offset(i);
-        let (cgrf_kind, field_payload_size) = match field.ty {
-            Type::S32 => (CGRF_S32, 4),
-            Type::S64 => (CGRF_S64, 8),
-            Type::F32 => (CGRF_F32, 4),
-            Type::F64 => (CGRF_F64, 8),
-            _ => continue,
-        };
-
-        // Write node kind
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", node_offset));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", cgrf_kind as i32));
-        out.push_str("    i32.store8\n");
-
-        // Flags
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", node_offset + 1));
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store8\n");
-
-        // Reserved
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", node_offset + 2));
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-
-        // Payload length
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", node_offset + 4));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", field_payload_size));
-        out.push_str("    i32.store\n");
-
-        // Load field value from record and store in payload
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", node_offset + 8));
-        out.push_str("    i32.add\n");
-        out.push_str("    local.get $value\n");
-        if field_offset > 0 {
-            out.push_str(&format!("    i32.const {}\n", field_offset));
-            out.push_str("    i32.add\n");
-        }
-        let load_instr = match field.ty {
-            Type::S32 => "i32.load",
-            Type::S64 => "i64.load",
-            Type::F32 => "f32.load",
-            Type::F64 => "f64.load",
-            _ => "i32.load",
-        };
-        out.push_str(&format!("    {}\n", load_instr));
-        let store_instr = match field.ty {
-            Type::S32 => "i32.store",
-            Type::S64 => "i64.store",
-            Type::F32 => "f32.store",
-            Type::F64 => "f64.store",
-            _ => "i32.store",
-        };
-        out.push_str(&format!("    {}\n", store_instr));
-
-        node_offset += 8 + field_payload_size;
-    }
-
-    // Return total bytes written
-    out.push_str(&format!("    i32.const {}\n", node_offset));
-}
-
-/// Generate WAT code to encode a variant value to CGRF at $out_ptr.
-/// Variant layout in wisp: [tag: i32, payload...]
-/// CGRF v2 Variant payload: [type_name_len:u32, type_name:utf8, case_name_len:u32, case_name:utf8,
-///                          tag:u32, payload_count:u32, child_indices:u32*]
-fn generate_cgrf_encode_variant(
-    out: &mut String,
-    name: &str,
-    _records: &HashMap<String, RecordDef>,
-    variants: &HashMap<String, VariantDef>,
-) {
-    let variant_def = match variants.get(name) {
-        Some(v) => v,
-        None => {
-            out.push_str(&format!("    ;; ERROR: unknown variant '{}'\n", name));
-            out.push_str("    i32.const -1\n");
-            return;
-        }
-    };
-
-    // Analyze variant cases
-    let all_no_payload = variant_def.cases.iter().all(|c| c.payload.is_empty());
-    let all_have_payload = variant_def.cases.iter().all(|c| !c.payload.is_empty());
-
-    // For simplicity, only support variants with single scalar payload or no payload
-    let mut all_simple = true;
-    for case in &variant_def.cases {
-        if case.payload.len() > 1 {
-            all_simple = false;
-            break;
-        }
-        if case.payload.len() == 1 {
-            if !matches!(
-                case.payload[0],
-                Type::S32 | Type::S64 | Type::F32 | Type::F64
-            ) {
-                all_simple = false;
-                break;
-            }
-        }
-    }
-
-    if !all_simple {
-        out.push_str("    ;; TODO: encode variant with complex payloads\n");
-        out.push_str("    i32.const -1\n");
-        return;
-    }
-
-    // Find the max case name length for buffer sizing
-    let max_case_name_len = variant_def
-        .cases
-        .iter()
-        .map(|c| c.name.len())
-        .max()
-        .unwrap_or(0);
-
-    out.push_str(&format!("    ;; Encode variant '{}' (CGRF v2)\n", name));
-
-    if all_no_payload {
-        // Simple case: no cases have payloads
-        // CGRF v2 Variant payload: type_name_len + type_name + case_name_len + case_name + tag + payload_count
-        // Payload size varies based on which case is active (case_name has different lengths)
-
-        // Write CGRF header
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-        out.push_str("    i32.store\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 4\n");
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-        out.push_str("    i32.store16\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 6\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-
-        // node_count = 1 (just the variant node)
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 8\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 1\n");
-        out.push_str("    i32.store\n");
-
-        // root_index = 0
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 12\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store\n");
-
-        // Write variant node at offset 16
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 16\n");
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", CGRF_VARIANT as i32));
-        out.push_str("    i32.store8\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 17\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store8\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 18\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-
-        // Payload length is written inside each case branch (varies by case_name length)
-        // Payload starts at offset 24
-        let mut payload_offset = 24;
-
-        // Write type_name_len
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", name.len()));
-        out.push_str("    i32.store\n");
-        payload_offset += 4;
-
-        // Write type_name bytes
-        for (i, byte) in name.bytes().enumerate() {
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", payload_offset + i));
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", byte));
-            out.push_str("    i32.store8\n");
-        }
-        payload_offset += name.len();
-
-        // Read tag from value to determine case_name
-        out.push_str("    local.get $value\n");
-        out.push_str("    i32.load\n");
-        out.push_str("    local.set $tag\n");
-
-        // Write case_name based on tag using if/else chain
-        // Each branch writes: case_name_len, case_name, tag, payload_count
-        // And sets payload_len and returns the correct total size
-        let case_name_len_offset = payload_offset;
-
-        // Generate if/else chain for case names
-        // Each branch is a complete expression that returns (result i32)
-        for (i, case) in variant_def.cases.iter().enumerate() {
-            // Calculate this case's payload_len and total size
-            // payload = type_name_len(4) + type_name + case_name_len(4) + case_name + tag(4) + payload_count(4)
-            let case_payload_len = 4 + name.len() + 4 + case.name.len() + 4 + 4;
-            let case_total_size = 16 + 8 + case_payload_len;
-            let case_name_start = case_name_len_offset + 4;
-            let tag_offset = case_name_start + case.name.len();
-            let payload_count_offset = tag_offset + 4;
-
-            if i == 0 {
-                out.push_str("    local.get $tag\n");
-                out.push_str("    i32.const 0\n");
-                out.push_str("    i32.eq\n");
-                out.push_str("    if (result i32)\n");
-            } else {
-                out.push_str("    else\n");
-                if i < variant_def.cases.len() - 1 {
-                    out.push_str("      local.get $tag\n");
-                    out.push_str(&format!("      i32.const {}\n", i));
-                    out.push_str("      i32.eq\n");
-                    out.push_str("      if (result i32)\n");
-                }
-            }
-
-            // Write payload_len for this case (at offset 20)
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str("      i32.const 20\n");
-            out.push_str("      i32.add\n");
-            out.push_str(&format!("      i32.const {}\n", case_payload_len));
-            out.push_str("      i32.store\n");
-
-            // Write case_name_len
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str(&format!("      i32.const {}\n", case_name_len_offset));
-            out.push_str("      i32.add\n");
-            out.push_str(&format!("      i32.const {}\n", case.name.len()));
-            out.push_str("      i32.store\n");
-
-            // Write case_name bytes
-            for (j, byte) in case.name.bytes().enumerate() {
-                out.push_str("      local.get $out_ptr\n");
-                out.push_str(&format!("      i32.const {}\n", case_name_start + j));
-                out.push_str("      i32.add\n");
-                out.push_str(&format!("      i32.const {}\n", byte));
-                out.push_str("      i32.store8\n");
-            }
-
-            // Write tag immediately after case_name
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str(&format!("      i32.const {}\n", tag_offset));
-            out.push_str("      i32.add\n");
-            out.push_str(&format!("      i32.const {}\n", i)); // tag value
-            out.push_str("      i32.store\n");
-
-            // Write payload_count = 0
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str(&format!("      i32.const {}\n", payload_count_offset));
-            out.push_str("      i32.add\n");
-            out.push_str("      i32.const 0\n");
-            out.push_str("      i32.store\n");
-
-            // Return this case's total size
-            out.push_str(&format!("      i32.const {}\n", case_total_size));
-        }
-
-        // Close all the if/else blocks
-        // We have (cases.len() - 1) nested if statements
-        for _ in 0..(variant_def.cases.len() - 1) {
-            out.push_str("    end\n");
-        }
-    } else if all_have_payload {
-        // All cases have payloads
-        // CGRF v2: payload node first (depth-first), then variant node
-
-        // Variant payload size: 4 + name.len() + 4 + max_case_name_len + 4 + 4 + 4 (one child index)
-        let variant_payload_len = 4 + name.len() + 4 + max_case_name_len + 4 + 4 + 4;
-
-        // Write CGRF header
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-        out.push_str("    i32.store\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 4\n");
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-        out.push_str("    i32.store16\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 6\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-
-        // node_count = 2 (payload + variant)
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 8\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 2\n");
-        out.push_str("    i32.store\n");
-
-        // root_index = 1 (variant node is after payload, depth-first)
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 12\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 1\n");
-        out.push_str("    i32.store\n");
-
-        // Write payload node at offset 16 (depth-first: children first)
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 16\n");
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", CGRF_S32 as i32));
-        out.push_str("    i32.store8\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 17\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store8\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 18\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 20\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 4\n"); // payload_len for s32
-        out.push_str("    i32.store\n");
-
-        // Write payload value at offset 24
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str("    i32.const 24\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    local.get $value\n");
-        out.push_str("    i32.const 4\n");
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.load\n");
-        out.push_str("    i32.store\n");
-
-        // Write variant node at offset 28 (16 + 12)
-        let variant_node_offset = 28;
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", variant_node_offset));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", CGRF_VARIANT as i32));
-        out.push_str("    i32.store8\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", variant_node_offset + 1));
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store8\n");
-
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", variant_node_offset + 2));
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store16\n");
-
-        // Variant payload length
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", variant_node_offset + 4));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", variant_payload_len));
-        out.push_str("    i32.store\n");
-
-        // Variant payload starts at variant_node_offset + 8
-        let mut payload_offset = variant_node_offset + 8;
-
-        // Write type_name_len
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset));
-        out.push_str("    i32.add\n");
-        out.push_str(&format!("    i32.const {}\n", name.len()));
-        out.push_str("    i32.store\n");
-        payload_offset += 4;
-
-        // Write type_name bytes
-        for (i, byte) in name.bytes().enumerate() {
-            out.push_str("    local.get $out_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", payload_offset + i));
-            out.push_str("    i32.add\n");
-            out.push_str(&format!("    i32.const {}\n", byte));
-            out.push_str("    i32.store8\n");
-        }
-        payload_offset += name.len();
-
-        // Read tag from value
-        out.push_str("    local.get $value\n");
-        out.push_str("    i32.load\n");
-        out.push_str("    local.set $tag\n");
-
-        // Write case_name based on tag using if/else chain
-        let case_name_len_offset = payload_offset;
-        payload_offset += 4;
-        let case_name_start = payload_offset;
-
-        // Generate if/else chain for case names
-        for (i, case) in variant_def.cases.iter().enumerate() {
-            if i == 0 {
-                out.push_str("    local.get $tag\n");
-                out.push_str("    i32.const 0\n");
-                out.push_str("    i32.eq\n");
-                out.push_str("    if\n");
-            } else {
-                out.push_str("    else\n");
-                if i < variant_def.cases.len() - 1 {
-                    out.push_str(&format!("      local.get $tag\n"));
-                    out.push_str(&format!("      i32.const {}\n", i));
-                    out.push_str("      i32.eq\n");
-                    out.push_str("      if\n");
-                }
-            }
-
-            // Write case_name_len
-            out.push_str("      local.get $out_ptr\n");
-            out.push_str(&format!("      i32.const {}\n", case_name_len_offset));
-            out.push_str("      i32.add\n");
-            out.push_str(&format!("      i32.const {}\n", case.name.len()));
-            out.push_str("      i32.store\n");
-
-            // Write case_name bytes
-            for (j, byte) in case.name.bytes().enumerate() {
-                out.push_str("      local.get $out_ptr\n");
-                out.push_str(&format!("      i32.const {}\n", case_name_start + j));
-                out.push_str("      i32.add\n");
-                out.push_str(&format!("      i32.const {}\n", byte));
-                out.push_str("      i32.store8\n");
-            }
-        }
-
-        // Close all the if/else blocks
-        // We have (cases.len() - 1) nested if statements
-        // (the last case has no 'if' because it's in the final 'else')
-        for _ in 0..(variant_def.cases.len() - 1) {
-            out.push_str("    end\n");
-        }
-
-        payload_offset += max_case_name_len;
-
-        // Write tag
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset));
-        out.push_str("    i32.add\n");
-        out.push_str("    local.get $tag\n");
-        out.push_str("    i32.store\n");
-        payload_offset += 4;
-
-        // Write payload_count = 1
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset));
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 1\n");
-        out.push_str("    i32.store\n");
-        payload_offset += 4;
-
-        // Write child_index = 0
-        out.push_str("    local.get $out_ptr\n");
-        out.push_str(&format!("    i32.const {}\n", payload_offset));
-        out.push_str("    i32.add\n");
-        out.push_str("    i32.const 0\n");
-        out.push_str("    i32.store\n");
-        payload_offset += 4;
-
-        // Return bytes written
-        out.push_str(&format!("    i32.const {}\n", payload_offset));
-    } else {
-        // Mixed case: need runtime check
-        // For now, use a simplified approach - TODO: implement proper runtime branching
-        out.push_str("    ;; TODO: encode variant with mixed payload cases\n");
-        out.push_str("    i32.const -1\n");
-    }
-}
-
-/// Generate WAT code to encode a result value to CGRF at $out_ptr.
-/// CGRF v2 Result payload: [ok_type:type_tag*, err_type:type_tag*, tag:u32, has_payload:u8, child_index?:u32]
-fn generate_cgrf_encode_result(
-    out: &mut String,
-    ok_ty: &Type,
-    err_ty: &Type,
-    _records: &HashMap<String, RecordDef>,
-    _variants: &HashMap<String, VariantDef>,
-) {
-    // Result is encoded as CGRF_RESULT (0x14) with type tags
-    // Memory layout: [tag: i32 (0 or 1), payload...]
-
-    // For simplicity, only support scalar ok/err types for now
-    if !matches!(ok_ty, Type::S32 | Type::S64 | Type::F32 | Type::F64)
-        || !matches!(err_ty, Type::S32 | Type::S64 | Type::F32 | Type::F64)
-    {
-        out.push_str("    ;; TODO: encode result with non-scalar types\n");
-        out.push_str("    i32.const -1\n");
-        return;
-    }
-
-    // Calculate type tag sizes
-    let ok_type_tag_size = type_tag_size(ok_ty);
-    let err_type_tag_size = type_tag_size(err_ty);
-
-    // Result payload: ok_type_tag + err_type_tag + tag(4) + has_payload(1) + child_index(4)
-    let result_payload_len = ok_type_tag_size + err_type_tag_size + 4 + 1 + 4;
-
-    out.push_str("    ;; Encode result value (CGRF v2)\n");
-
-    // Write CGRF header
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_MAGIC));
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_VERSION as i32));
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 6\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Node count = 2 (result + payload)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 8\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 2\n");
-    out.push_str("    i32.store\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n"); // root = result node
-    out.push_str("    i32.store\n");
-
-    // Write result node at offset 16
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 16\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", CGRF_RESULT as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 17\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 18\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    // Payload length
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str("    i32.const 20\n");
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", result_payload_len));
-    out.push_str("    i32.store\n");
-
-    // Payload starts at offset 24
-    let mut payload_offset: i32 = 24;
-
-    // Write ok_type tag
-    let ok_tag_written = generate_write_type_tag(out, ok_ty, "$out_ptr", payload_offset);
-    payload_offset += ok_tag_written as i32;
-
-    // Write err_type tag
-    let err_tag_written = generate_write_type_tag(out, err_ty, "$out_ptr", payload_offset);
-    payload_offset += err_tag_written as i32;
-
-    // Write tag (read from value's discriminant: 0=ok, 1=err)
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset));
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.load\n");
-    out.push_str("    i32.store\n");
-    payload_offset += 4;
-
-    // Write has_payload = 1
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset));
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store8\n");
-    payload_offset += 1;
-
-    // Write child index = 1
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset));
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 1\n");
-    out.push_str("    i32.store\n");
-    payload_offset += 4;
-
-    // Write payload node
-    // Determine type based on tag (ok=0 uses ok_ty, err=1 uses err_ty)
-    // For simplicity, assume both are same size (s32 for now)
-    let (cgrf_kind, value_payload_size) = match ok_ty {
-        Type::S32 => (CGRF_S32, 4),
-        Type::S64 => (CGRF_S64, 8),
-        Type::F32 => (CGRF_F32, 4),
-        Type::F64 => (CGRF_F64, 8),
-        _ => (CGRF_S32, 4),
-    };
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset));
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", cgrf_kind as i32));
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset + 1));
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store8\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset + 2));
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.const 0\n");
-    out.push_str("    i32.store16\n");
-
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset + 4));
-    out.push_str("    i32.add\n");
-    out.push_str(&format!("    i32.const {}\n", value_payload_size));
-    out.push_str("    i32.store\n");
-
-    // Write payload value
-    out.push_str("    local.get $out_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", payload_offset + 8));
-    out.push_str("    i32.add\n");
-    out.push_str("    local.get $value\n");
-    out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
-    let load_instr = match ok_ty {
-        Type::S32 => "i32.load",
-        Type::S64 => "i64.load",
-        Type::F32 => "f32.load",
-        Type::F64 => "f64.load",
-        _ => "i32.load",
-    };
-    out.push_str(&format!("    {}\n", load_instr));
-    let store_instr = match ok_ty {
-        Type::S32 => "i32.store",
-        Type::S64 => "i64.store",
-        Type::F32 => "f32.store",
-        Type::F64 => "f64.store",
-        _ => "i32.store",
-    };
-    out.push_str(&format!("    {}\n", store_instr));
-
-    // Return bytes written
-    let total_bytes = payload_offset + 8 + value_payload_size as i32;
-    out.push_str(&format!("    i32.const {}\n", total_bytes));
 }
 
 // =============================================================================
@@ -12952,12 +13315,14 @@ fn generate_cgrf_decode_string(out: &mut String) {
     out.push_str("    i32.add\n");
     out.push_str("    global.set $__heap_ptr\n");
 
-    // Write length to wisp string
-    out.push_str("    local.get $str_ptr\n");
-    out.push_str("    local.get $str_len\n");
-    out.push_str("    i32.store\n");
-
-    // Copy string data from CGRF to wisp string
+    // Copy string data from CGRF to wisp string FIRST, then write the length
+    // header. Order matters: the caller may place the input just below the heap
+    // base, so $str_ptr (= heap_ptr) can land inside the still-unread CGRF input
+    // for inputs larger than ~45 KB. Writing the 4-byte length header before the
+    // copy would clobber source bytes that memory.copy is about to read,
+    // corrupting the decoded string (the self-hosting size cliff). memory.copy is
+    // memmove-safe, so the overlapping copy itself is fine; and after it the
+    // source is consumed, so writing the header at $str_ptr is then safe.
     // Source: $in_ptr + 28 (24 for header+node + 4 for length prefix in payload)
     // Dest: $str_ptr + 4
     out.push_str("    local.get $str_ptr\n");
@@ -12968,6 +13333,11 @@ fn generate_cgrf_decode_string(out: &mut String) {
     out.push_str("    i32.add\n"); // src
     out.push_str("    local.get $str_len\n"); // len
     out.push_str("    memory.copy\n");
+
+    // Write length to wisp string (after the copy has consumed the source)
+    out.push_str("    local.get $str_ptr\n");
+    out.push_str("    local.get $str_len\n");
+    out.push_str("    i32.store\n");
 
     // Return the wisp string pointer
     out.push_str("    local.get $str_ptr\n");
@@ -13250,12 +13620,12 @@ fn generate_cgrf_decode_option(out: &mut String, inner_ty: &Type, param_name: &s
 /// CGRF v2 variant encoding (depth-first):
 /// - No payload: variant node is at index 0 (offset 16)
 ///   - Payload: [type_name_len:u32, type_name:utf8, case_name_len:u32, case_name:utf8,
-///              tag:u32, payload_count:u32]
+///     tag:u32, payload_count:u32]
 /// - With payload: child node first, then variant node
 ///   - Child node at offset 16
 ///   - Variant node at offset 16 + child_size
 ///   - Payload: [type_name_len:u32, type_name:utf8, case_name_len:u32, case_name:utf8,
-///              tag:u32, payload_count:u32, child_indices:u32*]
+///     tag:u32, payload_count:u32, child_indices:u32*]
 ///
 /// Wisp variant layout: [discriminant: i32, payload...]
 fn generate_cgrf_decode_variant(
@@ -13704,29 +14074,6 @@ fn generate_cgrf_decode_list(out: &mut String, elem_ty: &Type, param_name: &str)
     out.push_str(&format!("    local.set $param_{}\n", param_name));
 }
 
-/// Generate WAT code to decode a tuple element from CGRF.
-/// `element_idx` is the 0-based index of the tuple element.
-/// `node_offset` is the local variable holding the current node offset in the buffer.
-/// The tuple structure in CGRF:
-/// - Header at offset 16: kind=0x0B, flags, reserved, payload_len
-/// - Payload: element_count (u32), then element_count node indices (u32 each)
-/// - Child nodes follow the tuple node
-fn generate_cgrf_decode_tuple_element_offset(out: &mut String, element_idx: usize) {
-    // For now, we calculate the offset to the element node.
-    // Tuple payload structure: element_count (4 bytes) + indices (4 bytes each)
-    // First element index is at offset 24 + 4 = 28
-    // Second element index at offset 32, etc.
-    let index_offset = 28 + element_idx * 4;
-    out.push_str(&format!(
-        "    ;; Get tuple element {} node index\n",
-        element_idx
-    ));
-    out.push_str("    local.get $in_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", index_offset));
-    out.push_str("    i32.add\n");
-    out.push_str("    i32.load\n"); // node index on stack
-}
-
 /// Generate WAT code to decode a single parameter from CGRF.
 /// For single-param functions, the root node is the value.
 /// `param_name` is the parameter name (for the local variable).
@@ -13777,6 +14124,30 @@ fn generate_cgrf_decode_param(
         }
         Type::Result(ok_ty, err_ty) => {
             generate_cgrf_decode_result(out, ok_ty, err_ty, param_name);
+        }
+        Type::Any => {
+            // A top-level `any` param: the whole input CGRF buffer IS the value.
+            // Copy it into a len-prefixed heap blob [len:u32][cgrf bytes], the
+            // uniform in-guest representation shared with constructed values.
+            out.push_str("    ;; Decode `any`: copy input CGRF into a len-prefixed blob\n");
+            out.push_str("    local.get $in_len\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $any_ptr\n");
+            // Copy CGRF bytes to any_ptr+4 before writing the length prefix
+            // (memory.copy is memmove-safe, so any source overlap is fine).
+            out.push_str("    local.get $any_ptr\n");
+            out.push_str("    i32.const 4\n");
+            out.push_str("    i32.add\n");
+            out.push_str("    local.get $in_ptr\n");
+            out.push_str("    local.get $in_len\n");
+            out.push_str("    memory.copy\n");
+            out.push_str("    local.get $any_ptr\n");
+            out.push_str("    local.get $in_len\n");
+            out.push_str("    i32.store\n");
+            out.push_str("    local.get $any_ptr\n");
+            out.push_str(&format!("    local.set $param_{}\n", param_name));
         }
         _ => {
             // For complex types, we'd need more sophisticated decoding
@@ -14261,6 +14632,8 @@ fn generate_decode_result_at_offset(
 ///
 /// So child i is at offset: 16 + sum(sizes of nodes 0..i-1)
 /// For uniform scalars: 16 + i * node_size
+// Decoding needs both the current parameter and the complete tuple layout.
+#[allow(clippy::too_many_arguments)]
 fn generate_cgrf_decode_tuple_param(
     out: &mut String,
     param_ty: &Type,
@@ -14407,8 +14780,8 @@ fn generate_cgrf_decode_tuple_param(
     } else {
         // Compile-time offset mode for fixed-size types only
         let mut node_offset = 16; // Start after header
-        for i in 0..param_idx {
-            node_offset += match &all_params[i].ty {
+        for param in all_params.iter().take(param_idx) {
+            node_offset += match &param.ty {
                 Type::S64 | Type::F64 => 16, // 8 header + 8 payload
                 _ => 12,                     // 8 header + 4 payload (s32, f32, etc.)
             };
@@ -14505,12 +14878,9 @@ fn generate_cgrf_decode_tuple_param(
                         // Bridge to recursive decoder: $child_offset -> $dec_node_offset
                         out.push_str("    local.get $child_offset\n");
                         out.push_str("    local.set $dec_node_offset\n");
-                        generate_cgrf_decode_recursive(out, param_ty, records, variants);
+                        generate_cgrf_decode_recursive(out, param_ty);
                         out.push_str("    local.get $dec_result\n");
-                        out.push_str(&format!(
-                            "    local.set $param_{}\n",
-                            param_name
-                        ));
+                        out.push_str(&format!("    local.set $param_{}\n", param_name));
                     }
                     _ => unreachable!(),
                 }

@@ -1,8 +1,5 @@
 use std::collections::HashMap;
-use wisp::compiler::{
-    Function, InlineValue, Type, compile_repl_expr, compile_repl_expr_pack,
-    compile_repl_expr_pack_wat,
-};
+use wisp::compiler::{Function, InlineValue, Type, compile_repl_expr, compile_repl_expr_pack};
 
 /// A runtime value that can be inlined during REPL compilation
 #[derive(Debug, Clone)]
@@ -309,15 +306,12 @@ mod tests {
 
     #[test]
     fn test_pack_wat_output() {
-        use super::compile_repl_expr_pack_wat;
+        use wisp::compiler::compile_repl_expr_pack_wat;
         let bindings: HashMap<String, InlineValue> = HashMap::new();
         let functions = vec![];
 
         let wat =
             compile_repl_expr_pack_wat("42", &bindings, &functions).expect("WAT generation failed");
-
-        // Print the WAT for inspection
-        eprintln!("Generated WAT:\n{}", wat);
 
         // Verify key parts of the WAT structure
         assert!(wat.contains("(module"), "Should contain module declaration");
@@ -331,8 +325,8 @@ mod tests {
             "Should have pack calling convention params"
         );
         assert!(
-            wat.contains("(param $out_ptr i32)"),
-            "Should have output pointer param"
+            wat.contains("(param $out_ptr_ptr i32) (param $out_len_ptr i32)"),
+            "Should return the allocated output pointer and length through slots"
         );
     }
 }

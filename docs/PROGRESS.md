@@ -1,5 +1,10 @@
 # wisp Compiler Progress
 
+> Historical implementation notes. For the current build, output format, and
+> runtime limitations, start with [README.md](../README.md). The project now
+> emits Pack/Graph ABI modules; references below to component output describe
+> the earlier pipeline.
+
 **A Lisp-to-WebAssembly Compiler with Hygienic Macros**
 
 ## Overview

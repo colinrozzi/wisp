@@ -1,0 +1,158 @@
+# Interpreter → Theater integration
+
+Status: the minimal actor is wired and tested, including lifecycle, persistent
+sessions, RPC discovery/calls, socket transport, and deterministic replay.
+See the [actor launch and handoff guide](../../actors/wisp-repl/README.md).
+This is a local development target, not a deployment plan.
+
+## Pinned runtime
+
+The Wisp flake pins upstream Theater `main` at
+[`e2546700e00cb8c4a8050f27c62388bd57646483`](https://github.com/colinrozzi/theater/commit/e2546700e00cb8c4a8050f27c62388bd57646483),
+verified against upstream HEAD on 2026-10-05. This revision includes RPC export
+and type discovery (`rpc.describe`). Use this pin for the actor integration;
+the sibling checkout and the old integration manifests are not the version
+source of truth. Theater retains its own locked Nix build inputs.
+
+```sh
+nix build .#theater --no-link
+nix run .#theater -- --help
+nix develop .#theater
+```
+
+The default `nix develop` remains the compiler/interpreter shell. The dedicated
+Theater shell adds the pinned runtime CLI. The new `actors/wisp-repl`
+workspace pins this same revision independently of the legacy workspace below.
+When updating Theater, verify upstream HEAD, update the full revision in both
+manifests, refresh their lockfiles, and rebuild before updating this record.
+
+Validation on 2026-10-05: the upstream package built successfully on
+`x86_64-linux`, the CLI help ran through `nix run`, and the interpreter engine
+preflight passed in the default shell. The pinned Theater lockfile uses Packr
+0.24.0; the existing Wisp engine preflight uses 0.24.1. These are separate build
+checks. The new actor workspace uses Packr 0.24.1 and additionally tests actual
+Theater spawn/init, mailbox calls, guest-to-guest RPC, and replay.
+
+## What already works
+
+The evaluator is one compiled Wasm module. Each live instance owns its bindings,
+closures, types, trait instances, macros, globals, and allocator. Theater's
+current in-module state model fits this directly: calls pass arguments and
+results; the runtime does not thread an external state value through exports.
+
+`tests/interpreter_engine.rs` uses the same capture-based interfaces exposed by
+the local Theater `pack_bridge`: `HostImports`, `host_fn`, `WasmEngine`, and
+`packr_core::call_with_value`, with `packr_wasmtime::WasmtimeEngine`. It verifies:
+
+- The evaluator's embedded CGRF metadata is readable by the current metadata API.
+- Theater's single-argument tuple convention reaches `evaluate` correctly.
+- Definitions and closures survive successive calls to the same instance.
+- Separate instances have separate sessions.
+- Both source imports work with an in-memory bundle and ordinary result errors.
+- Failed includes publish no preceding definitions; language errors leave the
+  session usable.
+
+Run from the repository root:
+
+```sh
+nix develop --offline -c cargo test --locked --test interpreter_engine
+```
+
+This test exercises the engine boundary. It does not instantiate a Theater
+`ActorRuntime`, register a handler, replay a chain, or route an RPC.
+
+## Keep the first actor small
+
+The first vertical slice exposes a single typed evaluation operation:
+`theater:simple/wisp.evaluate(source: string) -> string`. Retain the existing
+printed-value/`error:` result convention for this slice. One actor owns one
+evaluator instance, with calls serialized by its mailbox.
+
+The adapter gives `evaluate` its Theater interface name and removes the local
+`evaluate-from` export from the actor's public surface. A small ABI wrapper
+implements `theater:simple/actor.init`: it accepts and ignores config and returns
+an encoded `result<unit, string>::ok(())`. Real `SpawnActor` tests exercise it.
+Wisp does not yet expose the general Pack `value` type, and compiled unit
+construction is incomplete, so this bridge lives in the actor artifact builder.
+The evaluator itself is unchanged.
+
+Do not implement one generated Wasm export per interpreted function. The first
+actor can evaluate calls such as `(add-two 40)` through the existing boundary.
+Structured values and application-specific RPC exports can follow after the
+actor session is proven.
+
+## Host capabilities
+
+The evaluator currently imports only:
+
+| Interface | Function | Type |
+| --- | --- | --- |
+| `wisp-source` | `resolve-path` | `(base: string, path: string) -> result<string, string>` |
+| `wisp-source` | `read-source` | `(path: string) -> result<string, string>` |
+
+The actor host supplies immutable, bounded bundles through `SourceBundle`.
+Logical paths never read the host filesystem. Both calls go through Theater's
+host-import registry/interceptor. A replay test uses an empty bundle and still
+reproduces all output and event hashes from the recorded source responses.
+Include deduplication, parsing, and expansion remain in Wisp.
+
+Keep the evaluator's source/file/step limits. The local Rust host additionally
+supplies 20 million fuel per request and file-count/total-byte limits; the engine
+preflight does not install those host policies. The actor path bounds bundles
+to 256 files/1 MiB total/64 KiB per file, memory to 256 MiB per actor, and uses
+Theater's existing epoch deadlines (60 seconds for init, 300 for ordinary calls).
+It does not install the local REPL's additional fuel policy. Allocations last
+until the instance is discarded; socket disconnection stops the session actor.
+
+General Wisp imports and Theater effects (`self.log`, RPC, storage) are a later
+slice. Route them through registered host capabilities and the same interceptor;
+they do not require serializing the interpreter's environment between calls.
+
+## Existing integration workspace
+
+`crates/` is a separate, older integration workspace. An offline
+`cargo check -p test-runtime` currently reaches compilation and fails with 27
+API errors. Its manifest pins Theater **v0.3.0** and Pack **v0.2.0**, while its
+working source uses the newer `HostImports`/`CachingPackRuntime` API and the
+four-argument, in-module-state `ActorStore` construction. The pinned Theater has
+neither those imports nor that constructor. This is a reproduced dependency/API
+mismatch, not evidence that the new evaluator cannot run on Pack.
+
+The local Theater checkout is newer (`theater` crate version 0.3.29) and uses
+`packr-core` plus `packr-wasmtime`. Its full build was not tested here. The other
+Wisp integration crates also retain older APIs, including a supervisor-handler
+dependency absent from the local Theater workspace. Choose and pin a coherent
+Theater/Pack release or revision before migrating this workspace. Keep the root
+compiler/interpreter workspace independent. Preserve the existing uncommitted
+`test-runtime` migration while doing that work.
+
+## Completed actor acceptance checks
+
+1. Build the isolated current host and actor; verify real init and metadata.
+2. Define functions and call them through the mailbox and from another Wasm
+   actor through `rpc.call`; discover string signatures through `rpc.describe`.
+3. Verify separate actors have separate definitions.
+4. Load relative bundled includes; verify include/language errors and evaluator
+   limits leave the established session usable.
+5. Replay the call/import sequence into a fresh actor with recorded source
+   responses; compare every event hash.
+6. Exercise fragmented/coalesced socket frames, malformed JSON recovery,
+   disconnect cleanup, and a fresh session after the previous one closes.
+
+The handoff can now build on this actor contract. General interpreted host
+effects, tighter execution budgets, GC/session recycling policy, and user-facing
+chain persistence/resume remain separate follow-ups.
+
+## Language compatibility baseline
+
+Core computation, macros, traits/generics, byte values, unit values, and derived
+record equality now have interpreter coverage. Shared fixtures compare supported
+behavior with the compilers, with exceptions documented in
+[`interpreter/README.md`](../../interpreter/README.md).
+
+Keep separate checklist entries for full expected-type inference, declaration
+ordering, static checks, resource handles, raw memory operations, and general
+imports. Compiler byte/string conversions still use an older list layout; they
+need focused repair/verification before byte-based actor transport relies on
+them. The string-based evaluation actor does not depend on those conversions;
+the local socket host handles JSON framing outside the guest.
