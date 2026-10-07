@@ -758,13 +758,16 @@ pub enum Expr {
     },
     /// Invoke a host import's raw CGRF entry point with a pre-encoded args blob:
     /// `args-any` is a len-prefixed CGRF blob (built by `marshal`), passed straight
-    /// to `$__raw_<import>`, and the returned CGRF is wrapped back into an `any`.
-    /// `import` names the import (e.g. "call" for rpc.call, "get" for store.get).
-    /// `(call-raw args)` is sugar for `import = "call"`; `(raw-invoke "name" args)`
+    /// to the import's raw symbol, and the returned CGRF is wrapped into an `any`.
+    /// `module`+`import` name the import (e.g. "theater:simple/store"+"get"); the raw
+    /// symbol is qualified by interface so same-named functions in different
+    /// interfaces (store.exists vs filesystem.exists) don't collide.
+    /// `(call-raw args)` is sugar for rpc.call; `(raw-invoke "iface" "name" args)`
     /// targets any declared import. This is the raw-CGRF calling convention: the
     /// import is declared with its real typed signature (so the interface hash
     /// matches Theater), but values cross as CGRF and are bridged by marshal/unmarshal.
     RawInvoke {
+        module: String,
         import: String,
         value: Box<Expr>,
     },
@@ -856,7 +859,6 @@ pub struct Import {
     pub name: String,
     pub params: Vec<Parameter>,
     pub return_type: Type,
-    span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -1564,9 +1566,11 @@ fn collect_signatures(prog: &Program) -> Result<HashMap<String, Signature>> {
             params,
             result: import.return_type.clone(),
         };
-        if signatures.insert(import.name.clone(), sig).is_some() {
-            bail!("Duplicate function '{}'", import.name);
-        }
+        // Imports are keyed by bare name only for typed-call resolution, which
+        // raw-invoked imports never use. Same-named functions in different
+        // interfaces (store.exists / filesystem.exists) are allowed; keep the
+        // first signature (its typed wrapper is the one that survives dedup).
+        signatures.entry(import.name.clone()).or_insert(sig);
     }
     Ok(signatures)
 }
@@ -5635,10 +5639,11 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                                 &span,
                             ));
                         }
-                        if !imported.insert(import.name.clone()) {
-                            return Err(
-                                ctx.error(format!("duplicate import '{}'", import.name), &span)
-                            );
+                        if !imported.insert((import.module.clone(), import.name.clone())) {
+                            return Err(ctx.error(
+                                format!("duplicate import '{}/{}'", import.module, import.name),
+                                &span,
+                            ));
                         }
                         imports.push(import);
                     }
@@ -5732,12 +5737,10 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
             params,
             result: import.return_type.clone(),
         };
-        if signatures.insert(import.name.clone(), sig).is_some() {
-            return Err(ctx.error(
-                format!("duplicate function '{}'", import.name),
-                &import.span,
-            ));
-        }
+        // Same-named imports across interfaces are allowed (keyed by bare name
+        // only for typed-call resolution, which raw-invoked imports don't use);
+        // keep the first, matching the typed-wrapper dedup.
+        signatures.entry(import.name.clone()).or_insert(sig);
     }
 
     for export in exports.iter() {
@@ -5747,7 +5750,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                 &Span::dummy(),
             ));
         }
-        if imported.contains(&export.func_name) {
+        if imported.iter().any(|(_, name)| name == &export.func_name) {
             return Err(ctx.error(
                 format!("cannot export imported function '{}'", export.func_name),
                 &Span::dummy(),
@@ -5993,7 +5996,6 @@ fn parse_import_form(
         name,
         params,
         return_type,
-        span,
     })
 }
 
@@ -7024,29 +7026,34 @@ fn parse_expr(
                     }
                     let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
                     Ok(Expr::RawInvoke {
+                        module: "theater:simple/rpc".to_string(),
                         import: "call".to_string(),
                         value: Box::new(value),
                     })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "raw-invoke" => {
-                    // (raw-invoke "import-name" args-any) -> any. Generic raw-CGRF
+                    // (raw-invoke "iface" "name" args-any) -> any. Generic raw-CGRF
                     // call to any declared host import; args-any is a marshalled blob.
-                    if items.len() != 3 {
+                    // The interface qualifies the raw symbol (so same-named functions
+                    // in different interfaces don't collide).
+                    if items.len() != 4 {
                         return Err(ctx.error_with_note(
                             "invalid 'raw-invoke' expression",
                             list_span,
-                            "expected: (raw-invoke \"import-name\" args-any)",
+                            "expected: (raw-invoke \"iface\" \"name\" args-any)",
                         ));
                     }
-                    let SExpr::Str(import, _) = &items[1] else {
+                    let (SExpr::Str(module, _), SExpr::Str(import, _)) = (&items[1], &items[2])
+                    else {
                         return Err(ctx.error_with_note(
-                            "raw-invoke import name must be a string literal",
+                            "raw-invoke interface and name must be string literals",
                             list_span,
-                            "expected: (raw-invoke \"import-name\" args-any)",
+                            "expected: (raw-invoke \"iface\" \"name\" args-any)",
                         ));
                     };
-                    let value = parse_expr(&items[2], vars, functions, records, variants, ctx)?;
+                    let value = parse_expr(&items[3], vars, functions, records, variants, ctx)?;
                     Ok(Expr::RawInvoke {
+                        module: module.clone(),
                         import: import.clone(),
                         value: Box::new(value),
                     })
@@ -8875,11 +8882,16 @@ fn gen_expr(
             );
             Type::Str
         }
-        Expr::RawInvoke { import, value } => {
+        Expr::RawInvoke {
+            module,
+            import,
+            value,
+        } => {
             // args-any is a len-prefixed CGRF blob [len:u32][cgrf]. Pass its bytes
             // straight to the import's raw CGRF entry point, then wrap the returned
             // CGRF (out_ptr,out_len) back into an `any` blob — the same shape the
             // import wrapper uses for an `any` result.
+            let raw_sym = raw_import_symbol(module, import);
             let blob = env.declare_local(Type::S32);
             gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
@@ -8901,7 +8913,7 @@ fn gen_expr(
                 "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
                 pad, slots, pad, pad
             ));
-            out.push_str(&format!("{}call $__raw_{}\n{}drop\n", pad, import, pad)); // ignore status
+            out.push_str(&format!("{}call ${}\n{}drop\n", pad, raw_sym, pad)); // ignore status
             let any_len = env.declare_local(Type::S32);
             out.push_str(&format!(
                 "{}local.get {}\n{}i32.const 4\n{}i32.add\n{}i32.load\n{}local.set {}\n",
@@ -10368,10 +10380,13 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
     // Generate import declarations with Pack/Graph ABI signature
     // Each import is declared as (i32, i32, i32, i32) -> i32
     for import in &prog.imports {
-        // Raw import with Pack/Graph ABI calling convention
+        // Raw import with Pack/Graph ABI calling convention. The internal symbol
+        // is qualified by interface to avoid collisions across interfaces.
         out.push_str(&format!(
-            "  (import \"{}\" \"{}\" (func $__raw_{} (param i32 i32 i32 i32) (result i32)))\n",
-            import.module, import.name, import.name
+            "  (import \"{}\" \"{}\" (func ${} (param i32 i32 i32 i32) (result i32)))\n",
+            import.module,
+            import.name,
+            raw_import_symbol(&import.module, &import.name)
         ));
     }
 
@@ -10532,10 +10547,17 @@ fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) ->
 "#,
     );
 
-    // Generate import wrapper functions
-    // These have the original wisp signature but internally encode args and call the raw import
+    // Generate import wrapper functions. These have the original wisp signature
+    // and are called by bare name (describe/self/...); raw-invoked imports call the
+    // qualified raw symbol instead, leaving their wrapper as dead code. The wrapper
+    // is named by the bare import name, so dedup by name: two interfaces exposing
+    // the same function name (store.exists / filesystem.exists) would otherwise emit
+    // two `$exists` wrappers. The bare-name-called wrappers all have unique names.
+    let mut wrapped = std::collections::HashSet::new();
     for import in &prog.imports {
-        generate_import_wrapper(&mut out, import);
+        if wrapped.insert(import.name.clone()) {
+            generate_import_wrapper(&mut out, import);
+        }
     }
 
     // Generate internal functions
@@ -10996,6 +11018,18 @@ fn generate_pack_wrapper(
     out.push_str("  )\n");
 }
 
+/// The internal symbol for an import's raw CGRF entry point, qualified by
+/// interface so same-named functions in different interfaces don't collide
+/// (e.g. store.exists vs filesystem.exists). The WASM import's module/name are
+/// unchanged; only this internal func symbol is disambiguated.
+fn raw_import_symbol(module: &str, name: &str) -> String {
+    let iface: String = module
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("__raw_{}_{}", iface, name)
+}
+
 /// Generate an import wrapper function.
 ///
 /// The wrapper has the original wisp signature but internally:
@@ -11004,7 +11038,7 @@ fn generate_pack_wrapper(
 /// 3. Decodes the result (if any)
 fn generate_import_wrapper(out: &mut String, import: &Import) {
     let wrapper_name = &import.name;
-    let raw_name = format!("$__raw_{}", import.name);
+    let raw_name = format!("${}", raw_import_symbol(&import.module, &import.name));
 
     // Start function with original signature
     out.push_str(&format!("  (func ${} ", wrapper_name));
