@@ -515,6 +515,14 @@
     ((wide-integer n) (u64-value n))
     ((u64-value n) (u64-value n))
     (else (u64-value (i64.const 0)))))
+; Coerce a REPL integer to a CGRF u32 argument (e.g. tcp-receive's max-bytes),
+; which the host rejects if it crosses as a plain s32.
+(fn as-u32 ((v value)) value
+  (value-case v
+    ((integer n) (u32-value n))
+    ((wide-integer n) (u32-value (i32.wrap_i64 n)))
+    ((u64-value n) (u32-value (i32.wrap_i64 n)))
+    (else (u32-value (i32.const 0)))))
 (fn apply-timer-now ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "now expects no arguments")
     (unmarshal (raw-invoke "theater:simple/timer" "now" (arg-tuple (list-new value))))))
@@ -658,7 +666,7 @@
   (if (i32.ne (list-len args) 2) (failure "tcp-receive expects (tcp-receive conn-id max-bytes)")
     (if (string-arg? (list-get args 0))
       (unmarshal (raw-invoke "theater:simple/tcp" "receive"
-        (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1))))))
+        (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (as-u32 (list-get args 1)))))))
       (failure "tcp-receive expects a connection id and an integer max-bytes"))))
 
 ; --- podman ----------------------------------------------------------------

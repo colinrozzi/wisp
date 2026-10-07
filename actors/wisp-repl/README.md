@@ -119,6 +119,8 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | assembler | `(wat-to-wasm wat-text)` → wasm bytes |
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
+| tcp⁴ | `(tcp-connect addr)` · `(tcp-send conn data)` → bytes · `(tcp-receive conn max)`⁵ · `(tcp-close conn)` · `(tcp-peer conn)` · `(tcp-is-tls conn)` · `(tcp-listen addr)`⁶ · `(tcp-accept lst)`⁶ · `(tcp-activate conn)` · `(tcp-set-active conn mode)` · `(tcp-transfer conn actor)` · `(tcp-transfer-async conn actor)` · `(tcp-tls-client conn name)` · `(tcp-tls-server conn)` · `(tcp-close-listener lst)` |
+| podman | `(podman-run image name)` · `(podman-stop name)` · `(podman-rm name force)` · `(podman-list)` |
 | meta | `(help)` · `(poll-events)` |
 
 ¹ Self-targeted blocking calls — `(exports (self))`, `(implements (self) …)`,
@@ -128,6 +130,26 @@ of hanging. Query *other* actors; for your own metadata use `(describe (self))`,
 which Theater serves without calling back into the actor. ² filesystem paths are relative to the sandbox root (the dir
 `serve` runs in). ³ http hosts are an exact-match allowlist set when the host
 registers the handler.
+
+⁴ TCP works both directions (verified live). **Client:** `(tcp-connect addr)` →
+connection id; `(tcp-send conn text)` → byte count; `(tcp-receive conn max)` →
+`list<u8>`. Data moves as `list<u8>` built from a string, so non-UTF-8 bytes need
+care. ⁵ `(tcp-receive …)` takes a `u32` `max` — the codec carries it as a proper
+CGRF `u32` (via `as-u32`), so a plain integer like `1024` works. ⁶ The **server**
+path is Erlang/OTP-style and *event-driven* — you do **not** call `(tcp-accept)`.
+`(tcp-listen addr)` starts a background accept loop; Theater then calls the actor's
+`tcp-client.{handle-connection,on-data,on-close}` exports, which dispatch to user
+handlers you define like any other trigger:
+
+```lisp
+(define on-connection (lambda (cid) cid))     ; a new connection id (PENDING)
+(define on-data       (lambda (e) e))          ; e = (sequence conn-id bytes)
+(tcp-listen "127.0.0.1:9000")
+;; when a client connects, on-connection fires with the id; to receive data:
+(tcp-activate cid)                             ; PENDING -> active
+(tcp-set-active cid "active")                  ; push mode -> on-data fires per read
+;; …or leave it activated and (tcp-receive cid max) to pull passively.
+```
 
 ## Observing Theater — inbound triggers as live handlers
 
@@ -159,7 +181,8 @@ theater-repl follow $id        # fired: beat … (Ctrl-C to stop)
 
 Redefine a handler any time to change behavior mid-stream. Triggers wired today:
 `on-tick` (timer), `on-spawn` (after `(subscribe-spawns)`), `on-message` (after
-`(msg-register)`).
+`(msg-register)`), and `on-connection` / `on-data` / `on-close` (after
+`(tcp-listen)` — see the TCP footnote).
 
 ## Extending — add a host verb
 

@@ -24,6 +24,7 @@
         ((byte-value n) (string=? name "u8"))
         ((boolean b) (string=? name "bool"))
         ((u64-value n) (string=? name "u64"))
+        ((u32-value n) (string=? name "u32"))
         ((wide-integer n) (string=? name "s64"))
         ((single n) (string=? name "f32"))
         ((double n) (string=? name "f64"))

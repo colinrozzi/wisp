@@ -37,3 +37,25 @@
 (export "theater:simple/message-server-client.handle-send"
   (fn handle-send ((raw any)) string
     (begin (dispatch-event "on-message" (unmarshal raw)) "ok")))
+
+; TCP server callbacks (theater:simple/tcp-client). After (tcp-listen addr),
+; Theater runs a background accept loop and delivers events by CALLING these
+; exports — so a TCP server in the REPL is just defining on-connection / on-data /
+; on-close handlers (like on-tick). handle-connection gets a bare connection id;
+; on-data/on-close arrive as a Tuple (taken raw as `any`, unmarshalled to a
+; sequence). on-data fires only for connections in active/once mode (set-active).
+; The pact return is result<_, string>, but the runtime only checks for a
+; transport error and otherwise ignores the value (and the dispatch already ran),
+; so — like handle-tick/handle-send — we return a plain string.
+(export "theater:simple/tcp-client.handle-connection"
+  (fn tcp-handle-connection ((connection-id string)) string
+    (begin (dispatch-event "on-connection" (text connection-id)) "ok")))
+(export "theater:simple/tcp-client.handle-connection-transfer"
+  (fn tcp-handle-transfer ((connection-id string)) string
+    (begin (dispatch-event "on-connection" (text connection-id)) "ok")))
+(export "theater:simple/tcp-client.on-data"
+  (fn tcp-on-data ((raw any)) string
+    (begin (dispatch-event "on-data" (unmarshal raw)) "ok")))
+(export "theater:simple/tcp-client.on-close"
+  (fn tcp-on-close ((raw any)) string
+    (begin (dispatch-event "on-close" (unmarshal raw)) "ok")))
