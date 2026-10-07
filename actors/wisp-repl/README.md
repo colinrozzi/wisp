@@ -123,7 +123,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
 | tcp⁴ | `(tcp-connect addr)` · `(tcp-send conn data)` → bytes · `(tcp-receive conn max)`⁵ · `(tcp-close conn)` · `(tcp-peer conn)` · `(tcp-is-tls conn)` · `(tcp-listen addr)`⁶ · `(tcp-accept lst)`⁶ · `(tcp-activate conn)` · `(tcp-set-active conn mode)` · `(tcp-transfer conn actor)` · `(tcp-transfer-async conn actor)` · `(tcp-tls-client conn name)` · `(tcp-tls-server conn)` · `(tcp-close-listener lst)` |
 | podman | `(podman-run image name)` · `(podman-stop name)` · `(podman-rm name force)` · `(podman-list)` |
-| meta | `(help)` · `(poll-events)` |
+| meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(poll-events)` |
 
 ¹ Self-targeted blocking calls — `(exports (self))`, `(implements (self) …)`,
 `(call (self) …)`, `(actor-state (self))` — would deadlock (the actor can't

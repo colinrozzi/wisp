@@ -710,16 +710,33 @@
       (begin (global.set $events (list-new value)) (sequence evs)))))
 
 ; Live catalog of the Theater host verbs, so a session can discover them cold.
+; Deeper, in-shell docs for the parts that need more than one line — reachable as
+; (help "tcp") / (help "triggers"). Keeps the bare (help) catalog scannable.
+(fn help-topic ((topic string)) string
+  (cond
+    ((string=? topic "tcp")
+      "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (sequence conn-id bytes)\n    (define on-close      (lambda (e) e))       ; e = (sequence conn-id reason)\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
+    ((string=? topic "triggers")
+      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(seq bytes)\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(seq conn-id bytes)\n  on-close      (lambda (e) ...)      TCP closed; e=(seq conn-id reason)\n\nEach firing records (handler-name event handler-result). Redefine any handler\nmid-stream to change behavior.  See also: (help \"tcp\")")
+    (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\")")))))
+
 (fn apply-help ((args (list value))) value
-  (text (string-append "Wisp REPL — a live session that drives and observes Theater.\nDefinitions accumulate: (define x ...) / (define f (lambda ...)) persist.\n\n"
-    (string-append "self/rpc:  (self) (log msg) (describe id) (exports id) (implements id iface) (call id fn arg...)\n"
-      (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
-        (string-append "runtime:   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\n"
-          (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
-            (string-append "files:     (fs-read p) (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
-              (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
-                (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
-                  "triggers:  define on-tick / on-spawn / on-message (lambda (e) ...); then (poll-events) to see what fired + results"))))))))))
+  (if (i32.eq (list-len args) 0)
+    (text (string-append "Wisp REPL — a live session that drives and observes Theater.\nDefinitions accumulate: (define x ...) / (define f (lambda ...)) persist.\n\n"
+      (string-append "self/rpc:  (self) (log msg) (describe id) (exports id) (implements id iface) (call id fn arg...)\n"
+        (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
+          (string-append "runtime:   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\n"
+            (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
+              (string-append "files:     (fs-read p) (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
+                (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
+                  (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
+                    (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\n"
+                      (string-append "podman:    (podman-run image name) (podman-stop name) (podman-rm name force) (podman-list)\n"
+                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close; (poll-events) to drain   see (help \"triggers\")\n"
+                          "topics:    (help \"tcp\")   (help \"triggers\")"))))))))))))
+    (if (string-arg? (list-get args 0))
+      (text (help-topic (as-string (list-get args 0))))
+      (failure "help expects an optional topic string"))))
 
 (fn apply-host-builtin ((name string) (args (list value))) value
   (cond
