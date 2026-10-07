@@ -15,3 +15,6 @@ examples/*.wit
 # Shareable interpreter actor artifacts (rebuild with actors/wisp-repl/build.sh).
 actors/wisp-repl/actor.wasm
 actors/wisp-repl/actor.wat
+
+# macOS folder metadata
+.DS_Store
