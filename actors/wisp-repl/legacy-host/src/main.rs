@@ -17,9 +17,12 @@ const EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), 
 const EMBEDDED_SOURCES: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../sources.json"));
 
+const VERSION: &str = env!("THEATER_REPL_VERSION");
+
 #[derive(Parser)]
 #[command(
     name = "theater-repl",
+    version = VERSION,
     about = "A live Wisp REPL that drives and observes a Theater runtime"
 )]
 struct Args {
@@ -64,6 +67,10 @@ enum Command {
     Stop { id: String },
     /// Interactive stdin/stdout prompt against a private session (for a human).
     Repl,
+    /// Print the installed version.
+    Version,
+    /// Download the latest release and replace this binary in place.
+    Upgrade,
 }
 
 #[tokio::main]
@@ -73,8 +80,30 @@ async fn main() -> Result<()> {
     match args.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(load(&args.actor_dir, &args.bundle)?, port).await,
         Command::Repl => repl(load(&args.actor_dir, &args.bundle)?).await,
+        Command::Version => {
+            println!("{VERSION}");
+            Ok(())
+        }
+        Command::Upgrade => upgrade(),
         client => run_client(client, port).await,
     }
+}
+
+/// Re-run the installer, targeting this binary's own location so the running
+/// `theater-repl` is replaced in place with the latest published release.
+fn upgrade() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().context("binary has no parent directory")?;
+    eprintln!("current version: {VERSION}");
+    eprintln!("upgrading {} ...", exe.display());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://raw.githubusercontent.com/colinrozzi/wisp/main/install.sh | sh")
+        .env("THEATER_REPL_BIN", dir)
+        .status()
+        .context("running the installer (is curl installed?)")?;
+    anyhow::ensure!(status.success(), "upgrade failed");
+    Ok(())
 }
 
 // ---- actor artifacts ------------------------------------------------------
@@ -323,7 +352,9 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
         Command::Status { id } => send(port, json!({ "op": "status", "id": id })).await,
         Command::Stop { id } => send(port, json!({ "op": "stop", "id": id })).await,
         Command::Follow { id } => follow(port, id).await,
-        Command::Serve | Command::Repl => unreachable!("handled in main"),
+        Command::Serve | Command::Repl | Command::Version | Command::Upgrade => {
+            unreachable!("handled in main")
+        }
     }
 }
 

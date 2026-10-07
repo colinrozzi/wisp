@@ -59,6 +59,8 @@ LISP
 | `status [id]` | show a session (with id) or the daemon (without) |
 | `stop <id>` | end a session and reclaim its heap |
 | `repl` | interactive stdin/stdout prompt against a private session (for a human) |
+| `version` | print the installed version (also `--version`) |
+| `upgrade` | download the latest release and replace this binary in place |
 
 Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
 `$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated
