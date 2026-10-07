@@ -136,6 +136,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "aws-lc-rs"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+dependencies = [
+ "aws-lc-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.45.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+]
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -254,6 +277,15 @@ name = "clap_lex"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "cobs"
@@ -718,6 +750,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,6 +849,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -824,6 +868,17 @@ name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
 
 [[package]]
 name = "futures-sink"
@@ -844,6 +899,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -1072,9 +1128,9 @@ dependencies = [
  "futures-util",
  "http",
  "hyper",
- "rustls",
+ "rustls 0.21.12",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.24.1",
 ]
 
 [[package]]
@@ -1880,21 +1936,21 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
- "rustls",
- "rustls-pemfile",
+ "rustls 0.21.12",
+ "rustls-pemfile 1.0.4",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "system-configuration",
  "tokio",
- "tokio-rustls",
+ "tokio-rustls 0.24.1",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 0.25.4",
  "winreg",
 ]
 
@@ -1958,8 +2014,23 @@ checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
 dependencies = [
  "log",
  "ring",
- "rustls-webpki",
+ "rustls-webpki 0.101.7",
  "sct",
+]
+
+[[package]]
+name = "rustls"
+version = "0.23.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+dependencies = [
+ "aws-lc-rs",
+ "log",
+ "once_cell",
+ "rustls-pki-types",
+ "rustls-webpki 0.103.15",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1972,12 +2043,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "rustls-pki-types"
+version = "1.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "rustls-webpki"
 version = "0.101.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring",
+ "untrusted",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+dependencies = [
+ "aws-lc-rs",
+ "ring",
+ "rustls-pki-types",
  "untrusted",
 ]
 
@@ -2121,6 +2222,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2128,6 +2239,18 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signal-hook-tokio"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "213241f76fb1e37e27de3b6aa1b068a2c333233b59cca6634f634b80a27ecf1e"
+dependencies = [
+ "futures-core",
+ "libc",
+ "signal-hook",
+ "tokio",
 ]
 
 [[package]]
@@ -2194,6 +2317,12 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
@@ -2321,6 +2450,68 @@ dependencies = [
 ]
 
 [[package]]
+name = "theater-handler-assembler"
+version = "0.3.11"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "theater",
+ "tracing",
+ "wat",
+]
+
+[[package]]
+name = "theater-handler-filesystem"
+version = "0.3.0"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "theater",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "theater-handler-http-client"
+version = "0.3.0"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "theater",
+ "tracing",
+]
+
+[[package]]
+name = "theater-handler-message-server"
+version = "0.3.13"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "theater",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "theater-handler-podman"
+version = "0.3.13"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "theater",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "theater-handler-rpc"
 version = "0.3.11"
 source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
@@ -2369,6 +2560,51 @@ dependencies = [
  "theater",
  "theater-store",
  "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "theater-handler-tcp"
+version = "0.3.22"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "rustls 0.23.45",
+ "rustls-pemfile 2.2.0",
+ "serde",
+ "theater",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-util",
+ "tracing",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "theater-handler-terminal"
+version = "0.3.11"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "libc",
+ "serde",
+ "signal-hook",
+ "signal-hook-tokio",
+ "theater",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "theater-handler-timer"
+version = "0.3.13"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "serde",
+ "theater",
+ "tokio",
  "tracing",
 ]
 
@@ -2488,7 +2724,17 @@ version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
 dependencies = [
- "rustls",
+ "rustls 0.21.12",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls 0.23.45",
  "tokio",
 ]
 
@@ -3467,6 +3713,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3775,10 +4039,18 @@ dependencies = [
  "clap",
  "serde_json",
  "theater",
+ "theater-handler-assembler",
+ "theater-handler-filesystem",
+ "theater-handler-http-client",
+ "theater-handler-message-server",
+ "theater-handler-podman",
  "theater-handler-rpc",
  "theater-handler-runtime",
  "theater-handler-self",
  "theater-handler-store",
+ "theater-handler-tcp",
+ "theater-handler-terminal",
+ "theater-handler-timer",
  "theater-native",
  "tokio",
 ]
@@ -3888,6 +4160,12 @@ dependencies = [
  "syn 3.0.6",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zerotrie"
