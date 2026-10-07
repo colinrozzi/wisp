@@ -29,3 +29,6 @@
 ; An http-request record arg (empty headers, no body) — the record-valued host
 ; argument path. The host decodes it to a Record{method,url,headers,body}.
 (export (fn m-http-req ((method string) (url string)) any (http-request-blob method url)))
+; Simulate an inbound trigger (what the actor's handle-tick export does): dispatch
+; to the user's on-tick in the live session and buffer the firing for (poll-events).
+(export (fn fire-tick ((name string)) string (begin (dispatch-event "on-tick" (text name)) "ok")))

@@ -802,6 +802,41 @@ fn test_repl_http_get_response_record() {
 }
 
 #[test]
+fn test_repl_inbound_event_dispatch() {
+    // The live-image inbound path: define on-tick in the session, fire a simulated
+    // trigger (what the actor's handle-tick export does), and (poll-events) shows
+    // the firing dispatched to the user's definition with its result.
+    let mut g = Guest::new();
+    assert_eq!(
+        g.call(
+            "evaluate",
+            Value::String("(define on-tick (lambda (n) (string-append \"got \" n)))".into()),
+        ),
+        Value::String("#<closure>".into())
+    );
+    // No events buffered yet.
+    assert_eq!(
+        g.call("evaluate", Value::String("(poll-events)".into())),
+        Value::String("()".into())
+    );
+    g.call("fire-tick", Value::String("beat".into()));
+    g.call("fire-tick", Value::String("beat".into()));
+    let out = match g.call("evaluate", Value::String("(poll-events)".into())) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        out.matches("on-tick").count() == 2 && out.contains("got beat"),
+        "poll-events did not show dispatched ticks: {out}"
+    );
+    // Drained.
+    assert_eq!(
+        g.call("evaluate", Value::String("(poll-events)".into())),
+        Value::String("()".into())
+    );
+}
+
+#[test]
 fn test_repl_store_put_writer() {
     // (store-put id content): content string -> list<u8> via str->bytes, marshalled
     // as a tuple, result unmarshalled. Mock replies ok("deadbeefhash").

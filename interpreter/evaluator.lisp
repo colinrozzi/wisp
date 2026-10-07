@@ -308,6 +308,7 @@
         (global.set $session-macros (list-new binding))
         (global.set $traits (list-new trait-definition))
         (global.set $instances (list-new trait-implementation))
+        (global.set $events (list-new value))
         (global.set $started 1) 0))
     (global.set $steps 0)
     (global.set $include-seen (list-new string))

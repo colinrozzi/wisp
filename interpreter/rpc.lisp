@@ -16,6 +16,34 @@
     ((_ (else result)) result)
     ((_ (test result) clause ...) (if test result (cond clause ...)))))
 
+; Inbound triggers (timer ticks, spawns, messages) are delivered by Theater
+; CALLING an export on this actor (handle-tick, handle-actor-spawn, ...). Because
+; the whole session is one live image — evaluate and the callbacks share $bindings
+; — a trigger just dispatches to a user-defined handler (on-tick, on-spawn, ...)
+; looked up in that env. So "add a handler" is literally "(define (on-tick d) ...)".
+; Each firing is buffered in $events (handler name, the event value, the handler's
+; result) so the REPL can see what fired via (poll-events).
+(global $events (list value) mut 0)
+
+(fn record-event ((handler string) (event value) (result value)) s32
+  (begin
+    (global.set $events (list-push (global.get $events)
+      (sequence (list-push (list-push (list-push (list-new value) (text handler)) event) result))))
+    0))
+
+; Dispatch an inbound event to a user handler named `handler` (a 1-arg function
+; defined in the session). Resets the step budget (the handler runs fresh), applies
+; the handler to the event, records (handler, event, result). If no such handler is
+; defined, records the event with a "no handler" note so it is still visible.
+(fn dispatch-event ((handler string) (event value)) value
+  (begin
+    (global.set $steps (i32.const 0))
+    (let (h (lookup handler (list-new binding)))
+      (if (failed? h)
+        (begin (record-event handler event (text "no handler defined")) h)
+        (let (result (apply-value h (list-push (list-new value) event) (i32.const 0) ""))
+          (begin (record-event handler event result) result))))))
+
 (import theater:simple/rpc describe ((actor-id string)) any)
 (import theater:simple/rpc exports ((actor-id string)) any)
 (import theater:simple/rpc implements ((actor-id string) (interface string)) any)
@@ -185,6 +213,7 @@
     ((string=? name "term-input") 1)
     ((string=? name "http-get") 1)
     ((string=? name "http-req") 1)
+    ((string=? name "poll-events") 1)
     (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
@@ -522,6 +551,14 @@
         (http-request-blob "GET" (as-string (list-get args 0)))))
       (failure "http-get expects a string url"))))
 
+; --- inbound events --------------------------------------------------------
+; Drain the buffered triggers: each is (handler-name event result). Clears the
+; buffer so you see only what fired since the last poll.
+(fn apply-poll-events ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "poll-events expects no arguments")
+    (let (evs (global.get $events))
+      (begin (global.set $events (list-new value)) (sequence evs)))))
+
 (fn apply-host-builtin ((name string) (args (list value))) value
   (cond
     ((string=? name "self") (apply-self args))
@@ -577,4 +614,5 @@
     ((string=? name "term-input") (apply-term-input args))
     ((string=? name "http-get") (apply-http-get args))
     ((string=? name "http-req") (apply-http-req args))
+    ((string=? name "poll-events") (apply-poll-events args))
     (else (failure (string-append "unknown host builtin: " name)))))

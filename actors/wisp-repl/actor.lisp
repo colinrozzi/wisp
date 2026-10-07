@@ -19,3 +19,11 @@
 (export "theater:simple/wisp.evaluate"
   (fn actor-evaluate ((source string)) string
     (evaluate source)))
+
+; Inbound trigger: Theater calls this when a timer interval fires. We dispatch to
+; a user-defined `on-tick` in the live session (define it from the REPL); the
+; firing + the handler's result are buffered for (poll-events). The return is
+; ignored by the runtime, so a trap-free "ok" suffices.
+(export "theater:simple/timer.handle-tick"
+  (fn handle-tick ((name string)) string
+    (begin (dispatch-event "on-tick" (text name)) "ok")))
