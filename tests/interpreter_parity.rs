@@ -13,16 +13,27 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 fn compile(source: &Path, name: &str) -> PathBuf {
-    compiler::compile(
-        source,
-        &root().join(format!(
-            "target/interpreter-parity/{}/{name}",
-            std::process::id()
-        )),
-        compiler::EmitOptions::default(),
-    )
-    .unwrap()
-    .wasm
+    // Compiling the evaluator recurses per expression node and exceeds the default
+    // 2 MiB test stack, so build on a large stack.
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn_scoped(s, || {
+                compiler::compile(
+                    source,
+                    &root().join(format!(
+                        "target/interpreter-parity/{}/{name}",
+                        std::process::id()
+                    )),
+                    compiler::EmitOptions::default(),
+                )
+                .unwrap()
+                .wasm
+            })
+            .expect("spawn big-stack compile thread")
+            .join()
+            .expect("big-stack compile thread panicked")
+    })
 }
 fn session() -> Interpreter {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();

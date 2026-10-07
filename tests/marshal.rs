@@ -18,13 +18,25 @@ fn package() -> &'static PathBuf {
             "target/marshal-tests/{}/marshal",
             std::process::id()
         ));
-        compiler::compile(
-            &root.join("tests/fixtures/marshal.lisp"),
-            &out,
-            EmitOptions::default(),
-        )
-        .unwrap()
-        .wasm
+        // The fixture includes the full evaluator; compiling it recurses per
+        // expression node and exceeds the default 2 MiB test stack, so run the
+        // compile on a large stack (as the codegen/self_hosted tests do).
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(1 << 30)
+                .spawn_scoped(s, || {
+                    compiler::compile(
+                        &root.join("tests/fixtures/marshal.lisp"),
+                        &out,
+                        EmitOptions::default(),
+                    )
+                    .unwrap()
+                    .wasm
+                })
+                .expect("spawn big-stack compile thread")
+                .join()
+                .expect("big-stack compile thread panicked")
+        })
     })
 }
 
@@ -194,6 +206,36 @@ impl Guest {
                             ),
                         ],
                     }],
+                })),
+            },
+        );
+        // More runtime verbs: get-actor-manifest (result<string>) and
+        // get-actor-state (result<option<list<u8>>>). The mock replies immediately,
+        // so these exercise the verb dispatch + codec without the self-query
+        // reentrancy that deadlocks a live (actor-state (self)).
+        mock_import(
+            &mut linker,
+            "theater:simple/runtime",
+            "get-actor-manifest",
+            Value::Result {
+                ok_type: ValueType::String,
+                err_type: ValueType::Record("runtime-error".into()),
+                value: Ok(Box::new(Value::String("name = \"demo\"".into()))),
+            },
+        );
+        mock_import(
+            &mut linker,
+            "theater:simple/runtime",
+            "get-actor-state",
+            Value::Result {
+                ok_type: ValueType::Option(Box::new(ValueType::List(Box::new(ValueType::U8)))),
+                err_type: ValueType::Record("runtime-error".into()),
+                value: Ok(Box::new(Value::Option {
+                    inner_type: ValueType::List(Box::new(ValueType::U8)),
+                    value: Some(Box::new(Value::List {
+                        elem_type: ValueType::U8,
+                        items: vec![Value::U8(1), Value::U8(2), Value::U8(3)],
+                    })),
                 })),
             },
         );
@@ -591,6 +633,37 @@ fn test_repl_runtime_list_actors_named_types() {
             && out.contains("counter"),
         "list-actors did not decode as expected: {out}"
     );
+}
+
+#[test]
+fn test_repl_runtime_more_verbs() {
+    // get-actor-manifest -> result<string>, and get-actor-state ->
+    // result<option<list<u8>>> (the option-of-byte-buffer ok arm). Both decode to
+    // inspectable values, confirming the extended runtime verbs dispatch + the
+    // codec handles option<list<u8>> inside a result.
+    let mut g = Guest::new();
+    let man = match g.call("evaluate", Value::String("(actor-manifest \"a\")".into())) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        man.contains("ok") && man.contains("demo"),
+        "actor-manifest: {man}"
+    );
+    let state = match g.call("evaluate", Value::String("(actor-state \"a\")".into())) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        state.contains("ok") && state.contains("some"),
+        "actor-state: {state}"
+    );
+    // Arity errors stay ordinary diagnostics.
+    let err = match g.call("evaluate", Value::String("(kill-actor)".into())) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(err.contains("kill-actor expects"), "{err}");
 }
 
 #[test]

@@ -7,16 +7,27 @@ fn session() -> Interpreter {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
     let package = PACKAGE.get_or_init(|| {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        compiler::compile(
-            &root.join("interpreter/evaluator.lisp"),
-            &root.join(format!(
-                "target/interpreter-tests/{}/evaluator",
-                std::process::id()
-            )),
-            compiler::EmitOptions::default(),
-        )
-        .unwrap()
-        .wasm
+        // Compiling the evaluator recurses per expression node and exceeds the
+        // default 2 MiB test stack, so build it on a large stack.
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(1 << 30)
+                .spawn_scoped(s, || {
+                    compiler::compile(
+                        &root.join("interpreter/evaluator.lisp"),
+                        &root.join(format!(
+                            "target/interpreter-tests/{}/evaluator",
+                            std::process::id()
+                        )),
+                        compiler::EmitOptions::default(),
+                    )
+                    .unwrap()
+                    .wasm
+                })
+                .expect("spawn big-stack compile thread")
+                .join()
+                .expect("big-stack compile thread panicked")
+        })
     });
     Interpreter::load(package).unwrap()
 }

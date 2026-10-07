@@ -90,7 +90,17 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
         );
     }
     // runtime bridge — likewise only needs to exist for this preflight.
-    for name in ["list-actors", "get-actor-status", "stop-actor"] {
+    for name in [
+        "list-actors",
+        "get-actor-status",
+        "get-actor-state",
+        "get-actor-manifest",
+        "stop-actor",
+        "kill-actor",
+        "subscribe-to-spawns",
+        "unsubscribe-from-spawns",
+        "shutdown-runtime",
+    ] {
         imports.define(
             "theater:simple/runtime",
             name,
@@ -125,15 +135,26 @@ fn test_interpreter_capture_based_engine_session_and_imports() {
 
 async fn engine_session() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let package = wisp::compiler::compile(
-        &root.join("interpreter/evaluator.lisp"),
-        &root.join(format!(
-            "target/interpreter-engine/{}/evaluator",
-            std::process::id()
-        )),
-        wisp::compiler::EmitOptions::default(),
-    )
-    .unwrap();
+    // Compiling the evaluator recurses per expression node and exceeds the default
+    // 2 MiB test stack, so build it on a large stack.
+    let package = std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn_scoped(s, || {
+                wisp::compiler::compile(
+                    &root.join("interpreter/evaluator.lisp"),
+                    &root.join(format!(
+                        "target/interpreter-engine/{}/evaluator",
+                        std::process::id()
+                    )),
+                    wisp::compiler::EmitOptions::default(),
+                )
+                .unwrap()
+            })
+            .expect("spawn big-stack compile thread")
+            .join()
+            .expect("big-stack compile thread panicked")
+    });
     let wasm = std::fs::read(package.wasm).unwrap();
     let metadata = packr_core::metadata::metadata_with_hashes_from_module(&wasm)
         .unwrap()
