@@ -110,6 +110,38 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("runtime not exercised".into())) }),
         );
     }
+    // message-server / assembler / timer — exist-only stubs for this preflight.
+    for name in [
+        "register",
+        "send",
+        "request",
+        "list-outstanding-requests",
+        "respond-to-request",
+        "cancel-request",
+        "open-channel",
+        "send-on-channel",
+        "close-channel",
+    ] {
+        imports.define(
+            "theater:simple/message-server-host",
+            name,
+            host_fn(
+                |_input| async move { Ok(Value::String("message-server not exercised".into())) },
+            ),
+        );
+    }
+    imports.define(
+        "wisp:assembler/runtime",
+        "wat-to-wasm",
+        host_fn(|_input| async move { Ok(Value::String("assembler not exercised".into())) }),
+    );
+    for name in ["now", "set-interval", "clear-interval"] {
+        imports.define(
+            "theater:simple/timer",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("timer not exercised".into())) }),
+        );
+    }
     imports
 }
 

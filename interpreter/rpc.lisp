@@ -9,6 +9,13 @@
 ; the glue is identical.) `call`, whose params are themselves dynamic values,
 ; needs import-side `any`-argument encoding and is a separate step.
 
+; Flat multi-way dispatch, so adding a host verb is a single clause (no nested-if
+; paren juggling). Standard recursive cond over the base compiler's syntax-rules.
+(define-syntax cond
+  (syntax-rules (else)
+    ((_ (else result)) result)
+    ((_ (test result) clause ...) (if test result (cond clause ...)))))
+
 (import theater:simple/rpc describe ((actor-id string)) any)
 (import theater:simple/rpc exports ((actor-id string)) any)
 (import theater:simple/rpc implements ((actor-id string) (interface string)) any)
@@ -66,31 +73,70 @@
 (import theater:simple/runtime unsubscribe-from-spawns () (result unit runtime-error))
 (import theater:simple/runtime shutdown-runtime () (result unit runtime-error))
 
+; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
+; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
+; actor, so they need a peer to exercise; register/list-requests are self-contained.)
+(import theater:simple/message-server-host register () (result unit string))
+(import theater:simple/message-server-host send ((actor-id string) (msg (list u8))) (result unit string))
+(import theater:simple/message-server-host request ((actor-id string) (msg (list u8))) (result (list u8) string))
+(import theater:simple/message-server-host list-outstanding-requests () (list string))
+(import theater:simple/message-server-host respond-to-request ((request-id string) (response (list u8))) (result unit string))
+(import theater:simple/message-server-host cancel-request ((request-id string)) (result unit string))
+(import theater:simple/message-server-host open-channel ((actor-id string) (initial-msg (list u8))) (result string string))
+(import theater:simple/message-server-host send-on-channel ((channel-id string) (msg (list u8))) (result unit string))
+(import theater:simple/message-server-host close-channel ((channel-id string)) (result unit string))
+
+; assembler (wisp:assembler/runtime): compile WAT text to a wasm byte vector —
+; directly useful inside a Wisp REPL.
+(import wisp:assembler/runtime wat-to-wasm ((wat string)) (result (list u8) string))
+
+; timer: now() reads the clock (bare u64); set-interval/clear-interval drive the
+; actor's tick callback.
+(import theater:simple/timer now () u64)
+(import theater:simple/timer set-interval ((name string) (interval-ms u64)) (result string string))
+(import theater:simple/timer clear-interval ((name string)) (result unit string))
+
 ; Names the evaluator routes to the Theater bridge rather than ordinary builtins.
 (fn host-builtin? ((name string)) s32
-  (i32.or (string=? name "self") (i32.or (string=? name "log")
-    (i32.or (string=? name "call")
-      (i32.or (string=? name "describe")
-        (i32.or (string=? name "exports")
-          (i32.or (string=? name "implements")
-            (i32.or (string=? name "store-new")
-              (i32.or (string=? name "store-get")
-                (i32.or (string=? name "store-get-by-label")
-                  (i32.or (string=? name "store-list-labels")
-                    (i32.or (string=? name "store-exists")
-                      (i32.or (string=? name "store-size")
-                        (i32.or (string=? name "list-actors")
-                          (i32.or (string=? name "actor-status")
-                            (i32.or (string=? name "stop-actor")
-                              (i32.or (string=? name "actor-state")
-                                (i32.or (string=? name "actor-manifest")
-                                  (i32.or (string=? name "kill-actor")
-                                    (i32.or (string=? name "subscribe-spawns")
-                                      (i32.or (string=? name "unsubscribe-spawns")
-                                        (i32.or (string=? name "shutdown-runtime")
-                                          (i32.or (string=? name "store-put")
-                                            (i32.or (string=? name "store-label")
-                                              (string=? name "store-put-at")))))))))))))))))))))))))
+  (cond
+    ((string=? name "self") 1)
+    ((string=? name "log") 1)
+    ((string=? name "call") 1)
+    ((string=? name "describe") 1)
+    ((string=? name "exports") 1)
+    ((string=? name "implements") 1)
+    ((string=? name "store-new") 1)
+    ((string=? name "store-get") 1)
+    ((string=? name "store-get-by-label") 1)
+    ((string=? name "store-list-labels") 1)
+    ((string=? name "store-exists") 1)
+    ((string=? name "store-size") 1)
+    ((string=? name "store-put") 1)
+    ((string=? name "store-label") 1)
+    ((string=? name "store-put-at") 1)
+    ((string=? name "list-actors") 1)
+    ((string=? name "actor-status") 1)
+    ((string=? name "actor-state") 1)
+    ((string=? name "actor-manifest") 1)
+    ((string=? name "stop-actor") 1)
+    ((string=? name "kill-actor") 1)
+    ((string=? name "subscribe-spawns") 1)
+    ((string=? name "unsubscribe-spawns") 1)
+    ((string=? name "shutdown-runtime") 1)
+    ((string=? name "msg-register") 1)
+    ((string=? name "msg-send") 1)
+    ((string=? name "msg-request") 1)
+    ((string=? name "msg-list-requests") 1)
+    ((string=? name "msg-respond") 1)
+    ((string=? name "msg-cancel") 1)
+    ((string=? name "msg-open") 1)
+    ((string=? name "msg-send-channel") 1)
+    ((string=? name "msg-close-channel") 1)
+    ((string=? name "wat-to-wasm") 1)
+    ((string=? name "now") 1)
+    ((string=? name "set-interval") 1)
+    ((string=? name "clear-interval") 1)
+    (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
 (fn as-string ((v value)) string (value-case v ((text s) s) (else "")))
@@ -265,29 +311,117 @@
   (if (i32.ne (list-len args) 0) (failure "shutdown-runtime expects no arguments")
     (unmarshal (raw-invoke "shutdown-runtime" (arg-tuple (list-new value))))))
 
+; --- message-server --------------------------------------------------------
+; Shared shapes: (string, message) -> Tuple(String, list<u8>); a single string
+; arg marshals bare (accepted by every host's parser, required by some).
+(fn str-bytes-tuple ((a value) (b value)) any
+  (marshal (sequence (list-push (list-push (list-new value) a) (str-to-bytes b)))))
+
+(fn apply-msg-register ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "msg-register expects no arguments")
+    (unmarshal (raw-invoke "register" (arg-tuple (list-new value))))))
+(fn apply-msg-list-requests ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "msg-list-requests expects no arguments")
+    (unmarshal (raw-invoke "list-outstanding-requests" (arg-tuple (list-new value))))))
+(fn apply-msg-send ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "msg-send expects (msg-send actor-id message)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "send" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "msg-send expects two strings: actor id and message"))))
+(fn apply-msg-request ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "msg-request expects (msg-request actor-id message)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "request" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "msg-request expects two strings: actor id and message"))))
+(fn apply-msg-respond ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "msg-respond expects (msg-respond request-id response)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "respond-to-request" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "msg-respond expects two strings: request id and response"))))
+(fn apply-msg-cancel ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "msg-cancel expects (msg-cancel request-id)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "cancel-request" (marshal (list-get args 0))))
+      (failure "msg-cancel expects a string request id"))))
+(fn apply-msg-open ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "msg-open expects (msg-open actor-id initial-message)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "open-channel" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "msg-open expects two strings: actor id and initial message"))))
+(fn apply-msg-send-channel ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "msg-send-channel expects (msg-send-channel channel-id message)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "send-on-channel" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "msg-send-channel expects two strings: channel id and message"))))
+(fn apply-msg-close-channel ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "msg-close-channel expects (msg-close-channel channel-id)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "close-channel" (marshal (list-get args 0))))
+      (failure "msg-close-channel expects a string channel id"))))
+
+; --- assembler -------------------------------------------------------------
+(fn apply-wat-to-wasm ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "wat-to-wasm expects (wat-to-wasm wat-text)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "wat-to-wasm" (marshal (list-get args 0))))
+      (failure "wat-to-wasm expects a string of WAT"))))
+
+; --- timer -----------------------------------------------------------------
+(fn as-u64 ((v value)) value
+  (value-case v
+    ((integer n) (u64-value (i64.extend_i32_s n)))
+    ((wide-integer n) (u64-value n))
+    ((u64-value n) (u64-value n))
+    (else (u64-value (i64.const 0)))))
+(fn apply-timer-now ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "now expects no arguments")
+    (unmarshal (raw-invoke "now" (arg-tuple (list-new value))))))
+(fn apply-timer-set ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "set-interval expects (set-interval name interval-ms)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "set-interval"
+        (marshal (sequence (list-push (list-push (list-new value)
+          (list-get args 0)) (as-u64 (list-get args 1)))))))
+      (failure "set-interval expects a string name and an integer interval"))))
+(fn apply-timer-clear ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "clear-interval expects (clear-interval name)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "clear-interval" (marshal (list-get args 0))))
+      (failure "clear-interval expects a string name"))))
+
 (fn apply-host-builtin ((name string) (args (list value))) value
-  (if (string=? name "self") (apply-self args)
-    (if (string=? name "log") (apply-log args)
-      (if (string=? name "call") (apply-call args)
-        (if (string=? name "describe") (apply-describe args)
-          (if (string=? name "exports") (apply-exports args)
-            (if (string=? name "implements") (apply-implements args)
-              (if (string=? name "store-new") (apply-store-new args)
-                (if (string=? name "store-get") (apply-store-get args)
-                  (if (string=? name "store-get-by-label") (apply-store-get-by-label args)
-                    (if (string=? name "store-list-labels") (apply-store-list-labels args)
-                      (if (string=? name "store-exists") (apply-store-exists args)
-                        (if (string=? name "store-size") (apply-store-size args)
-                          (if (string=? name "list-actors") (apply-runtime-list-actors args)
-                            (if (string=? name "actor-status") (apply-runtime-status args)
-                              (if (string=? name "stop-actor") (apply-runtime-stop args)
-                                (if (string=? name "actor-state") (apply-runtime-state args)
-                                  (if (string=? name "actor-manifest") (apply-runtime-manifest args)
-                                    (if (string=? name "kill-actor") (apply-runtime-kill args)
-                                      (if (string=? name "subscribe-spawns") (apply-runtime-subscribe args)
-                                        (if (string=? name "unsubscribe-spawns") (apply-runtime-unsubscribe args)
-                                          (if (string=? name "shutdown-runtime") (apply-runtime-shutdown args)
-                                            (if (string=? name "store-put") (apply-store-put args)
-                                              (if (string=? name "store-label") (apply-store-label args)
-                                                (if (string=? name "store-put-at") (apply-store-put-at args)
-                                                  (failure (string-append "unknown host builtin: " name)))))))))))))))))))))))))))
+  (cond
+    ((string=? name "self") (apply-self args))
+    ((string=? name "log") (apply-log args))
+    ((string=? name "call") (apply-call args))
+    ((string=? name "describe") (apply-describe args))
+    ((string=? name "exports") (apply-exports args))
+    ((string=? name "implements") (apply-implements args))
+    ((string=? name "store-new") (apply-store-new args))
+    ((string=? name "store-get") (apply-store-get args))
+    ((string=? name "store-get-by-label") (apply-store-get-by-label args))
+    ((string=? name "store-list-labels") (apply-store-list-labels args))
+    ((string=? name "store-exists") (apply-store-exists args))
+    ((string=? name "store-size") (apply-store-size args))
+    ((string=? name "store-put") (apply-store-put args))
+    ((string=? name "store-label") (apply-store-label args))
+    ((string=? name "store-put-at") (apply-store-put-at args))
+    ((string=? name "list-actors") (apply-runtime-list-actors args))
+    ((string=? name "actor-status") (apply-runtime-status args))
+    ((string=? name "actor-state") (apply-runtime-state args))
+    ((string=? name "actor-manifest") (apply-runtime-manifest args))
+    ((string=? name "stop-actor") (apply-runtime-stop args))
+    ((string=? name "kill-actor") (apply-runtime-kill args))
+    ((string=? name "subscribe-spawns") (apply-runtime-subscribe args))
+    ((string=? name "unsubscribe-spawns") (apply-runtime-unsubscribe args))
+    ((string=? name "shutdown-runtime") (apply-runtime-shutdown args))
+    ((string=? name "msg-register") (apply-msg-register args))
+    ((string=? name "msg-send") (apply-msg-send args))
+    ((string=? name "msg-request") (apply-msg-request args))
+    ((string=? name "msg-list-requests") (apply-msg-list-requests args))
+    ((string=? name "msg-respond") (apply-msg-respond args))
+    ((string=? name "msg-cancel") (apply-msg-cancel args))
+    ((string=? name "msg-open") (apply-msg-open args))
+    ((string=? name "msg-send-channel") (apply-msg-send-channel args))
+    ((string=? name "msg-close-channel") (apply-msg-close-channel args))
+    ((string=? name "wat-to-wasm") (apply-wat-to-wasm args))
+    ((string=? name "now") (apply-timer-now args))
+    ((string=? name "set-interval") (apply-timer-set args))
+    ((string=? name "clear-interval") (apply-timer-clear args))
+    (else (failure (string-append "unknown host builtin: " name)))))

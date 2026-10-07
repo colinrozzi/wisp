@@ -47,6 +47,17 @@ impl Runtime {
                 mutate: true,
             }),
         ));
+        // Inter-actor messaging (shares one background router across actors).
+        handlers.register(theater_handler_message_server::MessageServerHandler::new(
+            Some(theater::config::permissions::MessageServerPermissions),
+            theater_handler_message_server::MessageRouter::new(),
+        ));
+        // Periodic ticks + wall clock.
+        handlers.register(theater_handler_timer::TimerHandler::new(
+            theater_handler_timer::TimerHandlerConfig::default(),
+        ));
+        // WAT -> wasm assembly (wisp:assembler/runtime).
+        handlers.register(theater_handler_assembler::AssemblerHandler::new());
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,
