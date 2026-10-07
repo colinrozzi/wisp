@@ -172,6 +172,11 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("terminal not exercised".into())) }),
         );
     }
+    imports.define(
+        "theater:simple/http-client",
+        "request",
+        host_fn(|_input| async move { Ok(Value::String("http-client not exercised".into())) }),
+    );
     imports
 }
 

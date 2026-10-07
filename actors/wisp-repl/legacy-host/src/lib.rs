@@ -79,6 +79,18 @@ impl Runtime {
         handlers.register(theater_handler_terminal::TerminalHandler::new(
             theater_handler_terminal::TerminalHandlerConfig::default(),
         ));
+        // Outbound HTTP. allowed_hosts is an exact-match allowlist (no wildcard);
+        // seed a few well-known hosts so the REPL can make real requests.
+        handlers.register(theater_handler_http_client::HttpClientHandler::new(
+            theater::config::actor_manifest::HttpClientHandlerConfig {
+                allowed_hosts: vec![
+                    "example.com".to_string(),
+                    "api.github.com".to_string(),
+                    "httpbin.org".to_string(),
+                    "raw.githubusercontent.com".to_string(),
+                ],
+            },
+        ));
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,

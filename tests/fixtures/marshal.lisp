@@ -26,3 +26,6 @@
 ; routes to the packed Array node, not a List of u8 nodes).
 (export (fn m-strbytes ((s string)) any
   (marshal (sequence (list-push (list-push (list-new value) (text "id")) (str-to-bytes (text s)))))))
+; An http-request record arg (empty headers, no body) — the record-valued host
+; argument path. The host decodes it to a Record{method,url,headers,body}.
+(export (fn m-http-req ((method string) (url string)) any (http-request-blob method url)))

@@ -121,6 +121,14 @@
 (import theater:simple/terminal get-size () (result (tuple u16 u16) string))
 (import theater:simple/terminal enable-input () (result unit string))
 
+; http-client: outbound HTTP. The request is a RECORD argument (the first record
+; ARG we marshal), built via marshal-record; the response record (u16 status)
+; comes back through unmarshal/register-on-arrival.
+(record http-header (name string) (value string))
+(record http-request (method string) (url string) (headers (list http-header)) (body (option (list u8))))
+(record http-response (status u16) (headers (list http-header)) (body (option (list u8))))
+(import theater:simple/http-client request ((req http-request)) (result http-response string))
+
 ; Names the evaluator routes to the Theater bridge rather than ordinary builtins.
 (fn host-builtin? ((name string)) s32
   (cond
@@ -175,6 +183,8 @@
     ((string=? name "term-raw") 1)
     ((string=? name "term-size") 1)
     ((string=? name "term-input") 1)
+    ((string=? name "http-get") 1)
+    ((string=? name "http-req") 1)
     (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
@@ -486,6 +496,32 @@
   (if (i32.ne (list-len args) 0) (failure "term-input expects no arguments")
     (unmarshal (raw-invoke "theater:simple/terminal" "enable-input" (arg-tuple (list-new value))))))
 
+; --- http-client -----------------------------------------------------------
+; Build an http-request record value (empty headers, no body) and marshal it as
+; the record ARG. field names/order match the pact; headers is an empty
+; list<http-header>, body a none option<list<u8>> — their element/inner type tags
+; are emitted by the codec from the descriptors below.
+(fn http-request-blob ((method string) (url string)) any
+  (marshal-record "http-request"
+    (list-push (list-push (list-push (list-push (list-new value)
+      (symbol "method")) (symbol "url")) (symbol "headers")) (symbol "body"))
+    (list-push (list-push (list-push (list-push (list-new value)
+      (text method)) (text url))
+      (typed-list (symbol "http-header") (list-new value)))
+      (compound (unary-type "option" (unary-type "list" (symbol "u8"))) "none" (list-new value)))))
+(fn apply-http-req ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "http-req expects (http-req method url)")
+    (if (all-strings? args 0)
+      (unmarshal (raw-invoke "theater:simple/http-client" "request"
+        (http-request-blob (as-string (list-get args 0)) (as-string (list-get args 1)))))
+      (failure "http-req expects two strings: method and url"))))
+(fn apply-http-get ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "http-get expects (http-get url)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "theater:simple/http-client" "request"
+        (http-request-blob "GET" (as-string (list-get args 0)))))
+      (failure "http-get expects a string url"))))
+
 (fn apply-host-builtin ((name string) (args (list value))) value
   (cond
     ((string=? name "self") (apply-self args))
@@ -539,4 +575,6 @@
     ((string=? name "term-raw") (apply-term-raw args))
     ((string=? name "term-size") (apply-term-size args))
     ((string=? name "term-input") (apply-term-input args))
+    ((string=? name "http-get") (apply-http-get args))
+    ((string=? name "http-req") (apply-http-req args))
     (else (failure (string-append "unknown host builtin: " name)))))

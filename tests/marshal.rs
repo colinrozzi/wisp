@@ -266,6 +266,45 @@ impl Guest {
                 value: Ok(Box::new(Value::Bool(true))),
             },
         );
+        // http-client.request -> result<http-response, string>. The response is a
+        // record with a u16 status and a nested list<http-header>; the verb decodes
+        // it via register-on-arrival. (The mock ignores the request record arg,
+        // which m-http-req validates separately.)
+        mock_import(
+            &mut linker,
+            "theater:simple/http-client",
+            "request",
+            Value::Result {
+                ok_type: ValueType::Record("http-response".into()),
+                err_type: ValueType::String,
+                value: Ok(Box::new(Value::Record {
+                    type_name: "http-response".into(),
+                    fields: vec![
+                        ("status".into(), Value::U16(200)),
+                        (
+                            "headers".into(),
+                            Value::List {
+                                elem_type: ValueType::Record("http-header".into()),
+                                items: vec![Value::Record {
+                                    type_name: "http-header".into(),
+                                    fields: vec![
+                                        ("name".into(), Value::String("content-type".into())),
+                                        ("value".into(), Value::String("text/html".into())),
+                                    ],
+                                }],
+                            },
+                        ),
+                        (
+                            "body".into(),
+                            Value::Option {
+                                inner_type: ValueType::List(Box::new(ValueType::U8)),
+                                value: None,
+                            },
+                        ),
+                    ],
+                })),
+            },
+        );
         // Any other host import the evaluator declares (self/store.get/...) traps.
         linker.define_unknown_imports_as_traps(&module).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -702,6 +741,64 @@ fn test_repl_interface_qualified_collision() {
         other => panic!("{other:?}"),
     };
     assert!(fs.contains("bool") && fs.contains("true"), "{fs}");
+}
+
+#[test]
+fn test_marshal_http_request_record_arg() {
+    // The record-valued argument path: build an http-request record (empty headers,
+    // none body) and marshal it; the host decodes it to a Record with the right
+    // fields. The empty list<http-header> and option<list<u8>> carry their element/
+    // inner type tags.
+    let mut g = Guest::new();
+    let got = g.call(
+        "m-http-req",
+        Value::Tuple(vec![
+            Value::String("GET".into()),
+            Value::String("https://example.com".into()),
+        ]),
+    );
+    let Value::Record { type_name, fields } = got else {
+        panic!("expected http-request record, got {got:?}")
+    };
+    assert_eq!(type_name, "http-request");
+    let get = |n: &str| fields.iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    assert_eq!(get("method"), Some(&Value::String("GET".into())));
+    assert_eq!(
+        get("url"),
+        Some(&Value::String("https://example.com".into()))
+    );
+    assert!(
+        matches!(get("headers"), Some(Value::List { items, .. }) if items.is_empty()),
+        "headers: {:?}",
+        get("headers")
+    );
+    assert!(
+        matches!(get("body"), Some(Value::Option { value: None, .. })),
+        "body: {:?}",
+        get("body")
+    );
+}
+
+#[test]
+fn test_repl_http_get_response_record() {
+    // (http-get url) -> the verb builds+marshals the request record, calls the
+    // mock, and unmarshals the http-response record (u16 status + nested
+    // list<http-header>) to an inspectable value.
+    let mut g = Guest::new();
+    let out = match g.call(
+        "evaluate",
+        Value::String("(http-get \"https://example.com\")".into()),
+    ) {
+        Value::String(s) => s,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        out.contains("ok")
+            && out.contains("http-response")
+            && out.contains("200")
+            && out.contains("content-type"),
+        "http-get response not decoded as expected: {out}"
+    );
 }
 
 #[test]

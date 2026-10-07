@@ -304,6 +304,26 @@
             (i32.store buf cgrf-len)                                       ; len prefix
             (any-from-addr buf)))))))
 
+; Marshal a record directly from (type-name, field-name symbols, field values)
+; without needing the type registered in $types — the way to send a foreign
+; record as a host-call argument (e.g. http-request). Field values are ordinary
+; interp values (strings, lists, options, ...); nested records would recurse via
+; their own aggregate/marshal-record, but typical args (empty lists, none) don't.
+(fn marshal-record ((name string) (fnames (list value)) (fields (list value))) any
+  (let (buf (heap-alloc (i32.const 16388)))
+    (begin
+      (global.set $enc-cur (i32.add buf (i32.const 20)))
+      (global.set $enc-idx (i32.const 0))
+      (let (root (enc-record name fnames fields))
+        (let (cgrf-len (i32.sub (global.get $enc-cur) (i32.add buf (i32.const 4))))
+          (begin
+            (i32.store (i32.add buf (i32.const 4)) (i32.const 1179797315))
+            (i32.store (i32.add buf (i32.const 8)) (i32.const 3))
+            (i32.store (i32.add buf (i32.const 12)) (global.get $enc-idx))
+            (i32.store (i32.add buf (i32.const 16)) root)
+            (i32.store buf cgrf-len)
+            (any-from-addr buf)))))))
+
 ; ---------------------------------------------------------------------------
 ; unmarshal — Pack dynamic `any` (CGRF) back into an interpreter `value`.
 ; The mirror of marshal: walk the node graph from the root, dispatch on the
