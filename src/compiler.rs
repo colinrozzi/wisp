@@ -781,6 +781,20 @@ pub enum Expr {
     TupleConstruct {
         values: Vec<Expr>,
     },
+    /// Mint a capability for the duration of a scope: (with-cap (c Cap) body).
+    /// `name` is bound to a fresh linear capability token of type `cap` (a resource
+    /// name); `body` must consume it exactly once. Zero runtime cost: the token is
+    /// an i32 witness and the form lowers to its body.
+    WithCap {
+        name: String,
+        cap: String,
+        body: Box<Expr>,
+    },
+    /// Consume (release) a capability token: (release-cap c) -> s32. The terminal
+    /// consumer that discharges a capability's linear obligation.
+    ReleaseCap {
+        value: Box<Expr>,
+    },
 }
 
 /// A single arm in a match expression
@@ -1113,6 +1127,10 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         | Expr::StringToBytes { .. } => true, // allocate new strings/lists
         Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
         Expr::TupleConstruct { .. } => true,
+        // A capability witness is an i32 constant; with-cap/release-cap only touch
+        // the heap if their body/value does.
+        Expr::WithCap { body, .. } => expr_uses_heap(body),
+        Expr::ReleaseCap { value } => expr_uses_heap(value),
     }
 }
 
@@ -1322,6 +1340,9 @@ pub struct Program {
     pub records: Vec<RecordDef>,
     pub variants: Vec<VariantDef>,
     pub resources: Vec<ResourceDef>,
+    /// Names of declared capability types (a subset of resource names). Bindings
+    /// of these types are linear and may only be minted by `with-cap`.
+    pub capabilities: HashSet<String>,
     pub world_config: Option<WorldConfig>,
     pub data_segments: Vec<DataSegment>,
 }
@@ -1607,7 +1628,7 @@ fn type_check(
                 body_ty
             );
         }
-        check_fn_linearity(func)?;
+        check_fn_linearity(func, &prog.capabilities)?;
     }
     Ok(())
 }
@@ -1643,6 +1664,7 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
         | Expr::GlobalSet { value: expr, .. }
         | Expr::Some { value: expr, .. }
         | Expr::Ok { value: expr, .. }
+        | Expr::ReleaseCap { value: expr }
         | Expr::Err { value: expr, .. } => vec![expr],
         Expr::Call { args, .. }
         | Expr::WasmInstr { args, .. }
@@ -1656,6 +1678,7 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
             else_branch,
         } => vec![cond, then_branch, else_branch],
         Expr::Let { value, body, .. } => vec![value, body],
+        Expr::WithCap { body, .. } => vec![body],
         Expr::Match { expr, cases } => {
             let mut v = vec![expr.as_ref()];
             v.extend(cases.iter().map(|a| &a.body));
@@ -1737,6 +1760,28 @@ fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usi
             acc = merge_sum(acc, &first);
             Ok(acc)
         }
+        Expr::WithCap { name, body, .. } => {
+            // The minted capability is linear: it must be consumed exactly once
+            // within the body, and does not escape the scope. Outer linear bindings
+            // referenced in the body still count toward their own obligations.
+            let mut inner = linear.clone();
+            inner.insert(name.clone());
+            let mut uses = linear_uses(body, &inner)?;
+            match uses.get(name).copied().unwrap_or(0) {
+                1 => {}
+                0 => bail!(
+                    "capability '{}' is never consumed; a with-cap binding must be released (or threaded to a consumer) exactly once",
+                    name
+                ),
+                n => bail!(
+                    "capability '{}' is consumed {} times but must be consumed exactly once",
+                    name,
+                    n
+                ),
+            }
+            uses.remove(name);
+            Ok(uses)
+        }
         _ => {
             let mut acc = HashMap::new();
             for child in expr_children(e) {
@@ -1747,33 +1792,61 @@ fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usi
     }
 }
 
-/// Enforce the linearity contract of a function's parameters: each `(lin T)`
-/// parameter must be referenced exactly once across the body, counting
-/// `if`/`match` branches consistently.
-fn check_fn_linearity(func: &Function) -> Result<()> {
+/// Confirm every `with-cap` names a declared capability. Walks the whole body.
+fn validate_cap_names(e: &Expr, capabilities: &HashSet<String>) -> Result<()> {
+    if let Expr::WithCap { cap, .. } = e
+        && !capabilities.contains(cap)
+    {
+        bail!(
+            "unknown capability '{}'; declare it with (capability {})",
+            cap,
+            cap
+        );
+    }
+    for child in expr_children(e) {
+        validate_cap_names(child, capabilities)?;
+    }
+    Ok(())
+}
+
+/// Enforce the linearity contract of a function: each linear parameter — a `(lin T)`
+/// parameter or one whose type is a capability — must be consumed exactly once, as
+/// must every `with-cap` binding, counting `if`/`match` branches consistently.
+fn check_fn_linearity(func: &Function, capabilities: &HashSet<String>) -> Result<()> {
+    validate_cap_names(&func.body, capabilities)?;
+    // A parameter is linear if marked `(lin T)` or if its type is a capability.
+    let is_linear = |p: &Parameter| {
+        p.linear || matches!(&p.ty, Type::Resource(name) if capabilities.contains(name))
+    };
     let linear: HashSet<String> = func
         .params
         .iter()
-        .filter(|p| p.linear)
+        .filter(|p| is_linear(p))
         .map(|p| p.name.clone())
         .collect();
-    if linear.is_empty() {
-        return Ok(());
-    }
+    // Always walk the body: it may contain `with-cap` bindings even when no
+    // parameter is linear (linear_uses enforces their exactly-once obligation).
     let uses = linear_uses(&func.body, &linear)?;
     for p in &func.params {
-        if !p.linear {
+        if !is_linear(p) {
             continue;
         }
+        let noun = if p.linear {
+            "linear parameter"
+        } else {
+            "capability parameter"
+        };
         match uses.get(&p.name).copied().unwrap_or(0) {
             1 => {}
             0 => bail!(
-                "linear parameter '{}' of function '{}' is never used; a linear value must be consumed exactly once",
+                "{} '{}' of function '{}' is never used; it must be consumed exactly once",
+                noun,
                 p.name,
                 func.name
             ),
             n => bail!(
-                "linear parameter '{}' of function '{}' is used {} times but must be used exactly once",
+                "{} '{}' of function '{}' is used {} times but must be used exactly once",
+                noun,
                 p.name,
                 func.name,
                 n
@@ -2282,6 +2355,20 @@ fn check_expr(
                 .map(|v| check_expr(v, env, signatures, globals, records, variants))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Type::Tuple(elem_types))
+        }
+        Expr::WithCap { name, cap, body } => {
+            // Bind the capability token (a resource-represented handle) and check
+            // the body. The exactly-once obligation is enforced by check_fn_linearity.
+            let mut next_env = env.clone();
+            next_env.insert(name.clone(), Type::Resource(cap.clone()));
+            check_expr(body, &next_env, signatures, globals, records, variants)
+        }
+        Expr::ReleaseCap { value } => {
+            let ty = check_expr(value, env, signatures, globals, records, variants)?;
+            match ty {
+                Type::Resource(_) => Ok(Type::S32),
+                other => bail!("release-cap expects a capability, got {:?}", other),
+            }
         }
         // List operations
         Expr::ListNew { elem_type } => Ok(Type::List(Box::new(elem_type.clone()))),
@@ -6440,6 +6527,11 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
     let mut variant_names: HashSet<String> = HashSet::new();
     let mut resources = Vec::new();
     let mut resource_names: HashSet<String> = HashSet::new();
+    // Capability type names. A capability is a linear resource: it shares the
+    // resource representation (an i32 handle, so it parses as Type::Resource and
+    // needs no new Type variant), but every binding of it carries a use-exactly-once
+    // obligation and it has no public constructor (minted only by `with-cap`).
+    let mut capability_names: HashSet<String> = HashSet::new();
     let mut world_config: Option<WorldConfig> = None;
     let mut data_segments = Vec::new();
 
@@ -6472,6 +6564,18 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         && !resource_names.insert(name.clone())
                     {
                         return Err(ctx.error(format!("duplicate resource type '{}'", name), span));
+                    }
+                }
+                SExpr::Sym(sym, _) if sym == "capability" => {
+                    if items.len() >= 2
+                        && let SExpr::Sym(name, _) = &items[1]
+                    {
+                        // Register as a resource name (so it parses as Type::Resource)
+                        // and as a capability (so the checker treats it as linear).
+                        if !resource_names.insert(name.clone()) {
+                            return Err(ctx.error(format!("duplicate type name '{}'", name), span));
+                        }
+                        capability_names.insert(name.clone());
                     }
                 }
                 _ => {}
@@ -6616,6 +6720,18 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         // Already checked for duplicates in first pass
                         resources.push(resource);
                     }
+                    SExpr::Sym(sym, _) if sym == "capability" => {
+                        // A capability is a pure type declaration (no fields, no
+                        // codegen, unforgeable). Validate shape; it was registered in
+                        // the first pass. `(capability Name)`.
+                        if items.len() != 2 || !matches!(&items[1], SExpr::Sym(..)) {
+                            return Err(ctx.error_with_note(
+                                "invalid capability declaration",
+                                &span,
+                                "expected: (capability Name)",
+                            ));
+                        }
+                    }
                     SExpr::Sym(sym, _) if sym == "world" => {
                         if world_config.is_some() {
                             return Err(
@@ -6650,7 +6766,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
                         return Err(ctx.error_with_note(
                             "unknown top-level form",
                             other.span(),
-                            "expected 'fn', 'export', 'import', 'global', 'record', 'variant', 'resource', 'world', or 'data'"
+                            "expected 'fn', 'export', 'import', 'global', 'record', 'variant', 'resource', 'capability', 'world', or 'data'"
                         ));
                     }
                 }
@@ -6742,6 +6858,7 @@ fn parse_program(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Program> {
         records,
         variants,
         resources,
+        capabilities: capability_names,
         world_config,
         data_segments,
     })
@@ -7621,6 +7738,63 @@ fn parse_expr(
                         name: mangled_name, // Use mangled name for codegen
                         value: Box::new(value_expr),
                         body: Box::new(body_expr),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "with-cap" => {
+                    // (with-cap (c Cap) body): bind c to a fresh linear capability
+                    // token of type Cap for the scope of body.
+                    if items.len() != 3 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'with-cap' expression",
+                            list_span,
+                            "expected: (with-cap (name Cap) body)",
+                        ));
+                    }
+                    let binding = match &items[1] {
+                        SExpr::List(parts, _) if parts.len() == 2 => parts,
+                        other => {
+                            return Err(ctx.error_with_note(
+                                "with-cap binding must be (name Cap)",
+                                other.span(),
+                                "expected: (with-cap (name Cap) body)",
+                            ));
+                        }
+                    };
+                    let (name, name_scopes) = match &binding[0] {
+                        SExpr::Sym(s, span) => (s.clone(), span.scopes.clone()),
+                        other => {
+                            return Err(ctx.error("capability name must be a symbol", other.span()));
+                        }
+                    };
+                    let cap = match &binding[1] {
+                        SExpr::Sym(s, _) => s.clone(),
+                        other => {
+                            return Err(ctx.error("capability type must be a symbol", other.span()));
+                        }
+                    };
+                    let new_binding = Binding::new(name, name_scopes);
+                    let mangled_name = new_binding.mangled_name();
+                    let mut next_vars = vars.to_vec();
+                    next_vars.push(new_binding);
+                    let body_expr =
+                        parse_expr(&items[2], &next_vars, functions, records, variants, ctx)?;
+                    Ok(Expr::WithCap {
+                        name: mangled_name,
+                        cap,
+                        body: Box::new(body_expr),
+                    })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "release-cap" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'release-cap' expression",
+                            list_span,
+                            "expected: (release-cap capability)",
+                        ));
+                    }
+                    let value = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::ReleaseCap {
+                        value: Box::new(value),
                     })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "begin" => {
@@ -9463,6 +9637,29 @@ fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             Type::Tuple(value_types)
         }
+        Expr::WithCap { name, cap, body } => {
+            // The capability token is a zero-cost i32 witness: mint it as a constant,
+            // bind it, and run the body. The linear discipline is purely static.
+            let idx = env.declare_local(Type::Resource(cap.clone()));
+            out.push_str(&format!("{}i32.const 0\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, idx));
+            env.push_binding(name.clone(), idx);
+            let body_ty = gen_expr(
+                body, out, indent, env, signatures, globals, records, variants, is_tail,
+            );
+            env.pop_binding();
+            body_ty
+        }
+        Expr::ReleaseCap { value } => {
+            // Evaluate the capability (an i32 witness), discard it, yield 0. Releasing
+            // is the terminal consumer; at runtime a static witness needs no teardown.
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}drop\n", pad));
+            out.push_str(&format!("{}i32.const 0\n", pad));
+            Type::S32
+        }
         // List: new - allocate header (len=0, cap=0, data=null)
         Expr::ListNew { elem_type } => {
             let header_size = 12; // 4 bytes len + 4 bytes cap + 4 bytes data ptr
@@ -11132,6 +11329,7 @@ pub fn compile_repl_expr(
         records: vec![],
         variants: vec![],
         resources: vec![],
+        capabilities: HashSet::new(),
         world_config: None,
         data_segments: vec![],
     };
@@ -16058,6 +16256,7 @@ pub fn compile_repl_expr_pack(
         records: vec![],
         variants: vec![],
         resources: vec![],
+        capabilities: HashSet::new(),
         world_config: None,
         data_segments: vec![],
     };
@@ -16139,6 +16338,7 @@ pub fn compile_repl_expr_pack_wat(
         records: vec![],
         variants: vec![],
         resources: vec![],
+        capabilities: HashSet::new(),
         world_config: None,
         data_segments: vec![],
     };
