@@ -791,6 +791,55 @@ pub struct MatchArm {
     body: Expr,
 }
 
+/// Expand a `_` wildcard arm into explicit arms for every case the concrete arms
+/// don't cover — each with fresh, unused bindings matching that case's payload
+/// arity and the wildcard's body. Non-wildcard matches pass through unchanged.
+/// Both the type checker and codegen call this so they see the same arm set, and
+/// the gnarly discriminant codegen needs no special wildcard handling.
+fn expand_match_wildcard(
+    cases: &[MatchArm],
+    expr_ty: &Type,
+    variants: &HashMap<String, VariantDef>,
+) -> Vec<MatchArm> {
+    let Some(wild) = cases.iter().find(|a| a.case_name == "_") else {
+        return cases.to_vec();
+    };
+    let covered: std::collections::HashSet<&str> = cases
+        .iter()
+        .filter(|a| a.case_name != "_")
+        .map(|a| a.case_name.as_str())
+        .collect();
+    let full: Vec<(String, usize)> = match expr_ty {
+        Type::Option(_) => vec![("some".to_string(), 1), ("none".to_string(), 0)],
+        Type::Result(_, _) => vec![("ok".to_string(), 1), ("err".to_string(), 1)],
+        Type::Variant(name) => match variants.get(name) {
+            Some(v) => v
+                .cases
+                .iter()
+                .map(|c| (c.name.clone(), c.payload.len()))
+                .collect(),
+            None => return cases.to_vec(),
+        },
+        _ => return cases.to_vec(),
+    };
+    let mut out: Vec<MatchArm> = cases
+        .iter()
+        .filter(|a| a.case_name != "_")
+        .cloned()
+        .collect();
+    for (name, arity) in full {
+        if !covered.contains(name.as_str()) {
+            let bindings = (0..arity).map(|i| format!("_wild_{name}_{i}")).collect();
+            out.push(MatchArm {
+                case_name: name,
+                bindings,
+                body: wild.body.clone(),
+            });
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
@@ -1819,6 +1868,9 @@ fn check_expr(
         }
         Expr::Match { expr, cases } => {
             let expr_ty = check_expr(expr, env, signatures, globals, records, variants)?;
+            // Desugar a `_` wildcard into explicit arms before checking coverage.
+            let effective = expand_match_wildcard(cases, &expr_ty, variants);
+            let cases = &effective;
 
             // Handle Option and Result types specially
             match &expr_ty {
@@ -8000,6 +8052,10 @@ fn gen_expr(
             // Save the pointer to a local
             let value_ptr = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.set {}\n", pad, value_ptr));
+
+            // Desugar a `_` wildcard the same way the checker did.
+            let effective = expand_match_wildcard(cases, &expr_ty, variants);
+            let cases = &effective;
 
             // Handle Option, Result, and Variant types
             match &expr_ty {
