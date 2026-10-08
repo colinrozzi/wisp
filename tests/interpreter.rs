@@ -210,3 +210,33 @@ fn test_interpreter_u64_literals() {
     eval(&mut s, "(if 0u64 1 2)", "2");
     eval(&mut s, "(if 3u64 1 2)", "1");
 }
+
+#[test]
+fn test_interpreter_bytes_string_bridge() {
+    let mut s = session();
+    // string->bytes yields a u8 byte list; the byte codes are UTF-8 of "Hi".
+    eval(
+        &mut s,
+        "(string->bytes \"Hi\")",
+        "#<list u8 (#<u8 72> #<u8 105>)>",
+    );
+    // bytes->string is the inverse: the round-trip returns the original string.
+    eval(
+        &mut s,
+        "(bytes->string (string->bytes \"hello\"))",
+        "\"hello\"",
+    );
+    // An empty string round-trips too.
+    eval(&mut s, "(bytes->string (string->bytes \"\"))", "\"\"");
+    // Arity and type errors are reported, not panics.
+    eval(
+        &mut s,
+        "(bytes->string \"nope\")",
+        "error: bytes->string expects a byte list",
+    );
+    eval(
+        &mut s,
+        "(string->bytes 42)",
+        "error: string->bytes expects a string",
+    );
+}

@@ -111,9 +111,56 @@
 (fn string-primitive? ((name string)) s32
   (i32.or (i32.or (string=? name "string-len") (string=? name "string-ref"))
     (i32.or (string=? name "string-append")
-      (i32.or (string=? name "string=?") (string=? name "substring")))))
+      (i32.or (string=? name "string=?")
+        (i32.or (string=? name "substring")
+          (i32.or (string=? name "bytes->string") (string=? name "string->bytes")))))))
+
+; A byte element carries its code as either a dedicated byte-value or a plain
+; integer (host arrays unmarshal to byte-value; REPL-built lists may hold integer).
+(fn byte-code ((v value)) s32
+  (value-case v
+    ((byte-value n) n)
+    ((integer n) n)
+    (else 0)))
+
+; A string is a [len:u32][bytes] buffer, so decoding bytes is: allocate that
+; buffer, write each code as one byte (the (u8 ...) cast masks to a byte), then
+; reinterpret the buffer as a string via string-from-addr.
+(fn pack-bytes ((items (list value)) (i s32) (n s32) (buf s32)) s32
+  (if (i32.ge_s i n) buf
+    (begin
+      (i32.store8 (i32.add (i32.add buf (i32.const 4)) i)
+                  (u8 (byte-code (list-get items i))))
+      (pack-bytes items (i32.add i (i32.const 1)) n buf))))
+
+(fn byte-values->string ((items (list value))) value
+  (let (n (list-len items))
+    (let (buf (heap-alloc (i32.add n (i32.const 4))))
+      (begin
+        (i32.store buf n)
+        (pack-bytes items (i32.const 0) n buf)
+        (text (string-from-addr buf))))))
+
+; bytes->string: decode a byte list (typed-list or sequence of byte-values) to a
+; string. The inverse of string->bytes; together they bridge the host byte boundary.
+(fn apply-bytes-to-string ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "bytes->string expects one argument")
+    (value-case (list-get args 0)
+      ((typed-list element items) (byte-values->string items))
+      ((sequence items) (byte-values->string items))
+      (else (failure "bytes->string expects a byte list")))))
+
+; string->bytes: encode a string to a (list u8) of byte-values (str-to-bytes is
+; the shared encoder the host-call marshalling already uses).
+(fn apply-string-to-bytes ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "string->bytes expects one argument")
+    (value-case (list-get args 0)
+      ((text s) (str-to-bytes (list-get args 0)))
+      (else (failure "string->bytes expects a string")))))
 
 (fn apply-string ((name string) (args (list value))) value
+  (if (string=? name "bytes->string") (apply-bytes-to-string args)
+    (if (string=? name "string->bytes") (apply-string-to-bytes args)
   (let (arity (if (string=? name "string-len") 1 (if (string=? name "substring") 3 2)))
     (if (i32.ne (list-len args) arity) (failure "wrong number of arguments")
       (value-case (list-get args 0)
@@ -135,4 +182,4 @@
                           (text (substring s start end)) (failure "substring bounds out of range")))
                       (else (failure "expected s32 bounds")))))
                 (else (failure "expected s32 index"))))))
-        (else (failure "expected string argument"))))))
+        (else (failure "expected string argument"))))))))
