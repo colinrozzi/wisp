@@ -96,7 +96,7 @@ Write a tokenizer that converts source string to list of tokens.
   (str-lit string))       ; string literal "..."
 ```
 
-**Implementation** (`examples/wisp-tokenizer.lisp`):
+**Implementation** (`examples/wisp-tokenizer.wisp`):
 
 The tokenizer includes:
 - Character classification: `is-whitespace`, `is-digit`, `is-delimiter`
@@ -139,7 +139,7 @@ Convert token list to S-expression AST.
   (lst (list sexpr)))     ; list of s-expressions
 ```
 
-**Implementation** (`examples/wisp-parser.lisp`):
+**Implementation** (`examples/wisp-parser.wisp`):
 
 The parser includes:
 - Token type (same as tokenizer)
@@ -174,7 +174,7 @@ Generate WAT string for basic expressions.
 - Variable references → `(local.get $name)`
 - Function calls → `(call $name ...)`
 
-**Implementation** (`examples/wisp-codegen.lisp`):
+**Implementation** (`examples/wisp-codegen.wisp`):
 
 The codegen includes:
 - `i32-to-string`: Convert integers to strings (needed for code generation)
@@ -217,7 +217,7 @@ Extend codegen to handle function definitions.
 - `if` conditionals
 - Function calls
 
-**Implementation** (extended `examples/wisp-codegen.lisp`):
+**Implementation** (extended `examples/wisp-codegen.wisp`):
 
 Added to M5 codegen:
 - `compile-if`: `(if c t e)` → `(if (result i32) <c> (then <t>) (else <e>))`
@@ -251,7 +251,7 @@ Added to M5 codegen:
 
 Complete self-hosted Wisp compiler that can compile Wisp source to WAT.
 
-**Implementation** (`examples/wisp-compiler.lisp`):
+**Implementation** (`examples/wisp-compiler.wisp`):
 
 The full compiler integrates all previous milestones:
 - Tokenizer from M3
@@ -460,16 +460,16 @@ runs on a large stack — that was never the actual blocker for the current sour
 
 - `docs/changes/STRING-OPERATIONS.md` - M1 documentation
 - `docs/changes/WISP-REPL-ARCHITECTURE.md` - REPL architecture and usage
-- `examples/string-test.lisp` - String operation examples
+- `examples/string-test.wisp` - String operation examples
 - `tests/string_ops.rs` - String operation tests
 - `tests/pattern_match.rs` - M2 pattern matching tests
-- `examples/wisp-tokenizer.lisp` - M3 tokenizer implementation
+- `examples/wisp-tokenizer.wisp` - M3 tokenizer implementation
 - `tests/tokenizer.rs` - M3 tokenizer tests
-- `examples/wisp-parser.lisp` - M4 parser implementation (includes tokenizer)
+- `examples/wisp-parser.wisp` - M4 parser implementation (includes tokenizer)
 - `tests/parser.rs` - M4 parser tests
-- `examples/wisp-codegen.lisp` - M5/M6 code generator implementation
+- `examples/wisp-codegen.wisp` - M5/M6 code generator implementation
 - `tests/codegen.rs` - M5/M6 codegen tests
-- `examples/wisp-compiler.lisp` - M7 complete self-hosted compiler
+- `examples/wisp-compiler.wisp` - M7 complete self-hosted compiler
 - `examples/wisp-compiler.wasm` - Compiled self-hosted compiler
 - `tests/self_hosted.rs` - M7 self-hosted compiler tests
 - `crates/test-runtime/` - REPL and test runtime implementation

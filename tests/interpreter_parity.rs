@@ -38,7 +38,7 @@ fn compile(source: &Path, name: &str) -> PathBuf {
 fn session() -> Interpreter {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
     Interpreter::load(
-        PACKAGE.get_or_init(|| compile(&root().join("interpreter/evaluator.lisp"), "evaluator")),
+        PACKAGE.get_or_init(|| compile(&root().join("interpreter/evaluator.wisp"), "evaluator")),
     )
     .unwrap()
 }
@@ -52,7 +52,7 @@ fn self_hosted_compiler() -> &'static Module {
             .spawn(|| {
                 Module::from_file(
                     &cgrf_guest::engine(),
-                    compile(&root().join("examples/wisp-compiler.lisp"), "compiler"),
+                    compile(&root().join("examples/wisp-compiler.wisp"), "compiler"),
                 )
                 .unwrap()
             })
@@ -129,7 +129,7 @@ fn compare_example(file: &str, cases: &[(&str, &[i32], i32)], compare_self_hoste
 #[test]
 fn test_parity_existing_typed_factorial() {
     compare_example(
-        "examples/factorial-test.lisp",
+        "examples/factorial-test.wisp",
         &[("factorial", &[0], 1), ("factorial", &[6], 720)],
         true,
     );
@@ -138,7 +138,7 @@ fn test_parity_existing_typed_factorial() {
 #[test]
 fn test_parity_small_types_bytes() {
     compare_example(
-        "tests/fixtures/interpreter_small_types.lisp",
+        "tests/fixtures/interpreter_small_types.wisp",
         &[
             ("byte-add", &[], 256),
             ("byte-wide", &[], 200),
@@ -152,7 +152,7 @@ fn test_parity_small_types_bytes() {
 
 #[test]
 fn test_small_types_cgrf_values() {
-    let path = root().join("tests/fixtures/interpreter_small_types.lisp");
+    let path = root().join("tests/fixtures/interpreter_small_types.wisp");
     let module =
         Module::from_file(&cgrf_guest::engine(), compile(&path, "small-types-values")).unwrap();
     let mut compiled = Guest::new(&module);
@@ -168,7 +168,7 @@ fn test_small_types_cgrf_values() {
 #[test]
 fn test_parity_derived_record_equality() {
     compare_example(
-        "tests/fixtures/interpreter_derive.lisp",
+        "tests/fixtures/interpreter_derive.wisp",
         &[
             ("equal", &[], 1),
             ("first-diff", &[], 0),
@@ -318,7 +318,7 @@ fn test_derived_instances_validate_and_capture_operations() {
 #[test]
 fn test_parity_generic_functions_and_trait_instances() {
     compare_example(
-        "tests/fixtures/interpreter_generics.lisp",
+        "tests/fixtures/interpreter_generics.wisp",
         &[
             ("twice", &[21], 42),
             ("twice", &[-3], -6),
@@ -333,7 +333,7 @@ fn test_parity_generic_functions_and_trait_instances() {
 #[test]
 fn test_parity_generic_standard_list_library() {
     compare_example(
-        "tests/fixtures/interpreter_generic_lists.lisp",
+        "tests/fixtures/interpreter_generic_lists.wisp",
         &[
             ("mapped", &[], 12),
             ("filtered", &[], 5),
@@ -424,7 +424,7 @@ fn test_generic_compound_types_and_runtime_closures() {
 fn test_generic_trait_return_inference_and_effect_order() {
     let mut s = session();
     assert!(
-        !s.load_file(root().join("std/list.lisp"))
+        !s.load_file(root().join("std/list.wisp"))
             .unwrap()
             .starts_with("error:")
     );
@@ -549,7 +549,7 @@ fn test_generic_traits_introduced_by_hygienic_macros() {
 #[test]
 fn test_parity_existing_records() {
     compare_example(
-        "examples/record-test.lisp",
+        "examples/record-test.wisp",
         &[("test", &[], 30), ("test2", &[], 7)],
         true,
     );
@@ -559,7 +559,7 @@ fn test_parity_existing_variants() {
     // Existing self-hosted codegen only binds the first variant payload; it
     // emits an unknown $h local for this fixture's (rectangle w h) arm.
     compare_example(
-        "examples/variant-test.lisp",
+        "examples/variant-test.wisp",
         &[
             ("test-circle", &[], 75),
             ("test-rect", &[], 28),
@@ -646,7 +646,7 @@ fn test_nominal_types_and_pattern_errors_recover() {
 #[test]
 fn test_parity_single_payload_variant() {
     compare_example(
-        "tests/fixtures/interpreter_variant.lisp",
+        "tests/fixtures/interpreter_variant.wisp",
         &[("test-present", &[], 42), ("test-absent", &[], 0)],
         true,
     );
@@ -655,7 +655,7 @@ fn test_parity_single_payload_variant() {
 #[test]
 fn test_parity_primitives_and_strings() {
     compare_example(
-        "tests/fixtures/interpreter_primitives.lisp",
+        "tests/fixtures/interpreter_primitives.wisp",
         &[
             ("wrap", &[], i32::MIN),
             ("unsigned-div", &[], i32::MAX),
@@ -756,7 +756,7 @@ fn test_malformed_declarations_do_not_trap_or_publish() {
 
 #[test]
 fn test_parity_s64_literals_arithmetic_and_payloads() {
-    let file = root().join("tests/fixtures/interpreter_s64.lisp");
+    let file = root().join("tests/fixtures/interpreter_s64.wisp");
     let mut interpreted = session();
     let loaded = interpreted
         .evaluate(&std::fs::read_to_string(&file).unwrap())
@@ -799,7 +799,7 @@ fn test_parity_s64_literals_arithmetic_and_payloads() {
 #[test]
 fn test_parity_i64_primitives_across_both_compilers() {
     compare_example(
-        "tests/fixtures/interpreter_i64_primitives.lisp",
+        "tests/fixtures/interpreter_i64_primitives.wisp",
         &[
             ("shift-mask", &[], 2),
             ("rotate-left", &[], -1),
@@ -833,7 +833,7 @@ fn test_s64_primitive_boundary_matrix_matches_compiled_wasm() {
     let loaded = interpreted.evaluate(&source).unwrap();
     assert!(!loaded.starts_with("error:"), "{loaded}");
     let path = root().join(format!(
-        "target/interpreter-parity/{}/integer-matrix.lisp",
+        "target/interpreter-parity/{}/integer-matrix.wisp",
         std::process::id()
     ));
     std::fs::write(&path, source).unwrap();
@@ -1046,7 +1046,7 @@ fn test_float_arithmetic_matrix_matches_compiled_wasm() {
     let loaded = interpreted.evaluate(&source).unwrap();
     assert!(!loaded.starts_with("error:"), "{loaded}");
     let path = root().join(format!(
-        "target/interpreter-parity/{}/float-matrix.lisp",
+        "target/interpreter-parity/{}/float-matrix.wisp",
         std::process::id()
     ));
     std::fs::write(&path, source).unwrap();
@@ -1293,7 +1293,7 @@ fn test_float_conversion_matrix_matches_compiled_wasm() {
     let loaded = s.evaluate(&declarations).unwrap();
     assert!(!loaded.starts_with("error:"), "{loaded}");
     let path = root().join(format!(
-        "target/interpreter-parity/{}/float-conversions.lisp",
+        "target/interpreter-parity/{}/float-conversions.wisp",
         std::process::id()
     ));
     std::fs::write(&path, declarations).unwrap();
@@ -1317,7 +1317,7 @@ fn test_float_conversion_matrix_matches_compiled_wasm() {
 #[test]
 fn test_parity_float_primitives_across_both_compilers() {
     compare_example(
-        "tests/fixtures/interpreter_floats.lisp",
+        "tests/fixtures/interpreter_floats.wisp",
         &[
             ("double-rounding", &[], 1),
             ("single-rounding", &[], 1),
@@ -1332,7 +1332,7 @@ fn test_parity_float_primitives_across_both_compilers() {
 #[test]
 fn test_parity_compound_operations_across_both_compilers() {
     compare_example(
-        "tests/fixtures/interpreter_collections.lisp",
+        "tests/fixtures/interpreter_collections.wisp",
         &[
             ("list-sum", &[], 42),
             ("list-alias", &[], 42),
@@ -1353,7 +1353,7 @@ fn test_parity_compound_operations_across_both_compilers() {
 
 #[test]
 fn test_compound_values_match_compiled_exports() {
-    let file = root().join("tests/fixtures/interpreter_collection_values.lisp");
+    let file = root().join("tests/fixtures/interpreter_collection_values.wisp");
     let mut s = session();
     let loaded = s
         .evaluate(&std::fs::read_to_string(&file).unwrap())
@@ -1632,7 +1632,7 @@ fn test_malformed_compound_forms_do_not_trap_or_publish() {
 #[test]
 fn test_global_state_parity_across_both_compilers() {
     compare_example(
-        "tests/fixtures/interpreter_globals.lisp",
+        "tests/fixtures/interpreter_globals.wisp",
         &[
             ("current", &[], 0),
             ("next", &[], 2),
@@ -1766,7 +1766,7 @@ fn test_malformed_globals_do_not_publish() {
 
 #[test]
 fn test_includes_relative_paths_cycles_and_compiled_parity() {
-    let file = root().join("tests/fixtures/interpreter_include/main.lisp");
+    let file = root().join("tests/fixtures/interpreter_include/main.wisp");
     let mut s = session();
     assert_eq!(s.load_file(&file).unwrap(), "#<function>");
     let module = Module::from_file(&cgrf_guest::engine(), compile(&file, "included")).unwrap();
@@ -1792,7 +1792,7 @@ fn test_includes_relative_paths_cycles_and_compiled_parity() {
     let mut relative = session();
     assert_eq!(
         relative
-            .evaluate("(include \"tests/fixtures/interpreter_include/main.lisp\") (next)")
+            .evaluate("(include \"tests/fixtures/interpreter_include/main.wisp\") (next)")
             .unwrap(),
         "2"
     );
@@ -1806,13 +1806,13 @@ fn test_include_failures_preflight_and_recovery() {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let main = dir.join("main.lisp");
-    let child = dir.join("child.lisp");
-    std::fs::write(&main, "(define marker 0) (include \"child.lisp\")").unwrap();
+    let main = dir.join("main.wisp");
+    let child = dir.join("child.wisp");
+    std::fs::write(&main, "(define marker 0) (include \"child.wisp\")").unwrap();
     assert_eq!(s.evaluate("(define marker 42)").unwrap(), "42");
     let out = s.load_file(&main).unwrap();
     assert!(
-        out.contains("child.lisp") && out.starts_with("error:"),
+        out.contains("child.wisp") && out.starts_with("error:"),
         "{out}"
     );
     assert_eq!(s.evaluate("marker").unwrap(), "42");
@@ -1871,21 +1871,21 @@ fn test_include_depth_limit_and_recovery() {
     std::fs::create_dir_all(&dir).unwrap();
     for index in 0..66 {
         std::fs::write(
-            dir.join(format!("{index}.lisp")),
-            format!("(include \"{}.lisp\")", index + 1),
+            dir.join(format!("{index}.wisp")),
+            format!("(include \"{}.wisp\")", index + 1),
         )
         .unwrap();
     }
-    let out = s.load_file(dir.join("0.lisp")).unwrap();
+    let out = s.load_file(dir.join("0.wisp")).unwrap();
     assert!(out.contains("include nesting limit"), "{out}");
-    std::fs::write(dir.join("1.lisp"), "42").unwrap();
-    assert_eq!(s.load_file(dir.join("0.lisp")).unwrap(), "42");
+    std::fs::write(dir.join("1.wisp"), "42").unwrap();
+    assert_eq!(s.load_file(dir.join("0.wisp")).unwrap(), "42");
 }
 
 #[test]
 fn test_macro_parity_across_both_compilers() {
     compare_example(
-        "examples/macro-test.lisp",
+        "examples/macro-test.wisp",
         &[
             ("double", &[21], 42),
             ("add-five", &[37], 42),
@@ -1896,7 +1896,7 @@ fn test_macro_parity_across_both_compilers() {
         true,
     );
     compare_example(
-        "tests/fixtures/interpreter_macros.lisp",
+        "tests/fixtures/interpreter_macros.wisp",
         &[
             ("answer", &[], 42),
             ("sum", &[], 42),
@@ -2057,23 +2057,23 @@ fn test_macros_collected_across_includes() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("main.lisp"),
-        "(fn answer () s32 (twice (inc 20))) (include \"macros.lisp\") (answer)",
+        dir.join("main.wisp"),
+        "(fn answer () s32 (twice (inc 20))) (include \"macros.wisp\") (answer)",
     )
     .unwrap();
     std::fs::write(
-        dir.join("macros.lisp"),
+        dir.join("macros.wisp"),
         "(defmacro twice (x) `(i32.add ,x ,x)) (define-syntax inc (syntax-rules () ((_ x) (i32.add x 1))))",
     )
     .unwrap();
-    assert_eq!(s.load_file(dir.join("main.lisp")).unwrap(), "42");
+    assert_eq!(s.load_file(dir.join("main.wisp")).unwrap(), "42");
     assert_eq!(s.evaluate("(twice 21)").unwrap(), "42");
 }
 
 #[test]
 fn test_syntax_rules_examples_and_hygiene_match_rust_compiler() {
     compare_example(
-        "examples/syntax-rules-test.lisp",
+        "examples/syntax-rules-test.wisp",
         &[
             ("test-simple", &[20, 22], 42),
             ("test-inc", &[41], 42),
@@ -2086,7 +2086,7 @@ fn test_syntax_rules_examples_and_hygiene_match_rust_compiler() {
         false,
     );
     compare_example(
-        "tests/fixtures/interpreter_syntax_rules.lisp",
+        "tests/fixtures/interpreter_syntax_rules.wisp",
         &[
             ("no-capture", &[], 42),
             ("self-reference", &[], 100),
@@ -2290,7 +2290,7 @@ fn test_syntax_rules_invalid_declarations_and_recovery() {
 #[test]
 fn test_syntax_case_examples_and_computation_match_rust_compiler() {
     compare_example(
-        "examples/syntax-case-test.lisp",
+        "examples/syntax-case-test.wisp",
         &[
             ("test-simple", &[20, 22], 42),
             ("test-guard-id", &[21], 42),
@@ -2303,7 +2303,7 @@ fn test_syntax_case_examples_and_computation_match_rust_compiler() {
         false,
     );
     compare_example(
-        "tests/fixtures/interpreter_syntax_case.lisp",
+        "tests/fixtures/interpreter_syntax_case.wisp",
         &[
             ("folded", &[], 42),
             ("dynamic", &[40], 42),
@@ -2460,16 +2460,16 @@ fn test_syntax_case_hygiene_persistence_and_include_loading() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("main.lisp"),
-        "(fn answer () s32 (twice 21)) (include \"macro.lisp\") (answer)",
+        dir.join("main.wisp"),
+        "(fn answer () s32 (twice 21)) (include \"macro.wisp\") (answer)",
     )
     .unwrap();
     std::fs::write(
-        dir.join("macro.lisp"),
+        dir.join("macro.wisp"),
         "(define-syntax twice (syntax-case-lambda (stx) ((_ x) #'(+ x x))))",
     )
     .unwrap();
-    assert_eq!(s.load_file(dir.join("main.lisp")).unwrap(), "42");
+    assert_eq!(s.load_file(dir.join("main.wisp")).unwrap(), "42");
 }
 
 #[test]

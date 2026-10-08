@@ -1,5 +1,5 @@
 // Tests for the minimal numeric standard library and the (include ...) form.
-// Programs pull in std/num.lisp and use its operators and constants. Each exports
+// Programs pull in std/num.wisp and use its operators and constants. Each exports
 // `test-func` returning s32.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +11,7 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 fn compile_and_run(source: &str) -> i32 {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_stdlib_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_stdlib_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_stdlib_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
@@ -67,10 +67,10 @@ fn compile_and_run(source: &str) -> i32 {
     i32::from_le_bytes(buf)
 }
 
-/// Include the real std/num.lisp by absolute path (robust from the temp dir).
+/// Include the real std/num.wisp by absolute path (robust from the temp dir).
 fn with_std(body: &str) -> String {
     format!(
-        "(include \"{}/std/num.lisp\")\n{}",
+        "(include \"{}/std/num.wisp\")\n{}",
         env!("CARGO_MANIFEST_DIR"),
         body
     )
@@ -199,11 +199,11 @@ fn test_stdlib_generic_over_add() {
 fn test_include_relative_path() {
     // Write a helper next to the (temp) source and include it by a relative name.
     let temp_dir = std::env::temp_dir();
-    let helper = temp_dir.join("wisp_test_include_helper.lisp");
+    let helper = temp_dir.join("wisp_test_include_helper.wisp");
     std::fs::write(&helper, "(fn helper-answer () : s32 (i32.const 42))\n")
         .expect("failed to write helper");
 
-    let src = "(include \"wisp_test_include_helper.lisp\")
+    let src = "(include \"wisp_test_include_helper.wisp\")
 (export (fn test-func () s32 (helper-answer)))";
     assert_eq!(compile_and_run(src), 42);
 }

@@ -9,6 +9,6 @@ mkdir -p target
 tar -czf target/wisp-repl.tar.gz -C actors \
   wisp-repl/actor.wasm wisp-repl/manifest.toml wisp-repl/wisp.pact \
   wisp-repl/source.pact wisp-repl/sources.json wisp-repl/README.md \
-  wisp-repl/DEVELOPMENT.md wisp-repl/actor.lisp wisp-repl/src wisp-repl/tests \
+  wisp-repl/DEVELOPMENT.md wisp-repl/actor.wisp wisp-repl/src wisp-repl/tests \
   wisp-repl/Cargo.toml wisp-repl/Cargo.lock wisp-repl/build.sh
 echo "Shareable bundle: $repo_dir/target/wisp-repl.tar.gz"

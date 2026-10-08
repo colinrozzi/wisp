@@ -12,7 +12,7 @@ fn package() -> &'static PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let out = root.join(format!("target/cgrf-tests/{}/values", std::process::id()));
         compiler::compile(
-            &root.join("tests/fixtures/cgrf_v3.lisp"),
+            &root.join("tests/fixtures/cgrf_v3.wisp"),
             &out,
             EmitOptions::default(),
         )
@@ -262,7 +262,7 @@ fn test_cgrf_cli_and_dependency_bridge() {
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let imported = compiler::compile(
-        &root.join("tests/fixtures/cgrf_v3_import.lisp"),
+        &root.join("tests/fixtures/cgrf_v3_import.wisp"),
         &package().parent().unwrap().join("imported"),
         EmitOptions::default(),
     )

@@ -1,4 +1,4 @@
-; std/memory.lisp — Bump allocator and memory utilities
+; std/memory.wisp — Bump allocator and memory utilities
 
 (export
   (fn init-heap () s32

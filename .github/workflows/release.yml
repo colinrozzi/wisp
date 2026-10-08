@@ -42,7 +42,7 @@ jobs:
 
       - name: Build the actor (embeds into the binary)
         # The compiler is a host tool; build it for the native (glibc) target.
-        run: cargo run --release -- compile actors/wisp-repl/actor.lisp actors/wisp-repl/actor
+        run: cargo run --release -- compile actors/wisp-repl/actor.wisp actors/wisp-repl/actor
 
       - name: Build theater-repl (static musl)
         working-directory: actors/wisp-repl/legacy-host

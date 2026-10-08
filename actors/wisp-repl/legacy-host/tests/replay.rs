@@ -54,7 +54,7 @@ async fn drive(
     for source in [
         "(define add-two (lambda (x) (+ x 2)))",
         "(add-two 40)",
-        "(include \"library.lisp\") (increment 41)",
+        "(include \"library.wisp\") (increment 41)",
         "(/ 1 0)",
         "(increment 41)",
     ] {
@@ -80,7 +80,7 @@ async fn test_actor_replays_recorded_source_responses() -> anyhow::Result<()> {
     let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/replay-test");
     let wasm = adapter::build(&output)?;
     let bundle = SourceBundle::new(BTreeMap::from([(
-        "library.lisp".into(),
+        "library.wisp".into(),
         "(fn increment ((x s32)) s32 (i32.add x 1))".into(),
     )]))?;
     let (results, events) = drive(wasm.clone(), bundle, None).await?;

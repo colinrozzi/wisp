@@ -7,9 +7,9 @@ actor system** through a broad set of host interfaces. It's the interactive way 
 prototype and develop Theater actors — poke at the system live, then crystallize
 the working code into an actor.
 
-`actor.lisp` is the whole actor: it `(include …)`s the shared evaluator
-(`interpreter/evaluator.lisp`, which includes the codec `marshal.lisp` and the host
-bridge `rpc.lisp`) and declares the Theater ABI in Wisp. The stock compiler emits
+`actor.wisp` is the whole actor: it `(include …)`s the shared evaluator
+(`interpreter/evaluator.wisp`, which includes the codec `marshal.wisp` and the host
+bridge `rpc.wisp`) and declares the Theater ABI in Wisp. The stock compiler emits
 `actor.wasm`.
 
 ## Install and run (zero to a live REPL)
@@ -74,7 +74,7 @@ the host's pinned Theater deps):
 
 ```sh
 # 1. Build the actor -> actors/wisp-repl/actor.wasm (embedded into the binary).
-#    Re-run after editing actor.lisp or any interpreter/*.lisp it includes.
+#    Re-run after editing actor.wisp or any interpreter/*.wisp it includes.
 actors/wisp-repl/build.sh
 
 # 2. Build + run the host. First build pulls Theater from git (pinned rev) and is
@@ -188,7 +188,7 @@ Redefine a handler any time to change behavior mid-stream. Triggers wired today:
 
 ## Extending — add a host verb
 
-The bridge (`interpreter/rpc.lisp`) is uniform, so adding a verb is small:
+The bridge (`interpreter/rpc.wisp`) is uniform, so adding a verb is small:
 
 1. `(import <iface> <fn> (params) ret)` — declare the import with its **real** typed
    signature (so the interface hash matches Theater). Named result types
@@ -203,14 +203,14 @@ The bridge (`interpreter/rpc.lisp`) is uniform, so adding a verb is small:
    deployments enable handlers via the manifest instead), and stub it in
    `tests/interpreter_engine.rs` (the packr preflight has no wildcard trap).
 
-For an inbound trigger: add an `export` in `actor.lisp` for the callback
+For an inbound trigger: add an `export` in `actor.wisp` for the callback
 (`handle-*`) that calls `(dispatch-event "on-…" <event>)` — the arg is a bare value
 for single-arg callbacks, or the raw `any` unmarshalled to a `(sequence …)` for
 Tuple-wrapped ones.
 
 ## The actor ABI and `wisp-source`
 
-`actor.lisp` exports:
+`actor.wisp` exports:
 
 - `theater:simple/actor.init(state) -> result<tuple<option<list<u8>>>, string>` —
   lifecycle entry; a fresh module is an empty session, so init is not a reset.
@@ -235,7 +235,7 @@ reclaim its heap. Validated against Theater rev
 
 | File | Purpose |
 | --- | --- |
-| `actor.lisp` | The actor: includes the evaluator, declares ABI + inbound callbacks |
+| `actor.wisp` | The actor: includes the evaluator, declares ABI + inbound callbacks |
 | `actor.wasm` | Compiled actor (interface-qualified exports + CGRF metadata) |
 | `manifest.toml` | Manifest; grants the `runtime` control capability |
 | `source.pact` / `sources.json` | The `wisp-source` host interface + example bundle |

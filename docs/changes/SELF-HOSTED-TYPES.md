@@ -4,7 +4,7 @@
 environment + signature table), 2.5 (typed locals), 3 (generics / monomorphization),
 4 (traits + instances), 5 (`derive Eq`), and 6 (higher-order fn params) ✅ COMPLETE.
 
-**Why:** The self-hosted compiler (`examples/wisp-compiler.lisp`) does **zero** type
+**Why:** The self-hosted compiler (`examples/wisp-compiler.wisp`) does **zero** type
 inference today — it is pure codegen, treating everything as `i32`/pointer. The remaining
 parity features all need types known at each use site:
 

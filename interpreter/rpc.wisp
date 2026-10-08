@@ -1,6 +1,6 @@
-; rpc.lisp — the REPL's hook into Theater. REPL verbs that call Theater's rpc
+; rpc.wisp — the REPL's hook into Theater. REPL verbs that call Theater's rpc
 ; host interface and hand results back as ordinary, inspectable interpreter
-; values via `unmarshal`. Requires marshal.lisp (for unmarshal) first.
+; values via `unmarshal`. Requires marshal.wisp (for unmarshal) first.
 ;
 ; Each verb is the same uniform shape: evaluate string argument(s), call the
 ; matching static import, unmarshal the dynamic `value` result. Adding a verb is

@@ -1,4 +1,4 @@
-; std/math.lisp — Arithmetic utilities
+; std/math.wisp — Arithmetic utilities
 
 (export
   (fn abs ((x s32)) s32

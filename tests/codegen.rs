@@ -24,7 +24,7 @@ fn run_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 fn compile_and_run(source: &str) -> i32 {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_codegen_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_codegen_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_codegen_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");

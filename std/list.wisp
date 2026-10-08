@@ -1,14 +1,14 @@
-; std/list.lisp — generic algorithms over (list T).
+; std/list.wisp — generic algorithms over (list T).
 ;
 ; These are ordinary generic functions, monomorphized per element type when used.
 ; An unused function costs nothing. Bring them in with:
 ;
-;   (include "std/list.lisp")   ; path is relative to your source file
+;   (include "std/list.wisp")   ; path is relative to your source file
 ;
 ; The list operations recurse by index (list-len + list-get); Wisp lists have no
-; nil/cons pattern matching. Numeric constraints (Add, Zero, Eq) come from num.lisp.
+; nil/cons pattern matching. Numeric constraints (Add, Zero, Eq) come from num.wisp.
 
-(include "num.lisp")
+(include "num.wisp")
 
 ; --- length: fully parametric, no constraint ---------------------------------
 

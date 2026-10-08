@@ -2,7 +2,7 @@
 
 **Status:** Audit complete (2026-09-22). No code changes yet.
 
-**Goal:** Know *exactly* what the self-hosted compiler (`examples/wisp-compiler.lisp`,
+**Goal:** Know *exactly* what the self-hosted compiler (`examples/wisp-compiler.wisp`,
 compiled to `examples/wisp-compiler.wasm`) is missing relative to the Rust reference
 compiler (`src/compiler.rs`), so we can choose parity work deliberately.
 
@@ -23,7 +23,7 @@ gap in what the REPL can do — parity is the whole game.
   checked against its actual implementation, not just the arm. This corrected two
   read-only mis-scores: `begin` is fully implemented, and `variant`/`record`/`import`/
   `data` return `""` in `compile-by-name` *by design* (they are metadata-only forms
-  gathered in earlier passes at `wisp-compiler.lisp:422,443`), not stubs.
+  gathered in earlier passes at `wisp-compiler.wisp:422,443`), not stubs.
 
 ## At parity — works in the REPL today
 
@@ -61,7 +61,7 @@ builtins (`string-len` / `string-ref` / `string-append` / `string=?` / `substrin
 The interpreter differential tests added on 2026-10-05 also exposed two existing
 self-hosted code-generation gaps:
 
-- `examples/variant-test.lisp`: a multi-payload match such as `(rectangle w h)`
+- `examples/variant-test.wisp`: a multi-payload match such as `(rectangle w h)`
   binds only the first payload. Generated WAT references an undefined `$h` local.
 - The literal `-2147483648` is printed as `-9999999999` by the signed integer
   formatting helper, producing invalid WAT. Arithmetic can still produce the
@@ -90,8 +90,8 @@ These are **not** the same target — decide which we're chasing:
 1. **REPL parity** — everything a user might type. Wants Option/Result, tuples, macros,
    traits/generics. Large surface.
 2. **Self-hosting closure** — the self-hosted compiler compiles *its own* source
-   (`wisp-compiler.lisp`) unaided, so the Rust compiler can be retired (see the
-   self-hosting campaign). This needs only the features `wisp-compiler.lisp` *itself*
+   (`wisp-compiler.wisp`) unaided, so the Rust compiler can be retired (see the
+   self-hosting campaign). This needs only the features `wisp-compiler.wisp` *itself*
    uses — which is core language + lists + strings + variants/records/match. It uses
    **no** macros, traits, generics, Option/Result, or tuples. So this finish line is
    much closer; the remaining blocker is the M8 memory/stack limit (recursive tokenizer

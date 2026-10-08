@@ -63,10 +63,10 @@ The project uses a two-tier documentation system:
 ### Build and Run
 ```bash
 # Compile a Lisp source file to a .wasm package (written to <dir>/compiled/<stem>.wasm)
-cargo run -- compile <source.lisp> [out-stem]
-# Example: cargo run -- compile examples/prog.lisp    # -> examples/compiled/prog.wasm
+cargo run -- compile <source.wisp> [out-stem]
+# Example: cargo run -- compile examples/prog.wisp    # -> examples/compiled/prog.wasm
 # Also write the readable views (off by default; both are derivable from the wasm):
-cargo run -- compile <source.lisp> --emit-wat --emit-pact
+cargo run -- compile <source.wisp> --emit-wat --emit-pact
 
 # Run an exported function from a compiled component
 cargo run -- run <component.wasm> <function-name> <args...>
@@ -126,7 +126,7 @@ cargo fmt && cargo clippy --all-targets --all-features
 cargo build
 
 # Run in debug mode
-cargo run -- compile examples/prog.lisp
+cargo run -- compile examples/prog.wisp
 ```
 
 ## Architecture
@@ -213,7 +213,7 @@ Exports: `(export name)` or `(export (fn ...))`
 Conditionals: `(if cond then else)` - condition must be s32 (0=false, 1=true)
 Let bindings: `(let (name value) body)` - introduces lexically scoped local
 Type casts: `(s32 expr)`, `(s64 expr)`, `(f32 expr)`, `(f64 expr)`
-Includes: `(include "path.lisp")` - splice another file's forms (path relative to this file); pulls in the stdlib, e.g. `(include "std/num.lisp")`
+Includes: `(include "path.wisp")` - splice another file's forms (path relative to this file); pulls in the stdlib, e.g. `(include "std/num.wisp")`
 Comments: `; comment to end of line`
 
 ## Testing
@@ -245,7 +245,7 @@ Test fixtures also live in `tests/fixtures/` for manual `cargo run -- compile` c
 
 ## Output Files
 
-By default, compiling `examples/prog.lisp` writes just one file, in a `compiled/`
+By default, compiling `examples/prog.wisp` writes just one file, in a `compiled/`
 subfolder next to the source (Racket-style), so source directories stay clean:
 - `examples/compiled/prog.wasm` - the Pack package. It embeds the interface metadata
   (CGRF), so it is the one true artifact.
@@ -257,6 +257,6 @@ holds; nothing consumes them, so they are off by default:
 - `--emit-pact` -> `examples/compiled/prog.pact` - text interface (also embedded in the
   wasm as CGRF metadata).
 
-An explicit out-stem (`compile prog.lisp path/name`) is used verbatim (relative to the
+An explicit out-stem (`compile prog.wisp path/name`) is used verbatim (relative to the
 current directory), bypassing the `compiled/` default. The output directory is created
 if missing. `compiled/` is gitignored.

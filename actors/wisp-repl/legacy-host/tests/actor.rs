@@ -10,11 +10,11 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
     let wasm = adapter::build(&output)?;
     let bundle = SourceBundle::new(BTreeMap::from([
         (
-            "lib/main.lisp".into(),
-            "(include \"increment.lisp\")".into(),
+            "lib/main.wisp".into(),
+            "(include \"increment.wisp\")".into(),
         ),
         (
-            "lib/increment.lisp".into(),
+            "lib/increment.wisp".into(),
             "(fn increment ((x s32)) s32 (i32.add x 1))".into(),
         ),
     ]))?;
@@ -29,20 +29,20 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
     assert_eq!(first.evaluate("(add-two 40)").await?, "42");
     assert_eq!(
         first
-            .evaluate("(include \"lib/main.lisp\") (increment 41)")
+            .evaluate("(include \"lib/main.wisp\") (increment 41)")
             .await?,
         "42"
     );
     assert!(
         first
-            .evaluate("(define marker 0) (include \"missing.lisp\")")
+            .evaluate("(define marker 0) (include \"missing.wisp\")")
             .await?
             .starts_with("error:")
     );
     assert!(first.evaluate("marker").await?.contains("unbound"));
     assert!(
         first
-            .evaluate("(include \"../outside.lisp\")")
+            .evaluate("(include \"../outside.wisp\")")
             .await?
             .contains("escapes bundle")
     );

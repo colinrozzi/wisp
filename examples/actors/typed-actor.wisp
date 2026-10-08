@@ -1,4 +1,4 @@
-; typed-actor.lisp — Theater actor using Wisp compound types
+; typed-actor.wisp — Theater actor using Wisp compound types
 ;
 ; This actor uses high-level types instead of hand-crafted CGRF buffers.
 ; The compiler generates all CGRF encoding/decoding automatically.

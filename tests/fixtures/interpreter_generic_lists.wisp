@@ -1,4 +1,4 @@
-(include "../../std/list.lisp")
+(include "../../std/list.wisp")
 (fn numbers () (list s32)
   (list-push (list-push (list-push (list-new s32) 1) 2) 3))
 (fn double ((x T)) T (where (Add T)) (+ x x))

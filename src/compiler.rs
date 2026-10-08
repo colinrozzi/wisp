@@ -333,7 +333,7 @@ fn expand_includes(
             Some(SExpr::Str(s, _)) if items.len() == 2 => s,
             _ => {
                 return Err(ctx.error(
-                    "include expects a string path: (include \"file.lisp\")",
+                    "include expects a string path: (include \"file.wisp\")",
                     span,
                 ));
             }

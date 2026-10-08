@@ -19,7 +19,7 @@ fn fixture_wasm() -> &'static PathBuf {
             std::process::id()
         ));
         compiler::compile(
-            &root.join("tests/fixtures/rpc_any.lisp"),
+            &root.join("tests/fixtures/rpc_any.wisp"),
             &out,
             EmitOptions::default(),
         )

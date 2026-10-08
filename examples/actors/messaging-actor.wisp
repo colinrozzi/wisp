@@ -1,4 +1,4 @@
-; messaging-actor.lisp — Theater actor with message-server handlers
+; messaging-actor.wisp — Theater actor with message-server handlers
 ;
 ; Exports:
 ;   theater:simple/actor.init — actor initialization

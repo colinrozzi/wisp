@@ -22,7 +22,7 @@ prepended to every program would collide with fixtures that define their own `Ad
 inclusion is **explicit** instead:
 
 ```lisp
-(include "std/num.lisp")   ; path is relative to the including file
+(include "std/num.wisp")   ; path is relative to the including file
 ```
 
 `expand_includes` (in `src/compiler.rs`) runs *before* macro and generic expansion, so
@@ -31,7 +31,7 @@ top-level forms in place, resolving the path relative to the including file's di
 and includes each file **at most once** (keyed by canonical path), which also breaks
 cycles. A bad path is a clear error.
 
-### 2. `std/num.lisp` — the library
+### 2. `std/num.wisp` — the library
 
 Traits with one instance per scalar type (`s32`, `s64`, `f32`, `f64`):
 
@@ -52,7 +52,7 @@ in a table and emitted only when a method call resolves to it (transitively — 
 that uses `+` pulls in the `Add` instances for the types it is used at). Unused
 instances are never emitted.
 
-Measured on `tests/fixtures/use_std.lisp` (uses `+ - * <`, `zero`/`one`, and a generic
+Measured on `tests/fixtures/use_std.wisp` (uses `+ - * <`, `zero`/`one`, and a generic
 `double` at two types): **9** instance functions emitted out of **36** defined; total
 module functions **22** instead of **49**. An included-but-unused instance costs zero.
 
@@ -62,7 +62,7 @@ drains the generic and instance worklists together until both are empty.
 
 ## Proof
 
-`tests/fixtures/use_std.lisp` compiles and each operator lowers to the right
+`tests/fixtures/use_std.wisp` compiles and each operator lowers to the right
 instruction:
 
 - `add3` → `Add--c43--s32` (`i32.add`)
@@ -71,7 +71,7 @@ instruction:
   `Add` trait)
 - `clamp-sign` → `Ord--c60--s32` (`i32.lt_s`), `Zero`/`One`/`Sub` at `s32`
 
-## `std/list.lisp` — generic algorithms over `(list T)` (2026-08-13)
+## `std/list.wisp` — generic algorithms over `(list T)` (2026-08-13)
 
 Built on structural unification (see GENERICS-AND-TRAITS.md), a second stdlib module
 provides generic list functions, monomorphized per element type when used:
@@ -87,8 +87,8 @@ The higher-order functions are **compile-time specialized**: `(map f xs)` monomo
 So `sum` really is `fold` plus `+`/`zero`, with zero indirection after specialization.
 
 They recurse by index (`list-len` + `list-get`); Wisp lists have no nil/cons pattern
-matching. `std/list.lisp` starts with `(include "num.lisp")` for the numeric traits;
-the include-once rule makes a double include of `num.lisp` harmless. Tests:
+matching. `std/list.wisp` starts with `(include "num.wisp")` for the numeric traits;
+the include-once rule makes a double include of `num.wisp` harmless. Tests:
 `tests/list.rs` (length, sum at s32 and f64, contains present/absent, reverse).
 
 Two small compiler enablers landed with this:
@@ -105,7 +105,7 @@ Two small compiler enablers landed with this:
   ops apply fixed operations (via trait methods) instead.
 - **No `include` path search** — the path is resolved only relative to the including
   file. No standard search root (e.g. a `WISP_PATH`) yet, so programs outside the repo
-  reference `std/num.lisp` by a relative path.
+  reference `std/num.wisp` by a relative path.
 - **Error spans in included files** render against the top file's source text (the
   include is spliced before a single shared `CompileContext`). Fine while the stdlib is
   correct; worth revisiting if libraries grow.

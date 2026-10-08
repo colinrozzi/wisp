@@ -1,4 +1,4 @@
-; std/logic.lisp — Boolean and bitwise utilities
+; std/logic.wisp — Boolean and bitwise utilities
 
 (export
   (fn not ((x s32)) s32

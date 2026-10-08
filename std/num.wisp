@@ -1,10 +1,10 @@
-; std/num.lisp — a minimal numeric standard library for Wisp.
+; std/num.wisp — a minimal numeric standard library for Wisp.
 ;
 ; Traits over the scalar types (s32, s64, f32, f64), with one instance each.
 ; These ARE the arithmetic operators: `+` is just the `Add` method, resolved at
 ; the concrete type after monomorphization. Bring them in with:
 ;
-;   (include "std/num.lisp")   ; path is relative to your source file
+;   (include "std/num.wisp")   ; path is relative to your source file
 ;
 ; Constants (`zero`, `one`) dispatch on the return type, so they need the
 ; expected type from context — a `: type` annotation or the surrounding call.

@@ -96,10 +96,10 @@ Optionally supply `--bundle PATH` before `repl` or `serve` to override it. The
 file is a JSON object mapping logical paths to source strings:
 
 ```json
-{"lib/math.lisp": "(fn increment ((x s32)) s32 (i32.add x 1))"}
+{"lib/math.wisp": "(fn increment ((x s32)) s32 (i32.add x 1))"}
 ```
 
-Then evaluate `(include "lib/math.lisp") (increment 41)`. Relative includes
+Then evaluate `(include "lib/math.wisp") (increment 41)`. Relative includes
 resolve within the bundle; `..` cannot escape its root. Guest paths never read
 the host filesystem. The host registers `resolve-path` and `read-source` through
 Theater's import registry, so their responses are recorded and replayable.
