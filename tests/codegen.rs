@@ -896,3 +896,66 @@ fn test_scalar_cast_colon_form_u8_masks() {
 "#;
     assert_eq!(compile_and_run(source), 44);
 }
+
+#[test]
+fn test_generic_variant_single_param_inferred() {
+    // A generic variant monomorphized by inference from the constructor argument:
+    // (box s32) instantiated, wrap/unwrap round-trip returns 42.
+    let source = r#"
+(variant (box T) (wrap T))
+(fn unwrap ((b (box s32))) s32 (match b ((wrap x) x)))
+(export (fn test-func () s32 (unwrap (wrap (i32.const 42)))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn test_generic_variant_nullary_via_annotation() {
+    // The nullary `none` case can't be inferred from arguments; the `: (opt s32)`
+    // annotation supplies the instantiation. get-or returns the default, 7.
+    let source = r#"
+(variant (opt T) (some T) (none))
+(fn get-or ((o (opt s32)) (d s32)) s32 (match o ((some x) x) ((none) d)))
+(export (fn test-func () s32 (get-or ((none) : (opt s32)) (i32.const 7))))
+"#;
+    assert_eq!(compile_and_run(source), 7);
+}
+
+#[test]
+fn test_generic_variant_some_case_inferred() {
+    // The `some` case infers T from its argument; get-or returns the payload, 5.
+    let source = r#"
+(variant (opt T) (some T) (none))
+(fn get-or ((o (opt s32)) (d s32)) s32 (match o ((some x) x) ((none) d)))
+(export (fn test-func () s32 (get-or (some (i32.const 5)) (i32.const 0))))
+"#;
+    assert_eq!(compile_and_run(source), 5);
+}
+
+#[test]
+fn test_generic_variant_two_type_params() {
+    // Two type parameters, both inferred from the constructor arguments:
+    // (pair s32 s64); the first projection returns 11.
+    let source = r#"
+(variant (pair A B) (mk A B))
+(fn fst2 ((p (pair s32 s64))) s32 (match p ((mk a b) a)))
+(export (fn test-func () s32 (fst2 (mk (i32.const 11) (i64.const 99)))))
+"#;
+    assert_eq!(compile_and_run(source), 11);
+}
+
+#[test]
+fn test_generic_variant_two_instantiations_coexist() {
+    // The same generic variant instantiated at two different types in one program;
+    // each gets its own nominal variant. unwrap-s32 (box s32) + a truncated
+    // (box s64): 42 + 8 == 50.
+    let source = r#"
+(variant (box T) (wrap T))
+(fn unwrap-s32 ((b (box s32))) s32 (match b ((wrap x) x)))
+(fn unwrap-s64 ((b (box s64))) s32 (match b ((wrap x) (i32.wrap_i64 x))))
+(export (fn test-func () s32
+  (i32.add (unwrap-s32 (wrap (i32.const 42)))
+           (unwrap-s64 (wrap (i64.const 8))))))
+"#;
+    assert_eq!(compile_and_run(source), 50);
+}

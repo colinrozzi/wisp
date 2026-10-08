@@ -4174,6 +4174,16 @@ struct GenericFnDef {
     body: SExpr,
 }
 
+/// A generic variant template: `(variant (Name T ...) (case payload...) ...)`.
+/// Monomorphized on demand into a concrete nominal variant with per-instantiation
+/// case names, mirroring how generic functions are specialized.
+#[derive(Clone)]
+struct GenericTypeDef {
+    tparams: Vec<String>,
+    cases: Vec<SExpr>, // each `(case-name payload-type...)`, type params symbolic
+    span: Span,
+}
+
 /// One monomorphization request: a template specialized at concrete types (one binding
 /// per type parameter, in declaration order) and function-name arguments.
 #[derive(Debug, Clone)]
@@ -4303,6 +4313,10 @@ struct Lowering<'a> {
     instance_worklist: Vec<String>,          // instance fns awaiting emission
     worklist: Vec<SpecKey>,                  // template specializations awaiting emission
     emitted: HashSet<String>,                // mangled names already emitted
+    generic_variants: HashMap<String, GenericTypeDef>, // generic variant templates
+    case_to_generic: HashMap<String, String>, // variant case name -> generic variant name
+    type_instances: HashMap<String, (String, Vec<String>)>, // mangled -> (generic, concretes)
+    type_worklist: Vec<(String, Vec<String>)>, // (generic, concretes) awaiting emission
 }
 
 /// The scalar type name for a type-expr that is a bare symbol (e.g. `s32`).
@@ -4723,14 +4737,14 @@ impl<'a> Lowering<'a> {
     ) -> Result<SExpr> {
         match e {
             SExpr::List(items, span) => {
-                // Colon ascription `(expr : type)`: steer the expected type into `expr`.
-                if items.len() == 3
-                    && is_colon(&items[1])
-                    && let Some(t) = type_expr_string(&items[2])
-                {
-                    let inner = self.walk(&items[0], env, mrc, Some(t))?;
+                // Colon ascription `(expr : type)`: rewrite a generic ADT annotation
+                // to its concrete name and steer the expected type into `expr`.
+                if items.len() == 3 && is_colon(&items[1]) {
+                    let rewritten_ty = self.rewrite_type_expr(&items[2]);
+                    let exp = canonical_type(&rewritten_ty);
+                    let inner = self.walk(&items[0], env, mrc, exp)?;
                     return Ok(SExpr::List(
-                        vec![inner, items[1].clone(), items[2].clone()],
+                        vec![inner, items[1].clone(), rewritten_ty],
                         span.clone(),
                     ));
                 }
@@ -4869,6 +4883,158 @@ impl<'a> Lowering<'a> {
                         return Ok(SExpr::List(new_items, span.clone()));
                     }
 
+                    // Generic ADT constructor: a case of a generic variant. The
+                    // instantiation is inferred from the argument types, falling back
+                    // to the expected type for nullary / under-determined cases.
+                    if let Some(gen_name) = self.case_to_generic.get(head).cloned() {
+                        let gdef = self.generic_variants.get(&gen_name).cloned().unwrap();
+                        let args = &items[1..];
+                        let payload_pats: Vec<SExpr> = gdef
+                            .cases
+                            .iter()
+                            .find_map(|c| match c {
+                                SExpr::List(ci, _) if head_sym(ci) == Some(head) => {
+                                    Some(ci[1..].to_vec())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        if args.len() != payload_pats.len() {
+                            return Err(self.ctx.error(
+                                format!(
+                                    "variant case '{}' expects {} argument(s), got {}",
+                                    head,
+                                    payload_pats.len(),
+                                    args.len()
+                                ),
+                                span,
+                            ));
+                        }
+                        // Infer type-parameter bindings from the argument types.
+                        let mut found: Vec<(String, String)> = Vec::new();
+                        for (pat, a) in payload_pats.iter().zip(args) {
+                            if let Some(cs) = self.infer_type(a, env)
+                                && let Some(ce) = type_str_to_expr(&cs)
+                            {
+                                unify_types(pat, &ce, &gdef.tparams, &mut found);
+                            }
+                        }
+                        // Fallback: an expected type naming this generic supplies any
+                        // still-unbound parameter (e.g. `((none) : (opt s32))`).
+                        if found.len() < gdef.tparams.len()
+                            && let Some(exp) = expected.as_deref()
+                            && let Some((g, concretes)) = self.type_instances.get(exp).cloned()
+                            && g == gen_name
+                        {
+                            for (tp, c) in gdef.tparams.iter().zip(concretes) {
+                                if !found.iter().any(|(k, _)| k == tp) {
+                                    found.push((tp.clone(), c));
+                                }
+                            }
+                        }
+                        let mut concretes = Vec::new();
+                        for tp in &gdef.tparams {
+                            match found.iter().find(|(k, _)| k == tp) {
+                                Some((_, c)) => concretes.push(c.clone()),
+                                None => {
+                                    return Err(self.ctx.error(
+                                        format!(
+                                            "cannot infer type argument '{}' for constructor '{}'; add a type annotation",
+                                            tp, head
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                        }
+                        let mangled_type = self.queue_variant(&gen_name, &concretes);
+                        let mangled_case = Self::mangle_case_name(head, &mangled_type);
+                        let bindings: Vec<(String, String)> = gdef
+                            .tparams
+                            .iter()
+                            .cloned()
+                            .zip(concretes.iter().cloned())
+                            .collect();
+                        let mut new_items = Vec::with_capacity(items.len());
+                        new_items.push(SExpr::Sym(mangled_case, items[0].span().clone()));
+                        for (pat, a) in payload_pats.iter().zip(args) {
+                            let exp = canonical_type(&subst_types(pat, &bindings));
+                            new_items.push(self.walk(a, env, mrc, exp)?);
+                        }
+                        return Ok(SExpr::List(new_items, span.clone()));
+                    }
+
+                    // `match` on a generic-variant value: rewrite each arm's case name
+                    // to the scrutinee's concrete instantiation and bind the arm
+                    // variables at their substituted payload types.
+                    if head == "match"
+                        && items.len() >= 2
+                        && let Some(sty) = self.infer_type(&items[1], env)
+                        && let Some((gen_name, concretes)) = self.type_instances.get(&sty).cloned()
+                    {
+                        let gdef = self.generic_variants.get(&gen_name).cloned().unwrap();
+                        let bindings: Vec<(String, String)> = gdef
+                            .tparams
+                            .iter()
+                            .cloned()
+                            .zip(concretes.iter().cloned())
+                            .collect();
+                        let new_scrut = self.walk(&items[1], env, mrc, None)?;
+                        let mut new_items = vec![items[0].clone(), new_scrut];
+                        for arm in &items[2..] {
+                            if let SExpr::List(ai, aspan) = arm
+                                && ai.len() == 2
+                                && let SExpr::List(pat, pspan) = &ai[0]
+                                && let Some(SExpr::Sym(case, cspan)) = pat.first()
+                                && self.case_to_generic.get(case) == Some(&gen_name)
+                            {
+                                let payload_pats: Vec<SExpr> = gdef
+                                    .cases
+                                    .iter()
+                                    .find_map(|c| match c {
+                                        SExpr::List(ci, _)
+                                            if head_sym(ci) == Some(case.as_str()) =>
+                                        {
+                                            Some(ci[1..].to_vec())
+                                        }
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default();
+                                let mut arm_env = env.to_vec();
+                                for (bnd, pty) in pat[1..].iter().zip(&payload_pats) {
+                                    if let SExpr::Sym(bn, _) = bnd
+                                        && let Some(ts) =
+                                            canonical_type(&subst_types(pty, &bindings))
+                                    {
+                                        arm_env.push((bn.clone(), ts));
+                                    }
+                                }
+                                let new_body =
+                                    self.walk(&ai[1], &arm_env, mrc, expected.clone())?;
+                                let mut new_pat = pat.clone();
+                                new_pat[0] =
+                                    SExpr::Sym(Self::mangle_case_name(case, &sty), cspan.clone());
+                                new_items.push(SExpr::List(
+                                    vec![SExpr::List(new_pat, pspan.clone()), new_body],
+                                    aspan.clone(),
+                                ));
+                            } else if let SExpr::List(ai, aspan) = arm
+                                && ai.len() == 2
+                            {
+                                // A non-generic arm (e.g. the `_` wildcard): keep the
+                                // pattern, walk only the body.
+                                let new_body = self.walk(&ai[1], env, mrc, expected.clone())?;
+                                new_items.push(SExpr::List(
+                                    vec![ai[0].clone(), new_body],
+                                    aspan.clone(),
+                                ));
+                            } else {
+                                new_items.push(self.walk(arm, env, mrc, None)?);
+                            }
+                        }
+                        return Ok(SExpr::List(new_items, span.clone()));
+                    }
+
                     // Forms that carry the expected type into their tail positions.
                     match head {
                         "if" if items.len() == 4 => {
@@ -4982,6 +5148,143 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Mangle a generic type instantiation into a concrete nominal name:
+    /// `box` @ `[s32]` -> `box$s32`; non-symbol characters in a nested argument
+    /// (e.g. the parens of `(list s32)`) become `_`.
+    fn mangle_type_name(base: &str, concretes: &[String]) -> String {
+        let mut s = base.to_string();
+        for c in concretes {
+            s.push('$');
+            for ch in c.chars() {
+                if ch.is_alphanumeric() || ch == '-' {
+                    s.push(ch);
+                } else {
+                    s.push('_');
+                }
+            }
+        }
+        s
+    }
+
+    /// The per-instantiation case name: `wrap` in `box$s32` -> `wrap$box$s32`.
+    /// Unique per instantiation, so the existing by-name constructor/match
+    /// resolution needs no change once a generic type is monomorphized.
+    fn mangle_case_name(case: &str, type_name: &str) -> String {
+        format!("{}${}", case, type_name)
+    }
+
+    /// Queue a generic variant instantiation for emission (once) and return its
+    /// mangled concrete type name.
+    fn queue_variant(&mut self, name: &str, concretes: &[String]) -> String {
+        let mangled = Self::mangle_type_name(name, concretes);
+        if !self.type_instances.contains_key(&mangled) {
+            self.type_instances
+                .insert(mangled.clone(), (name.to_string(), concretes.to_vec()));
+            self.type_worklist
+                .push((name.to_string(), concretes.to_vec()));
+        }
+        mangled
+    }
+
+    /// Rewrite type-expression occurrences of generic ADTs into their mangled
+    /// concrete names, queueing each instantiation. Recurses into builtin
+    /// parameterized types (list/option/result/tuple/->) so nested generics like
+    /// `(list (box s32))` resolve. Non-generic type exprs pass through unchanged.
+    fn rewrite_type_expr(&mut self, e: &SExpr) -> SExpr {
+        match e {
+            SExpr::List(items, span) if !items.is_empty() => {
+                let rewritten: Vec<SExpr> =
+                    items.iter().map(|i| self.rewrite_type_expr(i)).collect();
+                if let Some(head) = head_sym(items)
+                    && let Some(gdef) = self.generic_variants.get(head)
+                    && rewritten.len() - 1 == gdef.tparams.len()
+                {
+                    let concretes: Vec<String> =
+                        rewritten[1..].iter().filter_map(canonical_type).collect();
+                    if concretes.len() == gdef.tparams.len() {
+                        let mangled = self.queue_variant(head, &concretes);
+                        return SExpr::Sym(mangled, span.clone());
+                    }
+                }
+                SExpr::List(rewritten, span.clone())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Rewrite the type positions of one parameter (`(name type)` or `(name : type)`).
+    fn rewrite_param(&mut self, p: &SExpr) -> SExpr {
+        if let SExpr::List(pp, pspan) = p {
+            if pp.len() == 2 {
+                return SExpr::List(
+                    vec![pp[0].clone(), self.rewrite_type_expr(&pp[1])],
+                    pspan.clone(),
+                );
+            } else if pp.len() == 3 && is_colon(&pp[1]) {
+                return SExpr::List(
+                    vec![pp[0].clone(), pp[1].clone(), self.rewrite_type_expr(&pp[2])],
+                    pspan.clone(),
+                );
+            }
+        }
+        p.clone()
+    }
+
+    /// Rewrite generic ADT references in a function signature (parameter types and
+    /// return type), leaving the body for `walk`. Returns the new `fn` items.
+    fn rewrite_fn_signature(&mut self, items: &[SExpr]) -> Vec<SExpr> {
+        let mut out = items.to_vec();
+        if let Some(SExpr::List(ps, pspan)) = out.get(2).cloned() {
+            let new_ps: Vec<SExpr> = ps.iter().map(|p| self.rewrite_param(p)).collect();
+            out[2] = SExpr::List(new_ps, pspan);
+        }
+        // The return type is at index 3, or 4 when a `:` precedes it.
+        let ret_idx = if out.get(3).is_some_and(is_colon) {
+            4
+        } else {
+            3
+        };
+        if let Some(r) = out.get(ret_idx).cloned() {
+            out[ret_idx] = self.rewrite_type_expr(&r);
+        }
+        out
+    }
+
+    /// Emit a concrete variant form for one generic instantiation: substitute the
+    /// type parameters, mangle each case name, and rewrite nested generic payloads
+    /// (queueing them in turn).
+    fn emit_variant_instance(&mut self, gen_name: &str, concretes: &[String]) -> SExpr {
+        let gdef = self.generic_variants.get(gen_name).cloned().unwrap();
+        let mangled = Self::mangle_type_name(gen_name, concretes);
+        let span = gdef.span.clone();
+        let bindings: Vec<(String, String)> = gdef
+            .tparams
+            .iter()
+            .cloned()
+            .zip(concretes.iter().cloned())
+            .collect();
+        let mut out = vec![
+            SExpr::Sym("variant".to_string(), span.clone()),
+            SExpr::Sym(mangled.clone(), span.clone()),
+        ];
+        for case in &gdef.cases {
+            if let SExpr::List(ci, cspan) = case
+                && let Some(SExpr::Sym(cn, cnspan)) = ci.first()
+            {
+                let mut new_ci = vec![SExpr::Sym(
+                    Self::mangle_case_name(cn, &mangled),
+                    cnspan.clone(),
+                )];
+                for pty in &ci[1..] {
+                    let subst = subst_types(pty, &bindings);
+                    new_ci.push(self.rewrite_type_expr(&subst));
+                }
+                out.push(SExpr::List(new_ci, cspan.clone()));
+            }
+        }
+        SExpr::List(out, span)
+    }
+
     /// Produce the specialized `fn` form for one monomorphization request:
     /// the type parameter is substituted, each function parameter's name is replaced
     /// by its function argument (and the parameter is dropped from the signature),
@@ -5049,13 +5352,16 @@ impl<'a> Lowering<'a> {
     /// Rewrite the body of a retained `fn` form (generic calls -> specialized names).
     /// The body is always the last element, whatever the annotation shape.
     fn process_fn_form(&mut self, items: &[SExpr], span: &Span) -> Result<SExpr> {
-        let shape =
-            fn_shape(items).ok_or_else(|| self.ctx.error("malformed function definition", span))?;
+        // Rewrite generic ADT references in the signature first, so the body's env
+        // and expected return type see the mangled concrete names.
+        let items = self.rewrite_fn_signature(items);
+        let shape = fn_shape(&items)
+            .ok_or_else(|| self.ctx.error("malformed function definition", span))?;
         let env = param_env(shape.params);
         // The body is in return position, so it is expected at the return type.
         let ret_exp = canonical_type(shape.ret);
         let new_body = self.walk(shape.body, &env, None, ret_exp)?;
-        let mut new_items = items.to_vec();
+        let mut new_items = items.clone();
         if let Some(last) = new_items.last_mut() {
             *last = new_body;
         }
@@ -5240,6 +5546,10 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
         instance_worklist: Vec::new(),
         worklist: Vec::new(),
         emitted: HashSet::new(),
+        generic_variants: HashMap::new(),
+        case_to_generic: HashMap::new(),
+        type_instances: HashMap::new(),
+        type_worklist: Vec::new(),
     };
 
     let mut retained: Vec<SExpr> = Vec::new();
@@ -5294,6 +5604,66 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
     }
     // Make the trait declarations available during body rewriting (Pass 2/3).
     low.traits = traits.clone();
+
+    // Pass 0.5: collect generic variant templates `(variant (Name T ...) ...)`, so
+    // their constructors/matches resolve regardless of source order (Pass 1/2).
+    for form in &forms {
+        let (items, span) = match form {
+            SExpr::List(items, span) if !items.is_empty() => (items, span),
+            _ => continue,
+        };
+        if head_sym(items) != Some("variant") {
+            continue;
+        }
+        let head = match items.get(1) {
+            Some(SExpr::List(head, _)) if !head.is_empty() => head,
+            _ => continue, // concrete variant (bare-symbol name): handled in Pass 1
+        };
+        let name = match &head[0] {
+            SExpr::Sym(n, _) => n.clone(),
+            _ => return Err(ctx.error("variant name must be a symbol", span)),
+        };
+        let mut tparams = Vec::new();
+        for t in &head[1..] {
+            match t {
+                SExpr::Sym(tp, _) => tparams.push(tp.clone()),
+                _ => return Err(ctx.error("variant type parameter must be a symbol", span)),
+            }
+        }
+        if tparams.is_empty() {
+            return Err(ctx.error("generic variant needs at least one type parameter", span));
+        }
+        let cases: Vec<SExpr> = items[2..].to_vec();
+        for c in &cases {
+            if let SExpr::List(ci, _) = c
+                && let Some(SExpr::Sym(cn, _)) = ci.first()
+                && let Some(prev) = low.case_to_generic.insert(cn.clone(), name.clone())
+                && prev != name
+            {
+                return Err(ctx.error(
+                    format!(
+                        "variant case '{}' is declared by both '{}' and '{}'",
+                        cn, prev, name
+                    ),
+                    span,
+                ));
+            }
+        }
+        if low
+            .generic_variants
+            .insert(
+                name.clone(),
+                GenericTypeDef {
+                    tparams,
+                    cases,
+                    span: span.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(ctx.error(format!("duplicate generic variant '{}'", name), span));
+        }
+    }
 
     // Pass 1: classify every top-level form.
     for form in &forms {
@@ -5551,6 +5921,13 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                 }
                 retained.push(form.clone());
             }
+            Some("variant") => {
+                // A generic variant template (list name) is collected in Pass 0.5 and
+                // emitted per instantiation; a concrete variant is retained as-is.
+                if !matches!(items.get(1), Some(SExpr::List(..))) {
+                    retained.push(form.clone());
+                }
+            }
             _ => retained.push(form.clone()),
         }
     }
@@ -5580,6 +5957,11 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                 let rewritten = low.process_fn_form(&items, &span)?;
                 output.push(rewritten);
             }
+        } else if let Some((gen_name, concretes)) = low.type_worklist.pop() {
+            // Emit a concrete variant per generic instantiation. Emission may rewrite
+            // nested generic payloads, queueing further instantiations.
+            let form = low.emit_variant_instance(&gen_name, &concretes);
+            output.push(form);
         } else {
             break;
         }
