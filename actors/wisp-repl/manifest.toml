@@ -10,6 +10,11 @@ type = "runtime"
 [[handler]]
 type = "rpc"
 
+# Lifecycle relationships (link / monitor another actor). No per-op policy;
+# subscription is self-service (subscriber = caller).
+[[handler]]
+type = "lifecycle"
+
 # The evaluator imports the custom wisp-source interface (see source.pact). The
 # embedding host must register it before spawning; stock `theater spawn` does
 # not provide it. Construct the bundle from the adjacent sources.json.

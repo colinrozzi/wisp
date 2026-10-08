@@ -207,6 +207,13 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("podman not exercised".into())) }),
         );
     }
+    for name in ["monitor", "unmonitor", "link", "unlink"] {
+        imports.define(
+            "theater:simple/lifecycle",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("lifecycle not exercised".into())) }),
+        );
+    }
     imports
 }
 

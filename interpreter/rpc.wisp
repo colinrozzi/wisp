@@ -187,6 +187,16 @@
 (import theater:simple/podman rm ((name string) (force bool)) (result unit string))
 (import theater:simple/podman list () (result (list container-info) string))
 
+; lifecycle: attach a relationship to another actor (the "subject"), self-service.
+; link/unlink = fate-sharing (no callback); monitor/unmonitor = watch the subject's
+; chain, delivered to our exported handle-actor-event (-> on-actor-event handler).
+; monitor-filtered (subject + a packr Pattern) is a follow-up: it needs the Pattern
+; value built in Wisp, so it is omitted here.
+(import theater:simple/lifecycle monitor ((subject string)) (result unit string))
+(import theater:simple/lifecycle unmonitor ((subject string)) (result unit string))
+(import theater:simple/lifecycle link ((subject string)) (result unit string))
+(import theater:simple/lifecycle unlink ((subject string)) (result unit string))
+
 ; Names the evaluator routes to the Theater bridge rather than ordinary builtins.
 (fn host-builtin? ((name string)) s32
   (cond
@@ -264,6 +274,10 @@
     ((string=? name "podman-stop") 1)
     ((string=? name "podman-rm") 1)
     ((string=? name "podman-list") 1)
+    ((string=? name "monitor") 1)
+    ((string=? name "unmonitor") 1)
+    ((string=? name "link") 1)
+    ((string=? name "unlink") 1)
     (else 0)))
 
 (fn string-arg? ((v value)) s32 (value-case v ((text s) 1) (else 0)))
@@ -351,6 +365,7 @@
     ((text s) (typed-list (symbol "u8")
                 (str-bytes s (i32.const 0) (i32.load (string-addr s)) (list-new value))))
     (else (typed-list (symbol "u8") (list-new value)))))
+
 
 (fn apply-store-new ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "store-new expects no arguments")
@@ -701,6 +716,19 @@
   (if (i32.ne (list-len args) 0) (failure "podman-list expects no arguments")
     (unmarshal (raw-invoke "theater:simple/podman" "list" (arg-tuple (list-new value))))))
 
+; --- lifecycle -------------------------------------------------------------
+; Each takes a subject actor id. monitor delivers the subject's chain events to
+; the exported handle-actor-event -> (on-actor-event). Self-service: the runtime
+; forces subscriber = this actor.
+(fn apply-monitor ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/lifecycle" "monitor" (marshal (list-get args 0)))) (failure "monitor expects a subject actor id")))
+(fn apply-unmonitor ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/lifecycle" "unmonitor" (marshal (list-get args 0)))) (failure "unmonitor expects a subject actor id")))
+(fn apply-link ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/lifecycle" "link" (marshal (list-get args 0)))) (failure "link expects a subject actor id")))
+(fn apply-unlink ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/lifecycle" "unlink" (marshal (list-get args 0)))) (failure "unlink expects a subject actor id")))
+
 ; --- inbound events --------------------------------------------------------
 ; Drain the buffered triggers: each is (handler-name event result). Clears the
 ; buffer so you see only what fired since the last poll.
@@ -717,7 +745,7 @@
     ((string=? topic "tcp")
       "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (sequence conn-id bytes)\n    (define on-close      (lambda (e) e))       ; e = (sequence conn-id reason)\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
     ((string=? topic "triggers")
-      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(seq bytes)\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(seq conn-id bytes)\n  on-close      (lambda (e) ...)      TCP closed; e=(seq conn-id reason)\n\nEach firing records (handler-name event handler-result). Redefine any handler\nmid-stream to change behavior.  See also: (help \"tcp\")")
+      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(seq bytes)\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(seq conn-id bytes)\n  on-close      (lambda (e) ...)      TCP closed; e=(seq conn-id reason)\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name event handler-result). Redefine any handler\nmid-stream to change behavior.  See also: (help \"tcp\")")
     (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\")")))))
 
 (fn apply-help ((args (list value))) value
@@ -732,8 +760,9 @@
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\n"
                       (string-append "podman:    (podman-run image name) (podman-stop name) (podman-rm name force) (podman-list)\n"
-                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close; (poll-events) to drain   see (help \"triggers\")\n"
-                          "topics:    (help \"tcp\")   (help \"triggers\")"))))))))))))
+                        (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
+                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events) to drain   see (help \"triggers\")\n"
+                          "topics:    (help \"tcp\")   (help \"triggers\")")))))))))))))
     (if (string-arg? (list-get args 0))
       (text (help-topic (as-string (list-get args 0))))
       (failure "help expects an optional topic string"))))
@@ -814,4 +843,8 @@
     ((string=? name "podman-stop") (apply-podman-stop args))
     ((string=? name "podman-rm") (apply-podman-rm args))
     ((string=? name "podman-list") (apply-podman-list args))
+    ((string=? name "monitor") (apply-monitor args))
+    ((string=? name "unmonitor") (apply-unmonitor args))
+    ((string=? name "link") (apply-link args))
+    ((string=? name "unlink") (apply-unlink args))
     (else (failure (string-append "unknown host builtin: " name)))))

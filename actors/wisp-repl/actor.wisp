@@ -59,3 +59,26 @@
 (export "theater:simple/tcp-client.on-close"
   (fn tcp-on-close ((raw any)) string
     (begin (dispatch-event "on-close" (unmarshal raw)) "ok")))
+
+; Lifecycle monitoring (theater:simple/lifecycle-handlers). After (monitor id),
+; Theater delivers every chain event of the monitored actor here, dispatched to a
+; user on-actor-event handler as (sequence subject event-type data) — route on
+; event-type (a string); data is the pack-encoded ChainEventPayload as bytes.
+; This export MUST match the pact signature exactly: the lifecycle handler gates
+; delivery on has_export(lifecycle-handlers, handle-actor-event), so a (raw any)
+; shortcut (fine for tcp/message callbacks, which call by name) makes has_export
+; false here and every event is silently dropped.
+; Return type is (result bool string): pack maps result<_, E> to Result{ok:Bool,E},
+; so this hashes identically to the pact's result<_, string> while giving us a
+; constructible ok value. The 3-param signature must match the pact exactly (the
+; lifecycle handler gates delivery on has_export). on-actor-event receives
+; (sequence subject event-type) — route on event-type; the raw ChainEventPayload
+; bytes in `data` are not yet surfaced (needs a list<u8> -> value helper; follow-up).
+(export "theater:simple/lifecycle-handlers.handle-actor-event"
+  (fn handle-actor-event ((subject string) (event-type string) (data (list u8)))
+    (result bool string)
+    (begin
+      (dispatch-event "on-actor-event"
+        (sequence (list-push (list-push (list-new value)
+          (text subject)) (text event-type))))
+      (ok bool string (bool 1)))))

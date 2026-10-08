@@ -98,6 +98,12 @@ impl Runtime {
         handlers.register(theater_handler_podman::PodmanHandler::new(
             theater_handler_podman::PodmanHandlerConfig {},
         ));
+        // Lifecycle relationships: link (fate-sharing) + monitor (watch another
+        // actor's chain, delivered to handle-actor-event). Self-service — the
+        // runtime forces subscriber = caller.
+        handlers.register(theater_handler_lifecycle::LifecycleHandler::new(
+            commands.clone(),
+        ));
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,

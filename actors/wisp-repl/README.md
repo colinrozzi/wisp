@@ -123,6 +123,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
 | tcp⁴ | `(tcp-connect addr)` · `(tcp-send conn data)` → bytes · `(tcp-receive conn max)`⁵ · `(tcp-close conn)` · `(tcp-peer conn)` · `(tcp-is-tls conn)` · `(tcp-listen addr)`⁶ · `(tcp-accept lst)`⁶ · `(tcp-activate conn)` · `(tcp-set-active conn mode)` · `(tcp-transfer conn actor)` · `(tcp-transfer-async conn actor)` · `(tcp-tls-client conn name)` · `(tcp-tls-server conn)` · `(tcp-close-listener lst)` |
 | podman | `(podman-run image name)` · `(podman-stop name)` · `(podman-rm name force)` · `(podman-list)` |
+| lifecycle⁷ | `(monitor id)` · `(unmonitor id)` · `(link id)` · `(unlink id)` |
 | meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(poll-events)` |
 
 ¹ Self-targeted blocking calls — `(exports (self))`, `(implements (self) …)`,
@@ -152,6 +153,15 @@ handlers you define like any other trigger:
 (tcp-set-active cid "active")                  ; push mode -> on-data fires per read
 ;; …or leave it activated and (tcp-receive cid max) to pull passively.
 ```
+
+⁷ `(monitor id)` watches another actor's whole event chain (self-service — you can
+only monitor on your own behalf); every chain event of the subject is delivered to
+your `on-actor-event` handler as `(sequence subject event-type)`. `(link id)`
+fate-shares instead (no callback — if the subject dies, you are stopped);
+`(unmonitor)`/`(unlink)` detach. **Each call on the monitored actor yields two
+`"wasm"` events (call + result)** plus one per host-call it makes, so it is chatty —
+route on `event-type` (e.g. `"terminated"`) in your handler. (A host-side
+`monitor-filtered` + the raw `data` payload are follow-ups.)
 
 ## Observing Theater — inbound triggers as live handlers
 
@@ -183,7 +193,7 @@ theater-repl follow $id        # fired: beat … (Ctrl-C to stop)
 
 Redefine a handler any time to change behavior mid-stream. Triggers wired today:
 `on-tick` (timer), `on-spawn` (after `(subscribe-spawns)`), `on-message` (after
-`(msg-register)`), and `on-connection` / `on-data` / `on-close` (after
+`(msg-register)`), `on-actor-event` (after `(monitor id)`), and `on-connection` / `on-data` / `on-close` (after
 `(tcp-listen)` — see the TCP footnote).
 
 ## Extending — add a host verb

@@ -6481,18 +6481,47 @@ fn parse_expr(
             let op = &items[0];
             match op {
                 SExpr::Sym(sym, sym_span) if is_type_symbol(sym) && items.len() == 2 => {
-                    let ty = match sym.as_str() {
-                        "s32" => Type::S32,
-                        "s64" => Type::S64,
-                        "f32" => Type::F32,
-                        "f64" => Type::F64,
-                        _ => unreachable!(),
+                    // Numeric casts emit conversion instructions.
+                    let numeric = match sym.as_str() {
+                        "s32" => Some(Type::S32),
+                        "s64" => Some(Type::S64),
+                        "f32" => Some(Type::F32),
+                        "f64" => Some(Type::F64),
+                        _ => None,
                     };
-                    let inner = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
-                    Ok(Expr::Ascribe {
-                        expr: Box::new(inner),
-                        ty,
-                    })
+                    if let Some(ty) = numeric {
+                        let inner =
+                            parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                        return Ok(Expr::Ascribe {
+                            expr: Box::new(inner),
+                            ty,
+                        });
+                    }
+                    // The first-class integer/bool scalars have no literal syntax of
+                    // their own; `(bool 1)` / `(u32 100)` retypes an integer literal.
+                    let scalar = match sym.as_str() {
+                        "u8" => Some(Type::U8),
+                        "u16" => Some(Type::U16),
+                        "u32" => Some(Type::U32),
+                        "u64" => Some(Type::U64),
+                        "bool" => Some(Type::Bool),
+                        _ => None,
+                    };
+                    if let Some(ty) = scalar {
+                        if let SExpr::Int { value, .. } = &items[1] {
+                            return Ok(Expr::Int { value: *value, ty });
+                        }
+                        return Err(ctx.error_with_note(
+                            format!("cast to '{sym}' supports only an integer literal"),
+                            sym_span,
+                            "e.g. (bool 1) or (u32 100)",
+                        ));
+                    }
+                    return Err(ctx.error_with_note(
+                        format!("cannot cast to '{sym}'"),
+                        sym_span,
+                        "casts apply to scalar types (s32/s64/f32/f64/u8/u16/u32/u64/bool)",
+                    ));
                 }
                 SExpr::Sym(sym, sym_span) if sym == "if" => {
                     if items.len() != 4 {
@@ -7482,8 +7511,9 @@ fn gen_expr(
     match expr {
         Expr::Int { value, ty } => {
             let instr = match ty {
-                Type::S32 => "i32.const",
-                Type::S64 => "i64.const",
+                // i32-backed scalars (Bool/U8/U16/U32 live in an i32 in Wisp memory).
+                Type::S32 | Type::Bool | Type::U8 | Type::U16 | Type::U32 => "i32.const",
+                Type::S64 | Type::U64 => "i64.const",
                 _ => panic!("integer literal not supported for {:?}", ty),
             };
             out.push_str(&format!("{}{} {}\n", pad, instr, *value));
@@ -10387,17 +10417,29 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
             } else {
                 vec![wisp_type_to_pack_type(&func.return_type)]
             };
+            // Split an interface-qualified export ("pkg:ns/iface.func") into its
+            // interface ("pkg:ns/iface") and bare function name ("func"), and group
+            // by that interface. This is what packr's arena stores and what
+            // `has_export(interface, fn)` / rpc.describe read; putting everything
+            // flat under a single "exports" interface made has_export always false
+            // (so e.g. lifecycle delivery, gated on has_export, silently dropped).
+            // Bare exports (no interface) stay under "exports".
+            let (interface_name, fn_name) = match exp.export_name.rsplit_once('.') {
+                Some((iface, name)) if iface.contains('/') => {
+                    (iface.to_string(), name.to_string())
+                }
+                _ => ("exports".to_string(), exp.export_name.clone()),
+            };
             let pack_func = Function::with_signature(
-                exp.export_name.clone(),
+                fn_name,
                 func.params
                     .iter()
                     .map(|p| Param::new(p.name.clone(), wisp_type_to_pack_type(&p.ty)))
                     .collect(),
                 results,
             );
-            // Use "exports" as the default interface for exports
             export_by_interface
-                .entry("exports".to_string())
+                .entry(interface_name)
                 .or_default()
                 .push(pack_func);
         }
