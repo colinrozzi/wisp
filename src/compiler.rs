@@ -791,9 +791,16 @@ pub enum Expr {
         body: Box<Expr>,
     },
     /// Consume (release) a capability token: (release-cap c) -> s32. The terminal
-    /// consumer that discharges a capability's linear obligation.
+    /// consumer that discharges an owned capability's linear obligation (for caps
+    /// obtained by transfer; a with-cap-bound cap is released by its scope).
     ReleaseCap {
         value: Box<Expr>,
+    },
+    /// Borrow a capability without consuming it: (& c) -> (borrow Cap). A borrow is
+    /// unrestricted (usable any number of times) and does not count toward the
+    /// capability's single consuming use. Zero runtime cost: the same i32 witness.
+    BorrowCap {
+        name: String,
     },
 }
 
@@ -1128,9 +1135,10 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
         Expr::TupleConstruct { .. } => true,
         // A capability witness is an i32 constant; with-cap/release-cap only touch
-        // the heap if their body/value does.
+        // the heap if their body/value does; a borrow is a bare local.get.
         Expr::WithCap { body, .. } => expr_uses_heap(body),
         Expr::ReleaseCap { value } => expr_uses_heap(value),
+        Expr::BorrowCap { .. } => false,
     }
 }
 
@@ -1628,6 +1636,11 @@ fn type_check(
                 body_ty
             );
         }
+        // A borrow is transient and tied to its source; it must not escape by being
+        // returned (that would outlive the borrowed capability).
+        if matches!(func.return_type, Type::Borrow(_)) {
+            bail!("function '{}' cannot return a borrow", func.name);
+        }
         check_fn_linearity(func, &prog.capabilities)?;
     }
     Ok(())
@@ -1679,6 +1692,9 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
         } => vec![cond, then_branch, else_branch],
         Expr::Let { value, body, .. } => vec![value, body],
         Expr::WithCap { body, .. } => vec![body],
+        // A borrow references a name, not a sub-expression; it never counts as a
+        // consuming use (that is the whole point), so it has no children here.
+        Expr::BorrowCap { .. } => vec![],
         Expr::Match { expr, cases } => {
             let mut v = vec![expr.as_ref()];
             v.extend(cases.iter().map(|a| &a.body));
@@ -1761,23 +1777,24 @@ fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usi
             Ok(acc)
         }
         Expr::WithCap { name, body, .. } => {
-            // The minted capability is linear: it must be consumed exactly once
-            // within the body, and does not escape the scope. Outer linear bindings
+            // RAII: the scope owns the capability and releases it at the end, so the
+            // body may only *borrow* it (via `(& c)`, which does not count) — it must
+            // never consume it by value. A by-value use would be a second release
+            // (the scope already releases), and, crucially, releasing early then
+            // borrowing would be use-after-release. Zero by-value uses keeps the
+            // scope's release strictly last, which is sound. Outer linear bindings
             // referenced in the body still count toward their own obligations.
             let mut inner = linear.clone();
             inner.insert(name.clone());
             let mut uses = linear_uses(body, &inner)?;
-            match uses.get(name).copied().unwrap_or(0) {
-                1 => {}
-                0 => bail!(
-                    "capability '{}' is never consumed; a with-cap binding must be released (or threaded to a consumer) exactly once",
-                    name
-                ),
-                n => bail!(
-                    "capability '{}' is consumed {} times but must be consumed exactly once",
+            let by_value = uses.get(name).copied().unwrap_or(0);
+            if by_value > 0 {
+                bail!(
+                    "capability '{}' may only be borrowed (& {}) inside with-cap, not consumed; the scope releases it (used by value {} time(s))",
                     name,
-                    n
-                ),
+                    name,
+                    by_value
+                );
             }
             uses.remove(name);
             Ok(uses)
@@ -2358,16 +2375,32 @@ fn check_expr(
         }
         Expr::WithCap { name, cap, body } => {
             // Bind the capability token (a resource-represented handle) and check
-            // the body. The exactly-once obligation is enforced by check_fn_linearity.
+            // the body. The borrow-only obligation is enforced by check_fn_linearity.
             let mut next_env = env.clone();
             next_env.insert(name.clone(), Type::Resource(cap.clone()));
-            check_expr(body, &next_env, signatures, globals, records, variants)
+            let body_ty = check_expr(body, &next_env, signatures, globals, records, variants)?;
+            // A borrow must not outlive the capability it borrows; the scope releases
+            // the cap at its end, so the body may not yield a borrow of it.
+            if matches!(body_ty, Type::Borrow(_)) {
+                bail!("a borrow cannot escape its with-cap scope");
+            }
+            Ok(body_ty)
         }
         Expr::ReleaseCap { value } => {
             let ty = check_expr(value, env, signatures, globals, records, variants)?;
             match ty {
                 Type::Resource(_) => Ok(Type::S32),
                 other => bail!("release-cap expects a capability, got {:?}", other),
+            }
+        }
+        Expr::BorrowCap { name } => {
+            let ty = env
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown variable '{}'", name))?;
+            match ty {
+                Type::Resource(_) => Ok(Type::Borrow(Box::new(ty))),
+                other => bail!("(& {}) expects a capability, got {:?}", name, other),
             }
         }
         // List operations
@@ -7797,6 +7830,25 @@ fn parse_expr(
                         value: Box::new(value),
                     })
                 }
+                SExpr::Sym(sym, sym_span) if sym == "&" => {
+                    // (& c): borrow the capability bound to c without consuming it.
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid borrow expression",
+                            list_span,
+                            "expected: (& capability-variable)",
+                        ));
+                    }
+                    let inner = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    match inner {
+                        Expr::Var(name) => Ok(Expr::BorrowCap { name }),
+                        _ => Err(ctx.error_with_note(
+                            "borrow expects a capability variable",
+                            sym_span,
+                            "expected: (& c) where c is a capability bound by with-cap",
+                        )),
+                    }
+                }
                 SExpr::Sym(sym, _sym_span) if sym == "begin" => {
                     if items.len() < 2 {
                         return Err(ctx.error_with_note(
@@ -9659,6 +9711,12 @@ fn gen_expr(
             out.push_str(&format!("{}drop\n", pad));
             out.push_str(&format!("{}i32.const 0\n", pad));
             Type::S32
+        }
+        Expr::BorrowCap { name } => {
+            // A borrow is the same i32 witness as the capability; just load it.
+            let (idx, ty) = env.lookup(name);
+            out.push_str(&format!("{}local.get {}\n", pad, idx));
+            Type::Borrow(Box::new(ty))
         }
         // List: new - allocate header (len=0, cap=0, data=null)
         Expr::ListNew { elem_type } => {

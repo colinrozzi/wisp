@@ -65,54 +65,88 @@ fn compile_error(source: &str) -> String {
     }
 }
 
-// A capability minted by with-cap, threaded through a function, and released
-// exactly once compiles and runs. The cap is zero-cost; test-func returns 42.
+// RAII with-cap: the scope owns the capability; the body borrows it (any number
+// of times) for gated operations. `peek` takes a (borrow Store); two borrows sum
+// to 14. The cap is released by the scope, at zero runtime cost.
 #[test]
-fn test_capability_thread_and_release() {
+fn test_capability_borrow_and_use() {
     let source = r#"
 (capability Store)
-(fn tag ((c Store) (x s32)) Store c)
+(fn peek ((c (borrow Store))) s32 (i32.const 7))
 (export (fn test-func () s32
   (with-cap (c Store)
-    (begin
-      (release-cap (tag c 42))
-      (i32.const 42)))))
+    (i32.add (peek (& c)) (peek (& c))))))
 "#;
-    assert_eq!(compile_and_run(source), 42);
+    assert_eq!(compile_and_run(source), 14);
 }
 
-// A capability parameter is linear by its type: a function may thread it (use it
-// exactly once) with no `(lin ...)` annotation.
+// A with-cap body that never touches the capability is fine — the scope releases
+// it regardless (RAII).
 #[test]
-fn test_capability_param_is_linear() {
+fn test_capability_unused_ok() {
     let source = r#"
 (capability Store)
 (export (fn test-func () s32
-  (with-cap (c Store) (release-cap c))))
+  (with-cap (c Store) (i32.const 5))))
 "#;
-    assert_eq!(compile_and_run(source), 0);
+    assert_eq!(compile_and_run(source), 5);
 }
 
-// Dropping a capability (never consuming it) is rejected.
+// A borrow may be taken on every branch of a conditional; it never consumes.
 #[test]
-fn test_capability_drop_rejected() {
+fn test_capability_borrow_in_branches() {
+    let source = r#"
+(capability Store)
+(fn peek ((c (borrow Store))) s32 (i32.const 9))
+(export (fn test-func () s32
+  (with-cap (c Store)
+    (if (i32.const 1) (peek (& c)) (peek (& c))))))
+"#;
+    assert_eq!(compile_and_run(source), 9);
+}
+
+// Consuming a with-cap capability by value (here via release-cap) is rejected:
+// the scope releases it, so the body may only borrow.
+#[test]
+fn test_capability_consume_in_body_rejected() {
     let err = compile_error(
         "(capability Store)
 (export (fn test-func () s32
-  (with-cap (c Store) (i32.const 0))))",
+  (with-cap (c Store) (release-cap c))))",
     );
-    assert!(err.contains("never consumed"), "unexpected error: {err}");
+    assert!(
+        err.contains("may only be borrowed"),
+        "unexpected error: {err}"
+    );
 }
 
-// Consuming a capability twice is rejected.
+// Moving the capability out of the scope (returning it by value) is rejected.
 #[test]
-fn test_capability_double_consume_rejected() {
+fn test_capability_move_out_rejected() {
+    let err = compile_error(
+        "(capability Store)
+(fn keep ((c Store)) Store c)
+(export (fn test-func () s32
+  (with-cap (c Store) (begin (keep c) (i32.const 0)))))",
+    );
+    assert!(
+        err.contains("may only be borrowed"),
+        "unexpected error: {err}"
+    );
+}
+
+// A borrow cannot escape its with-cap scope (be the scope's result).
+#[test]
+fn test_capability_borrow_escape_rejected() {
     let err = compile_error(
         "(capability Store)
 (export (fn test-func () s32
-  (with-cap (c Store) (i32.add (release-cap c) (release-cap c)))))",
+  (with-cap (c Store) (& c))))",
     );
-    assert!(err.contains("consumed 2 times"), "unexpected error: {err}");
+    assert!(
+        err.contains("borrow cannot escape"),
+        "unexpected error: {err}"
+    );
 }
 
 // A capability is unforgeable: it has no public constructor.
@@ -134,7 +168,7 @@ fn test_capability_unforgeable() {
 fn test_with_cap_unknown_capability_rejected() {
     let err = compile_error(
         "(export (fn test-func () s32
-  (with-cap (c Bogus) (release-cap c))))",
+  (with-cap (c Bogus) (i32.const 0))))",
     );
     assert!(
         err.contains("unknown capability"),
@@ -142,14 +176,14 @@ fn test_with_cap_unknown_capability_rejected() {
     );
 }
 
-// A capability threaded through a conditional must be consumed on every path.
+// The move-model primitives remain for owned (transfer/close) capabilities: a
+// function taking a capability by value and releasing it once type-checks.
 #[test]
-fn test_capability_consumed_on_both_branches() {
+fn test_owned_capability_close_compiles() {
     let source = r#"
 (capability Store)
-(export (fn test-func () s32
-  (with-cap (c Store)
-    (if (i32.const 1) (release-cap c) (release-cap c)))))
+(fn close ((c Store)) s32 (release-cap c))
+(export (fn test-func () s32 (i32.const 0)))
 "#;
     assert_eq!(compile_and_run(source), 0);
 }
