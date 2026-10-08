@@ -1866,6 +1866,12 @@ fn check_expr(
                             }
                         }
                     }
+                    // Exhaustiveness: both 'some' and 'none' must be covered.
+                    for req in ["some", "none"] {
+                        if !cases.iter().any(|a| a.case_name == req) {
+                            bail!("non-exhaustive match on option: missing '{}' case", req);
+                        }
+                    }
                     result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
                 }
                 Type::Result(ok_ty, err_ty) => {
@@ -1912,6 +1918,12 @@ fn check_expr(
                             }
                         }
                     }
+                    // Exhaustiveness: both 'ok' and 'err' must be covered.
+                    for req in ["ok", "err"] {
+                        if !cases.iter().any(|a| a.case_name == req) {
+                            bail!("non-exhaustive match on result: missing '{}' case", req);
+                        }
+                    }
                     result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
                 }
                 Type::Variant(variant_name) => {
@@ -1956,6 +1968,20 @@ fn check_expr(
                                 }
                             }
                         }
+                    }
+                    // Exhaustiveness: every case of the variant must be covered.
+                    let missing: Vec<&str> = variant_def
+                        .cases
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .filter(|n| !cases.iter().any(|a| a.case_name == *n))
+                        .collect();
+                    if !missing.is_empty() {
+                        bail!(
+                            "non-exhaustive match on variant '{}': missing case(s): {}",
+                            variant_name,
+                            missing.join(", ")
+                        );
                     }
                     result_ty.ok_or_else(|| anyhow!("match expression must have at least one case"))
                 }

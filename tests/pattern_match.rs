@@ -393,3 +393,45 @@ fn test_match_variant_returns_wide_call_result() {
 "#;
     assert_eq!(compile_and_run(source), 42);
 }
+
+fn compile_error(source: &str) -> String {
+    let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let temp_dir = std::env::temp_dir();
+    let source_path = temp_dir.join(format!("test_pattern_match_err_{}.wisp", test_id));
+    let out_base = temp_dir.join(format!("test_pattern_match_err_{}", test_id));
+    std::fs::write(&source_path, source).expect("failed to write temp source");
+    match compiler::compile(&source_path, &out_base, compiler::EmitOptions::default()) {
+        Ok(_) => panic!("expected compilation to fail, but it succeeded"),
+        Err(e) => format!("{:#}", e),
+    }
+}
+
+#[test]
+fn test_match_variant_non_exhaustive_rejected() {
+    // Missing the 'no' case -> compile error naming the gap.
+    let err = compile_error(
+        "(variant choice (yes) (no))
+(export (fn test-func ((v choice)) s32 (match v ((yes) (i32.const 1)))))",
+    );
+    assert!(err.contains("non-exhaustive"), "got: {err}");
+    assert!(err.contains("choice"), "got: {err}");
+}
+
+#[test]
+fn test_match_option_non_exhaustive_rejected() {
+    // Missing the 'none' case -> compile error.
+    let err =
+        compile_error("(export (fn test-func ((v (option s32))) s32 (match v ((some n) n))))");
+    assert!(err.contains("non-exhaustive"), "got: {err}");
+}
+
+#[test]
+fn test_match_exhaustive_still_compiles() {
+    // Covering every case compiles and runs as before.
+    let source = r#"
+(variant choice (yes) (no))
+(fn choose ((v choice)) s32 (match v ((yes) (i32.const 42)) ((no) (i32.const 0))))
+(export (fn test-func () s32 (choose (yes))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
