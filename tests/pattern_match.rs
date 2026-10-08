@@ -232,6 +232,25 @@ fn test_match_multiple_no_payload() {
     assert_eq!(compile_and_run(source), 1);
 }
 
+// A single-case variant always matches, so its match emits no discriminant test.
+// Previously the comparison was emitted anyway and left on the stack with no
+// branch to consume it, producing an invalid module.
+#[test]
+fn test_match_single_case_variant() {
+    let source = r#"
+(variant boxed
+  (wrapped s32))
+
+(fn unwrap ((b boxed)) s32
+  (match b
+    ((wrapped x) x)))
+
+(export (fn test-func () s32
+  (unwrap (wrapped (i32.const 42)))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
+
 // Test variant with list payload
 #[test]
 fn test_match_list_payload() {

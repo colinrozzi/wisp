@@ -8279,27 +8279,31 @@ fn gen_expr(
                 Type::Variant(variant_name) => {
                     let variant_def = variants.get(variant_name).expect("variant should exist");
 
-                    // Load discriminant
-                    out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
-                    out.push_str(&format!("{}i32.load\n", pad));
-
                     // For simplicity, use nested if-else for now
                     let num_cases = cases.len();
+
+                    // A single-case variant always matches, so no discriminant test is
+                    // emitted (emitting one would leave the comparison on the stack with
+                    // no branch to consume it). Multi-case matches load it to compare.
+                    if num_cases > 1 {
+                        out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                        out.push_str(&format!("{}i32.load\n", pad));
+                    }
+
                     for (i, arm) in cases.iter().enumerate() {
                         let (case_idx, case) = variant_def
                             .find_case(&arm.case_name)
                             .expect("case should exist");
 
-                        // Compare discriminant with case index
-                        if i > 0 {
-                            out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
-                            out.push_str(&format!("{}i32.load\n", pad));
-                        }
-                        out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
-                        out.push_str(&format!("{}i32.eq\n", pad));
-
                         let is_last = i == num_cases - 1;
                         if num_cases > 1 {
+                            // Compare discriminant with case index.
+                            if i > 0 {
+                                out.push_str(&format!("{}local.get {}\n", pad, value_ptr));
+                                out.push_str(&format!("{}i32.load\n", pad));
+                            }
+                            out.push_str(&format!("{}i32.const {}\n", pad, case_idx));
+                            out.push_str(&format!("{}i32.eq\n", pad));
                             out.push_str(&format!(
                                 "{}(if (result {})\n",
                                 pad,
