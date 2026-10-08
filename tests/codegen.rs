@@ -826,3 +826,73 @@ fn test_scalar_cast_via_colon_preserved() {
 "#;
     assert_eq!(compile_and_run(source), 42);
 }
+
+#[test]
+fn test_scalar_cast_u8_masks_runtime_value() {
+    // A runtime cast to u8 masks to 8 bits: 300 & 0xFF == 44. (A literal `(u8 300)`
+    // would merely retype; this uses an add so the value is computed at runtime.)
+    let source = r#"
+(export (fn test-func () s32
+  (s32 (u8 (i32.add (i32.const 299) (i32.const 1))))))
+"#;
+    assert_eq!(compile_and_run(source), 44);
+}
+
+#[test]
+fn test_scalar_cast_u8_in_range_roundtrips() {
+    // Values already inside u8's range survive the mask unchanged.
+    let source = r#"
+(export (fn test-func () s32
+  (s32 (u8 (i32.add (i32.const 100) (i32.const 1))))))
+"#;
+    assert_eq!(compile_and_run(source), 101);
+}
+
+#[test]
+fn test_scalar_cast_u16_masks_runtime_value() {
+    // 0x10001 & 0xFFFF == 1.
+    let source = r#"
+(export (fn test-func () s32
+  (s32 (u16 (i32.add (i32.const 65536) (i32.const 1))))))
+"#;
+    assert_eq!(compile_and_run(source), 1);
+}
+
+#[test]
+fn test_scalar_cast_bool_nonzero_is_one() {
+    // Any nonzero value casts to bool as 1.
+    let source = r#"
+(export (fn test-func () s32
+  (s32 (bool (i32.add (i32.const 5) (i32.const 2))))))
+"#;
+    assert_eq!(compile_and_run(source), 1);
+}
+
+#[test]
+fn test_scalar_cast_bool_zero_is_zero() {
+    let source = r#"
+(export (fn test-func () s32
+  (s32 (bool (i32.sub (i32.const 5) (i32.const 5))))))
+"#;
+    assert_eq!(compile_and_run(source), 0);
+}
+
+#[test]
+fn test_scalar_cast_through_i64_and_back() {
+    // i32-backed u8 -> i64-backed s64 (extend) -> back to s32 (wrap): 201 preserved.
+    let source = r#"
+(export (fn test-func () s32
+  (s32 (s64 (u8 (i32.add (i32.const 200) (i32.const 1)))))))
+"#;
+    assert_eq!(compile_and_run(source), 201);
+}
+
+#[test]
+fn test_scalar_cast_colon_form_u8_masks() {
+    // The colon form reaches the same conversion matrix: 300 & 0xFF == 44.
+    let source = r#"
+(export (fn test-func () s32
+  (s32 ((i32.add (i32.const 299) (i32.const 1)) : u8))))
+"#;
+    assert_eq!(compile_and_run(source), 44);
+}
