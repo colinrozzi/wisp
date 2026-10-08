@@ -435,3 +435,36 @@ fn test_match_exhaustive_still_compiles() {
 "#;
     assert_eq!(compile_and_run(source), 42);
 }
+
+#[test]
+fn test_match_wildcard_covers_rest() {
+    // `_` satisfies exhaustiveness and dispatches correctly for uncovered cases.
+    let source = r#"
+(variant color (red) (green) (blue))
+(fn pick ((c color)) s32 (match c ((red) (i32.const 1)) ((_) (i32.const 0))))
+(export (fn test-func () s32 (i32.add (pick (red)) (pick (blue)))))
+"#;
+    // red -> 1, blue -> 0 (via wildcard)
+    assert_eq!(compile_and_run(source), 1);
+}
+
+#[test]
+fn test_match_wildcard_only() {
+    // A bare `_` arm is a total catch-all.
+    let source = r#"
+(variant color (red) (green) (blue))
+(fn pick ((c color)) s32 (match c ((_) (i32.const 7))))
+(export (fn test-func () s32 (pick (green))))
+"#;
+    assert_eq!(compile_and_run(source), 7);
+}
+
+#[test]
+fn test_match_option_wildcard() {
+    // `_` covers the 'none' case on an option.
+    let source = r#"
+(fn f ((o (option s32))) s32 (match o ((some n) n) ((_) (i32.const 99))))
+(export (fn test-func () s32 (f (none s32))))
+"#;
+    assert_eq!(compile_and_run(source), 99);
+}
