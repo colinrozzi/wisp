@@ -902,6 +902,9 @@ pub struct Parameter {
     pub name: String,
     pub ty: Type,
     scopes: ScopeSet,
+    /// Multiplicity: a `(lin T)` parameter must be used exactly once in the body
+    /// (substructural / linearity axis). `false` is the unrestricted default.
+    pub linear: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1603,6 +1606,178 @@ fn type_check(
                 func.return_type,
                 body_ty
             );
+        }
+        check_fn_linearity(func)?;
+    }
+    Ok(())
+}
+
+/// The direct sub-expressions of an expression. Exhaustive so that adding a new
+/// `Expr` variant forces a decision here (the linearity use-count must see every
+/// value position, or it would undercount and admit a double-use).
+fn expr_children(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::StringLiteral(_)
+        | Expr::Var(_)
+        | Expr::GlobalGet { .. }
+        | Expr::None { .. }
+        | Expr::ListNew { .. } => vec![],
+        Expr::Ascribe { expr, .. }
+        | Expr::RecordAccess { expr, .. }
+        | Expr::ListLen { list: expr }
+        | Expr::StringLen { string: expr }
+        | Expr::StringFromBytes { bytes: expr }
+        | Expr::StringToBytes { string: expr }
+        | Expr::AnyFromS32 { value: expr }
+        | Expr::AnyToS32 { value: expr }
+        | Expr::AnyFromString { value: expr }
+        | Expr::AnyToString { value: expr }
+        | Expr::HeapAlloc { size: expr }
+        | Expr::AnyAddr { value: expr }
+        | Expr::AnyFromAddr { value: expr }
+        | Expr::StringAddr { value: expr }
+        | Expr::StringFromAddr { value: expr }
+        | Expr::RawInvoke { value: expr, .. }
+        | Expr::GlobalSet { value: expr, .. }
+        | Expr::Some { value: expr, .. }
+        | Expr::Ok { value: expr, .. }
+        | Expr::Err { value: expr, .. } => vec![expr],
+        Expr::Call { args, .. }
+        | Expr::WasmInstr { args, .. }
+        | Expr::VariantConstruct { payload: args, .. }
+        | Expr::RecordConstruct { fields: args, .. }
+        | Expr::Begin { exprs: args }
+        | Expr::TupleConstruct { values: args } => args.iter().collect(),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => vec![cond, then_branch, else_branch],
+        Expr::Let { value, body, .. } => vec![value, body],
+        Expr::Match { expr, cases } => {
+            let mut v = vec![expr.as_ref()];
+            v.extend(cases.iter().map(|a| &a.body));
+            v
+        }
+        Expr::ListPush { list, value } => vec![list, value],
+        Expr::ListGet { list, index } => vec![list, index],
+        Expr::StringRef { string, index } => vec![string, index],
+        Expr::Substring { string, start, end } => vec![string, start, end],
+        Expr::StringAppend { left, right } | Expr::StringEq { left, right } => vec![left, right],
+    }
+}
+
+/// Count how many times each linear binding is referenced in `e`, enforcing that
+/// `if`/`match` branches agree (a linear value used in one branch must be used
+/// the same number of times in every other, or its total use count is undefined).
+/// Only names in `linear` are tracked. Increment 1: linear bindings are function
+/// parameters (`match`/`let`-bound names are unrestricted).
+fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usize>> {
+    fn merge_sum(
+        mut a: HashMap<String, usize>,
+        b: &HashMap<String, usize>,
+    ) -> HashMap<String, usize> {
+        for (k, v) in b {
+            *a.entry(k.clone()).or_insert(0) += v;
+        }
+        a
+    }
+    // Require two branches to consume each linear name identically; return that
+    // common count.
+    fn merge_branches(
+        a: &HashMap<String, usize>,
+        b: &HashMap<String, usize>,
+        linear: &HashSet<String>,
+    ) -> Result<HashMap<String, usize>> {
+        for name in linear {
+            let ca = a.get(name).copied().unwrap_or(0);
+            let cb = b.get(name).copied().unwrap_or(0);
+            if ca != cb {
+                bail!(
+                    "linear value '{}' is used {} time(s) in one branch but {} in another; a linear value must be consumed the same way on every path",
+                    name,
+                    ca,
+                    cb
+                );
+            }
+        }
+        Ok(a.clone())
+    }
+    match e {
+        Expr::Var(name) => {
+            let mut m = HashMap::new();
+            if linear.contains(name) {
+                m.insert(name.clone(), 1);
+            }
+            Ok(m)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let c = linear_uses(cond, linear)?;
+            let t = linear_uses(then_branch, linear)?;
+            let f = linear_uses(else_branch, linear)?;
+            Ok(merge_sum(c, &merge_branches(&t, &f, linear)?))
+        }
+        Expr::Match { expr, cases } => {
+            let mut acc = linear_uses(expr, linear)?;
+            let mut arms = cases.iter();
+            let first = match arms.next() {
+                Some(arm) => linear_uses(&arm.body, linear)?,
+                None => HashMap::new(),
+            };
+            for arm in arms {
+                let u = linear_uses(&arm.body, linear)?;
+                merge_branches(&first, &u, linear)?;
+            }
+            acc = merge_sum(acc, &first);
+            Ok(acc)
+        }
+        _ => {
+            let mut acc = HashMap::new();
+            for child in expr_children(e) {
+                acc = merge_sum(acc, &linear_uses(child, linear)?);
+            }
+            Ok(acc)
+        }
+    }
+}
+
+/// Enforce the linearity contract of a function's parameters: each `(lin T)`
+/// parameter must be referenced exactly once across the body, counting
+/// `if`/`match` branches consistently.
+fn check_fn_linearity(func: &Function) -> Result<()> {
+    let linear: HashSet<String> = func
+        .params
+        .iter()
+        .filter(|p| p.linear)
+        .map(|p| p.name.clone())
+        .collect();
+    if linear.is_empty() {
+        return Ok(());
+    }
+    let uses = linear_uses(&func.body, &linear)?;
+    for p in &func.params {
+        if !p.linear {
+            continue;
+        }
+        match uses.get(&p.name).copied().unwrap_or(0) {
+            1 => {}
+            0 => bail!(
+                "linear parameter '{}' of function '{}' is never used; a linear value must be consumed exactly once",
+                p.name,
+                func.name
+            ),
+            n => bail!(
+                "linear parameter '{}' of function '{}' is used {} times but must be used exactly once",
+                p.name,
+                func.name,
+                n
+            ),
         }
     }
     Ok(())
@@ -4465,6 +4640,21 @@ fn param_name_and_type(p: &SExpr) -> Option<(&str, &SExpr)> {
     None
 }
 
+/// Strip a `(lin T)` / `(aff T)` multiplicity qualifier, returning the inner type
+/// expr. The lowering pass reasons about types structurally and ignores
+/// multiplicity (the linearity checker handles it later), so its type lookups
+/// see `T`, not `(lin T)`.
+fn unwrap_mult(e: &SExpr) -> &SExpr {
+    if let SExpr::List(items, _) = e
+        && items.len() == 2
+        && matches!(head_sym(items), Some("lin") | Some("aff"))
+    {
+        &items[1]
+    } else {
+        e
+    }
+}
+
 /// Build a name->canonical-type environment from a param list SExpr. Compound
 /// types (e.g. `(list s32)`) are included, so structural inference can use them.
 fn param_env(params: &SExpr) -> Vec<(String, String)> {
@@ -4472,7 +4662,7 @@ fn param_env(params: &SExpr) -> Vec<(String, String)> {
     if let SExpr::List(items, _) = params {
         for p in items {
             if let Some((n, ty)) = param_name_and_type(p)
-                && let Some(ts) = canonical_type(ty)
+                && let Some(ts) = canonical_type(unwrap_mult(ty))
             {
                 env.push((n.to_string(), ts));
             }
@@ -4487,7 +4677,7 @@ fn param_type_strings(params: &SExpr) -> Vec<Option<String>> {
     if let SExpr::List(items, _) = params {
         for p in items {
             match param_name_and_type(p) {
-                Some((_, ty)) => out.push(canonical_type(ty)),
+                Some((_, ty)) => out.push(canonical_type(unwrap_mult(ty))),
                 None => out.push(None),
             }
         }
@@ -5564,8 +5754,9 @@ impl<'a> Lowering<'a> {
         let shape = fn_shape(&items)
             .ok_or_else(|| self.ctx.error("malformed function definition", span))?;
         let env = param_env(shape.params);
-        // The body is in return position, so it is expected at the return type.
-        let ret_exp = canonical_type(shape.ret);
+        // The body is in return position, so it is expected at the return type
+        // (ignoring any multiplicity qualifier, which the checker handles).
+        let ret_exp = canonical_type(unwrap_mult(shape.ret));
         let new_body = self.walk(shape.body, &env, None, ret_exp)?;
         let mut new_items = items.clone();
         if let Some(last) = new_items.last_mut() {
@@ -6998,8 +7189,20 @@ fn parse_typed_params(
                                 );
                             }
                         };
+                        // A `(lin T)` parameter type marks the parameter linear (used
+                        // exactly once). The qualifier is erased at the Type level;
+                        // `parse_type_expr` yields the underlying `T`.
+                        let linear = matches!(
+                            type_expr,
+                            SExpr::List(q, _) if head_sym(q) == Some("lin")
+                        );
                         let ty = parse_type_expr(type_expr, variant_names, resource_names, ctx)?;
-                        result.push(Parameter { name, ty, scopes });
+                        result.push(Parameter {
+                            name,
+                            ty,
+                            scopes,
+                            linear,
+                        });
                     }
                     other => {
                         return Err(ctx.error_with_note(
@@ -7088,6 +7291,24 @@ fn parse_type_expr(
                         .collect::<Result<Vec<_>>>()?;
                     Ok(Type::Tuple(elems))
                 }
+                // Multiplicity qualifier: `(lin T)` is `T` with a use-exactly-once
+                // obligation enforced by the linearity checker; the qualifier is
+                // erased at the Type level (same runtime representation as `T`).
+                SExpr::Sym(s, _) if s == "lin" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid linear type",
+                            span,
+                            "expected: (lin T)",
+                        ));
+                    }
+                    parse_type_expr(&items[1], variant_names, resource_names, ctx)
+                }
+                SExpr::Sym(s, _) if s == "aff" => Err(ctx.error_with_note(
+                    "affine types are not yet supported",
+                    span,
+                    "only (lin T) is available for now",
+                )),
                 _ => Err(ctx.error("unknown parameterized type", span)),
             }
         }
