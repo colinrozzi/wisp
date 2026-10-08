@@ -945,6 +945,49 @@ fn test_generic_variant_two_type_params() {
 }
 
 #[test]
+fn test_generic_record_two_params_inferred() {
+    // A generic record monomorphized from the field argument types; both fields
+    // read back and summed: 30 + 12 == 42.
+    let source = r#"
+(record (pair A B) (fst A) (snd B))
+(fn add-pair ((p (pair s32 s32))) s32 (i32.add (pair.fst p) (pair.snd p)))
+(export (fn test-func () s32
+  (let (p (pair (i32.const 30) (i32.const 12)))
+    (add-pair p))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn test_generic_record_mixed_field_widths() {
+    // Fields of different concrete types (s32 and s64); the s64 field is read
+    // and truncated: 5 + 37 == 42.
+    let source = r#"
+(record (pair A B) (fst A) (snd B))
+(fn use-pair ((p (pair s32 s64))) s32
+  (i32.add (pair.fst p) (i32.wrap_i64 (pair.snd p))))
+(export (fn test-func () s32
+  (use-pair (pair (i32.const 5) (i64.const 37)))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
+
+#[test]
+fn test_generic_record_two_instantiations_coexist() {
+    // The same generic record at two different type pairs, each its own nominal
+    // record: fst of (pair s32 s32) + fst of (pair s32 s64) == 7 + 3 == 10.
+    let source = r#"
+(record (pair A B) (fst A) (snd B))
+(fn fst-ii ((p (pair s32 s32))) s32 (pair.fst p))
+(fn fst-il ((p (pair s32 s64))) s32 (pair.fst p))
+(export (fn test-func () s32
+  (i32.add (fst-ii (pair (i32.const 7) (i32.const 1)))
+           (fst-il (pair (i32.const 3) (i64.const 9))))))
+"#;
+    assert_eq!(compile_and_run(source), 10);
+}
+
+#[test]
 fn test_generic_variant_two_instantiations_coexist() {
     // The same generic variant instantiated at two different types in one program;
     // each gets its own nominal variant. unwrap-s32 (box s32) + a truncated
