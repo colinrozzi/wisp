@@ -1652,8 +1652,11 @@ fn check_expr(
             // A same-type ascription is an identity annotation (any type is fine);
             // a differing ascription is a numeric cast (both sides must be numeric).
             if inner_ty != *ty {
-                ensure_numeric(&inner_ty, "cast requires numeric types")?;
-                ensure_numeric(ty, "cast requires numeric types")?;
+                ensure_numeric(&inner_ty, "cast requires scalar types")?;
+                ensure_numeric(ty, "cast requires scalar types")?;
+                if conversion_instr(&inner_ty, ty).is_none() {
+                    bail!("unsupported cast from {:?} to {:?}", inner_ty, ty);
+                }
             }
             Ok(ty.clone())
         }
@@ -2292,22 +2295,27 @@ fn check_expr(
 
 fn ensure_numeric(ty: &Type, msg: &str) -> Result<()> {
     match ty {
-        Type::S32 | Type::S64 | Type::F32 | Type::F64 => Ok(()),
-        Type::U8 => bail!("{}: expected numeric type, got u8", msg),
-        Type::Bool => bail!("{}: expected numeric type, got bool", msg),
-        Type::U16 => bail!("{}: expected numeric type, got u16", msg),
-        Type::U32 => bail!("{}: expected numeric type, got u32", msg),
-        Type::U64 => bail!("{}: expected numeric type, got u64", msg),
-        Type::Record(name) => bail!("{}: expected numeric type, got record '{}'", msg, name),
-        Type::Variant(name) => bail!("{}: expected numeric type, got variant '{}'", msg, name),
-        Type::Option(_) => bail!("{}: expected numeric type, got option", msg),
-        Type::Result(_, _) => bail!("{}: expected numeric type, got result", msg),
-        Type::List(_) => bail!("{}: expected numeric type, got list", msg),
-        Type::Str => bail!("{}: expected numeric type, got string", msg),
-        Type::Tuple(_) => bail!("{}: expected numeric type, got tuple", msg),
-        Type::Any => bail!("{}: expected numeric type, got any", msg),
-        Type::Resource(name) => bail!("{}: expected numeric type, got resource '{}'", msg, name),
-        Type::Borrow(_) => bail!("{}: expected numeric type, got borrow", msg),
+        // Every scalar is castable: the four native WASM numerics plus the
+        // i32-backed integer refinements (bool/u8/u16/u32) and u64.
+        Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Bool => Ok(()),
+        Type::Record(name) => bail!("{}: expected scalar type, got record '{}'", msg, name),
+        Type::Variant(name) => bail!("{}: expected scalar type, got variant '{}'", msg, name),
+        Type::Option(_) => bail!("{}: expected scalar type, got option", msg),
+        Type::Result(_, _) => bail!("{}: expected scalar type, got result", msg),
+        Type::List(_) => bail!("{}: expected scalar type, got list", msg),
+        Type::Str => bail!("{}: expected scalar type, got string", msg),
+        Type::Tuple(_) => bail!("{}: expected scalar type, got tuple", msg),
+        Type::Any => bail!("{}: expected scalar type, got any", msg),
+        Type::Resource(name) => bail!("{}: expected scalar type, got resource '{}'", msg, name),
+        Type::Borrow(_) => bail!("{}: expected scalar type, got borrow", msg),
     }
 }
 
@@ -6582,14 +6590,16 @@ fn parse_expr(
                         _ => None,
                     };
                     if let Some(ty) = scalar {
+                        // An integer literal retypes in place; a runtime value
+                        // casts via Ascribe (masking/extension as needed).
                         if let SExpr::Int { value, .. } = &items[1] {
                             return Ok(Expr::Int { value: *value, ty });
                         }
-                        return Err(ctx.error_with_note(
-                            format!("cast to '{sym}' supports only an integer literal"),
-                            sym_span,
-                            "e.g. (bool 1) or (u32 100)",
-                        ));
+                        let inner = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                        return Ok(Expr::Ascribe {
+                            expr: Box::new(inner),
+                            ty,
+                        });
                     }
                     Err(ctx.error_with_note(
                         format!("cannot cast to '{sym}'"),
@@ -7641,9 +7651,11 @@ fn gen_expr(
             if from_ty == *ty {
                 return from_ty;
             }
-            let instr = conversion_instr(&from_ty, ty)
+            let instrs = conversion_instr(&from_ty, ty)
                 .unwrap_or_else(|| panic!("unsupported conversion {:?} -> {:?}", from_ty, ty));
-            out.push_str(&format!("{}{}\n", pad, instr));
+            for instr in instrs {
+                out.push_str(&format!("{}{}\n", pad, instr));
+            }
             ty.clone()
         }
         Expr::Var(name) => {
@@ -9431,25 +9443,111 @@ fn expr_type(
         .expect("type checking already performed")
 }
 
-fn conversion_instr(from: &Type, to: &Type) -> Option<&'static str> {
-    match (from, to) {
-        (Type::S32, Type::S64) => Some("i64.extend_i32_s"),
-        (Type::S64, Type::S32) => Some("i32.wrap_i64"),
-        (Type::F32, Type::F64) => Some("f64.promote_f32"),
-        (Type::F64, Type::F32) => Some("f32.demote_f64"),
-        (Type::S32, Type::F32) => Some("f32.convert_i32_s"),
-        (Type::S32, Type::F64) => Some("f64.convert_i32_s"),
-        (Type::S64, Type::F32) => Some("f32.convert_i64_s"),
-        (Type::S64, Type::F64) => Some("f64.convert_i64_s"),
-        (Type::F32, Type::S32) => Some("i32.trunc_f32_s"),
-        (Type::F32, Type::S64) => Some("i64.trunc_f32_s"),
-        (Type::F64, Type::S32) => Some("i32.trunc_f64_s"),
-        (Type::F64, Type::S64) => Some("i64.trunc_f64_s"),
-        _ if from == to => None,
-        // Records don't have conversion instructions
-        (Type::Record(_), _) | (_, Type::Record(_)) => None,
+/// Classify an integer-family scalar for conversion:
+/// `(backed_by_i64, source_is_signed, narrowing_mask)`.
+///
+/// `narrowing_mask` is `Some` for refinements narrower than their i32 backing
+/// (u8/u16); after a wrap or extend lands a value in an i32, the mask clamps it
+/// to the type's range. `source_is_signed` decides sign- vs zero-extension when
+/// widening to i64. `bool` is i32-backed and handled separately (0/1 coercion).
+fn int_kind(ty: &Type) -> Option<(bool, bool, Option<&'static str>)> {
+    match ty {
+        Type::S32 => Some((false, true, None)),
+        Type::U32 => Some((false, false, None)),
+        Type::U16 => Some((false, false, Some("i32.const 65535"))),
+        Type::U8 => Some((false, false, Some("i32.const 255"))),
+        Type::Bool => Some((false, false, None)),
+        Type::S64 => Some((true, true, None)),
+        Type::U64 => Some((true, false, None)),
         _ => None,
     }
+}
+
+/// The WASM instruction sequence that converts a value of `from` into `to`.
+/// `Some(vec![])` means the conversion is a no-op (same representation);
+/// `None` means there is no supported conversion.
+fn conversion_instr(from: &Type, to: &Type) -> Option<Vec<&'static str>> {
+    use Type::*;
+    if from == to {
+        return Some(vec![]);
+    }
+    // Float <-> float.
+    match (from, to) {
+        (F32, F64) => return Some(vec!["f64.promote_f32"]),
+        (F64, F32) => return Some(vec!["f32.demote_f64"]),
+        _ => {}
+    }
+    let from_int = int_kind(from);
+    // Casting to bool is a zero-test against the source's own width, so it must
+    // come before any wrap that would discard high bits.
+    if matches!(to, Bool) {
+        if let Some((from64, _, _)) = from_int {
+            return Some(if from64 {
+                vec!["i64.const 0", "i64.ne"]
+            } else {
+                vec!["i32.const 0", "i32.ne"]
+            });
+        }
+        return match from {
+            F32 => Some(vec!["f32.const 0", "f32.ne"]),
+            F64 => Some(vec!["f64.const 0", "f64.ne"]),
+            _ => None,
+        };
+    }
+    let to_int = int_kind(to);
+    // Integer family -> integer family: adjust backing width, then clamp range.
+    if let (Some((from64, from_signed, _)), Some((to64, _, to_mask))) = (from_int, to_int) {
+        let mut instrs = Vec::new();
+        if from64 && !to64 {
+            instrs.push("i32.wrap_i64");
+        } else if !from64 && to64 {
+            instrs.push(if from_signed {
+                "i64.extend_i32_s"
+            } else {
+                "i64.extend_i32_u"
+            });
+        }
+        if let Some(mask) = to_mask {
+            instrs.push(mask);
+            instrs.push("i32.and");
+        }
+        return Some(instrs);
+    }
+    // Integer -> float.
+    if let Some((from64, from_signed, _)) = from_int {
+        return match (from64, from_signed, to) {
+            (false, true, F32) => Some(vec!["f32.convert_i32_s"]),
+            (false, true, F64) => Some(vec!["f64.convert_i32_s"]),
+            (false, false, F32) => Some(vec!["f32.convert_i32_u"]),
+            (false, false, F64) => Some(vec!["f64.convert_i32_u"]),
+            (true, true, F32) => Some(vec!["f32.convert_i64_s"]),
+            (true, true, F64) => Some(vec!["f64.convert_i64_s"]),
+            (true, false, F32) => Some(vec!["f32.convert_i64_u"]),
+            (true, false, F64) => Some(vec!["f64.convert_i64_u"]),
+            _ => None,
+        };
+    }
+    // Float -> integer: truncate to the target width/signedness, then clamp.
+    if let Some((to64, to_signed, to_mask)) = to_int {
+        let mut instrs = Vec::new();
+        match (from, to64, to_signed) {
+            (F32, false, true) => instrs.push("i32.trunc_f32_s"),
+            (F64, false, true) => instrs.push("i32.trunc_f64_s"),
+            (F32, false, false) => instrs.push("i32.trunc_f32_u"),
+            (F64, false, false) => instrs.push("i32.trunc_f64_u"),
+            (F32, true, true) => instrs.push("i64.trunc_f32_s"),
+            (F64, true, true) => instrs.push("i64.trunc_f64_s"),
+            (F32, true, false) => instrs.push("i64.trunc_f32_u"),
+            (F64, true, false) => instrs.push("i64.trunc_f64_u"),
+            _ => return None,
+        }
+        if let Some(mask) = to_mask {
+            instrs.push(mask);
+            instrs.push("i32.and");
+        }
+        return Some(instrs);
+    }
+    None
 }
 
 /// Check if a type is unit (empty tuple)
