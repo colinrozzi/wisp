@@ -4184,6 +4184,15 @@ struct GenericTypeDef {
     span: Span,
 }
 
+/// A generic record template: `(record (Name T ...) (field T) ...)`. Monomorphized
+/// by name into a concrete nominal record, the same way generic variants are.
+#[derive(Clone)]
+struct GenericRecordDef {
+    tparams: Vec<String>,
+    fields: Vec<SExpr>, // each `(field-name field-type)`, type params symbolic
+    span: Span,
+}
+
 /// One monomorphization request: a template specialized at concrete types (one binding
 /// per type parameter, in declaration order) and function-name arguments.
 #[derive(Debug, Clone)]
@@ -4317,6 +4326,9 @@ struct Lowering<'a> {
     case_to_generic: HashMap<String, String>, // variant case name -> generic variant name
     type_instances: HashMap<String, (String, Vec<String>)>, // mangled -> (generic, concretes)
     type_worklist: Vec<(String, Vec<String>)>, // (generic, concretes) awaiting emission
+    generic_records: HashMap<String, GenericRecordDef>, // generic record templates
+    record_instances: HashMap<String, (String, Vec<String>)>, // mangled -> (generic, concretes)
+    record_worklist: Vec<(String, Vec<String>)>, // (generic, concretes) awaiting emission
 }
 
 /// The scalar type name for a type-expr that is a bare symbol (e.g. `s32`).
@@ -4601,6 +4613,10 @@ impl<'a> Lowering<'a> {
                     let bindings = self.infer_bindings(genfn, &items[1..], env);
                     let ret = subst_types(&genfn.ret, &bindings);
                     return canonical_type(&ret);
+                }
+                // A generic record construction's type is its mangled instantiation.
+                if self.generic_records.contains_key(head) {
+                    return self.generic_record_instance(head, &items[1..], env);
                 }
                 self.monofn_returns.get(head).cloned()
             }
@@ -5035,6 +5051,103 @@ impl<'a> Lowering<'a> {
                         return Ok(SExpr::List(new_items, span.clone()));
                     }
 
+                    // Generic record field access `(Name.field expr)`: rewrite the
+                    // accessor to the record expression's concrete instantiation.
+                    if let Some((rec, field)) = head.split_once('.')
+                        && self.generic_records.contains_key(rec)
+                        && items.len() == 2
+                    {
+                        let expr_ty = self.infer_type(&items[1], env);
+                        let new_expr = self.walk(&items[1], env, mrc, None)?;
+                        let new_head = match expr_ty {
+                            Some(t) if self.record_instances.contains_key(&t) => {
+                                format!("{}.{}", t, field)
+                            }
+                            // Unresolved: leave the generic accessor; parse_program
+                            // reports the unknown record type with a source span.
+                            _ => head.to_string(),
+                        };
+                        return Ok(SExpr::List(
+                            vec![SExpr::Sym(new_head, items[0].span().clone()), new_expr],
+                            span.clone(),
+                        ));
+                    }
+
+                    // Generic record construction `(Name field...)`: infer the
+                    // instantiation from the field argument types (expected-type
+                    // fallback for under-determined parameters), then rewrite to the
+                    // concrete record constructor.
+                    if let Some(gdef) = self.generic_records.get(head).cloned() {
+                        let args = &items[1..];
+                        let field_pats: Vec<SExpr> = gdef
+                            .fields
+                            .iter()
+                            .filter_map(|f| match f {
+                                SExpr::List(fd, _) if fd.len() >= 2 => Some(fd[1].clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        if args.len() != field_pats.len() {
+                            return Err(self.ctx.error(
+                                format!(
+                                    "record '{}' expects {} field(s), got {}",
+                                    head,
+                                    field_pats.len(),
+                                    args.len()
+                                ),
+                                span,
+                            ));
+                        }
+                        let mut found: Vec<(String, String)> = Vec::new();
+                        for (pat, a) in field_pats.iter().zip(args) {
+                            if let Some(cs) = self.infer_type(a, env)
+                                && let Some(ce) = type_str_to_expr(&cs)
+                            {
+                                unify_types(pat, &ce, &gdef.tparams, &mut found);
+                            }
+                        }
+                        if found.len() < gdef.tparams.len()
+                            && let Some(exp) = expected.as_deref()
+                            && let Some((g, concretes)) = self.record_instances.get(exp).cloned()
+                            && g == *head
+                        {
+                            for (tp, c) in gdef.tparams.iter().zip(concretes) {
+                                if !found.iter().any(|(k, _)| k == tp) {
+                                    found.push((tp.clone(), c));
+                                }
+                            }
+                        }
+                        let mut concretes = Vec::new();
+                        for tp in &gdef.tparams {
+                            match found.iter().find(|(k, _)| k == tp) {
+                                Some((_, c)) => concretes.push(c.clone()),
+                                None => {
+                                    return Err(self.ctx.error(
+                                        format!(
+                                            "cannot infer type argument '{}' for record '{}'; add a type annotation",
+                                            tp, head
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                        }
+                        let mangled = self.queue_record(head, &concretes);
+                        let bindings: Vec<(String, String)> = gdef
+                            .tparams
+                            .iter()
+                            .cloned()
+                            .zip(concretes.iter().cloned())
+                            .collect();
+                        let mut new_items = Vec::with_capacity(items.len());
+                        new_items.push(SExpr::Sym(mangled, items[0].span().clone()));
+                        for (pat, a) in field_pats.iter().zip(args) {
+                            let exp = canonical_type(&subst_types(pat, &bindings));
+                            new_items.push(self.walk(a, env, mrc, exp)?);
+                        }
+                        return Ok(SExpr::List(new_items, span.clone()));
+                    }
+
                     // Forms that carry the expected type into their tail positions.
                     match head {
                         "if" if items.len() == 4 => {
@@ -5186,6 +5299,61 @@ impl<'a> Lowering<'a> {
         mangled
     }
 
+    /// Queue a generic record instantiation for emission (once) and return its
+    /// mangled concrete type name.
+    fn queue_record(&mut self, name: &str, concretes: &[String]) -> String {
+        let mangled = Self::mangle_type_name(name, concretes);
+        if !self.record_instances.contains_key(&mangled) {
+            self.record_instances
+                .insert(mangled.clone(), (name.to_string(), concretes.to_vec()));
+            self.record_worklist
+                .push((name.to_string(), concretes.to_vec()));
+        }
+        mangled
+    }
+
+    /// The mangled concrete name of a generic record construction, inferring each
+    /// type parameter from the field argument types. Read-only (no queueing) so
+    /// `infer_type` can use it. None if `name` is not a generic record or a type
+    /// parameter can't be determined.
+    fn generic_record_instance(
+        &self,
+        name: &str,
+        args: &[SExpr],
+        env: &[(String, String)],
+    ) -> Option<String> {
+        let gdef = self.generic_records.get(name)?;
+        let field_pats: Vec<&SExpr> = gdef
+            .fields
+            .iter()
+            .filter_map(|f| match f {
+                SExpr::List(fd, _) if fd.len() >= 2 => Some(&fd[1]),
+                _ => None,
+            })
+            .collect();
+        if args.len() != field_pats.len() {
+            return None;
+        }
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (pat, a) in field_pats.iter().zip(args) {
+            if let Some(cs) = self.infer_type(a, env)
+                && let Some(ce) = type_str_to_expr(&cs)
+            {
+                unify_types(pat, &ce, &gdef.tparams, &mut found);
+            }
+        }
+        let mut concretes = Vec::new();
+        for tp in &gdef.tparams {
+            concretes.push(
+                found
+                    .iter()
+                    .find(|(k, _)| k == tp)
+                    .map(|(_, c)| c.clone())?,
+            );
+        }
+        Some(Self::mangle_type_name(name, &concretes))
+    }
+
     /// Rewrite type-expression occurrences of generic ADTs into their mangled
     /// concrete names, queueing each instantiation. Recurses into builtin
     /// parameterized types (list/option/result/tuple/->) so nested generics like
@@ -5195,14 +5363,20 @@ impl<'a> Lowering<'a> {
             SExpr::List(items, span) if !items.is_empty() => {
                 let rewritten: Vec<SExpr> =
                     items.iter().map(|i| self.rewrite_type_expr(i)).collect();
-                if let Some(head) = head_sym(items)
-                    && let Some(gdef) = self.generic_variants.get(head)
-                    && rewritten.len() - 1 == gdef.tparams.len()
-                {
+                if let Some(head) = head_sym(items) {
                     let concretes: Vec<String> =
                         rewritten[1..].iter().filter_map(canonical_type).collect();
-                    if concretes.len() == gdef.tparams.len() {
+                    let arity = concretes.len();
+                    if let Some(gdef) = self.generic_variants.get(head)
+                        && arity == gdef.tparams.len()
+                    {
                         let mangled = self.queue_variant(head, &concretes);
+                        return SExpr::Sym(mangled, span.clone());
+                    }
+                    if let Some(gdef) = self.generic_records.get(head)
+                        && arity == gdef.tparams.len()
+                    {
+                        let mangled = self.queue_record(head, &concretes);
                         return SExpr::Sym(mangled, span.clone());
                     }
                 }
@@ -5280,6 +5454,38 @@ impl<'a> Lowering<'a> {
                     new_ci.push(self.rewrite_type_expr(&subst));
                 }
                 out.push(SExpr::List(new_ci, cspan.clone()));
+            }
+        }
+        SExpr::List(out, span)
+    }
+
+    /// Emit a concrete record form for one generic instantiation: substitute the
+    /// type parameters into each field type (rewriting nested generics in turn).
+    /// Field names are kept; the record name carries the instantiation.
+    fn emit_record_instance(&mut self, gen_name: &str, concretes: &[String]) -> SExpr {
+        let gdef = self.generic_records.get(gen_name).cloned().unwrap();
+        let mangled = Self::mangle_type_name(gen_name, concretes);
+        let span = gdef.span.clone();
+        let bindings: Vec<(String, String)> = gdef
+            .tparams
+            .iter()
+            .cloned()
+            .zip(concretes.iter().cloned())
+            .collect();
+        let mut out = vec![
+            SExpr::Sym("record".to_string(), span.clone()),
+            SExpr::Sym(mangled, span.clone()),
+        ];
+        for field in &gdef.fields {
+            if let SExpr::List(fd, fspan) = field
+                && fd.len() >= 2
+                && let SExpr::Sym(..) = &fd[0]
+            {
+                let subst = subst_types(&fd[1], &bindings);
+                out.push(SExpr::List(
+                    vec![fd[0].clone(), self.rewrite_type_expr(&subst)],
+                    fspan.clone(),
+                ));
             }
         }
         SExpr::List(out, span)
@@ -5550,6 +5756,9 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
         case_to_generic: HashMap::new(),
         type_instances: HashMap::new(),
         type_worklist: Vec::new(),
+        generic_records: HashMap::new(),
+        record_instances: HashMap::new(),
+        record_worklist: Vec::new(),
     };
 
     let mut retained: Vec<SExpr> = Vec::new();
@@ -5662,6 +5871,50 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
             .is_some()
         {
             return Err(ctx.error(format!("duplicate generic variant '{}'", name), span));
+        }
+    }
+
+    // Pass 0.6: collect generic record templates `(record (Name T ...) ...)`.
+    for form in &forms {
+        let (items, span) = match form {
+            SExpr::List(items, span) if !items.is_empty() => (items, span),
+            _ => continue,
+        };
+        if head_sym(items) != Some("record") {
+            continue;
+        }
+        let head = match items.get(1) {
+            Some(SExpr::List(head, _)) if !head.is_empty() => head,
+            _ => continue, // concrete record (bare-symbol name): handled in Pass 1
+        };
+        let name = match &head[0] {
+            SExpr::Sym(n, _) => n.clone(),
+            _ => return Err(ctx.error("record name must be a symbol", span)),
+        };
+        let mut tparams = Vec::new();
+        for t in &head[1..] {
+            match t {
+                SExpr::Sym(tp, _) => tparams.push(tp.clone()),
+                _ => return Err(ctx.error("record type parameter must be a symbol", span)),
+            }
+        }
+        if tparams.is_empty() {
+            return Err(ctx.error("generic record needs at least one type parameter", span));
+        }
+        let fields: Vec<SExpr> = items[2..].to_vec();
+        if low
+            .generic_records
+            .insert(
+                name.clone(),
+                GenericRecordDef {
+                    tparams,
+                    fields,
+                    span: span.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(ctx.error(format!("duplicate generic record '{}'", name), span));
         }
     }
 
@@ -5928,6 +6181,13 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
                     retained.push(form.clone());
                 }
             }
+            Some("record") => {
+                // Likewise: a generic record template is emitted per instantiation; a
+                // concrete record is retained as-is.
+                if !matches!(items.get(1), Some(SExpr::List(..))) {
+                    retained.push(form.clone());
+                }
+            }
             _ => retained.push(form.clone()),
         }
     }
@@ -5961,6 +6221,10 @@ fn expand_generics(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>
             // Emit a concrete variant per generic instantiation. Emission may rewrite
             // nested generic payloads, queueing further instantiations.
             let form = low.emit_variant_instance(&gen_name, &concretes);
+            output.push(form);
+        } else if let Some((gen_name, concretes)) = low.record_worklist.pop() {
+            // Emit a concrete record per generic instantiation.
+            let form = low.emit_record_instance(&gen_name, &concretes);
             output.push(form);
         } else {
             break;
