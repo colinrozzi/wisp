@@ -6490,8 +6490,7 @@ fn parse_expr(
                         _ => None,
                     };
                     if let Some(ty) = numeric {
-                        let inner =
-                            parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                        let inner = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
                         return Ok(Expr::Ascribe {
                             expr: Box::new(inner),
                             ty,
@@ -6517,11 +6516,11 @@ fn parse_expr(
                             "e.g. (bool 1) or (u32 100)",
                         ));
                     }
-                    return Err(ctx.error_with_note(
+                    Err(ctx.error_with_note(
                         format!("cannot cast to '{sym}'"),
                         sym_span,
                         "casts apply to scalar types (s32/s64/f32/f64/u8/u16/u32/u64/bool)",
-                    ));
+                    ))
                 }
                 SExpr::Sym(sym, sym_span) if sym == "if" => {
                     if items.len() != 4 {
@@ -10425,9 +10424,7 @@ fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
             // (so e.g. lifecycle delivery, gated on has_export, silently dropped).
             // Bare exports (no interface) stay under "exports".
             let (interface_name, fn_name) = match exp.export_name.rsplit_once('.') {
-                Some((iface, name)) if iface.contains('/') => {
-                    (iface.to_string(), name.to_string())
-                }
+                Some((iface, name)) if iface.contains('/') => (iface.to_string(), name.to_string()),
                 _ => ("exports".to_string(), exp.export_name.clone()),
             };
             let pack_func = Function::with_signature(
