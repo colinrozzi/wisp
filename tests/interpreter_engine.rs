@@ -29,8 +29,8 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             let [Value::String(_base), Value::String(path)] = args.as_slice() else {
                 panic!("resolve-path args: {args:?}")
             };
-            Ok(source_result(if path == "library.lisp" {
-                Ok("/bundle/library.lisp".into())
+            Ok(source_result(if path == "library.wisp" {
+                Ok("/bundle/library.wisp".into())
             } else {
                 Err("source is not in the actor bundle".into())
             }))
@@ -46,7 +46,7 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
                     panic!("read-source input: {input:?}")
                 };
                 calls.lock().unwrap().push(path.clone());
-                Ok(source_result(if path == "/bundle/library.lisp" {
+                Ok(source_result(if path == "/bundle/library.wisp" {
                     Ok("(fn increment ((x s32)) s32 (i32.add x 1))".into())
                 } else {
                     Err("source is not in the actor bundle".into())
@@ -242,7 +242,7 @@ async fn engine_session() {
             .stack_size(1 << 30)
             .spawn_scoped(s, || {
                 wisp::compiler::compile(
-                    &root.join("interpreter/evaluator.lisp"),
+                    &root.join("interpreter/evaluator.wisp"),
                     &root.join(format!(
                         "target/interpreter-engine/{}/evaluator",
                         std::process::id()
@@ -273,12 +273,12 @@ async fn engine_session() {
     );
     assert_eq!(evaluate(&mut first, "(add-two 40)").await, "42");
     assert_eq!(
-        evaluate(&mut first, "(include \"library.lisp\") (increment 41)").await,
+        evaluate(&mut first, "(include \"library.wisp\") (increment 41)").await,
         "42"
     );
-    assert_eq!(*calls.lock().unwrap(), ["/bundle/library.lisp"]);
+    assert_eq!(*calls.lock().unwrap(), ["/bundle/library.wisp"]);
     assert!(
-        evaluate(&mut first, "(define marker 0) (include \"missing.lisp\")")
+        evaluate(&mut first, "(define marker 0) (include \"missing.wisp\")")
             .await
             .starts_with("error:")
     );

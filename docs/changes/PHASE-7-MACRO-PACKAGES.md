@@ -419,7 +419,7 @@ pub fn expand_macro(
 ## Example: A Simple Macro in Wisp
 
 ```lisp
-;; double-macro.lisp
+;; double-macro.wisp
 ;; Doubles a numeric literal: (double 21) -> 42
 
 (import syntax get-kind ((s (borrow sexpr))) s32)

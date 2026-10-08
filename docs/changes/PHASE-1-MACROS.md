@@ -87,7 +87,7 @@ With macros, we can restore convenience while keeping the core minimal:
 
 ### Phase 1.5: Integration
 - [x] Update compilation pipeline: tokenize → parse → **expand** → type-check → codegen
-- [x] Test with example macros (`examples/macro-test.lisp`)
+- [x] Test with example macros (`examples/macro-test.wisp`)
 
 ### Phase 1.6: Standard Macro Library
 - [ ] Create `std/arithmetic.wisp` with `+`, `-`, `*`, `/`, `%` (future work)
@@ -191,12 +191,12 @@ Phase 1 is complete when:
 - [x] Can implement `+`, `-`, `*` as macros
 - [x] Can implement `when` control flow macro
 - [x] All existing examples still compile
-- [x] New macro examples demonstrate the feature (`examples/macro-test.lisp`)
+- [x] New macro examples demonstrate the feature (`examples/macro-test.wisp`)
 
 ## Example: Full Workflow
 
 ```lisp
-; File: examples/macro-test.lisp
+; File: examples/macro-test.wisp
 
 ; Define convenience macros
 (defmacro + (a b) `(i32.add ,a ,b))

@@ -21,18 +21,18 @@ native dependencies include a C/C++ toolchain, pkg-config, and OpenSSL.
 Compile the sample program:
 
 ```sh
-cargo run -p wisp -- compile examples/prog.lisp
+cargo run -p wisp -- compile examples/prog.wisp
 ```
 
 This writes `examples/compiled/prog.wasm`. The compiler embeds interface metadata
 in the module. Request readable output explicitly:
 
 ```sh
-cargo run -p wisp -- compile examples/prog.lisp target/prog --emit-wat --emit-pact
+cargo run -p wisp -- compile examples/prog.wisp target/prog --emit-wat --emit-pact
 ```
 
 An explicit output stem is relative to the current working directory. Without
-one, outputs go into `compiled/` beside the source. Both `.lisp` and `.wisp`
+one, outputs go into `compiled/` beside the source. Both `.wisp` and `.wisp`
 examples use the same compiler.
 
 ## Language
@@ -60,8 +60,8 @@ The Rust compiler supports:
   globals, and function imports/exports.
 - `defmacro`, hygienic `syntax-rules`, and procedural `syntax-case` macros.
 - Traits, instances, generic specialization, and derived record equality.
-- `(include "relative/path.lisp")` for source inclusion. The numeric standard
-  library in `std/num.lisp` supplies operators such as `+` through traits.
+- `(include "relative/path.wisp")` for source inclusion. The numeric standard
+  library in `std/num.wisp` supplies operators such as `+` through traits.
 
 See [examples/](examples/), [test fixtures](tests/fixtures/), and the
 [standard library](std/) for executable examples. Features in the Rust and
@@ -83,7 +83,7 @@ It supports lexical closures, persistent definitions, typed functions, records,
 variants and pattern matching, s32/s64/f32/f64 arithmetic and casts, u8 values, unit, recursion,
 typed lists/options/results/tuples, Lisp lists, typed globals, and recoverable errors.
 Generic functions, trait instances, and higher-order arguments run directly in the
-interpreter, including the algorithms in `std/list.lisp`. Record equality can be
+interpreter, including the algorithms in `std/list.wisp`. Record equality can be
 derived with `(derive Eq Type)`.
 Persistent `defmacro` templates support quasiquotation and splicing; hygienic
 `syntax-rules` supports literal patterns and nested ellipses. Procedural
@@ -138,7 +138,7 @@ integrations remain a separate migration; see the [runtime migration notes](docs
 | `src/lib.rs` | Public compiler library |
 | `src/interpreter.rs` | Local host for the Wisp-written interpreter |
 | `src/main.rs` | Compile and execution CLI |
-| `examples/wisp-compiler.lisp` | Self-hosted compiler |
+| `examples/wisp-compiler.wisp` | Self-hosted compiler |
 | `interpreter/` | Interpreter, reader, and printer written in Wisp |
 | `std/` | Wisp standard library sources |
 | `tests/` | Compiler, language, and self-hosting integration tests |

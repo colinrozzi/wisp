@@ -209,4 +209,4 @@ Potential additions for future phases:
 
 - `src/compiler.rs` - Implementation of string operations
 - `tests/string_ops.rs` - Test suite
-- `examples/string-test.lisp` - Example usage
+- `examples/string-test.wisp` - Example usage

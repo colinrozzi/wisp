@@ -8,7 +8,7 @@ fn compile_and_run(source: &str) -> i32 {
     // Create unique temp files for each test
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_string_ops_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_string_ops_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_string_ops_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");

@@ -75,4 +75,4 @@ of unknown traits and non-record types).
 - **`Eq` only** — `Ord`, `Show` (needs a string builder), `Default`/`Zero`,
   `Convert` follow the same per-trait-generator pattern.
 - **`derive` requires the trait to be declared** (e.g. `(trait (Eq T) ...)`, as in
-  `std/num.lisp`).
+  `std/num.wisp`).

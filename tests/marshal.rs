@@ -26,7 +26,7 @@ fn package() -> &'static PathBuf {
                 .stack_size(1 << 30)
                 .spawn_scoped(s, || {
                     compiler::compile(
-                        &root.join("tests/fixtures/marshal.lisp"),
+                        &root.join("tests/fixtures/marshal.wisp"),
                         &out,
                         EmitOptions::default(),
                     )
@@ -305,7 +305,16 @@ impl Guest {
                 })),
             },
         );
-        // Any other host import the evaluator declares (self/store.get/...) traps.
+        // self.self -> the actor's own id. The exports/implements/call/actor-state
+        // guards call (self) to reject self-targeted RPC; mock it with an id
+        // distinct from the "actor-1" these tests target, so the guard stays inert.
+        mock_import(
+            &mut linker,
+            "theater:simple/self",
+            "self",
+            Value::String("repl-self".into()),
+        );
+        // Any other host import the evaluator declares (store.get/...) traps.
         linker.define_unknown_imports_as_traps(&module).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();

@@ -4,15 +4,15 @@
 The root Cargo workspace contains the `wisp` compiler and `wisp-repl`. Rust compiler
 code lives in `src/compiler.rs`, exposed by `src/lib.rs`; `src/main.rs` implements
 the CLI. Keep additional compiler modules inside `src/`. The self-hosted compiler
-is `examples/wisp-compiler.lisp`, and standard library sources live in `std/`.
+is `examples/wisp-compiler.wisp`, and standard library sources live in `std/`.
 Shared fixtures belong in `tests/fixtures/`. Theater integrations use a separate
 workspace in `crates/`; see `crates/README.md` before working on them.
 
 ## Build, Test, and Development Commands
 - `nix develop` supplies Rust and native build dependencies.
 - `cargo build --workspace` builds the compiler and Rust-backed REPL.
-- `cargo run -p wisp -- compile examples/prog.lisp` writes `examples/compiled/prog.wasm`.
-- `cargo run -p wisp -- compile <source.lisp> <out-stem> --emit-wat --emit-pact`
+- `cargo run -p wisp -- compile examples/prog.wisp` writes `examples/compiled/prog.wasm`.
+- `cargo run -p wisp -- compile <source.wisp> <out-stem> --emit-wat --emit-pact`
   also writes readable WAT and interface text. Explicit output stems are relative
   to the current directory; use `target/` for temporary build products.
 - `cargo test --workspace` runs compiler and REPL library tests.
@@ -29,7 +29,7 @@ before running them; see README.md for supported CLI argument conventions.
 Follow idiomatic Rust 2024 style in the root workspace: four-space indentation,
 snake_case for functions/variables, and CamelCase for types/enums. Keep parser,
 emitter, and analyzer helpers grouped by responsibility. Name S-expression fixtures
-descriptively, such as `double_then_factorial.lisp`.
+descriptively, such as `double_then_factorial.wisp`.
 
 ## Testing Guidelines
 Use the existing integration suites in `tests/` for regression coverage. Tests

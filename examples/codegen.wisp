@@ -138,7 +138,7 @@
 (fn str-i32-mul-len () s32 7)
 
 ;; ============================================================
-;; Tokenizer (simplified from tokenizer.lisp)
+;; Tokenizer (simplified from tokenizer.wisp)
 ;; ============================================================
 
 (global $tok-input-ptr s32 mut 0)
@@ -244,7 +244,7 @@
         (tok-all)))))
 
 ;; ============================================================
-;; Parser (simplified from parser.lisp)
+;; Parser (simplified from parser.wisp)
 ;; ============================================================
 
 (global $parse-tok-ptr s32 mut 0)

@@ -4,7 +4,7 @@
 ;
 ; The evaluator is shared with the local REPL; one compiled module is one live
 ; session that owns its own bindings, closures, types, macros, and heap.
-(include "../../interpreter/evaluator.lisp")
+(include "../../interpreter/evaluator.wisp")
 
 ; Theater lifecycle. Config is ignored: a fresh module is an empty session, so
 ; init is not a reset. State is the standard option<list<u8>> the runtime

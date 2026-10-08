@@ -14,7 +14,7 @@ fn session() -> Interpreter {
                 .stack_size(1 << 30)
                 .spawn_scoped(s, || {
                     compiler::compile(
-                        &root.join("interpreter/evaluator.lisp"),
+                        &root.join("interpreter/evaluator.wisp"),
                         &root.join(format!(
                             "target/interpreter-tests/{}/evaluator",
                             std::process::id()

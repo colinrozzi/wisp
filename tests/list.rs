@@ -1,4 +1,4 @@
-// Tests for the generic list standard library (std/list.lisp): length, sum,
+// Tests for the generic list standard library (std/list.wisp): length, sum,
 // contains, reverse — monomorphized per element type. Each program exports
 // `test-func` returning s32.
 
@@ -11,7 +11,7 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 fn compile_and_run(source: &str) -> i32 {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_list_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_list_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_list_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
@@ -70,7 +70,7 @@ fn compile_and_run(source: &str) -> i32 {
 /// makes the s32 list [10, 20, 30].
 fn with_list(body: &str) -> String {
     format!(
-        "(include \"{}/std/list.lisp\")
+        "(include \"{}/std/list.wisp\")
 (fn build () : (list s32)
   (list-push (list-push (list-push (list-new s32)
     (i32.const 10)) (i32.const 20)) (i32.const 30)))
@@ -112,7 +112,7 @@ fn test_list_sum() {
 fn test_list_sum_f64() {
     // The same generic sum monomorphizes at f64.
     let src = format!(
-        "(include \"{}/std/list.lisp\")
+        "(include \"{}/std/list.wisp\")
 (export (fn test-func () s32
   (let (xs (list-push (list-push (list-new f64) (f64.const 1.5)) (f64.const 2.5)))
     (if (f64.eq (sum xs) (f64.const 4.0)) (i32.const 1) (i32.const 0)))))",

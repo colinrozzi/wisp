@@ -134,7 +134,7 @@ plain monomorphic `fn`s, so the rest of the pipeline is untouched.
 - [x] Infer type arguments at generic call sites (from literals, params, known calls).
 - [x] Monomorphize: emit one specialized function copy per concrete type-argument set.
 - [x] Resolve method calls to instance bodies inside each copy; erase dictionaries.
-- [x] Ship `Add` instances for `s32` and `f64` (fixture `tests/fixtures/traits_add.lisp`).
+- [x] Ship `Add` instances for `s32` and `f64` (fixture `tests/fixtures/traits_add.wisp`).
 - [x] Prove the slice: `(double 5)` → `i32.add`, `(double 2.5)` → `f64.add`.
 
 ### Type-annotation syntax: `(name : type)` (Form A) — everywhere
@@ -156,7 +156,7 @@ not space-delimited). Both the old form and the colon form are accepted everywhe
   The annotation ascribes the value to the declared type (so `(let (big : s64 n) ...)`
   with `n : s32` emits `i64.extend_i32_s`). Scalar types, matching ascription.
 
-Fixtures: `tests/fixtures/colon_everywhere.lisp`, plus a typed-let example verified
+Fixtures: `tests/fixtures/colon_everywhere.wisp`, plus a typed-let example verified
 (`(let (big : s64 n) ...)` → widen then bind). Every existing type position now takes
 the colon; non-scalar annotations (records/lists in `let`/ascription) remain future work.
 
@@ -167,7 +167,7 @@ context. It picks the dispatch type from the first argument whose inferred type 
 matching instance; inside a generic body it falls back to the type-parameter binding.
 So `(+ a b)` and `(+ (i32.const 40) (i32.const 2))` work in plain functions —
 `+` is a true top-level operator, not only usable inside a generic wrapper.
-Fixture: `tests/fixtures/top_level_plus.lisp`.
+Fixture: `tests/fixtures/top_level_plus.wisp`.
 
 ### Trait checker (Pass 0 + instance checks in the pre-pass)
 
@@ -199,7 +199,7 @@ carries the trait's type parameter (`method_dispatch`). `walk` dispatches on tha
 argument first (falling back to any argument with a matching instance, then to the
 generic type-parameter binding). This picks the right instance even when the type
 parameter is not the first argument and a competing instance exists.
-Fixtures: `tests/fixtures/inference_nested.lisp`, `tests/fixtures/inference_dispatch.lisp`.
+Fixtures: `tests/fixtures/inference_nested.wisp`, `tests/fixtures/inference_dispatch.wisp`.
 
 ### Return-type dispatch (top-down, first slice — 2026-08-10)
 
@@ -228,7 +228,7 @@ The expected type is seeded from four places:
 A generic whose result *is* its type parameter also takes its type argument from the
 expected type when no argument determines it.
 
-Fixture: `tests/fixtures/return_dispatch.lisp` — return position, ascription, sibling
+Fixture: `tests/fixtures/return_dispatch.wisp` — return position, ascription, sibling
 argument, both-constants, `if` branches, and raw wasm-instruction arguments, each
 picking the right instruction (`Zero--zero--s32` vs `Zero--zero--f64`, etc.). When no
 context exists at all (a truly unconstrained `(zero)`), the error is clear: "cannot
@@ -257,7 +257,7 @@ it to a float. So these now compile that previously did not:
 Float literals are **not** adopted: a default `f64` and an explicit `3.14f64` are
 indistinguishable from the type alone, so respecting the suffix wins. Use integer
 literals (which promote) or a `f32`/`f64` suffix where a specific float width is needed.
-Fixture: `tests/fixtures/literal_adoption.lisp`.
+Fixture: `tests/fixtures/literal_adoption.wisp`.
 
 ### Structural unification: generics over `(list T)` (2026-08-12)
 
@@ -299,7 +299,7 @@ clause *or* a function parameter. The specialization key (`SpecKey`) carries the
 argument and the list of function-name arguments; the mangled name encodes both
 (`map--inc--s32`, `apply-twice--inc`). `specialize` substitutes the type parameter,
 substitutes each function parameter's name with its argument, and drops the function
-parameters. This unlocked `fold`/`map`/`filter` in `std/list.lisp` (`sum` is now
+parameters. This unlocked `fold`/`map`/`filter` in `std/list.wisp` (`sum` is now
 `(fold + (zero) xs)`). Tests: `tests/generics.rs` (`test_hof_*`), `tests/list.rs`.
 
 Function arguments must be statically known names — no dynamic function values (that
@@ -361,7 +361,7 @@ favour of full structural resolution. Tests: `tests/generics.rs::test_multi_trai
 - **Float literals do not adopt the expected type** (the default-vs-explicit `f64`
   ambiguity). Integer literals promote to floats, so this is rarely felt.
 - **Standard library** — a first minimal slice exists (`+ - * /`, `<`/`>`, `=`,
-  `zero`/`one` for the scalar types), reachable via `(include "std/num.lisp")`.
+  `zero`/`one` for the scalar types), reachable via `(include "std/num.wisp")`.
   Instances are emitted on demand, so an unused stdlib costs nothing. See
   [STDLIB.md](STDLIB.md).
 - **Name mangling** uses `Trait--method--type` and `gen--type` (readable, `-` is a

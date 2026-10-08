@@ -1,7 +1,7 @@
-; Reader for the interpreted REPL. Adapted from examples/wisp-compiler.lisp.
+; Reader for the interpreted REPL. Adapted from examples/wisp-compiler.wisp.
 ; Syntax and runtime data share the same values; malformed input is a failure.
 
-(include "values.lisp")
+(include "values.wisp")
 
 (fn whitespace? ((c s32)) s32
   (i32.or (i32.or (i32.eq c 32) (i32.eq c 9))

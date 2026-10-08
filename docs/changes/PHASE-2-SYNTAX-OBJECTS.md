@@ -19,7 +19,7 @@ Unknown operator or function: foo
 With syntax objects, errors will show:
 ```
 error: Unknown operator or function: foo
-  --> examples/test.lisp:15:5
+  --> examples/test.wisp:15:5
    |
 15 |     (foo x y)
    |      ^^^
@@ -114,7 +114,7 @@ enum SExprKind {
 
 ```
 error[E001]: type mismatch
-  --> examples/test.lisp:10:5
+  --> examples/test.wisp:10:5
    |
 10 |     (i32.add x 3.14)
    |              ^^^^^
@@ -122,12 +122,12 @@ error[E001]: type mismatch
    = expected s32, found f64
 
 error[E002]: undefined function
-  --> examples/test.lisp:15:5
+  --> examples/test.wisp:15:5
    |
 15 |     (foo x)
    |      ^^^
    |
-   = note: expanded from macro at examples/test.lisp:3:1
+   = note: expanded from macro at examples/test.wisp:3:1
 ```
 
 ## Breaking Changes

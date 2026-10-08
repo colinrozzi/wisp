@@ -131,16 +131,16 @@ Currently, Wisp has "convenient" operators that automatically unify types:
   - [x] `global.set $name` (for mutable globals)
 - [x] Generate WAT global declarations
 - [x] Type check global operations
-- [x] Test with example (`examples/global-test.lisp`)
+- [x] Test with example (`examples/global-test.wisp`)
 
 ### Phase 6: Testing & Documentation
 - [x] Update all examples to use new syntax
-  - [x] `examples/prog.lisp`
-  - [x] `examples/math.lisp`
-  - [x] `examples/user.lisp`
-  - [x] `examples/typed.lisp`
-  - [x] `tests/fixtures/s64_factorial.lisp`
-  - [x] `tests/fixtures/f64_math.lisp`
+  - [x] `examples/prog.wisp`
+  - [x] `examples/math.wisp`
+  - [x] `examples/user.wisp`
+  - [x] `examples/typed.wisp`
+  - [x] `tests/fixtures/s64_factorial.wisp`
+  - [x] `tests/fixtures/f64_math.wisp`
 - [x] Verify all examples compile and run correctly
 - [x] Update CLAUDE.md with new language reference
 - [x] Mark this change document as complete
@@ -186,7 +186,7 @@ Currently, Wisp has "convenient" operators that automatically unify types:
 
 ## Breaking Changes
 
-This is a **complete rewrite** of the language syntax. All existing `.lisp` files will need updating.
+This is a **complete rewrite** of the language syntax. All existing `.wisp` files will need updating.
 
 **Migration strategy:**
 1. Implement new instructions alongside old operators

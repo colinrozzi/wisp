@@ -103,13 +103,13 @@ A likely staging:
       *Done 2026-08-10* — the expected type is a resolution source for trait methods
       whose type parameter is only in the return. See
       [changes/GENERICS-AND-TRAITS.md](../changes/GENERICS-AND-TRAITS.md) and
-      `tests/fixtures/return_dispatch.lisp`.
+      `tests/fixtures/return_dispatch.wisp`.
 - [x] Literals adopt the expected type.
       *Done 2026-08-10* — a default integer literal (type `s32`; there is no `s32`
       suffix, so it is provably a default) adopts the expected type: it widens to
       `s64` or promotes to a float. Explicit suffixes are respected. So
       `(fn f () : s64 5)`, `(i64.add 1 2)`, and `(f64.add 1 2)` now work.
-      Fixture: `tests/fixtures/literal_adoption.lisp`.
+      Fixture: `tests/fixtures/literal_adoption.wisp`.
 - [ ] Metavariables + postponement, only where a case genuinely needs them.
 - [ ] Type-aware macros / elaborators (Design C): macros that may query the expected
       type — the unified metaprogramming mechanism envisioned in METAPROGRAMMING.md.

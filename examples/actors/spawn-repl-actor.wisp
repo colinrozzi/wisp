@@ -1,4 +1,4 @@
-; spawn-repl-actor.lisp — Theater actor with WASM-to-WASM compilation and direct eval
+; spawn-repl-actor.wisp — Theater actor with WASM-to-WASM compilation and direct eval
 ;
 ; This actor demonstrates the full eval loop with import support:
 ; 1. Receives expression (optionally with imports) from user

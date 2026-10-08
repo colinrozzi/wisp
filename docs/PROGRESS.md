@@ -71,7 +71,7 @@ Added source location tracking to all S-expressions for better error messages.
 **Example Error:**
 ```
 error: unknown function or operator 'foo'
-  --> examples/test.lisp:15:5
+  --> examples/test.wisp:15:5
    |
 15 |     (foo x y)
    |      ^^^
@@ -229,7 +229,7 @@ Added `syntax-case-lambda` for procedural macros that can run arbitrary code dur
 │                     Compilation Pipeline                      │
 ├──────────────────────────────────────────────────────────────┤
 │                                                              │
-│   Source Code (.lisp)                                        │
+│   Source Code (.wisp)                                        │
 │        │                                                     │
 │        ▼                                                     │
 │   ┌─────────────┐                                           │
@@ -324,7 +324,7 @@ enum Template {
 
 ```bash
 # Compile a source file
-cargo run -- compile examples/prog.lisp examples/prog
+cargo run -- compile examples/prog.wisp examples/prog
 
 # Run an exported function
 cargo run -- run examples/prog.wasm function-name arg1 arg2

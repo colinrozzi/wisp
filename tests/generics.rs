@@ -11,7 +11,7 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 fn compile_and_run(source: &str) -> i32 {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_generics_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_generics_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_generics_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
@@ -464,7 +464,7 @@ fn test_hof_fold_with_trait_method() {
 fn compile_error(source: &str) -> String {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_generics_err_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_generics_err_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_generics_err_{}", test_id));
     std::fs::write(&source_path, source).expect("failed to write temp source");
     match compiler::compile(&source_path, &out_base, compiler::EmitOptions::default()) {

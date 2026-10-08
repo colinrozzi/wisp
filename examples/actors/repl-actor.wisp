@@ -1,4 +1,4 @@
-; repl-actor.lisp — Theater actor that evaluates Wisp expressions
+; repl-actor.wisp — Theater actor that evaluates Wisp expressions
 ;
 ; Exports:
 ;   theater:simple/actor.init — actor initialization

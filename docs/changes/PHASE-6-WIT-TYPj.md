@@ -287,7 +287,7 @@ For macro components (future Phase 7), `sexpr` becomes a real WIT variant that c
 - [x] Test with simple resource example
 
 Note: WIT MVP doesn't support recursive type definitions. For complex data structures
-like `sexpr`, use resources with handle-based APIs instead. See examples/resource-test.lisp.
+like `sexpr`, use resources with handle-based APIs instead. See examples/resource-test.wisp.
 
 ## Examples
 

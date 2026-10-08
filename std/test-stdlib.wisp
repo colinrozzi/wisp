@@ -1,4 +1,4 @@
-; std/test-stdlib.lisp — End-to-end test for stdlib packages
+; std/test-stdlib.wisp — End-to-end test for stdlib packages
 
 (import math abs ((x s32)) s32)
 (import math min ((a s32) (b s32)) s32)

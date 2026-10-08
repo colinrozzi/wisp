@@ -9,7 +9,7 @@ From the repository root, inside `nix develop`:
 ```sh
 cargo run --example interpreter
 # Or load an existing source file into the session first:
-cargo run --example interpreter -- examples/factorial-test.lisp
+cargo run --example interpreter -- examples/factorial-test.wisp
 # wisp> (factorial 6)
 # 720
 ```
@@ -179,7 +179,7 @@ Numeric initializers convert to the declared scalar type. Other types accept onl
 the compiler's zero placeholder; reading one before assigning a typed value is a
 diagnostic. Globals persist across inputs and are isolated between sessions.
 
-Top-level `(include "path.lisp")` expands source before evaluation. File paths are
+Top-level `(include "path.wisp")` expands source before evaluation. File paths are
 relative to the including file's directory; interactive includes start at the
 host's working directory. Canonical paths are included once per input graph,
 including cycles and aliases. Loading again reads and evaluates the files again;
@@ -357,7 +357,7 @@ container/record fields retain their function contracts.
 The existing standard library can be loaded unchanged in a fresh session:
 
 ```sh
-cargo run --example interpreter -- std/list.lisp
+cargo run --example interpreter -- std/list.wisp
 ```
 
 ```lisp
@@ -367,7 +367,7 @@ cargo run --example interpreter -- std/list.lisp
 (contains xs 21)                         ; 1
 ```
 
-Loading `std/num.lisp` publishes its trait operators, including `+` and `=`.
+Loading `std/num.wisp` publishes its trait operators, including `+` and `=`.
 Signature lookahead can use a later typed argument to resolve an earlier literal
 or method call, as in `(fold + (zero) xs)`. It only reads type metadata; argument
 expressions still execute once, from left to right. All type parameters must be
@@ -375,7 +375,7 @@ resolved before entering the body. Expected compound return types and arbitrary
 expression analysis are not implemented; provide typed arguments when inference
 has insufficient information. Quoted data keeps its symbols unchanged.
 
-`evaluator.lisp` exports `evaluate(source: string) -> string`: a printed value or
+`evaluator.wisp` exports `evaluate(source: string) -> string`: a printed value or
 an `error:` diagnostic. Interpreter values stay in the session. This is a local
 REPL text boundary, not a structured value transport. The module can also be
 compiled directly for a host that keeps its Wasm instance alive. It also exports
@@ -391,7 +391,7 @@ includes, and evaluating forms remain in Wisp. The local host implements these
 imports and bounds file reads.
 
 ```sh
-cargo run -- compile interpreter/evaluator.lisp target/interpreter/evaluator
+cargo run -- compile interpreter/evaluator.wisp target/interpreter/evaluator
 ```
 
 This is a feasibility implementation, not full compiled-Wisp parity: resource

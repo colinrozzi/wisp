@@ -1,4 +1,4 @@
-; marshal.lisp — convert an interpreter `value` to a Pack dynamic `any` (CGRF).
+; marshal.wisp — convert an interpreter `value` to a Pack dynamic `any` (CGRF).
 ;
 ; One recursive, tag-directed, TOTAL map: each interpreter type has exactly one
 ; Pack type. No coercion, no target type, no consulting rpc.describe — the value's
@@ -89,7 +89,7 @@
                             (if (i32.eq tag (i32.const 19)) (symbol "flags")
                               (symbol "unknown"))))))))))))))))
 
-; Type descriptors matching the interpreter's own (collections.lisp).
+; Type descriptors matching the interpreter's own (collections.wisp).
 (fn mk-option-type ((inner value)) value
   (sequence (list-push (list-push (list-new value) (symbol "option")) inner)))
 (fn mk-result-type ((ok value) (err value)) value

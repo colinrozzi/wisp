@@ -103,7 +103,7 @@ fn compile_and_call_with_string_arg(source: &str, func_name: &str, input: &str) 
 fn compile_and_call_with_string_arg_inner(source: &str, func_name: &str, input: &str) -> String {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_selfhost_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_selfhost_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_selfhost_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
@@ -218,7 +218,7 @@ fn compile_and_call_string(source: &str, func_name: &str) -> String {
 fn compile_and_call_string_inner(source: &str, func_name: &str) -> String {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
-    let source_path = temp_dir.join(format!("test_selfhost_{}.lisp", test_id));
+    let source_path = temp_dir.join(format!("test_selfhost_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_selfhost_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
@@ -288,8 +288,8 @@ fn compile_and_call_string_inner(source: &str, func_name: &str) -> String {
 
 // Read the self-hosted compiler source
 fn get_compiler_source() -> String {
-    std::fs::read_to_string("examples/wisp-compiler.lisp")
-        .expect("failed to read wisp-compiler.lisp")
+    std::fs::read_to_string("examples/wisp-compiler.wisp")
+        .expect("failed to read wisp-compiler.wisp")
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn test_self_hosted_compiles() {
         let source = get_compiler_source();
         let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir = std::env::temp_dir();
-        let source_path = temp_dir.join(format!("test_selfhost_compile_{}.lisp", test_id));
+        let source_path = temp_dir.join(format!("test_selfhost_compile_{}.wisp", test_id));
         let out_base = temp_dir.join(format!("test_selfhost_compile_{}", test_id));
 
         std::fs::write(&source_path, &source).expect("failed to write temp source");

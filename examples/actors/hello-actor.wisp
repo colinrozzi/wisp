@@ -1,4 +1,4 @@
-; hello-actor.lisp — Minimal Theater actor in Wisp
+; hello-actor.wisp — Minimal Theater actor in Wisp
 ;
 ; This is the first Theater actor written in Wisp. It exports the
 ; theater:simple/actor.init function with the Pack/Graph ABI signature.

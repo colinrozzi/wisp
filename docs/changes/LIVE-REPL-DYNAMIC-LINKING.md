@@ -54,7 +54,7 @@ The escape is that **memory, globals, and functions can be imported**. So:
 
 ### The linking seam already exists
 
-The self-hosted compiler (`examples/wisp-compiler.lisp`) returns its output as a **WAT
+The self-hosted compiler (`examples/wisp-compiler.wisp`) returns its output as a **WAT
 string**; the host assembles it with `wat::parse_str` (main.rs ~3370). The host already
 rewrites that string — exporting memory, injecting globals, adding data segments,
 wiring Pack imports (main.rs ~3209–3361). Dynamic linking is **more of the same
@@ -64,7 +64,7 @@ rewrite**, so the first milestones need **no change to the self-hosted compiler*
 
 - Self-hosted compiler emits `(memory (export "memory") 1)` and
   `(global $__heap_ptr (mut i32) (i32.const 49152))`; the bump heap starts at byte
-  **49152** (`examples/wisp-compiler.lisp` ~1498, ~1513).
+  **49152** (`examples/wisp-compiler.wisp` ~1498, ~1513).
 - Below 49152 the REPL places **string data segments** at fixed low addresses
   (`preprocess_string_literals`) — this region must be reserved and, for the image, its
   allocation pointer must also persist (see M1 risk).
@@ -116,7 +116,7 @@ error (pre-existing error-quality issue, not M2).
 Original plan / ABI verdict below.
 
 **ABI verdict (probed 2026-08-22): no compiler changes needed.** The self-hosted
-compiler already emits everything plainly (`examples/wisp-compiler.lisp`):
+compiler already emits everything plainly (`examples/wisp-compiler.wisp`):
 - local fn → `(func $name (param $x i32) … (result i32) …)`; compound params are i32
   pointers (`compile-fn-def` ~1305, `compile-param` ~1185, `type-to-wat` ~1178);
 - local call → plain `call $name`, args on the stack (`compile-fn-call` ~802);
@@ -167,7 +167,7 @@ wrapper is `s32`); `set!` is future work.
 
 ### M4 — Strings as heap values ✅ DONE (no compiler change needed!)
 **Investigation surprise**: the self-hosted compiler *already* lowers a string literal
-`"…"` to a heap allocation — `compile-string` (`examples/wisp-compiler.lisp` ~750-767)
+`"…"` to a heap allocation — `compile-string` (`examples/wisp-compiler.wisp` ~750-767)
 bump-allocates `len+4` off `$__heap_ptr`, writes the length + bytes, returns the pointer;
 its tokenizer already reads `"…"`. Raw strings in the REPL already heap-allocated. The low
 arena was used *only* because the host intercepted `(str.const "…")` first. So M4 was a
@@ -194,7 +194,7 @@ record or a list. That deletes the arena, its 49152 ceiling, and the exception i
 out of the one-heap model.
 
 - **Home**: the compiler, not the host. The self-hosted compiler
-  (`examples/wisp-compiler.lisp`) should lower a literal to a heap allocation directly, so
+  (`examples/wisp-compiler.wisp`) should lower a literal to a heap allocation directly, so
   the host shim **disappears**. This means editing Wisp and re-bootstrapping (the heavy
   loop), so pair it with M2 — we are already in the compiler teaching it linking mode.
 - **Do NOT** build the intermediate host-side `memory.init` / passive-segment shim: it is

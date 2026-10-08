@@ -1,6 +1,6 @@
 ; Use the minimal numeric standard library through `(include ...)`.
 ; The path is relative to this file: tests/fixtures -> repo root -> std.
-(include "../../std/num.lisp")
+(include "../../std/num.wisp")
 
 ; Operators on s32, resolved to i32.* by the stdlib instances.
 (export (fn add3 ((a : s32) (b : s32) (c : s32)) : s32
