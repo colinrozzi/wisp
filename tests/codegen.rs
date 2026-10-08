@@ -805,3 +805,24 @@ fn test_compile_fn_simple() {
     );
     assert_eq!(compile_and_run(&source), 1);
 }
+
+#[test]
+fn test_compound_type_ascription() {
+    // `(expr : (list s32))` -- compound-type ascription now parses + checks
+    // (was scalar-only). A same-type annotation is an identity (no-op) ascription.
+    let source = r#"
+(export (fn test-func () s32
+  (let (xs (list-push (list-push (list-new s32) (i32.const 10)) (i32.const 20)))
+    (list-len (xs : (list s32))))))
+"#;
+    assert_eq!(compile_and_run(source), 2);
+}
+
+#[test]
+fn test_scalar_cast_via_colon_preserved() {
+    // The colon form still performs a numeric widening cast when the types differ.
+    let source = r#"
+(export (fn test-func () s32 (i32.wrap_i64 ((i32.const 42) : s64))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}

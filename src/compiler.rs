@@ -1649,8 +1649,12 @@ fn check_expr(
         Expr::StringLiteral(_) => Ok(Type::Str),
         Expr::Ascribe { expr, ty } => {
             let inner_ty = check_expr(expr, env, signatures, globals, records, variants)?;
-            ensure_numeric(&inner_ty, "ascribe requires numeric types")?;
-            ensure_numeric(ty, "ascribe requires numeric types")?;
+            // A same-type ascription is an identity annotation (any type is fine);
+            // a differing ascription is a numeric cast (both sides must be numeric).
+            if inner_ty != *ty {
+                ensure_numeric(&inner_ty, "cast requires numeric types")?;
+                ensure_numeric(ty, "cast requires numeric types")?;
+            }
             Ok(ty.clone())
         }
         Expr::Var(name) => env
@@ -6535,19 +6539,12 @@ fn parse_expr(
             if items.is_empty() {
                 return Err(ctx.error("empty list is not a valid expression", list_span));
             }
-            // Ascription in colon form: (expr : type), mirroring the head form (type expr).
-            if items.len() == 3
-                && is_colon(&items[1])
-                && let SExpr::Sym(tsym, _) = &items[2]
-                && is_type_symbol(tsym)
-            {
-                let ty = match tsym.as_str() {
-                    "s32" => Type::S32,
-                    "s64" => Type::S64,
-                    "f32" => Type::F32,
-                    "f64" => Type::F64,
-                    _ => unreachable!(),
-                };
+            // Ascription in colon form: (expr : type), mirroring the head form.
+            // Accepts any type (scalar OR compound): a same-type ascription is an
+            // identity annotation; a differing scalar ascription is a cast.
+            if items.len() == 3 && is_colon(&items[1]) {
+                let variant_names: HashSet<String> = variants.keys().cloned().collect();
+                let ty = parse_type_expr(&items[2], &variant_names, &HashSet::new(), ctx)?;
                 let inner = parse_expr(&items[0], vars, functions, records, variants, ctx)?;
                 return Ok(Expr::Ascribe {
                     expr: Box::new(inner),
