@@ -75,6 +75,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Env-filtered logs (RUST_LOG=...), so the daemon's Theater/handler activity
+    // is visible. Silent unless RUST_LOG is set.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     let args = Args::parse();
     let port = args.port;
     match args.command.unwrap_or(Command::Serve) {

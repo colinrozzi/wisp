@@ -2484,6 +2484,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "theater-handler-lifecycle"
+version = "0.3.14"
+source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
+dependencies = [
+ "anyhow",
+ "theater",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "theater-handler-message-server"
 version = "0.3.13"
 source = "git+https://github.com/colinrozzi/theater.git?rev=e2546700e00cb8c4a8050f27c62388bd57646483#e2546700e00cb8c4a8050f27c62388bd57646483"
@@ -4042,6 +4053,7 @@ dependencies = [
  "theater-handler-assembler",
  "theater-handler-filesystem",
  "theater-handler-http-client",
+ "theater-handler-lifecycle",
  "theater-handler-message-server",
  "theater-handler-podman",
  "theater-handler-rpc",
@@ -4053,6 +4065,7 @@ dependencies = [
  "theater-handler-timer",
  "theater-native",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
