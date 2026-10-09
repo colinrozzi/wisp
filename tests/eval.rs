@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use wisp::compiler::{
-    Host, InlineValue, Value, eval_repl_expr, eval_source, eval_source_entry_with_host,
-    eval_source_with_host,
+    Host, Import, InlineValue, Type, Value, eval_repl_expr, eval_repl_expr_with_host, eval_source,
+    eval_source_entry_with_host, eval_source_with_host,
 };
 
 fn ok(src: &str) -> Value {
@@ -212,6 +212,36 @@ fn test_eval_repl_typechecks_bindings() {
     let mut bindings = HashMap::new();
     bindings.insert("x".to_string(), InlineValue::Str("hi".to_string()));
     assert!(eval_repl_expr("(i32.add x (i32.const 1))", &bindings, &[]).is_err());
+}
+
+// A REPL session expression can call an imported function, which dispatches to the
+// session's host — the seam the Theater REPL reaches the live runtime through. The
+// import signature joins the type-check; the inferred type comes back alongside.
+#[test]
+fn test_eval_repl_expr_with_host_dispatches_import() {
+    struct FixedHost;
+    impl Host for FixedHost {
+        fn call(&mut self, _module: &str, name: &str, _args: &[Value]) -> anyhow::Result<Value> {
+            assert_eq!(name, "answer");
+            Ok(Value::Int(42))
+        }
+    }
+    let import = Import {
+        module: "host".to_string(),
+        name: "answer".to_string(),
+        params: vec![],
+        return_type: Type::S32,
+    };
+    let (v, ty) = eval_repl_expr_with_host(
+        "(answer)",
+        &HashMap::new(),
+        &[],
+        std::slice::from_ref(&import),
+        &mut FixedHost,
+    )
+    .expect("eval");
+    assert_eq!(v, Value::Int(42));
+    assert_eq!(ty, Type::S32);
 }
 
 #[test]

@@ -173,6 +173,22 @@ pub fn eval_repl_expr(
     bindings: &HashMap<String, InlineValue>,
     functions: &[Function],
 ) -> Result<(Value, Type)> {
+    eval_repl_expr_with_host(expr_source, bindings, functions, &[], &mut NullHost)
+}
+
+/// Like `eval_repl_expr`, but the expression may call `imports`, and those calls
+/// dispatch to `host`. This is the seam that lets a REPL *session* reach a live
+/// runtime (the Theater REPL) while staying the same interpreter the local REPL
+/// runs on — the imports and host are the only difference. Import signatures join
+/// the function signatures for parse + type-check, and the imports go into the
+/// evaluated program so eval routes their calls to `host`.
+pub fn eval_repl_expr_with_host(
+    expr_source: &str,
+    bindings: &HashMap<String, InlineValue>,
+    functions: &[Function],
+    imports: &[Import],
+    host: &mut dyn Host,
+) -> Result<(Value, Type)> {
     let ctx = CompileContext::new(expr_source.to_string(), "<repl>".to_string());
     let tokens = tokenize(expr_source);
     if tokens.is_empty() {
@@ -188,6 +204,15 @@ pub fn eval_repl_expr(
             Signature {
                 params: func.params.iter().map(|p| p.ty.clone()).collect(),
                 result: func.return_type.clone(),
+            },
+        );
+    }
+    for import in imports {
+        signatures.insert(
+            import.name.clone(),
+            Signature {
+                params: import.params.iter().map(|p| p.ty.clone()).collect(),
+                result: import.return_type.clone(),
             },
         );
     }
@@ -217,7 +242,7 @@ pub fn eval_repl_expr(
     all_functions.push(eval_fn);
     let prog = Program {
         functions: all_functions,
-        imports: vec![],
+        imports: imports.to_vec(),
         exports: vec![ExportDef::simple("eval".to_string())],
         globals: vec![],
         records: vec![],
@@ -229,7 +254,7 @@ pub fn eval_repl_expr(
     };
     let full_signatures = collect_signatures(&prog)?;
     type_check(&prog, &full_signatures, &ctx)?;
-    Ok((eval_program(&prog, "eval", &mut NullHost)?, return_type))
+    Ok((eval_program(&prog, "eval", host)?, return_type))
 }
 
 type Env = HashMap<String, Value>;

@@ -1,7 +1,9 @@
+pub mod eval_session;
 pub mod source;
 pub mod theater_host;
 pub mod transport;
 
+pub use eval_session::EvalSession;
 pub use theater_host::TheaterHost;
 
 /// The actor's public evaluation export (theater:simple/wisp.evaluate).
