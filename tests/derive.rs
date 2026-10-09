@@ -178,3 +178,66 @@ fn test_derive_eq_on_non_record_is_rejected() {
         "got: {err}"
     );
 }
+
+// Constructors are wrapped in functions with a declared return type so the
+// trait-method dispatch can infer the argument type (the record tests do the same).
+const SHAPE: &str = "(variant shape (circle s32) (rect s32 s32))
+(derive Eq shape)
+(fn circ ((a : s32)) : shape (circle a))
+(fn rct ((a : s32) (b : s32)) : shape (rect a b))";
+
+const COLOR: &str = "(variant color (red) (green) (blue))
+(derive Eq color)
+(fn mkred () : color (red))
+(fn mkgreen () : color (green))
+(fn mkblue () : color (blue))";
+
+#[test]
+fn test_derive_eq_variant_nullary_equal() {
+    let src = format!(
+        "{EQ_TRAIT}
+{COLOR}
+(export (fn test-func () s32 (= (mkgreen) (mkgreen))))"
+    );
+    assert_eq!(compile_and_run(&src), 1);
+}
+
+#[test]
+fn test_derive_eq_variant_nullary_differ() {
+    let src = format!(
+        "{EQ_TRAIT}
+{COLOR}
+(export (fn test-func () s32 (= (mkred) (mkblue))))"
+    );
+    assert_eq!(compile_and_run(&src), 0);
+}
+
+#[test]
+fn test_derive_eq_variant_payload_equal() {
+    let src = format!(
+        "{EQ_TRAIT}
+{SHAPE}
+(export (fn test-func () s32 (= (rct (i32.const 3) (i32.const 4)) (rct (i32.const 3) (i32.const 4)))))"
+    );
+    assert_eq!(compile_and_run(&src), 1);
+}
+
+#[test]
+fn test_derive_eq_variant_payload_differs() {
+    let src = format!(
+        "{EQ_TRAIT}
+{SHAPE}
+(export (fn test-func () s32 (= (rct (i32.const 3) (i32.const 4)) (rct (i32.const 3) (i32.const 9)))))"
+    );
+    assert_eq!(compile_and_run(&src), 0);
+}
+
+#[test]
+fn test_derive_eq_variant_different_case() {
+    let src = format!(
+        "{EQ_TRAIT}
+{SHAPE}
+(export (fn test-func () s32 (= (circ (i32.const 3)) (rct (i32.const 3) (i32.const 4)))))"
+    );
+    assert_eq!(compile_and_run(&src), 0);
+}
