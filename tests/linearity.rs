@@ -140,3 +140,45 @@ fn test_linear_inconsistent_branches_rejected() {
         "unexpected error: {err}"
     );
 }
+
+// An affine parameter used exactly once is fine.
+#[test]
+fn test_affine_used_once_ok() {
+    let source = r#"
+(fn consume ((x (aff s32))) s32 (i32.add x (i32.const 1)))
+(export (fn test-func () s32 (consume (i32.const 41))))
+"#;
+    assert_eq!(compile_and_run(source), 42);
+}
+
+// An affine parameter may be dropped (used zero times) — unlike linear.
+#[test]
+fn test_affine_drop_ok() {
+    let source = r#"
+(fn ignore ((x (aff s32))) s32 (i32.const 7))
+(export (fn test-func () s32 (ignore (i32.const 99))))
+"#;
+    assert_eq!(compile_and_run(source), 7);
+}
+
+// An affine value used on one branch and dropped on the other is fine (the
+// per-path maximum is 1); the same shape is rejected for a linear value.
+#[test]
+fn test_affine_dropped_on_one_branch_ok() {
+    let source = r#"
+(fn maybe ((x (aff s32)) (b s32)) s32
+  (if b x (i32.const 0)))
+(export (fn test-func () s32 (maybe (i32.const 5) (i32.const 1))))
+"#;
+    assert_eq!(compile_and_run(source), 5);
+}
+
+// Using an affine parameter twice is still rejected (at most once).
+#[test]
+fn test_affine_double_use_rejected() {
+    let err = compile_error(
+        "(fn dup ((x (aff s32))) s32 (i32.add x x))
+(export (fn test-func () s32 (dup (i32.const 3))))",
+    );
+    assert!(err.contains("at most once"), "unexpected error: {err}");
+}
