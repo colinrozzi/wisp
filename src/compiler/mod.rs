@@ -11,6 +11,8 @@ pub(crate) use tokenizer::*;
 mod codegen;
 use codegen::*;
 pub use codegen::{compile_repl_expr, compile_repl_expr_pack, compile_repl_expr_pack_wat};
+mod eval;
+pub use eval::{Value, eval_source};
 mod typecheck;
 pub(crate) use typecheck::*;
 mod macros;
@@ -385,14 +387,17 @@ fn expand_includes(
     Ok(out)
 }
 
-pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result<CompileArtifacts> {
-    let src = fs::read_to_string(source_path)
-        .with_context(|| format!("failed to read source file {}", source_path.display()))?;
-
-    let file_path = source_path.display().to_string();
-    let ctx = CompileContext::new(src.clone(), file_path);
-
-    let tokens = tokenize(&src);
+/// The shared front-end + middle of the pipeline: tokenize, parse, expand includes
+/// and macros, derive, lower/monomorphize generics, then type-check. Produces the
+/// typed `Program` (and its signatures) that either back-end consumes — `codegen`
+/// (WAT/Pack) in `compile`, or the tree-walking `eval`.
+pub(crate) fn analyze(
+    src: &str,
+    base_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    ctx: &CompileContext,
+) -> Result<(Program, HashMap<String, Signature>)> {
+    let tokens = tokenize(src);
     let mut forms = Vec::new();
     let mut pos = 0;
     while pos < tokens.len() {
@@ -403,6 +408,23 @@ pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result
     if forms.is_empty() {
         bail!("no function definitions found in source");
     }
+    let forms = expand_includes(forms, base_dir, visited, ctx)?;
+    let macros = collect_macros(&forms);
+    let expanded_forms = expand_all_macros(forms, &macros);
+    let expanded_forms = expand_derives(expanded_forms, ctx)?;
+    let expanded_forms = expand_generics(expanded_forms, ctx)?;
+    let prog = parse_program(expanded_forms, ctx)?;
+    let signatures = collect_signatures(&prog)?;
+    type_check(&prog, &signatures, ctx)?;
+    Ok((prog, signatures))
+}
+
+pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result<CompileArtifacts> {
+    let src = fs::read_to_string(source_path)
+        .with_context(|| format!("failed to read source file {}", source_path.display()))?;
+
+    let file_path = source_path.display().to_string();
+    let ctx = CompileContext::new(src.clone(), file_path);
 
     // Splice any `(include "...")` files before macro/generic expansion.
     let base_dir = source_path
@@ -413,21 +435,10 @@ pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result
     if let Ok(c) = source_path.canonicalize() {
         visited.insert(c);
     }
-    let forms = expand_includes(forms, &base_dir, &mut visited, &ctx)?;
 
-    // Collect macro definitions (both defmacro and define-syntax) and expand macros
-    let macros = collect_macros(&forms);
-    let expanded_forms = expand_all_macros(forms, &macros);
-
-    // Compile-time deriving: `(derive Trait Type)` -> a generated trait instance.
-    let expanded_forms = expand_derives(expanded_forms, &ctx)?;
-
-    // Lower traits / instances / generics to plain monomorphic forms.
-    let expanded_forms = expand_generics(expanded_forms, &ctx)?;
-
-    let prog = parse_program(expanded_forms, &ctx)?;
-    let signatures = collect_signatures(&prog)?;
-    type_check(&prog, &signatures, &ctx)?;
+    // The shared front + middle (parse -> expand -> lower -> type-check). Both
+    // back-ends -- codegen below and the tree-walking `eval` -- consume its output.
+    let (prog, signatures) = analyze(&src, &base_dir, &mut visited, &ctx)?;
 
     // Generate Pack-compatible WAT (raw module with Pack/Graph ABI). This text is
     // always produced because the wasm is built from it, but it is only *written*
