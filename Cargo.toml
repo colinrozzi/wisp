@@ -32,6 +32,7 @@ wit-parser = "0.220.1"
 pack.workspace = true
 
 [dev-dependencies]
+anyhow = "1.0"
 # Exercise the capture-based engine interface used by current Theater.
 packr-core = "=0.24.1"
 packr-wasmtime = "=0.24.1"
