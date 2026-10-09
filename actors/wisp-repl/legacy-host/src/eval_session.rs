@@ -1,51 +1,43 @@
-//! A host-side REPL session on the shared interpreter.
+//! The daemon's live session: a shared-interpreter `ReplSession` whose host is a
+//! `TheaterHost`.
 //!
-//! The convergence step past brick 1: instead of spawning the Wisp-interpreter
-//! actor and calling its `evaluate` export, the daemon holds this session and
-//! evaluates forms with Rust `eval` directly — the same interpreter the local REPL
-//! runs on. Its capability to reach the live runtime is supplied by a `TheaterHost`:
-//! the session pre-registers the Theater host interface as imports, so a form like
-//! `(list-actors)` type-checks and, under eval, dispatches to the runtime.
+//! The convergence, realized: the daemon no longer runs the Wisp-interpreter actor
+//! to evaluate — it holds a `wisp::compiler::ReplSession` (the same session type the
+//! local REPL uses) and feeds it a `TheaterHost`, so forms reach the live runtime.
+//! The session accumulates `(fn …)`/`(define …)` across inputs and pre-declares the
+//! Theater host interface so calls like `(list-actors)` type-check and dispatch.
 //!
-//! eval is synchronous and blocks on the runtime, so `evaluate` must be called from
-//! a blocking context (`tokio::task::spawn_blocking`) — see `TheaterHost`.
+//! eval is synchronous and blocks on the runtime, so `feed` must run on a blocking
+//! thread (`tokio::task::spawn_blocking`) — see `TheaterHost`.
 
 use crate::TheaterHost;
 use theater::messages::TheaterCommand;
 use tokio::sync::mpsc::UnboundedSender;
-use wisp::compiler::{Import, Type, Value, eval_repl_expr_with_host};
+use wisp::compiler::{Outcome, ReplSession};
 
-/// A REPL session that evaluates against a live Theater runtime.
+/// The Theater host interface the session exposes to evaluated code, as `(import …)`
+/// declarations. Grows alongside `TheaterHost`; for now, the live-actor roster.
+const THEATER_INTERFACE: &str = "(import host list-actors () (list string))\n";
+
+/// A REPL session bound to a live Theater runtime.
 pub struct EvalSession {
     commands: UnboundedSender<TheaterCommand>,
-    imports: Vec<Import>,
+    session: ReplSession,
 }
 
 impl EvalSession {
     pub fn new(commands: UnboundedSender<TheaterCommand>) -> Self {
         Self {
             commands,
-            imports: theater_interface(),
+            session: ReplSession::with_preamble(THEATER_INTERFACE),
         }
     }
 
-    /// Evaluate one expression through the shared interpreter, reaching the live
-    /// runtime via a fresh `TheaterHost`. Returns the value and its inferred type.
-    /// Synchronous — the host `blocking_recv`s the runtime's reply, so call this
-    /// from a blocking thread, never directly on a reactor task.
-    pub fn evaluate(&mut self, expr: &str) -> anyhow::Result<(Value, Type)> {
+    /// Feed one source form (a `(fn …)`, a `(define …)`, or an expression), reaching
+    /// the live runtime through a fresh `TheaterHost`. Synchronous — the host
+    /// `blocking_recv`s the runtime's reply, so call this from a blocking thread.
+    pub fn feed(&mut self, input: &str) -> anyhow::Result<Outcome> {
         let mut host = TheaterHost::new(self.commands.clone());
-        eval_repl_expr_with_host(expr, &Default::default(), &[], &self.imports, &mut host)
+        self.session.feed(input, &mut host)
     }
-}
-
-/// The Theater host interface the session exposes to evaluated code. Grows
-/// alongside `TheaterHost`; for now, the live-actor roster.
-fn theater_interface() -> Vec<Import> {
-    vec![Import {
-        module: "host".to_string(),
-        name: "list-actors".to_string(),
-        params: vec![],
-        return_type: Type::List(Box::new(Type::Str)),
-    }]
 }
