@@ -4,12 +4,12 @@
 // generics, and substructural checks as compiled code. Each program evaluates a
 // nullary `test-func`.
 
-use std::collections::HashMap;
-use std::path::Path;
-use wisp::compiler::{
+use granite::compiler::{
     Host, Import, InlineValue, Type, Value, eval_repl_expr, eval_repl_expr_with_host, eval_source,
     eval_source_entry_with_host, eval_source_with_host,
 };
+use std::collections::HashMap;
+use std::path::Path;
 
 fn ok(src: &str) -> Value {
     eval_source(src).expect("expected successful evaluation")

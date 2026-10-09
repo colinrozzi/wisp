@@ -1,7 +1,7 @@
 //! The convergence seam: the shared Rust interpreter's `Host`, implemented against
 //! a live Theater runtime.
 //!
-//! An imported-function call under `wisp::compiler::eval` — e.g. `(list-actors)` —
+//! An imported-function call under `granite::compiler::eval` — e.g. `(list-actors)` —
 //! dispatches to `Host::call`, which marshals it to a `TheaterCommand` on the
 //! runtime's channel and waits for the reply. So one interpreter serves both the
 //! local REPL (a trivial stdio host) and the live Theater session (this host): the
@@ -18,11 +18,11 @@
 //! so they are deliberately not here.
 
 use anyhow::{Result, anyhow, bail};
+use granite::compiler::{Host, Value};
 use theater::messages::TheaterCommand;
 use tokio::sync::{mpsc, oneshot};
-use wisp::compiler::{Host, Value};
 
-/// A `wisp::compiler::Host` backed by a live Theater runtime's command channel.
+/// A `granite::compiler::Host` backed by a live Theater runtime's command channel.
 pub struct TheaterHost {
     commands: mpsc::UnboundedSender<TheaterCommand>,
 }

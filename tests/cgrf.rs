@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use granite::compiler::{self, EmitOptions};
 use pack::abi::{Value, ValueType};
 use wasmtime::{Config, Engine, Instance, Memory, Module, Store};
-use wisp::compiler::{self, EmitOptions};
 
 fn package() -> &'static PathBuf {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
@@ -246,7 +246,7 @@ fn test_cgrf_pack_runtime_roundtrip() {
 
 #[test]
 fn test_cgrf_cli_and_dependency_bridge() {
-    let cli = env!("CARGO_BIN_EXE_wisp");
+    let cli = env!("CARGO_BIN_EXE_granite");
     let output = Command::new(cli)
         .arg("run-module")
         .arg(package())

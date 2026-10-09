@@ -6,9 +6,9 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use granite::compiler::{self, EmitOptions};
 use pack::abi::{Value, ValueType};
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
-use wisp::compiler::{self, EmitOptions};
 
 fn fixture_wasm() -> &'static PathBuf {
     static WASM: OnceLock<PathBuf> = OnceLock::new();

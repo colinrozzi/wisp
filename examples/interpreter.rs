@@ -5,7 +5,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use wisp::{compiler, interpreter::Interpreter};
+use granite::{compiler, interpreter::Interpreter};
 
 fn main() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

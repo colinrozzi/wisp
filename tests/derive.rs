@@ -1,9 +1,9 @@
 // Tests for compile-time deriving: `(derive Eq Type)` reflects on a record's fields
 // and generates the trait instance. Each program exports `test-func` returning s32.
 
+use granite::compiler;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::{Config, Engine, Instance, Module, Store};
-use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

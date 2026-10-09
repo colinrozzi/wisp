@@ -17,7 +17,7 @@ path = "src/main.rs"
 # forms host-side and reach the live runtime through a `TheaterHost` — the
 # convergence onto one interpreter (see src/theater_host.rs).
 [dependencies]
-wisp = { path = "../../.." }
+granite = { path = "../../.." }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"

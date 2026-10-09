@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use granite::compiler::Outcome;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -10,7 +11,6 @@ use theater::messages::TheaterCommand;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
-use wisp::compiler::Outcome;
 use wisp_interpreter_actor::{EvalSession, Runtime, source::SourceBundle, transport};
 
 /// The immutable source bundle served to the guest for relative `(include …)`.

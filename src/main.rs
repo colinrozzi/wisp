@@ -1,4 +1,4 @@
-use wisp::compiler;
+use granite::compiler;
 
 use std::path::{Path, PathBuf};
 
