@@ -35,6 +35,18 @@ enum Command {
         #[arg(long = "emit-pact")]
         emit_pact: bool,
     },
+    /// Evaluate a source file directly with the tree-walking interpreter — no
+    /// compile-to-wasm step. Runs the shared front/middle (so the full type system
+    /// still applies), then interprets the entry function. Import calls go to a
+    /// built-in stdio host: `(print s)` / `(write-line s)` write to stdout.
+    Eval {
+        /// Path to the input Lisp file.
+        #[arg(value_name = "SOURCE")]
+        source: PathBuf,
+        /// Nullary function to evaluate (defaults to `main`).
+        #[arg(long, value_name = "NAME", default_value = "main")]
+        entry: String,
+    },
     /// Run a function exported from a compiled WebAssembly package (component model).
     Run {
         /// Path to the wasm package produced by `wisp compile`.
@@ -87,6 +99,7 @@ fn main() -> Result<()> {
                 pact: emit_pact,
             },
         )?,
+        Command::Eval { source, entry } => run_eval(&source, &entry)?,
         Command::Run {
             package,
             func,
@@ -110,6 +123,50 @@ fn run_compile(source: &Path, out: Option<&str>, emit: compiler::EmitOptions) ->
 
     let artifacts = compiler::compile(source, &out_base, emit)?;
     print_artifacts(&artifacts);
+    Ok(())
+}
+
+/// A minimal console host for `wisp eval`: imported `print`/`write-line` calls
+/// write their string argument to stdout. This is the real-binary counterpart of
+/// the capturing test host — the same `Host` seam, backed by stdout instead of a
+/// `Vec`. More capabilities (a store, a clock, …) slot in as further match arms.
+struct StdHost;
+
+impl compiler::Host for StdHost {
+    fn call(
+        &mut self,
+        _module: &str,
+        name: &str,
+        args: &[compiler::Value],
+    ) -> Result<compiler::Value> {
+        match name {
+            "print" | "write-line" => {
+                let text = match args.first() {
+                    Some(compiler::Value::Str(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                if name == "print" {
+                    print!("{text}");
+                } else {
+                    println!("{text}");
+                }
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                Ok(compiler::Value::Int(0))
+            }
+            other => bail!("eval host: no such import '{other}'"),
+        }
+    }
+}
+
+fn run_eval(source: &Path, entry: &str) -> Result<()> {
+    let src =
+        std::fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
+    let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
+    let mut host = StdHost;
+    let value = compiler::eval_source_entry_with_host(&src, base_dir, entry, &mut host)?;
+    println!("{value}");
     Ok(())
 }
 

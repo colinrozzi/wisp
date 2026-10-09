@@ -12,7 +12,10 @@ mod codegen;
 use codegen::*;
 pub use codegen::{compile_repl_expr, compile_repl_expr_pack, compile_repl_expr_pack_wat};
 mod eval;
-pub use eval::{Host, NullHost, Value, eval_repl_expr, eval_source, eval_source_with_host};
+pub use eval::{
+    Host, NullHost, Value, eval_repl_expr, eval_source, eval_source_entry_with_host,
+    eval_source_with_host,
+};
 mod typecheck;
 pub(crate) use typecheck::*;
 mod macros;
