@@ -6015,6 +6015,85 @@ fn derive_eq_record(
     ]))
 }
 
+/// Generate an `(instance (Eq Variant) ...)` that compares two variant values:
+/// equal only when they share a case and that case's (scalar) payloads are equal.
+/// Built as a nested match — outer on `a`, inner on `b` with a `_` fallback to 0.
+fn derive_eq_variant(
+    trait_name: &str,
+    type_name: &str,
+    cases: &[(String, Vec<String>)],
+    span: &Span,
+    ctx: &CompileContext,
+) -> Result<SExpr> {
+    let sym = |s: &str| SExpr::Sym(s.to_string(), span.clone());
+    let list = |v: Vec<SExpr>| SExpr::List(v, span.clone());
+    let int = |v: i64| SExpr::Int {
+        value: v,
+        ty: Type::S32,
+        span: span.clone(),
+    };
+
+    let mut outer_arms = Vec::new();
+    for (case, payloads) in cases {
+        let a_binds: Vec<String> = (0..payloads.len()).map(|i| format!("a_{i}")).collect();
+        let b_binds: Vec<String> = (0..payloads.len()).map(|i| format!("b_{i}")).collect();
+        // Compare payloads pairwise (scalar equality, matching the record path).
+        let mut cmps = Vec::new();
+        for (i, pty) in payloads.iter().enumerate() {
+            let eq = scalar_eq_instr(pty).ok_or_else(|| {
+                ctx.error(
+                    format!(
+                        "cannot derive Eq for '{}': case '{}' has non-scalar payload '{}'",
+                        type_name, case, pty
+                    ),
+                    span,
+                )
+            })?;
+            cmps.push(list(vec![sym(eq), sym(&a_binds[i]), sym(&b_binds[i])]));
+        }
+        let eq_body = cmps
+            .into_iter()
+            .reduce(|acc, c| list(vec![sym("i32.and"), acc, c]))
+            .unwrap_or_else(|| int(1));
+        // Inner match on b: the same case compares payloads; anything else is 0.
+        let inner_pat = {
+            let mut p = vec![sym(case)];
+            p.extend(b_binds.iter().map(|n| sym(n)));
+            list(p)
+        };
+        let inner = list(vec![
+            sym("match"),
+            sym("b"),
+            list(vec![inner_pat, eq_body]),
+            list(vec![list(vec![sym("_")]), int(0)]),
+        ]);
+        let outer_pat = {
+            let mut p = vec![sym(case)];
+            p.extend(a_binds.iter().map(|n| sym(n)));
+            list(p)
+        };
+        outer_arms.push(list(vec![outer_pat, inner]));
+    }
+    let mut match_expr = vec![sym("match"), sym("a")];
+    match_expr.extend(outer_arms);
+    let body = list(match_expr);
+
+    let param = |n: &str| list(vec![sym(n), sym(":"), sym(type_name)]);
+    let method = list(vec![
+        sym("fn"),
+        sym("="),
+        list(vec![param("a"), param("b")]),
+        sym(":"),
+        sym("s32"),
+        body,
+    ]);
+    Ok(list(vec![
+        sym("instance"),
+        list(vec![sym(trait_name), sym(type_name)]),
+        method,
+    ]))
+}
+
 /// Compile-time deriving: `(derive Trait Type)` inspects Type's definition and emits a
 /// trait instance. Runs after macro expansion and before the generics pre-pass, so the
 /// generated instance flows through the normal trait pipeline. This is the first
@@ -6040,6 +6119,26 @@ fn expand_derives(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>>
         }
     }
 
+    // Collect (bare-named) variant shapes: name -> [(case, [payload canonical types])].
+    let mut variants: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
+    for form in &forms {
+        if let SExpr::List(items, _) = form
+            && head_sym(items) == Some("variant")
+            && let Some(SExpr::Sym(name, _)) = items.get(1)
+        {
+            let mut cases = Vec::new();
+            for c in &items[2..] {
+                if let SExpr::List(ci, _) = c
+                    && let Some(SExpr::Sym(cname, _)) = ci.first()
+                {
+                    let payloads: Vec<String> = ci[1..].iter().filter_map(canonical_type).collect();
+                    cases.push((cname.clone(), payloads));
+                }
+            }
+            variants.insert(name.clone(), cases);
+        }
+    }
+
     let mut out = Vec::new();
     for form in forms {
         let is_derive = matches!(&form, SExpr::List(items, _) if head_sym(items) == Some("derive"));
@@ -6061,22 +6160,31 @@ fn expand_derives(forms: Vec<SExpr>, ctx: &CompileContext) -> Result<Vec<SExpr>>
         };
         match trait_name.as_str() {
             "Eq" => {
-                let fields = records.get(&type_name).ok_or_else(|| {
-                    ctx.error(
+                if let Some(fields) = records.get(&type_name) {
+                    out.push(derive_eq_record(
+                        &trait_name,
+                        &type_name,
+                        fields,
+                        span,
+                        ctx,
+                    )?);
+                } else if let Some(cases) = variants.get(&type_name) {
+                    out.push(derive_eq_variant(
+                        &trait_name,
+                        &type_name,
+                        cases,
+                        span,
+                        ctx,
+                    )?);
+                } else {
+                    return Err(ctx.error(
                         format!(
-                            "cannot derive Eq for '{}': not a record (variant deriving is not yet supported)",
+                            "cannot derive Eq for '{}': not a record or variant",
                             type_name
                         ),
                         span,
-                    )
-                })?;
-                out.push(derive_eq_record(
-                    &trait_name,
-                    &type_name,
-                    fields,
-                    span,
-                    ctx,
-                )?);
+                    ));
+                }
             }
             other => {
                 return Err(ctx.error(format!("cannot derive '{}' (supported: Eq)", other), span));
