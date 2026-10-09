@@ -1,6 +1,6 @@
+use granite::compiler;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::{Config, Engine, Instance, Module, Store};
-use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

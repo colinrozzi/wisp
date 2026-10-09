@@ -6,11 +6,11 @@
 //! reply. Same interpreter the local REPL uses — only the host differs. Proves both
 //! the round-trip and that it reflects real runtime state (empty, then one actor).
 
+use granite::compiler::{Outcome, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
 use theater::messages::TheaterCommand;
 use tokio::sync::mpsc::UnboundedSender;
-use wisp::compiler::{Outcome, Value};
 use wisp_interpreter_actor::{EvalSession, Runtime, TheaterHost, source::SourceBundle};
 
 /// The value of an expression outcome (panics on a definition/binding).
@@ -32,7 +32,7 @@ const LIST_ACTORS: &str = r#"
 async fn live_actor_ids(commands: UnboundedSender<TheaterCommand>) -> anyhow::Result<Vec<String>> {
     let value = tokio::task::spawn_blocking(move || {
         let mut host = TheaterHost::new(commands);
-        wisp::compiler::eval_source_with_host(LIST_ACTORS, &mut host)
+        granite::compiler::eval_source_with_host(LIST_ACTORS, &mut host)
     })
     .await??;
     match value {

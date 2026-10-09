@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use granite::{compiler, interpreter::Interpreter};
 use pack::abi::{Value, ValueType};
 use wasmtime::Module;
-use wisp::{compiler, interpreter::Interpreter};
 
 #[path = "support/cgrf_guest.rs"]
 mod cgrf_guest;

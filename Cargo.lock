@@ -745,6 +745,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "granite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "packr",
+ "packr-core",
+ "packr-wasmtime",
+ "tokio",
+ "wasmtime 21.0.2",
+ "wat",
+ "wit-component",
+ "wit-parser 0.220.1",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2539,30 +2555,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "wisp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "packr",
- "packr-core",
- "packr-wasmtime",
- "tokio",
- "wasmtime 21.0.2",
- "wat",
- "wit-component",
- "wit-parser 0.220.1",
-]
-
-[[package]]
 name = "wisp-repl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "granite",
  "packr",
  "rustyline",
  "wasmtime 21.0.2",
- "wisp",
 ]
 
 [[package]]

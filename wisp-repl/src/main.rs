@@ -1,6 +1,6 @@
+use granite::compiler::{NullHost, Outcome, ReplSession};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use wisp::compiler::{NullHost, Outcome, ReplSession};
 
 fn main() -> anyhow::Result<()> {
     println!("Wisp REPL v0.1.0");
@@ -69,7 +69,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wisp::compiler::Value;
+    use granite::compiler::Value;
 
     #[test]
     fn repl_session_evaluates_and_accumulates() {

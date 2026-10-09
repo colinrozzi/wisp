@@ -6,9 +6,9 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use granite::compiler::{self, EmitOptions};
 use pack::abi::{Value, ValueType};
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Memory, Module, Store};
-use wisp::compiler::{self, EmitOptions};
 
 fn package() -> &'static PathBuf {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();

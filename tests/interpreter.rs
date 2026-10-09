@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use wisp::{compiler, interpreter::Interpreter};
+use granite::{compiler, interpreter::Interpreter};
 
 fn session() -> Interpreter {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();

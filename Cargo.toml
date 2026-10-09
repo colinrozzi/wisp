@@ -10,16 +10,16 @@ resolver = "3"
 pack = { package = "packr", version = "=0.24.1" }
 
 [package]
-name = "wisp"
+name = "granite"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "wisp"
+name = "granite"
 path = "src/lib.rs"
 
 [[bin]]
-name = "wisp"
+name = "granite"
 path = "src/main.rs"
 
 [dependencies]

@@ -3,7 +3,7 @@
 // middle + eval back-end. The local REPL and the live Theater REPL differ only in
 // the Host they feed and the imports they pre-declare.
 
-use wisp::compiler::{Host, Outcome, ReplSession, Type, Value};
+use granite::compiler::{Host, Outcome, ReplSession, Type, Value};
 
 /// A host for pure sessions: any import call is an error.
 struct NoHost;

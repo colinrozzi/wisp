@@ -8,7 +8,7 @@ name = "wisp-repl"
 path = "src/main.rs"
 
 [dependencies]
-wisp = { path = ".." }
+granite = { path = ".." }
 anyhow = "1.0"
 pack.workspace = true
 rustyline = "15"

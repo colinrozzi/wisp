@@ -1112,6 +1112,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "granite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "packr",
+ "wasmtime 21.0.2",
+ "wat",
+ "wit-component",
+ "wit-parser 0.220.1",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4578,24 +4591,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "wisp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "packr",
- "wasmtime 21.0.2",
- "wat",
- "wit-component",
- "wit-parser 0.220.1",
-]
-
-[[package]]
 name = "wisp-interpreter-actor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "granite",
  "serde_json",
  "theater",
  "theater-handler-assembler",
@@ -4614,7 +4615,6 @@ dependencies = [
  "theater-native",
  "tokio",
  "tracing-subscriber",
- "wisp",
 ]
 
 [[package]]

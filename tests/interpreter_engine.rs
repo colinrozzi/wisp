@@ -248,13 +248,13 @@ async fn engine_session() {
         std::thread::Builder::new()
             .stack_size(1 << 30)
             .spawn_scoped(s, || {
-                wisp::compiler::compile(
+                granite::compiler::compile(
                     &root.join("interpreter/evaluator.wisp"),
                     &root.join(format!(
                         "target/interpreter-engine/{}/evaluator",
                         std::process::id()
                     )),
-                    wisp::compiler::EmitOptions::default(),
+                    granite::compiler::EmitOptions::default(),
                 )
                 .unwrap()
             })

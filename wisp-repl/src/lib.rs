@@ -1,5 +1,5 @@
+use granite::compiler::{Function, InlineValue, Type, compile_repl_expr, compile_repl_expr_pack};
 use std::collections::HashMap;
-use wisp::compiler::{Function, InlineValue, Type, compile_repl_expr, compile_repl_expr_pack};
 
 /// A runtime value that can be inlined during REPL compilation
 #[derive(Debug, Clone)]
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_pack_wat_output() {
-        use wisp::compiler::compile_repl_expr_pack_wat;
+        use granite::compiler::compile_repl_expr_pack_wat;
         let bindings: HashMap<String, InlineValue> = HashMap::new();
         let functions = vec![];
 

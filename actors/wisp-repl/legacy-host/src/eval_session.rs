@@ -2,7 +2,7 @@
 //! `TheaterHost`.
 //!
 //! The convergence, realized: the daemon no longer runs the Wisp-interpreter actor
-//! to evaluate — it holds a `wisp::compiler::ReplSession` (the same session type the
+//! to evaluate — it holds a `granite::compiler::ReplSession` (the same session type the
 //! local REPL uses) and feeds it a `TheaterHost`, so forms reach the live runtime.
 //! The session accumulates `(fn …)`/`(define …)` across inputs and pre-declares the
 //! Theater host interface so calls like `(list-actors)` type-check and dispatch.
@@ -11,9 +11,9 @@
 //! thread (`tokio::task::spawn_blocking`) — see `TheaterHost`.
 
 use crate::TheaterHost;
+use granite::compiler::{Outcome, ReplSession};
 use theater::messages::TheaterCommand;
 use tokio::sync::mpsc::UnboundedSender;
-use wisp::compiler::{Outcome, ReplSession};
 
 /// The Theater host interface the session exposes to evaluated code, as `(import …)`
 /// declarations. Grows alongside `TheaterHost`; for now, the live-actor roster.

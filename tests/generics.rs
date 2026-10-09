@@ -2,9 +2,9 @@
 // return-type dispatch, and literal adoption. Each program exports `test-func`
 // returning s32; the harness runs it and reads the s32 result.
 
+use granite::compiler;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::{Config, Engine, Instance, Module, Store};
-use wisp::compiler;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
