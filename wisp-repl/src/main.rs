@@ -1,8 +1,8 @@
-use pack::Runtime;
-use pack::abi::Value as PackValue;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use wisp_repl::{ReplState, Value, compile_repl_pack};
+use std::collections::HashMap;
+use wisp::compiler::{Function, InlineValue, Type, Value as CValue, eval_repl_expr};
+use wisp_repl::{ReplState, Value};
 
 fn main() -> anyhow::Result<()> {
     println!("Wisp REPL v0.1.0 (pack runtime)");
@@ -10,7 +10,6 @@ fn main() -> anyhow::Result<()> {
     println!("Type :quit to exit.\n");
 
     let mut state = ReplState::new();
-    let runtime = Runtime::new();
 
     let mut rl = DefaultEditor::new()?;
 
@@ -50,7 +49,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Check for let binding: let name = expr
                 if line.starts_with("let ") {
-                    if let Some(result) = handle_let_binding(line, &mut state, &runtime) {
+                    if let Some(result) = handle_let_binding(line, &mut state) {
                         match result {
                             Ok((name, value)) => {
                                 println!("{} = {:?}", name, value);
@@ -64,7 +63,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Regular expression evaluation
-                match eval_expr(line, &state, &runtime) {
+                match eval_expr(line, &state) {
                     Ok(value) => {
                         println!("{:?}", value);
                     }
@@ -94,7 +93,6 @@ fn main() -> anyhow::Result<()> {
 fn handle_let_binding(
     line: &str,
     state: &mut ReplState,
-    runtime: &Runtime,
 ) -> Option<anyhow::Result<(String, Value)>> {
     // Parse: let name = expr
     let rest = line.strip_prefix("let ")?.trim();
@@ -112,7 +110,7 @@ fn handle_let_binding(
         return Some(Err(anyhow::anyhow!("Variable name cannot be empty")));
     }
 
-    match eval_expr(expr, state, runtime) {
+    match eval_expr(expr, state) {
         Ok(value) => {
             state.bindings.insert(name.clone(), value.clone());
             Some(Ok((name, value)))
@@ -121,156 +119,72 @@ fn handle_let_binding(
     }
 }
 
-fn eval_expr(expr: &str, state: &ReplState, runtime: &Runtime) -> anyhow::Result<Value> {
-    // Compile the expression to Pack package
-    let wasm_bytes = compile_repl_pack(expr, state)?;
-
-    // Load and instantiate with Pack runtime
-    let module = runtime.load_module(&wasm_bytes)?;
-    let mut instance = module.instantiate()?;
-
-    // Call eval with no arguments (empty tuple)
-    let input = PackValue::Tuple(vec![]);
-    let output = instance.call_with_value("eval", &input)?;
-
-    // Convert Pack Value to our Value
-    pack_to_repl_value(&output)
+fn eval_expr(expr: &str, state: &ReplState) -> anyhow::Result<Value> {
+    // Inline the session's value bindings, bring its functions into scope, and
+    // evaluate through the shared front/middle (parse + type-check) + eval back-end.
+    let bindings: HashMap<String, InlineValue> = state
+        .bindings
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_inline()))
+        .collect();
+    let functions: Vec<Function> = state.functions.values().cloned().collect();
+    let (value, ty) = eval_repl_expr(expr, &bindings, &functions)?;
+    eval_to_repl(&value, &ty)
 }
 
-use wisp::compiler::Type;
-
-/// Convert a Pack ValueType to a wisp Type
-fn pack_type_to_wisp_type(cvt: &pack::abi::ValueType) -> anyhow::Result<Type> {
-    use pack::abi::ValueType;
-    Ok(match cvt {
-        ValueType::Bool
-        | ValueType::S8
-        | ValueType::S16
-        | ValueType::S32
-        | ValueType::U8
-        | ValueType::U16
-        | ValueType::U32 => Type::S32,
-        ValueType::S64 | ValueType::U64 => Type::S64,
-        ValueType::F32 => Type::F32,
-        ValueType::F64 => Type::F64,
-        ValueType::Char | ValueType::String => Type::Str,
-        ValueType::List(elem) => Type::List(Box::new(pack_type_to_wisp_type(elem)?)),
-        ValueType::Option(inner) => Type::Option(Box::new(pack_type_to_wisp_type(inner)?)),
-        ValueType::Result { ok, err } => Type::Result(
-            Box::new(pack_type_to_wisp_type(ok)?),
-            Box::new(pack_type_to_wisp_type(err)?),
-        ),
-        ValueType::Record(name) => Type::Record(name.clone()),
-        ValueType::Variant(name) => Type::Variant(name.clone()),
-        ValueType::Tuple(_) => Type::S32, // Tuple doesn't have a direct mapping
-        ValueType::Flags => Type::S64,
-        ValueType::Map { .. } | ValueType::Set(_) => {
-            anyhow::bail!("Wisp does not support Pack type {cvt}")
-        }
-    })
-}
-
-fn pack_to_repl_value(cv: &PackValue) -> anyhow::Result<Value> {
-    match cv {
-        PackValue::S32(n) => Ok(Value::S32(*n)),
-        PackValue::S64(n) => Ok(Value::S64(*n)),
-        PackValue::F32(n) => Ok(Value::F32(*n)),
-        PackValue::F64(n) => Ok(Value::F64(*n)),
-        PackValue::String(s) => Ok(Value::Str(s.clone())),
-        PackValue::Option { inner_type, value } => Ok(Value::Option {
-            inner_type: pack_type_to_wisp_type(inner_type)?,
-            value: value
-                .as_ref()
-                .map(|v| pack_to_repl_value(v).map(Box::new))
-                .transpose()?,
-        }),
-        PackValue::List { elem_type, items } => Ok(Value::List {
-            elem_type: pack_type_to_wisp_type(elem_type)?,
+/// Convert an eval `Value` plus its inferred static type into the REPL's typed
+/// `Value`. The REPL evaluates expressions (no user record/variant construction),
+/// so only scalars, strings, lists, options, and results arise here.
+fn eval_to_repl(v: &CValue, ty: &Type) -> anyhow::Result<Value> {
+    Ok(match (v, ty) {
+        (CValue::Int(n), Type::S64 | Type::U64) => Value::S64(*n),
+        (CValue::Int(n), _) => Value::S32(*n as i32),
+        (CValue::Float(x), Type::F32) => Value::F32(*x as f32),
+        (CValue::Float(x), _) => Value::F64(*x),
+        (CValue::Str(s), _) => Value::Str(s.clone()),
+        (CValue::List(items), Type::List(elem)) => Value::List {
+            elem_type: (**elem).clone(),
             items: items
                 .iter()
-                .map(pack_to_repl_value)
+                .map(|i| eval_to_repl(i, elem))
                 .collect::<anyhow::Result<Vec<_>>>()?,
-        }),
-        PackValue::Result {
-            ok_type,
-            err_type,
-            value,
-        } => Ok(Value::Result {
-            ok_type: pack_type_to_wisp_type(ok_type)?,
-            err_type: pack_type_to_wisp_type(err_type)?,
-            value: match value {
-                Ok(v) => Ok(Box::new(pack_to_repl_value(v)?)),
-                Err(v) => Err(Box::new(pack_to_repl_value(v)?)),
+        },
+        (CValue::Opt(o), Type::Option(inner)) => Value::Option {
+            inner_type: (**inner).clone(),
+            value: o
+                .as_ref()
+                .map(|b| eval_to_repl(b, inner).map(Box::new))
+                .transpose()?,
+        },
+        (CValue::Res(r), Type::Result(ok, err)) => Value::Result {
+            ok_type: (**ok).clone(),
+            err_type: (**err).clone(),
+            value: match r {
+                Ok(b) => Ok(Box::new(eval_to_repl(b, ok)?)),
+                Err(b) => Err(Box::new(eval_to_repl(b, err)?)),
             },
-        }),
-        PackValue::Record { type_name, fields } => {
-            let converted_fields = fields
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), pack_to_repl_value(value)?)))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(Value::Record {
-                type_name: type_name.clone(),
-                fields: converted_fields,
-            })
-        }
-        PackValue::Variant {
-            type_name,
-            case_name,
-            tag: _,
-            payload,
-        } => Ok(Value::Variant {
-            type_name: type_name.clone(),
-            case: case_name.clone(),
-            payload: payload
-                .iter()
-                .map(pack_to_repl_value)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-        }),
-        other => Err(anyhow::anyhow!("Unsupported pack value: {:?}", other)),
-    }
+        },
+        (other, t) => anyhow::bail!("REPL cannot render {other} at type {t:?}"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pack::abi::ValueType;
 
     #[test]
-    fn test_repl_evaluates_with_cgrf_v3_runtime() {
-        let runtime = Runtime::new();
+    fn test_repl_evaluates_via_eval_backend() {
         let state = ReplState::new();
         assert!(matches!(
-            eval_expr("(i32.add 40 2)", &state, &runtime).unwrap(),
+            eval_expr("(i32.add 40 2)", &state).unwrap(),
             Value::S32(42)
         ));
         assert!(
-            matches!(eval_expr("\"hello, λ\"", &state, &runtime).unwrap(), Value::Str(s) if s == "hello, λ")
+            matches!(eval_expr("\"hello, λ\"", &state).unwrap(), Value::Str(s) if s == "hello, λ")
         );
-        assert!(
-            matches!(eval_expr("(some s32 42)", &state, &runtime).unwrap(), Value::Option { inner_type: Type::S32, value: Some(v) } if matches!(*v, Value::S32(42)))
-        );
-    }
-
-    #[test]
-    fn test_repl_rejects_unsupported_v3_collection_types() {
-        for inner_type in [
-            ValueType::Set(Box::new(ValueType::S32)),
-            ValueType::Map {
-                key: Box::new(ValueType::String),
-                value: Box::new(ValueType::S32),
-            },
-        ] {
-            // Even an empty outer value must not silently lose its inner type.
-            let value = PackValue::Option {
-                inner_type,
-                value: None,
-            };
-            assert!(
-                pack_to_repl_value(&value)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Wisp does not support Pack type")
-            );
-        }
+        assert!(matches!(
+            eval_expr("(some s32 42)", &state).unwrap(),
+            Value::Option { inner_type: Type::S32, value: Some(v) } if matches!(*v, Value::S32(42))
+        ));
     }
 }
