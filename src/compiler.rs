@@ -918,14 +918,25 @@ impl Binding {
     }
 }
 
+/// Substructural multiplicity — how many times a value may be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Multiplicity {
+    /// Unrestricted: use any number of times (the default).
+    Un,
+    /// Affine: use at most once (may be dropped). `(aff T)`.
+    Aff,
+    /// Linear: use exactly once. `(lin T)` and capability types.
+    Lin,
+}
+
 #[derive(Debug, Clone)]
 pub struct Parameter {
     pub name: String,
     pub ty: Type,
     scopes: ScopeSet,
-    /// Multiplicity: a `(lin T)` parameter must be used exactly once in the body
-    /// (substructural / linearity axis). `false` is the unrestricted default.
-    pub linear: bool,
+    /// Multiplicity on the substructural axis: `(lin T)` is used exactly once,
+    /// `(aff T)` at most once, unqualified is unrestricted.
+    pub mult: Multiplicity,
 }
 
 #[derive(Debug, Clone)]
@@ -1708,12 +1719,15 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
     }
 }
 
-/// Count how many times each linear binding is referenced in `e`, enforcing that
-/// `if`/`match` branches agree (a linear value used in one branch must be used
-/// the same number of times in every other, or its total use count is undefined).
-/// Only names in `linear` are tracked. Increment 1: linear bindings are function
-/// parameters (`match`/`let`-bound names are unrestricted).
-fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usize>> {
+/// Count how many times each tracked (linear or affine) binding is referenced in
+/// `e`. `if`/`match` branches are combined per multiplicity: a *linear* value must
+/// be used identically on every path (its total is otherwise undefined), while an
+/// *affine* value may be used on some paths and dropped on others (per-path max).
+/// Only names in `tracked` are counted (`match`/`let`-bound names are unrestricted).
+fn linear_uses(
+    e: &Expr,
+    tracked: &HashMap<String, Multiplicity>,
+) -> Result<HashMap<String, usize>> {
     fn merge_sum(
         mut a: HashMap<String, usize>,
         b: &HashMap<String, usize>,
@@ -1723,31 +1737,40 @@ fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usi
         }
         a
     }
-    // Require two branches to consume each linear name identically; return that
-    // common count.
     fn merge_branches(
         a: &HashMap<String, usize>,
         b: &HashMap<String, usize>,
-        linear: &HashSet<String>,
+        tracked: &HashMap<String, Multiplicity>,
     ) -> Result<HashMap<String, usize>> {
-        for name in linear {
+        let mut out = HashMap::new();
+        for (name, mult) in tracked {
             let ca = a.get(name).copied().unwrap_or(0);
             let cb = b.get(name).copied().unwrap_or(0);
-            if ca != cb {
-                bail!(
-                    "linear value '{}' is used {} time(s) in one branch but {} in another; a linear value must be consumed the same way on every path",
-                    name,
-                    ca,
-                    cb
-                );
+            let merged = match mult {
+                Multiplicity::Lin => {
+                    if ca != cb {
+                        bail!(
+                            "linear value '{}' is used {} time(s) on one branch but {} on another; it must be consumed the same way on every path",
+                            name,
+                            ca,
+                            cb
+                        );
+                    }
+                    ca
+                }
+                // Affine (and unrestricted) take the worst-case path.
+                Multiplicity::Aff | Multiplicity::Un => ca.max(cb),
+            };
+            if merged > 0 {
+                out.insert(name.clone(), merged);
             }
         }
-        Ok(a.clone())
+        Ok(out)
     }
     match e {
         Expr::Var(name) => {
             let mut m = HashMap::new();
-            if linear.contains(name) {
+            if tracked.contains_key(name) {
                 m.insert(name.clone(), 1);
             }
             Ok(m)
@@ -1757,35 +1780,33 @@ fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usi
             then_branch,
             else_branch,
         } => {
-            let c = linear_uses(cond, linear)?;
-            let t = linear_uses(then_branch, linear)?;
-            let f = linear_uses(else_branch, linear)?;
-            Ok(merge_sum(c, &merge_branches(&t, &f, linear)?))
+            let c = linear_uses(cond, tracked)?;
+            let t = linear_uses(then_branch, tracked)?;
+            let f = linear_uses(else_branch, tracked)?;
+            Ok(merge_sum(c, &merge_branches(&t, &f, tracked)?))
         }
         Expr::Match { expr, cases } => {
-            let mut acc = linear_uses(expr, linear)?;
+            let acc = linear_uses(expr, tracked)?;
             let mut arms = cases.iter();
-            let first = match arms.next() {
-                Some(arm) => linear_uses(&arm.body, linear)?,
+            let mut merged = match arms.next() {
+                Some(arm) => linear_uses(&arm.body, tracked)?,
                 None => HashMap::new(),
             };
             for arm in arms {
-                let u = linear_uses(&arm.body, linear)?;
-                merge_branches(&first, &u, linear)?;
+                let u = linear_uses(&arm.body, tracked)?;
+                merged = merge_branches(&merged, &u, tracked)?;
             }
-            acc = merge_sum(acc, &first);
-            Ok(acc)
+            Ok(merge_sum(acc, &merged))
         }
         Expr::WithCap { name, body, .. } => {
             // RAII: the scope owns the capability and releases it at the end, so the
-            // body may only *borrow* it (via `(& c)`, which does not count) — it must
-            // never consume it by value. A by-value use would be a second release
-            // (the scope already releases), and, crucially, releasing early then
-            // borrowing would be use-after-release. Zero by-value uses keeps the
-            // scope's release strictly last, which is sound. Outer linear bindings
-            // referenced in the body still count toward their own obligations.
-            let mut inner = linear.clone();
-            inner.insert(name.clone());
+            // body may only *borrow* it (via `(& c)`, which does not count) — never
+            // consume it by value. A by-value use would be a second release and, worse,
+            // releasing early then borrowing would be use-after-release; zero by-value
+            // uses keeps the scope's release strictly last, which is sound. The cap
+            // binding is linear; outer bindings still count toward their obligations.
+            let mut inner = tracked.clone();
+            inner.insert(name.clone(), Multiplicity::Lin);
             let mut uses = linear_uses(body, &inner)?;
             let by_value = uses.get(name).copied().unwrap_or(0);
             if by_value > 0 {
@@ -1802,7 +1823,7 @@ fn linear_uses(e: &Expr, linear: &HashSet<String>) -> Result<HashMap<String, usi
         _ => {
             let mut acc = HashMap::new();
             for child in expr_children(e) {
-                acc = merge_sum(acc, &linear_uses(child, linear)?);
+                acc = merge_sum(acc, &linear_uses(child, tracked)?);
             }
             Ok(acc)
         }
@@ -1826,48 +1847,64 @@ fn validate_cap_names(e: &Expr, capabilities: &HashSet<String>) -> Result<()> {
     Ok(())
 }
 
-/// Enforce the linearity contract of a function: each linear parameter — a `(lin T)`
-/// parameter or one whose type is a capability — must be consumed exactly once, as
-/// must every `with-cap` binding, counting `if`/`match` branches consistently.
+/// Enforce the substructural contract of a function: each `(lin T)` parameter (and
+/// every capability parameter, and every `with-cap` binding) must be consumed
+/// exactly once, and each `(aff T)` parameter at most once, counting `if`/`match`
+/// branches per multiplicity.
 fn check_fn_linearity(func: &Function, capabilities: &HashSet<String>) -> Result<()> {
     validate_cap_names(&func.body, capabilities)?;
-    // A parameter is linear if marked `(lin T)` or if its type is a capability.
-    let is_linear = |p: &Parameter| {
-        p.linear || matches!(&p.ty, Type::Resource(name) if capabilities.contains(name))
-    };
-    let linear: HashSet<String> = func
+    // A capability-typed parameter is linear by its type; otherwise the declared
+    // multiplicity applies.
+    let is_cap =
+        |p: &Parameter| matches!(&p.ty, Type::Resource(name) if capabilities.contains(name));
+    let mult_of =
+        |p: &Parameter| -> Multiplicity { if is_cap(p) { Multiplicity::Lin } else { p.mult } };
+    let tracked: HashMap<String, Multiplicity> = func
         .params
         .iter()
-        .filter(|p| is_linear(p))
-        .map(|p| p.name.clone())
+        .map(|p| (p.name.clone(), mult_of(p)))
+        .filter(|(_, m)| *m != Multiplicity::Un)
         .collect();
     // Always walk the body: it may contain `with-cap` bindings even when no
-    // parameter is linear (linear_uses enforces their exactly-once obligation).
-    let uses = linear_uses(&func.body, &linear)?;
+    // parameter is tracked (linear_uses enforces their obligations too).
+    let uses = linear_uses(&func.body, &tracked)?;
     for p in &func.params {
-        if !is_linear(p) {
-            continue;
-        }
-        let noun = if p.linear {
-            "linear parameter"
-        } else {
-            "capability parameter"
-        };
-        match uses.get(&p.name).copied().unwrap_or(0) {
-            1 => {}
-            0 => bail!(
-                "{} '{}' of function '{}' is never used; it must be consumed exactly once",
-                noun,
-                p.name,
-                func.name
-            ),
-            n => bail!(
-                "{} '{}' of function '{}' is used {} times but must be used exactly once",
-                noun,
-                p.name,
-                func.name,
-                n
-            ),
+        let count = uses.get(&p.name).copied().unwrap_or(0);
+        match mult_of(p) {
+            Multiplicity::Un => {}
+            Multiplicity::Lin => {
+                let noun = if is_cap(p) {
+                    "capability parameter"
+                } else {
+                    "linear parameter"
+                };
+                match count {
+                    1 => {}
+                    0 => bail!(
+                        "{} '{}' of function '{}' is never used; it must be consumed exactly once",
+                        noun,
+                        p.name,
+                        func.name
+                    ),
+                    n => bail!(
+                        "{} '{}' of function '{}' is used {} times but must be used exactly once",
+                        noun,
+                        p.name,
+                        func.name,
+                        n
+                    ),
+                }
+            }
+            Multiplicity::Aff => {
+                if count > 1 {
+                    bail!(
+                        "affine parameter '{}' of function '{}' is used {} times but must be used at most once",
+                        p.name,
+                        func.name,
+                        count
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -7339,19 +7376,20 @@ fn parse_typed_params(
                                 );
                             }
                         };
-                        // A `(lin T)` parameter type marks the parameter linear (used
-                        // exactly once). The qualifier is erased at the Type level;
-                        // `parse_type_expr` yields the underlying `T`.
-                        let linear = matches!(
-                            type_expr,
-                            SExpr::List(q, _) if head_sym(q) == Some("lin")
-                        );
+                        // A `(lin T)` / `(aff T)` parameter type sets its multiplicity.
+                        // The qualifier is erased at the Type level; `parse_type_expr`
+                        // yields the underlying `T`.
+                        let mult = match type_expr {
+                            SExpr::List(q, _) if head_sym(q) == Some("lin") => Multiplicity::Lin,
+                            SExpr::List(q, _) if head_sym(q) == Some("aff") => Multiplicity::Aff,
+                            _ => Multiplicity::Un,
+                        };
                         let ty = parse_type_expr(type_expr, variant_names, resource_names, ctx)?;
                         result.push(Parameter {
                             name,
                             ty,
                             scopes,
-                            linear,
+                            mult,
                         });
                     }
                     other => {
@@ -7444,21 +7482,19 @@ fn parse_type_expr(
                 // Multiplicity qualifier: `(lin T)` is `T` with a use-exactly-once
                 // obligation enforced by the linearity checker; the qualifier is
                 // erased at the Type level (same runtime representation as `T`).
-                SExpr::Sym(s, _) if s == "lin" => {
+                // Multiplicity qualifiers `(lin T)` / `(aff T)`: erased at the Type
+                // level (same representation as `T`); the obligation is enforced by
+                // the linearity checker from the binding's recorded multiplicity.
+                SExpr::Sym(s, _) if s == "lin" || s == "aff" => {
                     if items.len() != 2 {
                         return Err(ctx.error_with_note(
-                            "invalid linear type",
+                            "invalid multiplicity-qualified type",
                             span,
-                            "expected: (lin T)",
+                            "expected: (lin T) or (aff T)",
                         ));
                     }
                     parse_type_expr(&items[1], variant_names, resource_names, ctx)
                 }
-                SExpr::Sym(s, _) if s == "aff" => Err(ctx.error_with_note(
-                    "affine types are not yet supported",
-                    span,
-                    "only (lin T) is available for now",
-                )),
                 _ => Err(ctx.error("unknown parameterized type", span)),
             }
         }
