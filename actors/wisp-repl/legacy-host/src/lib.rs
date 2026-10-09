@@ -1,5 +1,8 @@
 pub mod source;
+pub mod theater_host;
 pub mod transport;
+
+pub use theater_host::TheaterHost;
 
 /// The actor's public evaluation export (theater:simple/wisp.evaluate).
 pub const EVALUATE: &str = "theater:simple/wisp.evaluate";

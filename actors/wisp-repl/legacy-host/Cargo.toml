@@ -12,9 +12,12 @@ edition = "2024"
 name = "theater-repl"
 path = "src/main.rs"
 
-# The host loads a prebuilt actor.wasm and runs it under a local Theater runtime;
-# it no longer compiles Wisp or does ABI surgery, so wisp/wat/pack are gone.
+# The host loads a prebuilt actor.wasm and runs it under a local Theater runtime.
+# It also embeds the shared Rust interpreter (`wisp`) so a session can evaluate
+# forms host-side and reach the live runtime through a `TheaterHost` — the
+# convergence onto one interpreter (see src/theater_host.rs).
 [dependencies]
+wisp = { path = "../../.." }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
