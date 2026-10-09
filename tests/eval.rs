@@ -4,7 +4,8 @@
 // generics, and substructural checks as compiled code. Each program evaluates a
 // nullary `test-func`.
 
-use wisp::compiler::{Value, eval_source};
+use std::collections::HashMap;
+use wisp::compiler::{InlineValue, Value, eval_repl_expr, eval_source};
 
 fn ok(src: &str) -> Value {
     eval_source(src).expect("expected successful evaluation")
@@ -122,6 +123,27 @@ fn test_eval_catches_type_error() {
         e.contains("returns") || e.contains("type"),
         "unexpected: {e}"
     );
+}
+
+// --- REPL evaluation primitive: typed, binding-aware eval (eval_repl_expr) ---
+
+#[test]
+fn test_eval_repl_inlines_binding() {
+    // A REPL session binding `x = 41` is inlined; the expression evaluates to 42,
+    // having gone through the shared parse + type-check.
+    let mut bindings = HashMap::new();
+    bindings.insert("x".to_string(), InlineValue::S32(41));
+    let v = eval_repl_expr("(i32.add x (i32.const 1))", &bindings, &[]).expect("eval");
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn test_eval_repl_typechecks_bindings() {
+    // A string binding used where an s32 is required is a type error, caught by the
+    // shared checker before eval — the REPL speaks the typed language.
+    let mut bindings = HashMap::new();
+    bindings.insert("x".to_string(), InlineValue::Str("hi".to_string()));
+    assert!(eval_repl_expr("(i32.add x (i32.const 1))", &bindings, &[]).is_err());
 }
 
 #[test]

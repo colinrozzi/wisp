@@ -87,16 +87,14 @@ struct EvalCtx<'a> {
 const MAX_DEPTH: usize = 50_000;
 
 /// Run the shared pipeline on `src` and evaluate its nullary `test-func`.
-pub fn eval_source(src: &str) -> Result<Value> {
-    let ctx = CompileContext::new(src.to_string(), "<eval>".to_string());
-    let mut visited = HashSet::new();
-    let (prog, _sigs) = analyze(src, Path::new("."), &mut visited, &ctx)?;
+/// Evaluate a nullary entry function of an already-analyzed program. The dual of
+/// codegen: the same typed `Program` either back-end consumes.
+pub(crate) fn eval_program(prog: &Program, entry: &str) -> Result<Value> {
     let entry = prog
         .functions
         .iter()
-        .find(|f| f.name == "test-func")
-        .ok_or_else(|| anyhow!("eval_source expects a nullary function named 'test-func'"))?;
-
+        .find(|f| f.name == entry)
+        .ok_or_else(|| anyhow!("eval: no entry function '{}'", entry))?;
     let ectx = EvalCtx {
         funcs: prog
             .functions
@@ -113,6 +111,83 @@ pub fn eval_source(src: &str) -> Result<Value> {
         depth: RefCell::new(0),
     };
     eval_expr(&ectx, &entry.body, &HashMap::new())
+}
+
+/// Run the shared pipeline on `src` and evaluate its nullary `test-func`.
+pub fn eval_source(src: &str) -> Result<Value> {
+    let ctx = CompileContext::new(src.to_string(), "<eval>".to_string());
+    let mut visited = HashSet::new();
+    let (prog, _sigs) = analyze(src, Path::new("."), &mut visited, &ctx)?;
+    eval_program(&prog, "test-func")
+}
+
+/// Evaluate a single REPL expression against accumulated value bindings and
+/// function definitions — the eval dual of `compile_repl_expr`. Bindings are
+/// inlined as literals; functions are in scope; the expression is type-checked and
+/// then evaluated to a `Value`. This is the typed evaluation primitive the REPL
+/// runs on (replacing the Wisp interpreter's dynamic eval).
+pub fn eval_repl_expr(
+    expr_source: &str,
+    bindings: &HashMap<String, InlineValue>,
+    functions: &[Function],
+) -> Result<Value> {
+    let ctx = CompileContext::new(expr_source.to_string(), "<repl>".to_string());
+    let tokens = tokenize(expr_source);
+    if tokens.is_empty() {
+        bail!("empty expression");
+    }
+    let (sexpr, _) = parse_sexpr(&tokens, 0);
+    let inlined = inline_bindings(&sexpr, bindings);
+
+    let mut signatures: HashMap<String, Signature> = HashMap::new();
+    for func in functions {
+        signatures.insert(
+            func.name.clone(),
+            Signature {
+                params: func.params.iter().map(|p| p.ty.clone()).collect(),
+                result: func.return_type.clone(),
+            },
+        );
+    }
+    let expr = parse_expr(
+        &inlined,
+        &[],
+        &signatures,
+        &HashMap::new(),
+        &HashMap::new(),
+        &ctx,
+    )?;
+    let return_type = check_expr(
+        &expr,
+        &HashMap::new(),
+        &signatures,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )?;
+    let eval_fn = Function {
+        name: "eval".to_string(),
+        params: vec![],
+        return_type,
+        body: expr,
+    };
+    let mut all_functions = functions.to_vec();
+    all_functions.push(eval_fn);
+    let prog = Program {
+        functions: all_functions,
+        imports: vec![],
+        exports: vec![ExportDef::simple("eval".to_string())],
+        globals: vec![],
+        records: vec![],
+        variants: vec![],
+        resources: vec![],
+        capabilities: HashSet::new(),
+        world_config: None,
+        data_segments: vec![],
+    };
+    let full_signatures = collect_signatures(&prog)?;
+    type_check(&prog, &full_signatures, &ctx)?;
+    eval_program(&prog, "eval")
 }
 
 type Env = HashMap<String, Value>;
