@@ -618,6 +618,10 @@ pub enum Expr {
         name: String,
         value: Box<Expr>,
         body: Box<Expr>,
+        /// Substructural multiplicity of the binding: `Lin`/`Aff` when the value is
+        /// a linear/affine resource (a linear variant, or an explicit `(lin T)`
+        /// annotation), so the body must consume it exactly/at-most once.
+        mult: Multiplicity,
     },
     Begin {
         exprs: Vec<Expr>,
@@ -1030,6 +1034,49 @@ fn find_variant_by_case<'a>(
     variants: &'a HashMap<String, VariantDef>,
 ) -> Option<&'a VariantDef> {
     variants.values().find(|v| v.find_case(case_name).is_some())
+}
+
+/// The multiplicity a variant has *by its type*: `Lin` if any payload is linear,
+/// else `Aff` if any is affine, else `Un`. A value of such a variant is infectiously
+/// linear/affine (it can't be freely copied and re-matched).
+fn variant_multiplicity(def: &VariantDef) -> Multiplicity {
+    let mut m = Multiplicity::Un;
+    for c in &def.cases {
+        for pm in &c.payload_mult {
+            match pm {
+                Multiplicity::Lin => return Multiplicity::Lin,
+                Multiplicity::Aff if m == Multiplicity::Un => m = Multiplicity::Aff,
+                _ => {}
+            }
+        }
+    }
+    m
+}
+
+/// The multiplicity of a `let` value expression (for infectious linear `let`): a
+/// direct constructor of a linear variant, or a call to a function returning one,
+/// yields that variant's multiplicity. Everything else is unrestricted.
+fn value_multiplicity(
+    value: &SExpr,
+    functions: &HashMap<String, Signature>,
+    variants: &HashMap<String, VariantDef>,
+) -> Multiplicity {
+    let SExpr::List(items, _) = value else {
+        return Multiplicity::Un;
+    };
+    let Some(head) = head_sym(items) else {
+        return Multiplicity::Un;
+    };
+    if let Some(def) = find_variant_by_case(head, variants) {
+        return variant_multiplicity(def);
+    }
+    if let Some(sig) = functions.get(head)
+        && let Type::Variant(name) = &sig.result
+        && let Some(def) = variants.get(name)
+    {
+        return variant_multiplicity(def);
+    }
+    Multiplicity::Un
 }
 
 /// A resource type definition (opaque handle managed externally)
@@ -1642,19 +1689,7 @@ fn type_check(
     let variant_mult: HashMap<String, Multiplicity> = prog
         .variants
         .iter()
-        .map(|v| {
-            let mut m = Multiplicity::Un;
-            for c in &v.cases {
-                for pm in &c.payload_mult {
-                    match pm {
-                        Multiplicity::Lin => m = Multiplicity::Lin,
-                        Multiplicity::Aff if m == Multiplicity::Un => m = Multiplicity::Aff,
-                        _ => {}
-                    }
-                }
-            }
-            (v.name.clone(), m)
-        })
+        .map(|v| (v.name.clone(), variant_multiplicity(v)))
         .collect();
 
     for func in &prog.functions {
@@ -1879,6 +1914,40 @@ fn linear_uses(
             uses.remove(name);
             Ok(uses)
         }
+        Expr::Let {
+            name,
+            value,
+            body,
+            mult,
+        } => {
+            // The value may itself consume outer linear bindings. A linear/affine
+            // binding is a local obligation: tracked in the body, enforced, then
+            // removed before returning the body's outer-binding uses.
+            let v = linear_uses(value, tracked)?;
+            let mut inner = tracked.clone();
+            if *mult != Multiplicity::Un {
+                inner.insert(name.clone(), *mult);
+            }
+            let mut b = linear_uses(body, &inner)?;
+            if *mult != Multiplicity::Un {
+                let c = b.get(name).copied().unwrap_or(0);
+                match mult {
+                    Multiplicity::Lin if c != 1 => bail!(
+                        "linear binding '{}' must be used exactly once (used {} time(s))",
+                        name,
+                        c
+                    ),
+                    Multiplicity::Aff if c > 1 => bail!(
+                        "affine binding '{}' must be used at most once (used {} time(s))",
+                        name,
+                        c
+                    ),
+                    _ => {}
+                }
+                b.remove(name);
+            }
+            Ok(merge_sum(v, &b))
+        }
         _ => {
             let mut acc = HashMap::new();
             for child in expr_children(e) {
@@ -2091,7 +2160,9 @@ fn check_expr(
             }
             Ok(then_ty)
         }
-        Expr::Let { name, value, body } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
             let mut next_env = env.clone();
             next_env.insert(name.clone(), value_ty);
@@ -7947,28 +8018,42 @@ fn parse_expr(
                             ));
                         }
                     };
-                    // Accept `(name value)` and `(name : type value)`.
-                    let (name_sexpr, value_sexpr, annotation) = match binding.len() {
-                        2 => (&binding[0], &binding[1], None),
-                        4 if is_colon(&binding[1]) => {
-                            let ty = match &binding[2] {
-                                SExpr::Sym(t, _) if is_type_symbol(t) => match t.as_str() {
+                    // Accept `(name value)`, `(name : scalar value)` (a cast), and
+                    // `(name : (lin T) value)` / `(name : (aff T) value)` (a linear/
+                    // affine binding — the qualifier marks multiplicity, no cast).
+                    let (name_sexpr, value_sexpr, annotation, explicit_mult) = match binding.len() {
+                        2 => (&binding[0], &binding[1], None, None),
+                        4 if is_colon(&binding[1]) => match &binding[2] {
+                            SExpr::List(q, _) if head_sym(q) == Some("lin") => {
+                                (&binding[0], &binding[3], None, Some(Multiplicity::Lin))
+                            }
+                            SExpr::List(q, _) if head_sym(q) == Some("aff") => {
+                                (&binding[0], &binding[3], None, Some(Multiplicity::Aff))
+                            }
+                            SExpr::Sym(t, _) if is_type_symbol(t) => {
+                                let ty = match t.as_str() {
                                     "s32" => Type::S32,
                                     "s64" => Type::S64,
                                     "f32" => Type::F32,
                                     "f64" => Type::F64,
-                                    _ => unreachable!(),
-                                },
-                                other => {
-                                    return Err(ctx.error_with_note(
-                                        "let type annotation must be a scalar type",
-                                        other.span(),
-                                        "e.g. (name : s32 value)",
-                                    ));
-                                }
-                            };
-                            (&binding[0], &binding[3], Some(ty))
-                        }
+                                    _ => {
+                                        return Err(ctx.error_with_note(
+                                                "let scalar cast supports s32/s64/f32/f64",
+                                                binding[2].span(),
+                                                "for other types use (name : (lin T) value) or no annotation",
+                                            ));
+                                    }
+                                };
+                                (&binding[0], &binding[3], Some(ty), None)
+                            }
+                            other => {
+                                return Err(ctx.error_with_note(
+                                    "let type annotation must be a scalar type or (lin T)/(aff T)",
+                                    other.span(),
+                                    "e.g. (name : s32 value) or (name : (lin T) value)",
+                                ));
+                            }
+                        },
                         _ => {
                             return Err(ctx.error_with_note(
                                 "invalid let binding",
@@ -7994,6 +8079,11 @@ fn parse_expr(
                             ty,
                         };
                     }
+                    // Multiplicity: an explicit `(lin/aff T)` wins; otherwise infer it
+                    // from the value (a linear-variant constructor or a function
+                    // returning one makes the binding linear — infectious linearity).
+                    let mult = explicit_mult
+                        .unwrap_or_else(|| value_multiplicity(value_sexpr, functions, variants));
                     // Create a new binding with the name and its scopes for hygienic resolution
                     let new_binding = Binding::new(name, name_scopes);
                     let mangled_name = new_binding.mangled_name();
@@ -8005,6 +8095,7 @@ fn parse_expr(
                         name: mangled_name, // Use mangled name for codegen
                         value: Box::new(value_expr),
                         body: Box::new(body_expr),
+                        mult,
                     })
                 }
                 SExpr::Sym(sym, _sym_span) if sym == "with-cap" => {
@@ -9066,7 +9157,9 @@ fn gen_expr(
             out.push_str(&format!("{})\n", pad));
             result_ty
         }
-        Expr::Let { name, value, body } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             let value_ty = gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );

@@ -149,6 +149,83 @@ fn test_linear_variant_cannot_be_rematched() {
     assert!(err.contains("used 2 times"), "unexpected error: {err}");
 }
 
+// A linear value can be held in a `let` and consumed exactly once. The binding is
+// infectiously linear because its value constructs a linear variant.
+#[test]
+fn test_linear_let_bind_and_consume() {
+    let src = format!(
+        "{BOX}
+(export (fn test-func () s32
+  (let (b (full (i32.const 7)))
+    (match b ((full r) r) ((empty) (i32.const 0))))))"
+    );
+    assert_eq!(compile_and_run(&src), 7);
+}
+
+// Dropping a linear `let` binding is rejected.
+#[test]
+fn test_linear_let_dropped_rejected() {
+    let err = compile_error(&format!(
+        "{BOX}
+(export (fn test-func () s32
+  (let (b (full (i32.const 7))) (i32.const 0))))"
+    ));
+    assert!(
+        err.contains("linear binding") && err.contains("exactly once"),
+        "unexpected error: {err}"
+    );
+}
+
+// Using a linear `let` binding twice is rejected.
+#[test]
+fn test_linear_let_duplicated_rejected() {
+    let err = compile_error(&format!(
+        "{BOX}
+(export (fn test-func () s32
+  (let (b (full (i32.const 7)))
+    (i32.add
+      (match b ((full r) r) ((empty) (i32.const 0)))
+      (match b ((full r) r) ((empty) (i32.const 0)))))))"
+    ));
+    assert!(
+        err.contains("linear binding") && err.contains("exactly once"),
+        "unexpected error: {err}"
+    );
+}
+
+// A linear value returned from a function is infectiously linear when let-bound.
+#[test]
+fn test_linear_let_from_function_result() {
+    let src = format!(
+        "{BOX}
+(fn mk () box (full (i32.const 4)))
+(export (fn test-func () s32
+  (let (b (mk))
+    (match b ((full r) r) ((empty) (i32.const 0))))))"
+    );
+    assert_eq!(compile_and_run(&src), 4);
+}
+
+// An explicit (lin T) annotation marks a let binding linear even for a scalar.
+#[test]
+fn test_linear_let_explicit_annotation() {
+    let src = "(export (fn test-func () s32
+  (let (x : (lin s32) (i32.const 5)) x)))";
+    assert_eq!(compile_and_run(src), 5);
+}
+
+#[test]
+fn test_linear_let_explicit_annotation_dropped_rejected() {
+    let err = compile_error(
+        "(export (fn test-func () s32
+  (let (x : (lin s32) (i32.const 5)) (i32.const 0))))",
+    );
+    assert!(
+        err.contains("linear binding") && err.contains("exactly once"),
+        "unexpected error: {err}"
+    );
+}
+
 // An affine payload may be dropped.
 #[test]
 fn test_affine_payload_may_drop() {
