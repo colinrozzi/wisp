@@ -1,8 +1,17 @@
-# Wisp
+# Granite + Wisp
 
-Wisp is a typed Lisp that compiles to WebAssembly. It has a Rust reference
-compiler, a compiler written in Wisp, hygienic macros, traits and generics,
-and experimental REPL and Theater actor integrations.
+This repo holds **two languages**, and the one-liner is: **Granite compiles Wisp.**
+
+**Granite** is a statically typed, ahead-of-time language that compiles
+S-expressions to WebAssembly — WASM instructions nearly 1:1, plus variants and
+records, exhaustive `match`, hygienic macros, traits and generics, substructural
+linearity, unforgeable capabilities, and type-state. It has S-expression *syntax* but
+not Lisp *semantics* (no runtime `eval`, no closures). Granite is the compiler at the
+repo root (the `granite` crate + `granite` CLI).
+
+**Wisp** is a dynamic **Scheme** (closures, a runtime reader, dynamic eval, runtime
+macros) written *in* Granite and compiled by it. It lives under `wisp/` and runs as a
+Theater actor. This is the actual Lisp. Both languages are first-class.
 
 ## Getting started
 
@@ -21,19 +30,18 @@ native dependencies include a C/C++ toolchain, pkg-config, and OpenSSL.
 Compile the sample program:
 
 ```sh
-cargo run -p wisp -- compile examples/prog.wisp
+cargo run -p granite -- compile examples/prog.wisp
 ```
 
 This writes `examples/compiled/prog.wasm`. The compiler embeds interface metadata
 in the module. Request readable output explicitly:
 
 ```sh
-cargo run -p wisp -- compile examples/prog.wisp target/prog --emit-wat --emit-pact
+cargo run -p granite -- compile examples/prog.wisp target/prog --emit-wat --emit-pact
 ```
 
 An explicit output stem is relative to the current working directory. Without
-one, outputs go into `compiled/` beside the source. Both `.wisp` and `.wisp`
-examples use the same compiler.
+one, outputs go into `compiled/` beside the source.
 
 ## Language
 
@@ -52,7 +60,7 @@ available as expressions:
       (i32.mul n (factorial (i32.sub n (i32.const 1)))))))
 ```
 
-The Rust compiler supports:
+Granite supports:
 
 - Numeric types (`s32`, `s64`, `f32`, `f64`, `u8`), strings, lists, tuples,
   records, variants, options, and results.
@@ -67,9 +75,10 @@ See [examples/](examples/), [test fixtures](tests/fixtures/), and the
 [standard library](std/) for executable examples. Features in the Rust and
 self-hosted compilers are tested separately; support is not identical.
 
-## Interpreted REPL
+## Wisp — the interpreted Scheme
 
-A small interpreter written in Wisp now runs inside one persistent Wasm instance:
+**Wisp** is a dynamic Scheme written in Granite (`wisp/interpreter/`), running inside
+one persistent Wasm instance:
 
 ```sh
 cargo run --example interpreter
@@ -90,10 +99,9 @@ Persistent `defmacro` templates support quasiquotation and splicing; hygienic
 `syntax-case-lambda` adds guards and computation during expansion.
 Source files can be loaded as command-line arguments, with relative `include`
 directives resolved from each file's directory.
-The [Theater interpreter actor](actors/wisp-repl/README.md) runs the same
-evaluator through a real actor mailbox, with a local socket REPL and RPC
-discovery. General Theater effects from interpreted programs, resource handles,
-and static checking remain ahead. See [interpreter/README.md](interpreter/README.md).
+The [Wisp Theater actor](wisp/actor/README.md) runs the same evaluator through a real
+actor mailbox, with a local socket REPL and RPC discovery — the `theater-repl` daemon
+drives it. See [wisp/interpreter/README.md](wisp/interpreter/README.md).
 
 ## Execution and ABI status
 
@@ -118,8 +126,8 @@ does not update its generated encoding code.
 For example, execute a string-returning export or start the REPL:
 
 ```sh
-cargo run -p wisp -- compile examples/string-return-test.wisp target/greet
-cargo run -p wisp -- run-module target/greet.wasm greet
+cargo run -p granite -- compile examples/string-return-test.wisp target/greet
+cargo run -p granite -- run-module target/greet.wasm greet
 # Hello from wisp!
 cargo run -p wisp-repl
 # wisp> (i32.add 40 2)
@@ -134,23 +142,21 @@ integrations remain a separate migration; see the [runtime migration notes](docs
 
 | Path | Purpose |
 | --- | --- |
-| `src/compiler.rs` | Rust compiler pipeline and Wasm/interface emission |
-| `src/lib.rs` | Public compiler library |
-| `src/interpreter.rs` | Local host for the Wisp-written interpreter |
-| `src/main.rs` | Compile and execution CLI |
-| `examples/wisp-compiler.wisp` | Self-hosted compiler |
-| `interpreter/` | Interpreter, reader, and printer written in Wisp |
-| `std/` | Wisp standard library sources |
-| `tests/` | Compiler, language, and self-hosting integration tests |
-| `wisp-repl/` | Rust-backed REPL library and experimental interactive runner |
-| `crates/` | Separate workspace for experimental Theater integrations |
-| `wisp-actor/` | Standalone guest actor experiment |
-| `docs/changes/` | Implementation and migration notes |
-| `docs/proposals/` | Design proposals |
+| `src/compiler/` | Granite compiler pipeline (one file per stage) + the `eval` back-end |
+| `src/lib.rs` | Public compiler library (`granite` crate) |
+| `src/main.rs` | The `granite` CLI (`compile`, `eval`, `run`) |
+| `examples/wisp-compiler.wisp` | Self-hosted Granite compiler (Granite in Granite) |
+| `std/` | Granite standard library sources |
+| `tests/` | Granite language + self-hosting integration tests |
+| `wisp-repl/` | Granite's host-side typed REPL |
+| `wisp/interpreter/` | **Wisp** — the dynamic Scheme, written in Granite |
+| `wisp/actor/` | The Wisp Theater actor + the `theater-repl` daemon |
+| `crates/`, `wisp-actor/` | Legacy/experimental, excluded from the workspace |
+| `docs/changes/`, `docs/proposals/` | Implementation notes and design proposals |
 
-The root workspace contains `wisp` and `wisp-repl`. Theater integrations have
-their own [workspace and build notes](crates/README.md), so their dependencies
-do not prevent building or testing the compiler.
+The root workspace contains `granite` and `wisp-repl`. The Wisp Theater daemon
+(`wisp/actor/legacy-host/`) is its own workspace, so its Theater dependencies do not
+prevent building or testing Granite.
 
 ## Development checks
 
@@ -160,12 +166,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-Run a focused suite with `cargo test -p wisp --test generics`. The self-hosting
+Run a focused suite with `cargo test -p granite --test generics`. The self-hosting
 suite includes `test_bootstrap_fixpoint`, which checks that two successive
 generations of the self-hosted compiler produce byte-identical WAT:
 
 ```sh
-cargo test -p wisp --test self_hosted test_bootstrap_fixpoint -- --nocapture
+cargo test -p granite --test self_hosted test_bootstrap_fixpoint -- --nocapture
 ```
 
 Self-hosting tests need substantially more memory and stack than ordinary

@@ -4,13 +4,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`wisp` is a Lisp-like compiler that compiles S-expressions to WebAssembly. It generates WAT (WebAssembly text) and WASM (binary) files. The compiler exposes WebAssembly instructions directly - nearly 1:1 mapping to WASM. Supports scalar types (s32, s64, f32, f64), explicit WASM instructions, conditionals, let bindings, function calls, and imports/exports.
+This repo holds **two languages**, and the one-liner is: **Granite compiles Wisp.**
 
-**The compiler is self-hosted** - a Wisp compiler written in Wisp, compiled to WASM, powers the interactive REPL.
+- **Granite** — a statically typed, ahead-of-time language that compiles
+  S-expressions to WebAssembly. It has S-expression *syntax* but not Lisp
+  *semantics*: no runtime `eval`, no first-class closures, everything is checked and
+  compiled ahead of time. It exposes WASM instructions nearly 1:1, plus scalar types
+  (s32/s64/f32/f64/u8/u16/u32/u64/bool), variants and records, exhaustive `match`,
+  generics, traits/instances, substructural linearity (`lin`/`aff`), unforgeable
+  capabilities, and type-state. **Granite is the compiler at the repo root** (the
+  `granite` crate + `granite` CLI). It is the foundation.
+- **Wisp** — a dynamic **Scheme** (runtime reader, closures, dynamic values, runtime
+  macros) that is *written in Granite and compiled by it*. It lives under `wisp/` and
+  runs as a Theater actor. This is the actual Lisp.
+
+Both are first-class, on purpose: Wisp for fast interactive/exploratory work and
+short-lived actors; Granite for typed actors built to last. (The name "Granite" is for
+New Hampshire, the Granite State.)
+
+### Repository layout
+
+- `src/` — the **Granite** compiler (Rust): the `granite` crate + `granite` CLI.
+- `std/`, `examples/`, `tests/` — Granite's stdlib, examples, and test suite.
+- `wisp-repl/` — Granite's host-side typed REPL (Rust).
+- `wisp/interpreter/` — **Wisp**, the Scheme, implemented in Granite (reader, values,
+  evaluator, printer, macros, …).
+- `wisp/actor/` — the Wisp Theater actor (`actor.wisp` → `actor.wasm`, which
+  `(include)`s `wisp/interpreter/evaluator.wisp`) and the `theater-repl` daemon
+  (`wisp/actor/legacy-host/`, crate `wisp-interpreter-actor`, its own workspace).
+- `crates/`, `wisp-actor/` — legacy/experimental, excluded from the workspace.
 
 ### Pack Packages (Not WASM Components)
 
-Wisp targets **Pack packages**, not standard WebAssembly Components:
+Granite targets **Pack packages**, not standard WebAssembly Components:
 
 | Aspect | Standard WASM Components | Pack Packages |
 |--------|-------------------------|---------------|
@@ -18,252 +44,169 @@ Wisp targets **Pack packages**, not standard WebAssembly Components:
 | **Types** | WIT | wit+ (recursive types) |
 | **Runtime** | wasmtime component model | Pack/Theater |
 
-**Why Pack?** Recursive types like `variant sexpr { sym(string), lst(list<sexpr>) }` are essential for a Lisp. Pack's wit+ and Graph ABI support this natively.
-
-See the [Pack crate](../pack) for the runtime.
-
-### Vision: Theater Shell
-
-The REPL is evolving into a **Theater Shell** - an interactive environment for developing and managing actors in the Theater runtime:
-
-- **Develop** actors (write Wisp code, compile to WASM)
-- **Deploy** actors (spawn them into Theater)
-- **Monitor** actors (inspect state, view event chains)
-- **Interact** with actors (send messages, receive responses)
-- **Connect** to remote Theaters (distributed actor management)
-
-The REPL runs its own lightweight Theater runtime and can communicate with actors on remote Theaters through standard actor interfaces. See [WISP-REPL-ARCHITECTURE.md](docs/changes/WISP-REPL-ARCHITECTURE.md) for details.
-
-## Documentation Structure
-
-The project uses a two-tier documentation system:
-
-1. **`docs/proposals/`** - High-level vision documents describing aspirational features and future directions
-   - `METAPROGRAMMING.md` - Vision for macro system and minimal core language
-   - `TYPE-SYSTEM.md` - Type system explorations
-   - `COMPONENT-MACROS.md` - Component-level macro ideas
-   - These are "blue sky" documents that inspire long-term direction
-
-2. **`docs/changes/`** - Concrete, actionable implementation plans with progress tracking
-   - Each change document describes a specific set of modifications being actively worked on
-   - Includes implementation plan with checkboxes that get updated as work progresses
-   - Tracks status, breaking changes, examples, and success criteria
-   - These are "on the ground" documents that drive current development
-
-**Recently completed**:
-- [SELF-HOSTED-COMPILER.md](docs/changes/SELF-HOSTED-COMPILER.md) - Self-hosted Wisp compiler (M1-M7 complete)
-- [WISP-REPL-ARCHITECTURE.md](docs/changes/WISP-REPL-ARCHITECTURE.md) - Interactive REPL powered by self-hosted compiler
-- [PHASE-1-MACROS.md](docs/changes/PHASE-1-MACROS.md) - Unhygienic macros with quasiquotation (complete)
-- [PHASE-0-WASM-INSTRUCTIONS.md](docs/changes/PHASE-0-WASM-INSTRUCTIONS.md) - Exposing core WASM instructions (complete)
-
-**Current focus**: Theater integration - actor spawning and messaging (see Theater Shell vision above)
+**Why Pack?** Recursive types like `variant sexpr { sym(string), lst(list<sexpr>) }`
+are essential for a Lisp (and for Granite's own ADTs). Pack's wit+ and Graph ABI
+support this natively. See the [Pack crate](../pack) for the runtime.
 
 ## Common Commands
 
-### Build and Run
 ```bash
-# Compile a Lisp source file to a .wasm package (written to <dir>/compiled/<stem>.wasm)
+# --- Granite (the compiler, at the repo root) ---
+
+# Compile a source file to a .wasm Pack package (-> <dir>/compiled/<stem>.wasm)
 cargo run -- compile <source.wisp> [out-stem]
-# Example: cargo run -- compile examples/prog.wisp    # -> examples/compiled/prog.wasm
-# Also write the readable views (off by default; both are derivable from the wasm):
-cargo run -- compile <source.wisp> --emit-wat --emit-pact
+cargo run -- compile <source.wisp> --emit-wat --emit-pact   # also write readable views
 
-# Run an exported function from a compiled component
-cargo run -- run <component.wasm> <function-name> <args...>
-# Example: cargo run -- run examples/prog.wasm factorial 5
+# Evaluate a source file with the tree-walking interpreter (no compile step).
+# Runs the full front/middle (so the type system still applies), then interprets a
+# nullary entry (default `main`). Imported calls hit a built-in stdio host.
+cargo run -- eval <source.wisp> [--entry NAME]
 
-# Run with a dependency component
-cargo run -- run <component.wasm> <function-name> <args...> --dep <module>=<dep.wasm>
-# Example: cargo run -- run examples/user.wasm run 5 --dep math=examples/math.wasm
+# Run an exported function from a compiled package
+cargo run -- run <package.wasm> <function-name> <args...> [--dep <module>=<dep.wasm>]
+
+# Granite's host-side typed REPL
+cargo run -p wisp-repl
+
+# --- Wisp (the Scheme, as a Theater actor) ---
+
+# Rebuild the Wisp actor (wisp/actor/actor.wasm) after editing the interpreter
+bash wisp/actor/build.sh
+
+# Interactive Dynamic Wisp REPL (spawns the Wisp actor, evaluates the Scheme live)
+cargo run --manifest-path wisp/actor/legacy-host/Cargo.toml -- repl
+
+# --- Development ---
+cargo fmt --all && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace            # Granite's suite (root crate + wisp-repl)
 ```
 
-### Self-Hosted REPL
-```bash
-# Interactive REPL powered by the self-hosted Wisp compiler
-cargo run -p test-runtime -- --repl
-```
+The installed binary is `granite`; `cargo run --` at the root invokes it (the one
+root bin). The two interpreters are distinct: `granite eval` / `wisp-repl` run
+**Granite** (typed, no closures); `theater-repl repl` runs **Wisp** (the dynamic
+Scheme — `(define f (lambda (x) (+ x 2)))` → `#<closure>`).
 
-**Example session:**
-```
-wisp> (i32.add (i32.const 40) (i32.const 2))
-42
-wisp> (define x 10)
-defined x = 10
-wisp> (i32.mul x (i32.const 5))
-50
-wisp> (fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (i32.mul n (factorial (i32.sub n (i32.const 1))))))
-defined function factorial
-wisp> (factorial (i32.const 5))
-120
-wisp> (import colin:math/ops from "examples/math-lib-raw.wasm")
-loaded interface colin:math/ops from examples/math-lib-raw.wasm
-  exports: add, multiply, square
-wisp> (square (i32.const 7))
-49
-wisp> (import wisp:repl/debug from host)
-loaded interface wisp:repl/debug from host
-  exports: print-i32, print-i64, print-f32, print-f64
-wisp> (print-i32 (add (i32.const 3) (i32.const 4)))
-[debug] 7
-7
-```
+## Architecture (Granite compiler)
 
-**REPL commands:**
-- `(define x 42)` - define variable (inlined into expressions)
-- `(fn name ...)` - define function (included in compilation)
-- `(import iface from "path.wasm")` - load component, import its functions
-- `(import iface from host)` - import host-provided interface
-- `(list)` - show bindings, functions, and imports with signatures
-- `(clear)` - clear all definitions and imports
-- `quit` - exit REPL
+### Pipeline
 
-### Development
-```bash
-# Format and lint code before commits
-cargo fmt && cargo clippy --all-targets --all-features
+`src/main.rs` is the CLI (`compile`, `eval`, `run`, `run-module` subcommands) and the
+wasmtime runtime for `run`.
 
-# Build the project
-cargo build
+`src/compiler/` is the pipeline, one file per stage (each submodule does
+`use super::*` and keeps items `pub(crate)`):
 
-# Run in debug mode
-cargo run -- compile examples/prog.wisp
-```
+- `mod.rs` — the AST / data model (`Type`, `Expr`, `SExpr`, `Program`, …), `compile()`,
+  `analyze()` (the shared front/middle: tokenize → parse → expand → lower →
+  type-check → typed `Program`), and shared helpers.
+- `tokenizer.rs` — `tokenize()`: source → `Token` stream.
+- `parser.rs` — `parse_sexpr()` → `SExpr`; `parse_program()`/`parse_expr()` → typed
+  `Program`/`Expr`.
+- `macros.rs` — defmacro, syntax-rules, syntax-case, pattern matching.
+- `lower.rs` — `expand_generics()`/`Lowering`: monomorphize generics/traits, expand
+  `derive`, resolve generic ADTs by name.
+- `typecheck.rs` — `check_expr()` (inference with numeric widening) and
+  `check_fn_linearity()`/`linear_uses()` (the substructural checker).
+- `codegen.rs` — `generate_wat()`, `generate_wit()`, CGRF/Pack encode+decode glue.
+- `eval.rs` — the tree-walking **back-end**: the dual of codegen. `analyze()` + eval.
+  `Value`, `Host` (imported calls dispatch here), `eval_source*`, `eval_repl_expr*`.
+- `repl.rs` — `ReplSession`: the shared REPL abstraction (accumulate `(fn)`/`(define)`,
+  evaluate expressions, host supplied per-`feed`). Used by `wisp-repl`.
 
-## Architecture
+`compile()` = `analyze()` + codegen; `eval_source()` = `analyze()` + eval. So the
+compiled and interpreted paths share the entire front/middle and type system; only the
+back-end differs.
 
-### Structure
+### Key data structures
 
-**src/main.rs** - CLI entry point and runtime
-   - Defines CLI using clap with `compile` and `run` subcommands
-   - `run_compile()`: orchestrates compilation pipeline
-   - `run_component()`: WebAssembly runtime using Wasmtime, handles component instantiation, dependency linking, and function execution
-   - `encode_params()`: converts string arguments to typed WebAssembly values
-   - `parse_dep_arg()`: parses `module=path.wasm` format for dependencies
+- **Type** — `S32`/`S64`/`F32`/`F64`, `U8`/`U16`/`U32`/`U64`/`Bool`, `Str`,
+  `Record(name)`, `Variant(name)`, `Option`/`Result`/`List`/`Tuple`, `Resource`,
+  `Borrow`.
+- **Expr** — the AST (literals, `Var`, `Call`, `WasmInstr`, `If`, `Let`, `Match`,
+  record/variant construction + access, list/string ops, `WithCap`/`BorrowCap`, …).
+- **Program** — functions, imports, exports, globals, records, variants, resources,
+  capabilities, data segments.
+- **Parameter** carries a `Multiplicity` (`Un`/`Aff`/`Lin`) for the substructural axis.
 
-**src/compiler/** - the compilation pipeline, one file per stage (the stages run
-in this order; each submodule does `use super::*` and keeps items `pub(crate)`):
-   - `mod.rs` - the AST / data model (`Type`, `Expr`, `SExpr`, `Program`, …), the
-     `compile()` orchestration, and shared helpers (`type_size`, `ensure_numeric`, …)
-   - `tokenizer.rs` - `tokenize()`: source text → `Token` stream
-   - `parser.rs` - `parse_sexpr()` → `SExpr`, `parse_program()`/`parse_expr()` → typed `Program`/`Expr`
-   - `macros.rs` - defmacro, syntax-rules, syntax-case, pattern matching
-   - `lower.rs` - `expand_generics()`/`Lowering`: monomorphize generics/traits, expand `derive`
-   - `typecheck.rs` - `check_expr()` (type inference with numeric widening), `check_fn_linearity()`/`linear_uses()` (the substructural checker)
-   - `codegen.rs` - `generate_wat()` (→ WAT), `generate_wit()` (→ WIT world), `encode_component()`, and the CGRF/Pack encode+decode glue
-
-   Historically this was one 16.7k-line `src/compiler.rs`; it was split by stage
-   for navigability (PRs #27, #28) with zero behavior change.
-
-### Key Data Structures
-
-- **Type**: Enum of S32, S64, F32, F64
-- **Expr**: AST nodes (Int, Float, Var, Call, WasmInstr, If, Let, Ascribe, GlobalGet, GlobalSet)
-- **Function**: Name, parameters with types, return type, and body expression
-- **Import**: Module, function name, parameters, return type (used for component imports)
-- **Global**: Name, type, mutability, and initial value (for module-level state)
-- **Program**: Functions, imports, exports, and globals
-- **CodegenEnv**: Tracks parameter bindings and local variables during WAT emission
-
-### Type System
-
-- Numeric literal defaults: integers to `s32`, floats to `f64`
-- Suffixes allowed: `42s64`, `3.14f32`
-- Type ascription/casting: `(s32 expr)`, `(f64 expr)` - triggers conversion instructions
-- **WASM instructions require exact type matches** - no automatic type unification
-- Comparisons require matching types and return `s32` (0 or 1)
-- Type checking happens before codegen with full expression tree validation
-- Example: `(i32.add x y)` requires both `x` and `y` to be exactly `s32`
-
-### Component Model
-
-- Exports are explicitly marked via `(export name)` or `(export (fn ...))`
-- Imports declared as `(import module-name func-name ((param type) ...) result-type)`
-- WIT world groups imports by module into interfaces
-- Component encoding uses wit-component crate with embedded metadata
-- Runtime dependency linking via `--dep module=path.wasm` creates namespace with exported functions
-
-### Pack Integration
-
-Wisp aligns with [Pack's](../pack) **wit+** - an extended WIT dialect that supports recursive types. This is essential for representing S-expressions and ASTs.
-
-**REPL import syntax** (planned):
-```lisp
-; Import interface from host
-(import theater:simple/runtime from host)
-
-; Import from WASM component
-(import colin:math/ops from "math.wasm")
-
-; Import specific function
-(import colin:math/ops.factorial from "math.wasm")
-```
-
-Key: Separate *what* to import (interface) from *where* (source).
-
-## Language Features
+## Language Features (Granite)
 
 Functions: `(fn name ((param type) ...) return-type body)`
-Generics: a `fn` with a `(where (Trait T) ...)` clause is a template, monomorphized per concrete type. A bare `(where T)` declares an unconstrained type parameter. Multiple type parameters are allowed: `(where T U)`, `(where (Ord T) (Convert T U))`.
-Higher-order functions: a parameter typed `(-> arg... ret)` is a function parameter. The argument is a function *name*, resolved at compile time — `(map f xs)` specializes to `map--f--T` with `f` inlined (defunctionalization; no runtime function values or closures).
-Imports: `(import module func ((param type) ...) return-type)`
-Exports: `(export name)` or `(export (fn ...))`
-**Traits/instances:** `(trait (Name T ...) (fn method (params) : ret) ...)` declares an interface over one or more type parameters; `(instance (Name Type ...) (fn method ... body) ...)` implements it. Methods resolve at compile time (monomorphized); the expected type disambiguates return-typed methods.
-**Deriving:** `(derive Trait Type)` reflects on a record's fields to generate a trait instance at compile time (e.g. `(derive Eq point)`). The first type-aware macro; per-trait generators, `Eq` supported. See docs/changes/DERIVING.md.
-**Macros:** `(defmacro name (params...) template)` - define syntactic abstractions
-**Quasiquote:** `` `expr `` - quote template, `,expr` - unquote, `,@expr` - splice
-**Globals:** `(global $name type mut|const init-value)` - module-level mutable/immutable state
-**Global ops:** `(global.get $name)`, `(global.set $name value)`
-**WASM arithmetic (explicit):** `(i32.add a b)`, `(i64.sub a b)`, `(f32.mul a b)`, `(f64.div a b)`
-**WASM comparisons:** `(i32.eq a b)`, `(i32.lt_s a b)`, `(i64.ge_s a b)`, `(f64.ne a b)`
-**WASM constants:** `(i32.const 42)`, `(i64.const 100)`, `(f32.const 3.14)`, `(f64.const 2.718)`
-**WASM conversions:** `(i64.extend_i32_s x)`, `(f32.demote_f64 x)`, `(i32.trunc_f64_s x)`
-**Memory ops:** `(i32.load addr)`, `(i32.store addr val)`, `(memory.size)`, `(memory.grow pages)`
-Conditionals: `(if cond then else)` - condition must be s32 (0=false, 1=true)
-Let bindings: `(let (name value) body)` - introduces lexically scoped local
-Type casts: `(s32 expr)`, `(s64 expr)`, `(f32 expr)`, `(f64 expr)`
-Includes: `(include "path.wisp")` - splice another file's forms (path relative to this file); pulls in the stdlib, e.g. `(include "std/num.wisp")`
-Comments: `; comment to end of line`
+Generics: a `fn` with a `(where (Trait T) ...)` clause is a template, monomorphized per concrete type. A bare `(where T)` is an unconstrained type parameter; multiple allowed (`(where T U)`, `(where (Ord T) (Convert T U))`).
+Higher-order functions: a parameter typed `(-> arg... ret)` takes a function *name*, resolved at compile time — `(map f xs)` specializes to `map--f--T` with `f` inlined (defunctionalization; no runtime closures).
+Imports/Exports: `(import module func ((param type) ...) return-type)`; `(export name)` or `(export (fn ...))`.
+**Variants/records:** `(variant name (case payload...) ...)`, `(record name (field type) ...)`; both may be generic (`(variant (Name T ...) ...)`), monomorphized by name in lowering.
+**Match:** `(match e ((case binding...) body) ...)` — exhaustive, `_` wildcard supported.
+**Traits/instances:** `(trait (Name T ...) (fn method (params) : ret) ...)` + `(instance (Name Type ...) (fn method ... body) ...)`; resolve at compile time, expected type disambiguates return-typed methods.
+**Deriving:** `(derive Trait Type)` generates an instance at compile time (`Eq` on records and variants).
+**Substructural:** `(lin T)` = used exactly once, `(aff T)` = at most once; checker-only (erases to `T`). A variant case payload may be `(lin T)`/`(aff T)` — type-state (a linear value whose structural type narrows on `match`).
+**Capabilities:** `(capability Name)` declares an unforgeable linear resource; `(with-cap (c Name) body)` mints it (RAII, released strictly last), `(& c)` borrows without consuming, `(release-cap c)` is the terminal consumer.
+**Macros:** `(defmacro name (params...) template)`; quasiquote `` `expr ``, unquote `,expr`, splice `,@expr`.
+**Globals:** `(global $name type mut|const init-value)`, `(global.get $name)`, `(global.set $name value)`.
+**WASM ops (explicit, exact-type):** arithmetic `(i32.add a b)`; comparisons `(i32.lt_s a b)` (→ s32 0/1); constants `(i32.const 42)`; conversions `(i64.extend_i32_s x)`; memory `(i32.load addr)`, `(memory.grow pages)`.
+Conditionals: `(if cond then else)` — cond must be s32. Let: `(let (name value) body)`.
+Casts: `(s32 expr)`, `(f64 expr)`, … Includes: `(include "path.wisp")` (relative to the including file; e.g. `(include "std/num.wisp")`). Comments: `; to end of line`.
+
+### Type system notes
+- Numeric literal defaults: integers `s32`, floats `f64`. Suffixes: `42s64`, `3.14f32`.
+- WASM instructions require exact type matches — no implicit unification. `(i32.add x y)` needs both exactly `s32`.
+- Type checking (and the substructural checker) run before codegen *and* before eval.
+
+## Wisp (the Scheme)
+
+`wisp/interpreter/` is a complete dynamic Scheme written in Granite:
+- `reader.wisp` parses S-expressions from a string **at runtime** (what makes it dynamic),
+- `values.wisp` defines the dynamic `(variant value …)` with `closure`/`symbol`/`builtin`/…,
+- `evaluator.wisp` is an environment-based tree-walking `eval`/`apply` with closures.
+
+`wisp/actor/actor.wisp` wraps it as a Theater actor: it exports `evaluate(source)` plus
+inbound-event callbacks (`handle-tick`, `handle-send`, tcp `on-data`/`on-close`,
+lifecycle `handle-actor-event`) that dispatch to user-defined handlers in the live
+session (`interpreter/rpc.wisp`). The `theater-repl` daemon (`wisp/actor/legacy-host/`)
+spawns this actor and drives it; because the session *is* a Theater actor, inbound
+events and host calls are native.
+
+Granite's `Host`/`EvalSession`/`TheaterHost` infra (in the daemon crate and
+`src/compiler/eval.rs`) is dormant groundwork for a possible future "live Granite in a
+Theater actor" — not currently on the `theater-repl` path.
 
 ## Testing
 
-Automated integration tests live in `tests/*.rs` (run with `cargo test -p wisp`):
-`tokenizer`, `parser`, `pattern_match`, `codegen`, `string_ops`, and `self_hosted`.
-Each compiles Wisp source to a `.wasm`, runs it under wasmtime, and checks the result.
-159 tests pass; 2 self-hosted bootstrap tests are `#[ignore]`d (they recurse past
-memory limits on a 42 KB file).
+`cargo test --workspace` runs Granite's suite from `tests/*.rs` (tokenizer, parser,
+pattern_match, codegen, string_ops, eval, repl, type_state, linearity, capabilities,
+generics, derive, cgrf, the `interpreter_*` tests that compile the Wisp Scheme, …).
+Each compiles source to `.wasm` and runs it under wasmtime (or evaluates it), checking
+the result. The `theater-repl` daemon has its own suite (`cargo test --manifest-path
+wisp/actor/legacy-host/Cargo.toml --test theater_host`).
 
 - **Output ABI**: an exported function is called as `(in_ptr, in_len, out_ptr_ptr,
-  out_len_ptr)`. The callee allocates the output buffer and writes its address into
-  the `out_ptr_ptr` slot and the length into the `out_len_ptr` slot. The result is
-  CGRF-encoded: after reading the pointer, an s32 payload sits at `+24` (16-byte CGRF
-  header + 8-byte node header); a string has its length at `+24` and bytes at `+28`.
-- **Big stack**: the self-hosted compiler recurses deeply (the tokenizer recurses per
-  character), so `self_hosted` tests run their body on a 1 GiB thread via
+  out_len_ptr)`. The callee allocates the output buffer, writes its address into
+  `out_ptr_ptr` and length into `out_len_ptr`. The result is CGRF-encoded: after the
+  pointer, an s32 payload sits at `+24` (16-byte CGRF header + 8-byte node header); a
+  string has length at `+24`, bytes at `+28`.
+- **Big stack**: the Wisp interpreter recurses deeply (the reader recurses per
+  character), so the `interpreter_*`/`self_hosted` tests run on a 1 GiB thread via
   `run_big_stack` rather than the default 2 MiB test stack.
 
-Test fixtures also live in `tests/fixtures/` for manual `cargo run -- compile` checks.
+Test fixtures live in `tests/fixtures/` for manual `cargo run -- compile` checks.
 
 ## Coding Style
 
-- Rust 2021 edition with standard formatting (4-space indent)
-- snake_case for functions/variables, CamelCase for types
-- Helper grouping: `tokenize_*`, `parse_*`, `gen_*`, `check_*`
-- Short imperative commit messages (~50 chars): "add s64 support", "fix type widening"
-- Keep compiler stages clearly separated: tokenize → parse → type-check → codegen
+- Rust 2024 edition, standard formatting (4-space indent).
+- snake_case for functions/variables, CamelCase for types.
+- Helper grouping: `tokenize_*`, `parse_*`, `gen_*`, `check_*`.
+- Short imperative commit messages (~50 chars): "add s64 support", "fix type widening".
+- Keep compiler stages clearly separated: tokenize → parse → type-check → codegen/eval.
 
 ## Output Files
 
-By default, compiling `examples/prog.wisp` writes just one file, in a `compiled/`
-subfolder next to the source (Racket-style), so source directories stay clean:
-- `examples/compiled/prog.wasm` - the Pack package. It embeds the interface metadata
+By default, compiling `examples/prog.wisp` writes one file, in a `compiled/` subfolder
+next to the source (Racket-style), so source directories stay clean:
+- `examples/compiled/prog.wasm` — the Pack package. It embeds the interface metadata
   (CGRF), so it is the one true artifact.
 
-The other two are optional, human-readable **views** of information the wasm already
-holds; nothing consumes them, so they are off by default:
-- `--emit-wat` -> `examples/compiled/prog.wat` - readable WAT disassembly (the wasm is
-  built from this; any wasm tool regenerates it).
-- `--emit-pact` -> `examples/compiled/prog.pact` - text interface (also embedded in the
-  wasm as CGRF metadata).
+Two optional human-readable **views** (off by default; derivable from the wasm):
+- `--emit-wat` → `examples/compiled/prog.wat` — readable WAT disassembly.
+- `--emit-pact` → `examples/compiled/prog.pact` — text interface (also embedded as CGRF).
 
 An explicit out-stem (`compile prog.wisp path/name`) is used verbatim (relative to the
 current directory), bypassing the `compiled/` default. The output directory is created
