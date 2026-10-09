@@ -131,20 +131,28 @@ cargo run -- compile examples/prog.wisp
 
 ## Architecture
 
-### Two-Module Structure
+### Structure
 
-1. **src/main.rs** - CLI entry point and runtime
+**src/main.rs** - CLI entry point and runtime
    - Defines CLI using clap with `compile` and `run` subcommands
    - `run_compile()`: orchestrates compilation pipeline
    - `run_component()`: WebAssembly runtime using Wasmtime, handles component instantiation, dependency linking, and function execution
    - `encode_params()`: converts string arguments to typed WebAssembly values
    - `parse_dep_arg()`: parses `module=path.wasm` format for dependencies
 
-2. **src/compiler.rs** - Complete compilation pipeline
-   - **Tokenization**: `tokenize()` converts source to Token stream (LParen, RParen, Symbol, Number)
-   - **Parsing**: `parse_sexpr()` builds SExpr tree, `parse_program()` creates top-level Program AST with functions, imports, and exports
-   - **Type Checking**: `collect_signatures()` builds function signature map, `check_expr()` performs type inference with numeric widening (s32→s64, f32→f64)
-   - **Code Generation**: `generate_wat()` emits WebAssembly text format, `generate_wit()` creates WIT world with imports/exports, `encode_component()` uses wit-component to create final WebAssembly component
+**src/compiler/** - the compilation pipeline, one file per stage (the stages run
+in this order; each submodule does `use super::*` and keeps items `pub(crate)`):
+   - `mod.rs` - the AST / data model (`Type`, `Expr`, `SExpr`, `Program`, …), the
+     `compile()` orchestration, and shared helpers (`type_size`, `ensure_numeric`, …)
+   - `tokenizer.rs` - `tokenize()`: source text → `Token` stream
+   - `parser.rs` - `parse_sexpr()` → `SExpr`, `parse_program()`/`parse_expr()` → typed `Program`/`Expr`
+   - `macros.rs` - defmacro, syntax-rules, syntax-case, pattern matching
+   - `lower.rs` - `expand_generics()`/`Lowering`: monomorphize generics/traits, expand `derive`
+   - `typecheck.rs` - `check_expr()` (type inference with numeric widening), `check_fn_linearity()`/`linear_uses()` (the substructural checker)
+   - `codegen.rs` - `generate_wat()` (→ WAT), `generate_wit()` (→ WIT world), `encode_component()`, and the CGRF/Pack encode+decode glue
+
+   Historically this was one 16.7k-line `src/compiler.rs`; it was split by stage
+   for navigability (PRs #27, #28) with zero behavior change.
 
 ### Key Data Structures
 
