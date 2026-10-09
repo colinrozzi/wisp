@@ -809,6 +809,10 @@ pub enum Expr {
 pub struct MatchArm {
     case_name: String,
     bindings: Vec<String>, // Variable names to bind payload values
+    /// Substructural multiplicity of each binding (parallel to `bindings`), taken
+    /// from the matched case's payload. A linear payload binding must be consumed
+    /// exactly once in the arm body — this is the type-state narrowing.
+    binding_mult: Vec<Multiplicity>,
     body: Expr,
 }
 
@@ -850,10 +854,12 @@ fn expand_match_wildcard(
         .collect();
     for (name, arity) in full {
         if !covered.contains(name.as_str()) {
-            let bindings = (0..arity).map(|i| format!("_wild_{name}_{i}")).collect();
+            let bindings: Vec<String> = (0..arity).map(|i| format!("_wild_{name}_{i}")).collect();
+            let binding_mult = vec![Multiplicity::Un; bindings.len()];
             out.push(MatchArm {
                 case_name: name,
                 bindings,
+                binding_mult,
                 body: wild.body.clone(),
             });
         }
@@ -986,6 +992,10 @@ impl RecordDef {
 pub struct VariantCase {
     pub name: String,
     pub payload: Vec<Type>, // Can have 0, 1, or more payload types
+    /// Substructural multiplicity of each payload (parallel to `payload`). A
+    /// `(lin T)` / `(aff T)` payload makes the slot linear/affine; a variant with
+    /// any such payload is itself a linear value (infectious linearity).
+    pub payload_mult: Vec<Multiplicity>,
 }
 
 /// A variant type definition (sum type)
@@ -1626,6 +1636,27 @@ fn type_check(
         .map(|v| (v.name.clone(), v.clone()))
         .collect();
 
+    // A variant is linear (or affine) by its type if any payload slot is — so a
+    // value holding a linear resource cannot be copied and re-matched. `Lin`
+    // dominates `Aff` dominates `Un`.
+    let variant_mult: HashMap<String, Multiplicity> = prog
+        .variants
+        .iter()
+        .map(|v| {
+            let mut m = Multiplicity::Un;
+            for c in &v.cases {
+                for pm in &c.payload_mult {
+                    match pm {
+                        Multiplicity::Lin => m = Multiplicity::Lin,
+                        Multiplicity::Aff if m == Multiplicity::Un => m = Multiplicity::Aff,
+                        _ => {}
+                    }
+                }
+            }
+            (v.name.clone(), m)
+        })
+        .collect();
+
     for func in &prog.functions {
         let mut env = HashMap::new();
         for param in &func.params {
@@ -1652,7 +1683,7 @@ fn type_check(
         if matches!(func.return_type, Type::Borrow(_)) {
             bail!("function '{}' cannot return a borrow", func.name);
         }
-        check_fn_linearity(func, &prog.capabilities)?;
+        check_fn_linearity(func, &prog.capabilities, &variant_mult)?;
     }
     Ok(())
 }
@@ -1786,17 +1817,45 @@ fn linear_uses(
             Ok(merge_sum(c, &merge_branches(&t, &f, tracked)?))
         }
         Expr::Match { expr, cases } => {
+            // The scrutinee is consumed here (a linear scrutinee counts as one use).
             let acc = linear_uses(expr, tracked)?;
-            let mut arms = cases.iter();
-            let mut merged = match arms.next() {
-                Some(arm) => linear_uses(&arm.body, tracked)?,
-                None => HashMap::new(),
-            };
-            for arm in arms {
-                let u = linear_uses(&arm.body, tracked)?;
-                merged = merge_branches(&merged, &u, tracked)?;
+            // Each arm's linear/affine payload bindings are local obligations: they
+            // are tracked within the arm, enforced (exactly/at-most once), and then
+            // removed before the arm's outer-binding uses are branch-merged. This is
+            // the type-state narrowing — a linear resource extracted by the match
+            // cannot be dropped or duplicated in the arm.
+            let mut merged: Option<HashMap<String, usize>> = None;
+            for arm in cases {
+                let mut inner = tracked.clone();
+                for (b, m) in arm.bindings.iter().zip(&arm.binding_mult) {
+                    if *m != Multiplicity::Un {
+                        inner.insert(b.clone(), *m);
+                    }
+                }
+                let mut u = linear_uses(&arm.body, &inner)?;
+                for (b, m) in arm.bindings.iter().zip(&arm.binding_mult) {
+                    let c = u.get(b).copied().unwrap_or(0);
+                    match m {
+                        Multiplicity::Lin if c != 1 => bail!(
+                            "match binding '{}' is linear and must be used exactly once (used {} time(s))",
+                            b,
+                            c
+                        ),
+                        Multiplicity::Aff if c > 1 => bail!(
+                            "match binding '{}' is affine and must be used at most once (used {} time(s))",
+                            b,
+                            c
+                        ),
+                        _ => {}
+                    }
+                    u.remove(b);
+                }
+                merged = Some(match merged {
+                    None => u,
+                    Some(prev) => merge_branches(&prev, &u, tracked)?,
+                });
             }
-            Ok(merge_sum(acc, &merged))
+            Ok(merge_sum(acc, &merged.unwrap_or_default()))
         }
         Expr::WithCap { name, body, .. } => {
             // RAII: the scope owns the capability and releases it at the end, so the
@@ -1851,14 +1910,35 @@ fn validate_cap_names(e: &Expr, capabilities: &HashSet<String>) -> Result<()> {
 /// every capability parameter, and every `with-cap` binding) must be consumed
 /// exactly once, and each `(aff T)` parameter at most once, counting `if`/`match`
 /// branches per multiplicity.
-fn check_fn_linearity(func: &Function, capabilities: &HashSet<String>) -> Result<()> {
+fn check_fn_linearity(
+    func: &Function,
+    capabilities: &HashSet<String>,
+    variant_mult: &HashMap<String, Multiplicity>,
+) -> Result<()> {
     validate_cap_names(&func.body, capabilities)?;
-    // A capability-typed parameter is linear by its type; otherwise the declared
-    // multiplicity applies.
+    // A capability-typed parameter is linear by its type; a variant holding a
+    // linear/affine payload is linear/affine by its type (infectious linearity, so
+    // it can't be copied and re-matched to extract the resource twice); otherwise
+    // the declared `(lin/aff T)` multiplicity applies.
     let is_cap =
         |p: &Parameter| matches!(&p.ty, Type::Resource(name) if capabilities.contains(name));
-    let mult_of =
-        |p: &Parameter| -> Multiplicity { if is_cap(p) { Multiplicity::Lin } else { p.mult } };
+    let mult_of = |p: &Parameter| -> Multiplicity {
+        if is_cap(p) {
+            return Multiplicity::Lin;
+        }
+        if let Type::Variant(name) = &p.ty
+            && let Some(m) = variant_mult.get(name)
+            && *m != Multiplicity::Un
+        {
+            // The declared qualifier can only strengthen the inherent one.
+            return if p.mult == Multiplicity::Lin {
+                Multiplicity::Lin
+            } else {
+                *m
+            };
+        }
+        p.mult
+    };
     let tracked: HashMap<String, Multiplicity> = func
         .params
         .iter()
@@ -7400,17 +7480,27 @@ fn parse_variant_form(
                     other => return Err(ctx.error("case name must be a symbol", other.span())),
                 };
                 let mut payload = Vec::new();
+                let mut payload_mult = Vec::new();
                 for ty_expr in &parts[1..] {
+                    // A `(lin T)` / `(aff T)` payload makes this slot linear/affine;
+                    // the qualifier is erased at the Type level.
+                    let mult = match ty_expr {
+                        SExpr::List(q, _) if head_sym(q) == Some("lin") => Multiplicity::Lin,
+                        SExpr::List(q, _) if head_sym(q) == Some("aff") => Multiplicity::Aff,
+                        _ => Multiplicity::Un,
+                    };
                     payload.push(parse_type_expr(
                         ty_expr,
                         variant_names,
                         resource_names,
                         ctx,
                     )?);
+                    payload_mult.push(mult);
                 }
                 cases.push(VariantCase {
                     name: case_name,
                     payload,
+                    payload_mult,
                 });
             }
             other => {
@@ -8083,9 +8173,20 @@ fn parse_expr(
                             ctx,
                         )?;
 
+                        // The bindings' multiplicities come from the matched case's
+                        // payload (a `(lin T)` payload binds a linear value). Unknown
+                        // cases (`_`, option/result) carry unrestricted bindings.
+                        let binding_mult = find_variant_by_case(&case_name, variants)
+                            .and_then(|vd| {
+                                vd.find_case(&case_name)
+                                    .map(|(_, c)| c.payload_mult.clone())
+                            })
+                            .filter(|m| m.len() == bindings.len())
+                            .unwrap_or_else(|| vec![Multiplicity::Un; bindings.len()]);
                         arms.push(MatchArm {
                             case_name,
                             bindings,
+                            binding_mult,
                             body,
                         });
                     }
