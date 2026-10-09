@@ -8,7 +8,10 @@ use std::time::Instant;
 use theater::messages::TheaterCommand;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-use wisp_interpreter_actor::{MANIFEST, Runtime, Session, source::SourceBundle, transport};
+use wisp::compiler::Outcome;
+use wisp_interpreter_actor::{
+    EvalSession, MANIFEST, Runtime, Session, source::SourceBundle, transport,
+};
 
 /// The actor built into the binary (produced by actors/wisp-repl/build.sh). A
 /// released theater-repl is self-contained: it carries its own actor + bundle.
@@ -413,32 +416,44 @@ async fn follow(port: u16, id: String) -> Result<()> {
 
 // ---- the human REPL -------------------------------------------------------
 
-/// Interactive stdin/stdout prompt against one private session.
+/// Interactive stdin/stdout prompt on a shared-interpreter session bound to a live
+/// Theater runtime. The read-eval-print loop runs on a blocking thread because
+/// `EvalSession::feed` is synchronous (its `TheaterHost` blocks on the runtime), so
+/// it can't run on a reactor task; the runtime itself keeps running on other threads.
 async fn repl(loaded: Loaded) -> Result<()> {
     let runtime = new_runtime(&loaded).await?;
-    let session = runtime
-        .spawn_with_manifest(loaded.wasm, loaded.manifest)
-        .await?;
-    eprintln!("Wisp Theater actor {} — :quit to exit", session.id);
-    let result = async {
-        let mut input = BufReader::new(tokio::io::stdin());
-        let mut output = tokio::io::stdout();
+    eprintln!("Wisp REPL on a live Theater runtime — :quit to exit");
+    let commands = runtime.commands.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::io::{BufRead, Write};
+        let mut session = EvalSession::new(commands);
+        let stdin = std::io::stdin();
+        let mut stdout = std::io::stdout();
+        let mut line = String::new();
         loop {
-            output.write_all(b"wisp> ").await?;
-            output.flush().await?;
-            let Some(line) = transport::read_line(&mut input).await? else {
-                break;
-            };
-            if line.trim() == ":quit" {
+            write!(stdout, "wisp> ")?;
+            stdout.flush()?;
+            line.clear();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break; // EOF
+            }
+            let input = line.trim();
+            if input.is_empty() {
+                continue;
+            }
+            if input == ":quit" || input == ":q" {
                 break;
             }
-            let value = session.evaluate(&line).await?;
-            output.write_all(format!("{value}\n").as_bytes()).await?;
+            match session.feed(input) {
+                Ok(Outcome::Defined(name)) => writeln!(stdout, "defined {name}")?,
+                Ok(Outcome::Bound { name, value, .. }) => writeln!(stdout, "{name} = {value}")?,
+                Ok(Outcome::Evaluated { value, .. }) => writeln!(stdout, "{value}")?,
+                Err(e) => eprintln!("error: {e:#}"),
+            }
         }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    session.shutdown().await?;
+        Ok(())
+    })
+    .await?;
     runtime.shutdown().await?;
     result
 }
