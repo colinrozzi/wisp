@@ -18,7 +18,7 @@ case "$os-$arch" in
   Linux-x86_64 | Linux-amd64) asset="theater-repl-linux-x86_64" ;;
   *)
     echo "no prebuilt theater-repl for $os-$arch." >&2
-    echo "build from source: https://github.com/$REPO (actors/wisp-repl)" >&2
+    echo "build from source: https://github.com/$REPO (wisp/actor)" >&2
     exit 1
     ;;
 esac

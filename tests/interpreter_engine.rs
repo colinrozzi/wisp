@@ -249,7 +249,7 @@ async fn engine_session() {
             .stack_size(1 << 30)
             .spawn_scoped(s, || {
                 granite::compiler::compile(
-                    &root.join("interpreter/evaluator.wisp"),
+                    &root.join("wisp/interpreter/evaluator.wisp"),
                     &root.join(format!(
                         "target/interpreter-engine/{}/evaluator",
                         std::process::id()

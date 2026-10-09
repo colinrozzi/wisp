@@ -1,4 +1,4 @@
-//! Local host for the interpreter written in `interpreter/evaluator.wisp`.
+//! Local host for the interpreter written in `wisp/interpreter/evaluator.wisp`.
 //! One instance owns one session; evaluation itself runs entirely in Wisp/Wasm.
 
 use std::fs::File;
