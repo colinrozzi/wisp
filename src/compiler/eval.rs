@@ -143,10 +143,23 @@ pub fn eval_source(src: &str) -> Result<Value> {
 /// Like `eval_source`, but import calls dispatch to `host` — the seam where eval'd
 /// code reaches the live runtime (store/tcp/print/...).
 pub fn eval_source_with_host(src: &str, host: &mut dyn Host) -> Result<Value> {
+    eval_source_entry_with_host(src, Path::new("."), "test-func", host)
+}
+
+/// Analyze `src` (resolving `(include …)` relative to `base_dir`) and evaluate its
+/// nullary entry function `entry`, dispatching import calls to `host`. This is the
+/// general entry point `wisp eval <file>` runs on — pick the file's directory as
+/// `base_dir` so its includes resolve, and the function to run as `entry`.
+pub fn eval_source_entry_with_host(
+    src: &str,
+    base_dir: &Path,
+    entry: &str,
+    host: &mut dyn Host,
+) -> Result<Value> {
     let ctx = CompileContext::new(src.to_string(), "<eval>".to_string());
     let mut visited = HashSet::new();
-    let (prog, _sigs) = analyze(src, Path::new("."), &mut visited, &ctx)?;
-    eval_program(&prog, "test-func", host)
+    let (prog, _sigs) = analyze(src, base_dir, &mut visited, &ctx)?;
+    eval_program(&prog, entry, host)
 }
 
 /// Evaluate a single REPL expression against accumulated value bindings and

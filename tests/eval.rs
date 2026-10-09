@@ -5,8 +5,10 @@
 // nullary `test-func`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use wisp::compiler::{
-    Host, InlineValue, Value, eval_repl_expr, eval_source, eval_source_with_host,
+    Host, InlineValue, Value, eval_repl_expr, eval_source, eval_source_entry_with_host,
+    eval_source_with_host,
 };
 
 fn ok(src: &str) -> Value {
@@ -135,7 +137,7 @@ struct CaptureHost {
 }
 impl Host for CaptureHost {
     fn call(&mut self, _module: &str, name: &str, args: &[Value]) -> anyhow::Result<Value> {
-        if name == "print" {
+        if name == "print" || name == "write-line" {
             if let Some(Value::Str(s)) = args.first() {
                 self.out.push(s.clone());
             }
@@ -162,6 +164,23 @@ fn test_eval_capability_gated_host_effect() {
     let v = eval_source_with_host(src, &mut host).expect("eval");
     assert_eq!(v, Value::Int(0));
     assert_eq!(host.out, vec!["hello".to_string()]);
+}
+
+// `wisp eval <file>` runs a named nullary entry (default `main`), not just
+// `test-func`. Same capability-gated effect, reached through a chosen entry.
+#[test]
+fn test_eval_entry_runs_named_function() {
+    let src = r#"
+(capability Console)
+(import host write-line ((msg string)) s32)
+(fn log ((c (borrow Console)) (msg string)) s32 (write-line msg))
+(export (fn main () s32
+  (with-cap (c Console) (log (& c) "hi"))))
+"#;
+    let mut host = CaptureHost { out: vec![] };
+    let v = eval_source_entry_with_host(src, Path::new("."), "main", &mut host).expect("eval");
+    assert_eq!(v, Value::Int(0));
+    assert_eq!(host.out, vec!["hi".to_string()]);
 }
 
 // Without a host, an import call errors (rather than silently doing nothing).
