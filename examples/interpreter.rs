@@ -10,7 +10,7 @@ use granite::{compiler, interpreter::Interpreter};
 fn main() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let artifacts = compiler::compile(
-        &root.join("interpreter/evaluator.wisp"),
+        &root.join("wisp/interpreter/evaluator.wisp"),
         &root.join("target/interpreter/evaluator"),
         compiler::EmitOptions::default(),
     )?;

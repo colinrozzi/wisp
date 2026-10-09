@@ -2,7 +2,7 @@
 ; (evaluator.wisp includes marshal.wisp), so record/variant register-on-arrival
 ; can reach the $types registry. A trivial `evaluate ""` first initialises the
 ; session globals ($types, etc.) before any record round-trips.
-(include "../../interpreter/evaluator.wisp")
+(include "../../wisp/interpreter/evaluator.wisp")
 (export (fn m-int ((n s32)) any (marshal (integer n))))
 (export (fn m-wide ((n s64)) any (marshal (wide-integer n))))
 (export (fn m-double ((d f64)) any (marshal (double d))))

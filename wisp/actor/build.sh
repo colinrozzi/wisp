@@ -6,5 +6,5 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 cd "$root"
-cargo run -q -- compile actors/wisp-repl/actor.wisp actors/wisp-repl/actor
-echo "built actors/wisp-repl/actor.wasm"
+cargo run -q -- compile wisp/actor/actor.wisp wisp/actor/actor
+echo "built wisp/actor/actor.wasm"

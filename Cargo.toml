@@ -1,9 +1,10 @@
 [workspace]
 members = ["wisp-repl"]
 default-members = ["."]
-exclude = ["crates", "wisp-actor", "actors/wisp-repl"]
+exclude = ["crates", "wisp-actor", "wisp/actor"]
 resolver = "3"
-# Legacy Theater integrations use crates/; the current actor uses actors/wisp-repl/.
+# Granite (this crate) compiles Wisp, the dynamic Scheme under wisp/ (its
+# interpreter + the Theater actor under wisp/actor/). Legacy integrations: crates/.
 
 [workspace.dependencies]
 # Keep compiler metadata and both Rust runners on the same CGRF v3 implementation.

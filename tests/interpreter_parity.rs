@@ -38,7 +38,7 @@ fn compile(source: &Path, name: &str) -> PathBuf {
 fn session() -> Interpreter {
     static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
     Interpreter::load(
-        PACKAGE.get_or_init(|| compile(&root().join("interpreter/evaluator.wisp"), "evaluator")),
+        PACKAGE.get_or_init(|| compile(&root().join("wisp/interpreter/evaluator.wisp"), "evaluator")),
     )
     .unwrap()
 }
