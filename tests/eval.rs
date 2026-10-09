@@ -5,7 +5,9 @@
 // nullary `test-func`.
 
 use std::collections::HashMap;
-use wisp::compiler::{InlineValue, Value, eval_repl_expr, eval_source};
+use wisp::compiler::{
+    Host, InlineValue, Value, eval_repl_expr, eval_source, eval_source_with_host,
+};
 
 fn ok(src: &str) -> Value {
     eval_source(src).expect("expected successful evaluation")
@@ -123,6 +125,53 @@ fn test_eval_catches_type_error() {
         e.contains("returns") || e.contains("type"),
         "unexpected: {e}"
     );
+}
+
+// --- Host effects: a capability-gated import call, dispatched to a Host ---
+
+/// A test host that captures `print` calls.
+struct CaptureHost {
+    out: Vec<String>,
+}
+impl Host for CaptureHost {
+    fn call(&mut self, _module: &str, name: &str, args: &[Value]) -> anyhow::Result<Value> {
+        if name == "print" {
+            if let Some(Value::Str(s)) = args.first() {
+                self.out.push(s.clone());
+            }
+            return Ok(Value::Int(0));
+        }
+        anyhow::bail!("unknown host function {name}")
+    }
+}
+
+// A capability-gated host effect runs under eval: `log` requires a borrowed
+// `Console`, calls the imported `print`, which the host captures. This is the
+// whole point of the capability work made observable — and the mechanism the REPL
+// daemon will reach the live Theater runtime through.
+#[test]
+fn test_eval_capability_gated_host_effect() {
+    let src = r#"
+(capability Console)
+(import host print ((msg string)) s32)
+(fn log ((c (borrow Console)) (msg string)) s32 (print msg))
+(export (fn test-func () s32
+  (with-cap (c Console) (log (& c) "hello"))))
+"#;
+    let mut host = CaptureHost { out: vec![] };
+    let v = eval_source_with_host(src, &mut host).expect("eval");
+    assert_eq!(v, Value::Int(0));
+    assert_eq!(host.out, vec!["hello".to_string()]);
+}
+
+// Without a host, an import call errors (rather than silently doing nothing).
+#[test]
+fn test_eval_import_without_host_errors() {
+    let src = r#"
+(import host print ((msg string)) s32)
+(export (fn test-func () s32 (print "x")))
+"#;
+    assert!(eval_source(src).is_err());
 }
 
 // --- REPL evaluation primitive: typed, binding-aware eval (eval_repl_expr) ---

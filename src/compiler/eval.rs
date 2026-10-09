@@ -77,19 +77,38 @@ impl fmt::Display for Value {
     }
 }
 
+/// A sink for host-interface calls encountered during eval. A call to an imported
+/// function — `(write-line msg)` for an `(import … write-line …)` — dispatches here
+/// with the interface, name, and argument values. The REPL daemon implements this
+/// to reach the live Theater runtime; tests implement it to capture effects. This
+/// is the eval dual of codegen's host-import ABI, at the `Value` level (no CGRF).
+pub trait Host {
+    fn call(&mut self, module: &str, name: &str, args: &[Value]) -> Result<Value>;
+}
+
+/// The default host: there is none, so any import call errors.
+pub struct NullHost;
+impl Host for NullHost {
+    fn call(&mut self, module: &str, name: &str, _args: &[Value]) -> Result<Value> {
+        bail!("eval: no host available for import {}/{}", module, name)
+    }
+}
+
 struct EvalCtx<'a> {
     funcs: HashMap<&'a str, &'a Function>,
     records: HashMap<&'a str, &'a RecordDef>,
+    imports: HashMap<&'a str, &'a Import>,
     globals: RefCell<HashMap<String, Value>>,
     depth: RefCell<usize>,
+    host: RefCell<&'a mut dyn Host>,
 }
 
 const MAX_DEPTH: usize = 50_000;
 
-/// Run the shared pipeline on `src` and evaluate its nullary `test-func`.
 /// Evaluate a nullary entry function of an already-analyzed program. The dual of
-/// codegen: the same typed `Program` either back-end consumes.
-pub(crate) fn eval_program(prog: &Program, entry: &str) -> Result<Value> {
+/// codegen: the same typed `Program` either back-end consumes. Import calls
+/// dispatch to `host`.
+pub(crate) fn eval_program(prog: &Program, entry: &str, host: &mut dyn Host) -> Result<Value> {
     let entry = prog
         .functions
         .iter()
@@ -102,6 +121,7 @@ pub(crate) fn eval_program(prog: &Program, entry: &str) -> Result<Value> {
             .map(|f| (f.name.as_str(), f))
             .collect(),
         records: prog.records.iter().map(|r| (r.name.as_str(), r)).collect(),
+        imports: prog.imports.iter().map(|i| (i.name.as_str(), i)).collect(),
         globals: RefCell::new(
             prog.globals
                 .iter()
@@ -109,16 +129,24 @@ pub(crate) fn eval_program(prog: &Program, entry: &str) -> Result<Value> {
                 .collect(),
         ),
         depth: RefCell::new(0),
+        host: RefCell::new(host),
     };
     eval_expr(&ectx, &entry.body, &HashMap::new())
 }
 
-/// Run the shared pipeline on `src` and evaluate its nullary `test-func`.
+/// Run the shared pipeline on `src` and evaluate its nullary `test-func`, with no
+/// host (import calls error).
 pub fn eval_source(src: &str) -> Result<Value> {
+    eval_source_with_host(src, &mut NullHost)
+}
+
+/// Like `eval_source`, but import calls dispatch to `host` — the seam where eval'd
+/// code reaches the live runtime (store/tcp/print/...).
+pub fn eval_source_with_host(src: &str, host: &mut dyn Host) -> Result<Value> {
     let ctx = CompileContext::new(src.to_string(), "<eval>".to_string());
     let mut visited = HashSet::new();
     let (prog, _sigs) = analyze(src, Path::new("."), &mut visited, &ctx)?;
-    eval_program(&prog, "test-func")
+    eval_program(&prog, "test-func", host)
 }
 
 /// Evaluate a single REPL expression against accumulated value bindings and
@@ -188,7 +216,7 @@ pub fn eval_repl_expr(
     };
     let full_signatures = collect_signatures(&prog)?;
     type_check(&prog, &full_signatures, &ctx)?;
-    Ok((eval_program(&prog, "eval")?, return_type))
+    Ok((eval_program(&prog, "eval", &mut NullHost)?, return_type))
 }
 
 type Env = HashMap<String, Value>;
@@ -247,15 +275,20 @@ fn eval_inner(ctx: &EvalCtx, expr: &Expr, env: &Env) -> Result<Value> {
         }
         Expr::Call { name, args } => {
             let argv = eval_args(ctx, args, env)?;
-            let func = ctx
-                .funcs
-                .get(name.as_str())
-                .ok_or_else(|| anyhow!("eval: call to unknown function '{}'", name))?;
-            let mut call_env = Env::new();
-            for (param, v) in func.params.iter().zip(argv) {
-                call_env.insert(param.name.clone(), v);
+            if let Some(func) = ctx.funcs.get(name.as_str()) {
+                let mut call_env = Env::new();
+                for (param, v) in func.params.iter().zip(argv) {
+                    call_env.insert(param.name.clone(), v);
+                }
+                eval_expr(ctx, &func.body, &call_env)
+            } else if let Some(import) = ctx.imports.get(name.as_str()) {
+                // A call to an imported function is a host call — dispatch to the host.
+                ctx.host
+                    .borrow_mut()
+                    .call(&import.module, &import.name, &argv)
+            } else {
+                bail!("eval: call to unknown function '{}'", name)
             }
-            eval_expr(ctx, &func.body, &call_env)
         }
         Expr::WasmInstr { name, args } => {
             let argv = eval_args(ctx, args, env)?;
