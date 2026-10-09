@@ -133,7 +133,7 @@ fn test_eval_repl_inlines_binding() {
     // having gone through the shared parse + type-check.
     let mut bindings = HashMap::new();
     bindings.insert("x".to_string(), InlineValue::S32(41));
-    let v = eval_repl_expr("(i32.add x (i32.const 1))", &bindings, &[]).expect("eval");
+    let (v, _ty) = eval_repl_expr("(i32.add x (i32.const 1))", &bindings, &[]).expect("eval");
     assert_eq!(v, Value::Int(42));
 }
 

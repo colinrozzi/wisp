@@ -124,13 +124,14 @@ pub fn eval_source(src: &str) -> Result<Value> {
 /// Evaluate a single REPL expression against accumulated value bindings and
 /// function definitions — the eval dual of `compile_repl_expr`. Bindings are
 /// inlined as literals; functions are in scope; the expression is type-checked and
-/// then evaluated to a `Value`. This is the typed evaluation primitive the REPL
-/// runs on (replacing the Wisp interpreter's dynamic eval).
+/// then evaluated. Returns the resulting `Value` and its inferred `Type` (the REPL
+/// needs the type to render/store the result). This is the typed evaluation
+/// primitive the REPL runs on (replacing the Wisp interpreter's dynamic eval).
 pub fn eval_repl_expr(
     expr_source: &str,
     bindings: &HashMap<String, InlineValue>,
     functions: &[Function],
-) -> Result<Value> {
+) -> Result<(Value, Type)> {
     let ctx = CompileContext::new(expr_source.to_string(), "<repl>".to_string());
     let tokens = tokenize(expr_source);
     if tokens.is_empty() {
@@ -168,7 +169,7 @@ pub fn eval_repl_expr(
     let eval_fn = Function {
         name: "eval".to_string(),
         params: vec![],
-        return_type,
+        return_type: return_type.clone(),
         body: expr,
     };
     let mut all_functions = functions.to_vec();
@@ -187,7 +188,7 @@ pub fn eval_repl_expr(
     };
     let full_signatures = collect_signatures(&prog)?;
     type_check(&prog, &full_signatures, &ctx)?;
-    eval_program(&prog, "eval")
+    Ok((eval_program(&prog, "eval")?, return_type))
 }
 
 type Env = HashMap<String, Value>;
