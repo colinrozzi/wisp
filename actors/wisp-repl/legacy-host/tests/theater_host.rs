@@ -11,7 +11,7 @@ use std::path::Path;
 use theater::messages::TheaterCommand;
 use tokio::sync::mpsc::UnboundedSender;
 use wisp::compiler::Value;
-use wisp_interpreter_actor::{Runtime, TheaterHost, source::SourceBundle};
+use wisp_interpreter_actor::{EvalSession, Runtime, TheaterHost, source::SourceBundle};
 
 /// A program whose entry calls the imported `list-actors` and returns the ids.
 const LIST_ACTORS: &str = r#"
@@ -51,6 +51,33 @@ async fn eval_reaches_live_runtime_through_theater_host() -> anyhow::Result<()> 
     let session = runtime.spawn(wasm).await?;
     let ids = live_actor_ids(runtime.commands.clone()).await?;
     assert_eq!(ids, vec![session.id.to_string()]);
+
+    runtime.shutdown().await?;
+    Ok(())
+}
+
+// A host-side REPL session runs entirely on the shared Rust interpreter — not the
+// Wisp-interpreter actor — and reaches the live runtime through its Theater
+// interface. One session evaluates a pure expression (no runtime needed) and a
+// Theater-reaching one, proving both halves go through the same interpreter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eval_session_runs_on_shared_interpreter() -> anyhow::Result<()> {
+    let runtime = Runtime::new(SourceBundle::new(BTreeMap::new())?).await?;
+    let wasm = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../actor.wasm"))?;
+    let session_actor = runtime.spawn(wasm).await?;
+    let expected_id = session_actor.id.to_string();
+    let commands = runtime.commands.clone();
+
+    let (pure, live) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut session = EvalSession::new(commands);
+        let (pure, _) = session.evaluate("(i32.add 40 2)")?;
+        let (live, _) = session.evaluate("(list-actors)")?;
+        Ok((pure, live))
+    })
+    .await??;
+
+    assert_eq!(pure, Value::Int(42));
+    assert_eq!(live, Value::List(vec![Value::Str(expected_id)]));
 
     runtime.shutdown().await?;
     Ok(())
