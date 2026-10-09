@@ -189,13 +189,29 @@ pub fn eval_repl_expr_with_host(
     imports: &[Import],
     host: &mut dyn Host,
 ) -> Result<(Value, Type)> {
-    let ctx = CompileContext::new(expr_source.to_string(), "<repl>".to_string());
     let tokens = tokenize(expr_source);
     if tokens.is_empty() {
         bail!("empty expression");
     }
     let (sexpr, _) = parse_sexpr(&tokens, 0);
-    let inlined = inline_bindings(&sexpr, bindings);
+    eval_repl_sexpr(&sexpr, expr_source, bindings, functions, imports, host)
+}
+
+/// The `SExpr`-level core of REPL evaluation, shared by `eval_repl_expr_with_host`
+/// and `ReplSession` (which already holds parsed forms, so it skips re-tokenizing).
+/// Inlines `bindings`, brings `functions` + `imports` into scope, infers the
+/// expression's type, type-checks, and evaluates — import calls dispatch to `host`.
+/// `source` is the original text the `SExpr`'s spans point into, for diagnostics.
+pub(crate) fn eval_repl_sexpr(
+    sexpr: &SExpr,
+    source: &str,
+    bindings: &HashMap<String, InlineValue>,
+    functions: &[Function],
+    imports: &[Import],
+    host: &mut dyn Host,
+) -> Result<(Value, Type)> {
+    let ctx = CompileContext::new(source.to_string(), "<repl>".to_string());
+    let inlined = inline_bindings(sexpr, bindings);
 
     let mut signatures: HashMap<String, Signature> = HashMap::new();
     for func in functions {

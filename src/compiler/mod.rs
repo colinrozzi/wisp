@@ -16,6 +16,8 @@ pub use eval::{
     Host, NullHost, Value, eval_repl_expr, eval_repl_expr_with_host, eval_source,
     eval_source_entry_with_host, eval_source_with_host,
 };
+mod repl;
+pub use repl::{Outcome, ReplSession};
 mod typecheck;
 pub(crate) use typecheck::*;
 mod macros;
