@@ -4,18 +4,15 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use theater::messages::TheaterCommand;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use wisp::compiler::Outcome;
-use wisp_interpreter_actor::{
-    EvalSession, MANIFEST, Runtime, Session, source::SourceBundle, transport,
-};
+use wisp_interpreter_actor::{EvalSession, Runtime, source::SourceBundle, transport};
 
-/// The actor built into the binary (produced by actors/wisp-repl/build.sh). A
-/// released theater-repl is self-contained: it carries its own actor + bundle.
-const EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../actor.wasm"));
 /// The immutable source bundle served to the guest for relative `(include …)`.
 const EMBEDDED_SOURCES: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../sources.json"));
@@ -115,68 +112,51 @@ fn upgrade() -> Result<()> {
     Ok(())
 }
 
-// ---- actor artifacts ------------------------------------------------------
+// ---- the source bundle ----------------------------------------------------
 
-struct Loaded {
-    manifest: theater::ManifestConfig,
-    wasm: Vec<u8>,
-    bundle_json: String,
-}
-
-/// Where the actor comes from: the built-in copies, or `--actor-dir` on disk.
-fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<Loaded> {
-    let (manifest_str, wasm, mut bundle_json) = match actor_dir {
-        Some(dir) => {
-            let manifest_str = std::fs::read_to_string(dir.join("manifest.toml"))?;
-            let package = theater::ManifestConfig::from_toml_str(&manifest_str)?.package;
-            let wasm = std::fs::read(dir.join(&package))
-                .context("actor is not built; run actors/wisp-repl/build.sh first")?;
-            let bundle = std::fs::read_to_string(dir.join("sources.json"))?;
-            (manifest_str, wasm, bundle)
-        }
-        None => (
-            MANIFEST.to_string(),
-            EMBEDDED_WASM.to_vec(),
-            EMBEDDED_SOURCES.to_string(),
-        ),
+/// The source bundle (paths -> source) a session resolves relative `(include …)`
+/// against: the copy built into the binary, or an `--actor-dir`/`--bundle` override.
+/// The daemon no longer embeds or spawns a Wisp-interpreter actor — sessions run on
+/// the host-side shared interpreter — so only the bundle is loaded.
+fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<String> {
+    let mut bundle_json = match actor_dir {
+        Some(dir) => std::fs::read_to_string(dir.join("sources.json"))?,
+        None => EMBEDDED_SOURCES.to_string(),
     };
     if let Some(path) = bundle {
         bundle_json = std::fs::read_to_string(path)
             .with_context(|| format!("reading bundle {}", path.display()))?;
     }
-    let manifest = theater::ManifestConfig::from_toml_str(&manifest_str)?;
-    Ok(Loaded {
-        manifest,
-        wasm,
-        bundle_json,
-    })
+    Ok(bundle_json)
 }
 
-async fn new_runtime(loaded: &Loaded) -> Result<Runtime> {
-    let sources: BTreeMap<String, String> = serde_json::from_str(&loaded.bundle_json)?;
+async fn new_runtime(bundle_json: &str) -> Result<Runtime> {
+    let sources: BTreeMap<String, String> = serde_json::from_str(bundle_json)?;
     Runtime::new(SourceBundle::new(sources)?).await
 }
 
 // ---- the daemon -----------------------------------------------------------
 
-/// A live session held by the daemon.
+/// A live session held by the daemon: a host-side `EvalSession` on the shared
+/// interpreter. `feed` is synchronous (its TheaterHost blocks on the runtime), so it
+/// runs under `spawn_blocking`, and the session sits behind a `std::sync::Mutex`
+/// locked only inside that blocking closure — never across an await.
 struct Entry {
-    session: Arc<Session>,
+    session: Arc<std::sync::Mutex<EvalSession>>,
     name: String,
-    actor: String,
     since: Instant,
 }
 type Registry = BTreeMap<String, Entry>;
 
-async fn serve(loaded: Loaded, port: u16) -> Result<()> {
-    let runtime = Arc::new(new_runtime(&loaded).await?);
+async fn serve(bundle_json: String, port: u16) -> Result<()> {
+    let runtime = new_runtime(&bundle_json).await?;
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("binding {address} (is a daemon already on this port?)"))?;
     let registry: Arc<Mutex<Registry>> = Arc::new(Mutex::new(BTreeMap::new()));
-    let wasm = Arc::new(loaded.wasm);
-    let manifest = Arc::new(loaded.manifest);
+    let commands = runtime.commands.clone();
+    let counter = Arc::new(AtomicU64::new(1));
     let hint = if port == 7777 {
         String::new()
     } else {
@@ -193,10 +173,10 @@ async fn serve(loaded: Loaded, port: u16) -> Result<()> {
             _ = &mut stop => break,
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let (registry, runtime, wasm, manifest) =
-                    (registry.clone(), runtime.clone(), wasm.clone(), manifest.clone());
+                let (registry, commands, counter) =
+                    (registry.clone(), commands.clone(), counter.clone());
                 connections.spawn(async move {
-                    if let Err(error) = handle(stream, registry, runtime, wasm, manifest).await {
+                    if let Err(error) = handle(stream, registry, commands, counter).await {
                         eprintln!("connection error: {error}");
                     }
                 });
@@ -211,16 +191,15 @@ async fn serve(loaded: Loaded, port: u16) -> Result<()> {
 async fn handle(
     stream: tokio::net::TcpStream,
     registry: Arc<Mutex<Registry>>,
-    runtime: Arc<Runtime>,
-    wasm: Arc<Vec<u8>>,
-    manifest: Arc<theater::ManifestConfig>,
+    commands: UnboundedSender<TheaterCommand>,
+    counter: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let Some(line) = transport::read_line(&mut reader).await? else {
         return Ok(());
     };
     let request: Value = serde_json::from_str(&line).unwrap_or_else(|_| json!({}));
-    let (ok, text) = dispatch(&request, &registry, &runtime, &wasm, &manifest).await;
+    let (ok, text) = dispatch(&request, &registry, &commands, &counter).await;
     let mut stream = reader.into_inner();
     let response = json!({ "ok": ok, "text": text }).to_string();
     stream.write_all(response.as_bytes()).await?;
@@ -232,57 +211,48 @@ fn field<'a>(request: &'a Value, key: &str) -> &'a str {
     request.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-async fn lookup(registry: &Arc<Mutex<Registry>>, id: &str) -> Option<Arc<Session>> {
-    registry
-        .lock()
-        .await
-        .get(id)
-        .map(|entry| entry.session.clone())
+fn lookup(map: &Registry, id: &str) -> Option<Arc<std::sync::Mutex<EvalSession>>> {
+    map.get(id).map(|entry| entry.session.clone())
+}
+
+/// Render a session outcome as the one-line text the client prints.
+fn render(outcome: Outcome) -> String {
+    match outcome {
+        Outcome::Defined(name) => format!("defined {name}"),
+        Outcome::Bound { name, value, .. } => format!("{name} = {value}"),
+        Outcome::Evaluated { value, .. } => format!("{value}"),
+    }
 }
 
 async fn dispatch(
     request: &Value,
     registry: &Arc<Mutex<Registry>>,
-    runtime: &Arc<Runtime>,
-    wasm: &Arc<Vec<u8>>,
-    manifest: &Arc<theater::ManifestConfig>,
+    commands: &UnboundedSender<TheaterCommand>,
+    counter: &Arc<AtomicU64>,
 ) -> (bool, String) {
     match field(request, "op") {
         "new" => {
+            let id = format!("s{}", counter.fetch_add(1, Ordering::Relaxed));
             let name = request
                 .get("name")
                 .and_then(Value::as_str)
-                .map(String::from);
-            match runtime
-                .spawn_with_manifest((**wasm).clone(), (**manifest).clone())
-                .await
-            {
-                Ok(session) => {
-                    let actor = session.id.to_string();
-                    let short: String = actor.chars().take(8).collect();
-                    let mut map = registry.lock().await;
-                    let id = if map.contains_key(&short) {
-                        actor.clone()
-                    } else {
-                        short
-                    };
-                    let name = name.unwrap_or_else(|| id.clone());
-                    map.insert(
-                        id.clone(),
-                        Entry {
-                            session: Arc::new(session),
-                            name,
-                            actor,
-                            since: Instant::now(),
-                        },
-                    );
-                    (true, id)
-                }
-                Err(error) => (false, format!("error: could not create session: {error}")),
-            }
+                .map(String::from)
+                .unwrap_or_else(|| id.clone());
+            let session = EvalSession::new(commands.clone());
+            registry.lock().await.insert(
+                id.clone(),
+                Entry {
+                    session: Arc::new(std::sync::Mutex::new(session)),
+                    name,
+                    since: Instant::now(),
+                },
+            );
+            (true, id)
         }
-        "eval" => run(registry, field(request, "id"), field(request, "form")).await,
-        "read" => run(registry, field(request, "id"), "(poll-events)").await,
+        "eval" => eval_in(registry, field(request, "id"), field(request, "form")).await,
+        // Inbound event dispatch (Theater callback -> eval the named handler) is not
+        // wired yet, so a host-side session buffers nothing: no events to drain.
+        "read" => (true, "()".into()),
         "list" => {
             let map = registry.lock().await;
             if map.is_empty() {
@@ -291,14 +261,13 @@ async fn dispatch(
                     "no sessions — create one with: theater-repl new".into(),
                 );
             }
-            let mut out = format!("{:<9} {:<16} {:>5}  {}", "ID", "NAME", "AGE", "ACTOR");
+            let mut out = format!("{:<9} {:<16} {:>5}", "ID", "NAME", "AGE");
             for (id, entry) in map.iter() {
                 out.push_str(&format!(
-                    "\n{:<9} {:<16} {:>4}s  {}",
+                    "\n{:<9} {:<16} {:>4}s",
                     id,
                     entry.name,
-                    entry.since.elapsed().as_secs(),
-                    entry.actor
+                    entry.since.elapsed().as_secs()
                 ));
             }
             (true, out)
@@ -310,9 +279,8 @@ async fn dispatch(
                     Some(entry) => (
                         true,
                         format!(
-                            "session {id}\n  name:  {}\n  actor: {}\n  age:   {}s",
+                            "session {id}\n  name: {}\n  age:  {}s",
                             entry.name,
-                            entry.actor,
                             entry.since.elapsed().as_secs()
                         ),
                     ),
@@ -323,12 +291,9 @@ async fn dispatch(
         }
         "stop" => {
             let id = field(request, "id");
-            let entry = registry.lock().await.remove(id);
-            match entry {
-                Some(entry) => {
-                    let _ = entry.session.stop().await;
-                    (true, format!("stopped {id}"))
-                }
+            match registry.lock().await.remove(id) {
+                // Dropping the Entry drops the EvalSession; there is no actor to stop.
+                Some(_) => (true, format!("stopped {id}")),
                 None => (false, format!("no such session: {id}")),
             }
         }
@@ -336,14 +301,22 @@ async fn dispatch(
     }
 }
 
-/// Evaluate `form` in session `id`; `ok` is false when the result is a diagnostic.
-async fn run(registry: &Arc<Mutex<Registry>>, id: &str, form: &str) -> (bool, String) {
-    match lookup(registry, id).await {
-        Some(session) => match session.evaluate(form).await {
-            Ok(output) => (!output.starts_with("error:"), output),
-            Err(error) => (false, format!("error: {error}")),
-        },
-        None => (false, format!("no such session: {id}")),
+/// Feed `form` to session `id` on a blocking thread (feed is synchronous). `ok` is
+/// false when the session or the form is in error.
+async fn eval_in(registry: &Arc<Mutex<Registry>>, id: &str, form: &str) -> (bool, String) {
+    let Some(session) = lookup(&*registry.lock().await, id) else {
+        return (false, format!("no such session: {id}"));
+    };
+    let form = form.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let mut session = session.lock().expect("session mutex poisoned");
+        session.feed(&form)
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => (true, render(outcome)),
+        Ok(Err(error)) => (false, format!("error: {error:#}")),
+        Err(join) => (false, format!("error: evaluation task failed: {join}")),
     }
 }
 
@@ -420,8 +393,8 @@ async fn follow(port: u16, id: String) -> Result<()> {
 /// Theater runtime. The read-eval-print loop runs on a blocking thread because
 /// `EvalSession::feed` is synchronous (its `TheaterHost` blocks on the runtime), so
 /// it can't run on a reactor task; the runtime itself keeps running on other threads.
-async fn repl(loaded: Loaded) -> Result<()> {
-    let runtime = new_runtime(&loaded).await?;
+async fn repl(bundle_json: String) -> Result<()> {
+    let runtime = new_runtime(&bundle_json).await?;
     eprintln!("Wisp REPL on a live Theater runtime — :quit to exit");
     let commands = runtime.commands.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
