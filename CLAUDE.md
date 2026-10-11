@@ -14,9 +14,12 @@ This repo holds **two languages**, and the one-liner is: **Granite compiles Wisp
   generics, traits/instances, substructural linearity (`lin`/`aff`), unforgeable
   capabilities, and type-state. **Granite is the compiler at the repo root** (the
   `granite` crate + `granite` CLI). It is the foundation.
-- **Wisp** — a dynamic **Scheme** (runtime reader, closures, dynamic values, runtime
-  macros) that is *written in Granite and compiled by it*. It lives under `wisp/` and
-  runs as a Theater actor. This is the actual Lisp.
+- **Wisp** — a small dynamic **Lisp** (runtime reader, closures, dynamic values,
+  runtime macros) that is *written in Granite and compiled by it*. It lives under
+  `wisp/` and runs as a Theater actor. This is the dynamic Lisp. It is deliberately
+  *not* a full Scheme — no `set!`, `call/cc`, `letrec`/named-let, varargs/`apply`, or
+  numeric tower (fixed-width `s32/s64/f32/f64` only); closures + macros + runtime
+  `eval` over a tagged value type, shaped to echo Granite's surface.
 
 Both are first-class, on purpose: Wisp for fast interactive/exploratory work and
 short-lived actors; Granite for typed actors built to last. (The name "Granite" is for
@@ -27,8 +30,8 @@ New Hampshire, the Granite State.)
 - `src/` — the **Granite** compiler (Rust): the `granite` crate + `granite` CLI.
 - `std/`, `examples/`, `tests/` — Granite's stdlib, examples, and test suite.
 - `wisp-repl/` — Granite's host-side typed REPL (Rust).
-- `wisp/interpreter/` — **Wisp**, the Scheme, implemented in Granite (reader, values,
-  evaluator, printer, macros, …).
+- `wisp/interpreter/` — **Wisp**, the dynamic Lisp, implemented in Granite (reader,
+  values, evaluator, printer, macros, …).
 - `wisp/actor/` — the Wisp Theater actor (`actor.wisp` → `actor.wasm`, which
   `(include)`s `wisp/interpreter/evaluator.wisp`) and the `theater-repl` daemon
   (`wisp/actor/legacy-host/`, crate `wisp-interpreter-actor`, its own workspace).
@@ -68,12 +71,12 @@ cargo run -- run <package.wasm> <function-name> <args...> [--dep <module>=<dep.w
 # Granite's host-side typed REPL
 cargo run -p wisp-repl
 
-# --- Wisp (the Scheme, as a Theater actor) ---
+# --- Wisp (the dynamic Lisp, as a Theater actor) ---
 
 # Rebuild the Wisp actor (wisp/actor/actor.wasm) after editing the interpreter
 bash wisp/actor/build.sh
 
-# Interactive Dynamic Wisp REPL (spawns the Wisp actor, evaluates the Scheme live)
+# Interactive Dynamic Wisp REPL (spawns the Wisp actor, evaluates the Lisp live)
 cargo run --manifest-path wisp/actor/legacy-host/Cargo.toml -- repl
 
 # --- Development ---
@@ -84,7 +87,7 @@ cargo test --workspace            # Granite's suite (root crate + wisp-repl)
 The installed binary is `granite`; `cargo run --` at the root invokes it (the one
 root bin). The two interpreters are distinct: `granite eval` / `wisp-repl` run
 **Granite** (typed, no closures); `theater-repl repl` runs **Wisp** (the dynamic
-Scheme — `(define f (lambda (x) (+ x 2)))` → `#<closure>`).
+Lisp — `(define f (lambda (x) (+ x 2)))` → `#<closure>`).
 
 ## Architecture (Granite compiler)
 
@@ -151,9 +154,10 @@ Casts: `(s32 expr)`, `(f64 expr)`, … Includes: `(include "path.wisp")` (relati
 - WASM instructions require exact type matches — no implicit unification. `(i32.add x y)` needs both exactly `s32`.
 - Type checking (and the substructural checker) run before codegen *and* before eval.
 
-## Wisp (the Scheme)
+## Wisp (the dynamic Lisp)
 
-`wisp/interpreter/` is a complete dynamic Scheme written in Granite:
+`wisp/interpreter/` is a small dynamic Lisp written in Granite (closures + macros +
+runtime eval over a tagged value type; not a full Scheme — see the overview):
 - `reader.wisp` parses S-expressions from a string **at runtime** (what makes it dynamic),
 - `values.wisp` defines the dynamic `(variant value …)` with `closure`/`symbol`/`builtin`/…,
 - `evaluator.wisp` is an environment-based tree-walking `eval`/`apply` with closures.
@@ -173,7 +177,7 @@ Theater actor" — not currently on the `theater-repl` path.
 
 `cargo test --workspace` runs Granite's suite from `tests/*.rs` (tokenizer, parser,
 pattern_match, codegen, string_ops, eval, repl, type_state, linearity, capabilities,
-generics, derive, cgrf, the `interpreter_*` tests that compile the Wisp Scheme, …).
+generics, derive, cgrf, the `interpreter_*` tests that compile the Wisp Lisp, …).
 Each compiles source to `.wasm` and runs it under wasmtime (or evaluates it), checking
 the result. The `theater-repl` daemon has its own suite (`cargo test --manifest-path
 wisp/actor/legacy-host/Cargo.toml --test theater_host`).
