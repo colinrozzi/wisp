@@ -33,6 +33,13 @@
 ; An http-request record arg (empty headers, no body) — the record-valued host
 ; argument path. The host decodes it to a Record{method,url,headers,body}.
 (export (fn m-http-req ((method string) (url string)) any (http-request-blob method url)))
+; A container-spec with one env pair and a one-element cmd — the podman-run arg path.
+; The host decodes it to Record{image,name,env:[tuple(k,v)],mounts:[],cmd:[c],...}.
+(export (fn m-container ((image string) (nm string) (k string) (v string) (c string)) any
+  (container-spec-blob image nm
+    (build-env-items (list-push (list-new value)
+      (sequence (list-push (list-push (list-new value) (text k)) (text v)))) 0 (list-new value))
+    (list-push (list-new value) (text c)))))
 ; Simulate an inbound trigger (what the actor's handle-tick export does): dispatch
 ; to the user's on-tick in the live session and buffer the firing for (poll-events).
 (export (fn fire-tick ((name string)) string (begin (dispatch-event "on-tick" (text name)) "ok")))
