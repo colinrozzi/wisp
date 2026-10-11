@@ -147,3 +147,44 @@ layer").
    resolution), not an explicit file path, so programs don't hardcode file layout.
 4. **Macros across modules — deferred.** v1 provides functions/values only; `provide`
    of a macro waits for Wisp's macro/phase story to get its own design pass.
+
+## Implementation plan (grounded in the interpreter)
+
+The top-level namespace today is a single flat global, `$bindings : (list binding)`,
+written **only** through one function —
+`publish name v = (global.set $bindings (list-push (global.get $bindings) (binding name v)))`
+— and read through `lookup` (local env → `$bindings` → builtins). `$bindings` is
+touched in just three files (evaluator, types, rpc). That narrowness is the leverage.
+
+**Key seam: `$bindings` already _is_ "the current module's env."** So rather than
+rewrite `publish`/`lookup` (and every top-level binder that routes through `publish` —
+`define`, `fn`, `record`/`variant` fields+ctors, trait methods, generics), keep them
+untouched and make `$bindings` hold the *current* module's env, backed by a registry:
+
+- `$modules : (list module)` — the registry; `module = { name, env, exports }` (the
+  saved env per non-current module). `$current-module : string` (default `"main"`).
+- The implicit top level / REPL session is the `main` module — identical to today.
+- `enter-module name`: save `$bindings` into the registry under `$current-module`,
+  set `$current-module = name`, point `$bindings` at that module's env (fresh if new).
+  `exit-module`: restore. Module context is thus a **dynamically-scoped global,
+  save/restored at module boundaries** — refining the doc's "threaded context" to
+  Wisp's existing global-session style (no new param on every `eval*`), same semantics
+  (context changes only at module/require boundaries, never per-expression).
+- `publish`/`lookup` stay **exactly as they are** — always targeting `$bindings` = the
+  current module. That is why existing behavior is preserved.
+
+### Bricks
+
+- **A — registry + `(module …)` + `(provide …)` (the structural brick).** Add the
+  registry + `main` module + `enter/exit-module`. `(module NAME body…)` runs `body`
+  under `enter-module NAME`; `(provide …)` records exports on the current module.
+  Test: a module's defines **do not leak** into `main` (encapsulation), and
+  `main`-only programs behave identically (all existing interpreter tests stay green).
+- **B — `(require m)`.** Resolve `m`'s source by name → bundle path (reusing
+  `loading.wisp`'s `resolve-path`/`read-source` + the `include-seen` load-once/cycle
+  pattern), instantiate it as a module, bind its `provide`d names into the requiring
+  module **unqualified**, erroring on an import/import conflict. Test: cross-module
+  use, privates invisible, conflict errors, load-once.
+- **Later layers** (separate bricks, no core rebuild): `only-in`/`prefix-in`/
+  `rename-in`/`except-in`; `provide` of macros; re-export; the distribution layer
+  (how a library's source reaches the bundle: fetch/registry/versioning).
