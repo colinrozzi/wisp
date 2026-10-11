@@ -67,7 +67,7 @@
                 (failure "global has not been initialized with a typed value"))
               (if (i32.eq (global-binding.mutable entry) 0) (failure "cannot set immutable global")
                 (let (ty (global-binding.type entry))
-                  (let (v (require-type (eval-expected (list-get items 2) env depth 0 (symbol-name ty)) ty))
+                  (let (v (require-type (eval-expected (list-get items 2) env (i32.add depth 1) 0 (symbol-name ty)) ty))
                     (if (failed? v) v
                       (begin
                         (global.set $session-globals

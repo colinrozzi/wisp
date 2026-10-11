@@ -53,7 +53,7 @@
         (let (v (lookup-local name env (i32.sub (list-len env) 1)))
           (if (failed? v) expr v)))
       (else (qq-walk expr env depth 1 mode)))
-    (eval expr env depth 0)))
+    (eval expr env (i32.add depth 1) 0)))
 (fn qq-walk ((expr value) (env (list binding)) (depth s32) (level s32) (mode s32)) value
   (if (if mode (i32.ge_s (global.get $macro-steps) 10000) 0) (failure "macro expansion step limit")
     (begin

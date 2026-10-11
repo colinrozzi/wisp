@@ -216,10 +216,10 @@ impl Interpreter {
             bytes: source.len(),
             files: usize::from(!base.is_empty()),
         };
-        // Backstop only: the evaluator's own step (10k) and nesting (128) guards
-        // fire first. host-builtin? is checked per lookup and grows with each wired
-        // interface, so keep generous headroom above what those guards cost.
-        self.store.set_fuel(200_000_000)?;
+        // Backstop only: the evaluator's own step (1M) and nesting (128) guards
+        // fire first. Must sit above the step budget's fuel cost so the graceful
+        // "step limit" error wins over a hard fuel trap; scaled with the 1M budget.
+        self.store.set_fuel(20_000_000_000)?;
         let input = pack::encode(&Value::Tuple(vec![
             Value::String(source.into()),
             Value::String(base.into()),

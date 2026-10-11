@@ -5,7 +5,7 @@
 (fn eval-numeric-ascription ((items (list value)) (env (list binding)) (depth s32)) value
   (let (name (symbol-name (list-get items 2)))
     (if (numeric-type? name)
-      (let (v (eval-expected (list-get items 0) env depth 0 name))
+      (let (v (eval-expected (list-get items 0) env (i32.add depth 1) 0 name))
         (if (failed? v) v (numeric-cast name v)))
       (failure "unsupported ascription type"))))
 

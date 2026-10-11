@@ -72,7 +72,7 @@
                   (if empty (compound ty name (list-new value))
                     (let (payload-type (if (string=? name "err") (list-get items 2) first))
                       (let (payload (require-type
-                        (eval-expected (list-get items (i32.sub (list-len items) 1)) env depth 0 (symbol-name payload-type)) payload-type))
+                        (eval-expected (list-get items (i32.sub (list-len items) 1)) env (i32.add depth 1) 0 (symbol-name payload-type)) payload-type))
                         (if (failed? payload) payload (compound ty name (list-push (list-new value) payload)))))))))))))))
 
 ; The second list-push argument can adopt the list's element type when it is
