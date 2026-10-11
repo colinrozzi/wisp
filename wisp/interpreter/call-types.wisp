@@ -123,7 +123,7 @@
 (fn eval-inferred-args ((items (list value)) (index s32) (env (list binding)) (depth s32) (args (list value)) (callee value) (hints (list value)) (expected string)) value
   (if (i32.ge_s index (list-len items)) (sequence args)
     (let (hint (inferred-argument-type callee (merged-argument-types hints args 0 (list-new value)) (i32.sub index 1) expected))
-      (let (v (eval-expected (list-get items index) env depth 0
+      (let (v (eval-expected (list-get items index) env (i32.add depth 1) 0
                 (if (string-len hint) hint (call-argument-type callee args (i32.sub index 1)))))
         (if (failed? v) v
           (eval-inferred-args items (i32.add index 1) env depth (list-push args v) callee hints expected))))))

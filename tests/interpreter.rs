@@ -92,7 +92,9 @@ fn test_interpreter_recursion_conditionals_and_recovery() {
         "(define forever (lambda () (forever)))",
         "#<closure>",
     );
-    eval(&mut s, "(forever)", "error: evaluation nesting limit");
+    // An infinite TAIL loop no longer grows nesting depth (it's flat under TCO),
+    // so it's caught by the step budget, not the nesting guard.
+    eval(&mut s, "(forever)", "error: evaluation step limit");
     eval(&mut s, "(fact 5)", "120");
     eval(
         &mut s,
@@ -432,4 +434,19 @@ fn test_interpreter_cross_module_call_chain_restores_scope() {
     // And main still works normally afterward (scope restored).
     eval(&mut s, "(define x 7)", "7");
     eval(&mut s, "(f x)", "107");
+}
+
+#[test]
+fn test_interpreter_tail_recursion_is_not_depth_limited() {
+    let mut s = session();
+    // A tail-recursive loop. Each iteration is in tail position, so it must not
+    // grow the eval nesting depth — deep loops should run, not hit the limit.
+    eval(
+        &mut s,
+        "(define count (lambda (i n) (if (< i n) (count (+ i 1) n) i)))",
+        "#<closure>",
+    );
+    eval(&mut s, "(count 0 50)", "50");
+    eval(&mut s, "(count 0 500)", "500");
+    eval(&mut s, "(count 0 5000)", "5000");
 }

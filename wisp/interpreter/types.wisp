@@ -99,7 +99,7 @@
 (fn apply-typed ((params (list value)) (result value) (body value) (args (list value)) (depth s32)) value
   (let (checked (check-arguments (schema-types params 0 (list-new value)) args 0))
     (if (failed? checked) checked
-      (require-type (eval-expected body (typed-bindings params args 0 (list-new binding)) depth 0 (symbol-name result)) result))))
+      (require-type (eval-expected body (typed-bindings params args 0 (list-new binding)) (i32.add depth 1) 0 (symbol-name result)) result))))
 
 (fn add-accessors ((name string) (id s32) (fields (list value)) (index s32)) value
   (if (i32.ge_s index (list-len fields)) (nil)

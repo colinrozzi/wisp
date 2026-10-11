@@ -170,4 +170,4 @@
                   (if (failed? checked) checked
                     (let (ret (substitute-type result bindings))
                       (require-type (eval-expected (specialize-body body bindings)
-                        (typed-bindings concrete args 0 (type-solution.bindings dictionary)) depth 0 (symbol-name ret)) ret))))))))))))
+                        (typed-bindings concrete args 0 (type-solution.bindings dictionary)) (i32.add depth 1) 0 (symbol-name ret)) ret))))))))))))

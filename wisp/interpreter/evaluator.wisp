@@ -69,9 +69,15 @@
 
 ; Only syntax literals adopt an expected type. Values retrieved from bindings
 ; keep their actual type, even when a caller expects a wider integer.
+; `depth` counts only NON-TAIL eval nesting — the places where the host stack
+; actually grows (arguments, conditions, let values, non-last body forms). Granite
+; compiles tail positions to return_call, so a tail-recursive loop runs at flat
+; depth and is bounded only by the step budget, not this nesting guard. Callers pass
+; depth+1 at non-tail sites; the tail chain (eval-form, if-branch, let/lambda body,
+; apply) carries depth unchanged.
 (fn eval-expected ((expr value) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (if (i32.ge_s depth 128) (failure "evaluation nesting limit")
-    (if (i32.ge_s (global.get $steps) 10000) (failure "evaluation step limit")
+    (if (i32.ge_s (global.get $steps) 1000000) (failure "evaluation step limit")
       (begin
         (global.set $steps (i32.add (global.get $steps) 1))
         (value-case expr
@@ -80,7 +86,7 @@
           ((identifier name key) (lookup-identifier name key env))
           ((sequence items)
             (if (i32.eq (list-len items) 0) expr
-              (eval-form items env (i32.add depth 1) top expected)))
+              (eval-form items env depth top expected)))
           (else expr))))))
 
 (fn eval-form ((items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
@@ -145,7 +151,7 @@
 
 (fn eval-if ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.ne (list-len items) 4) (failure "if expects condition, then, else")
-    (let (condition (eval (list-get items 1) env depth 0))
+    (let (condition (eval (list-get items 1) env (i32.add depth 1) 0))
       (if (failed? condition) condition
         (eval-expected (list-get items (if (truthy? condition) 2 3)) env depth 0 expected)))))
 
@@ -153,7 +159,7 @@
   (if (i32.eq top 0) (failure "define is only supported at top level")
     (if (i32.ne (list-len items) 3) (failure "define expects name and expression")
       (if (symbol? (list-get items 1))
-        (let (v (eval (list-get items 2) env depth 0))
+        (let (v (eval (list-get items 2) env (i32.add depth 1) 0))
           (if (failed? v) v
             (publish (binding-key (list-get items 1)) v)))
         (failure "define expects a symbol")))))
@@ -190,7 +196,7 @@
           (i32.and (string=? (symbol-name (list-get pair 1)) ":") (known-type? (list-get pair 2) "")) 0))
     (if (symbol? (list-get pair 0))
       (let (name (binding-key (list-get pair 0)))
-        (let (raw (eval-expected (list-get pair (i32.sub (list-len pair) 1)) env depth 0
+        (let (raw (eval-expected (list-get pair (i32.sub (list-len pair) 1)) env (i32.add depth 1) 0
                     (if (i32.eq (list-len pair) 4) (symbol-name (list-get pair 2)) "")))
           (let (v (if (i32.eq (list-len pair) 4) (require-type raw (list-get pair 2)) raw))
             (if (failed? v) v (eval-expected body (extend-env env (binding name v)) depth 0 expected)))))
@@ -202,14 +208,17 @@
 
 (fn eval-body-expected ((items (list value)) (index s32) (env (list binding)) (depth s32) (top s32) (last value) (expected string)) value
   (if (i32.ge_s index (list-len items)) last
-    (let (v (eval-expected (list-get items index) env depth top
+    ; The last form is in tail position (its value is the body's value); earlier
+    ; forms are non-tail (sequenced for effect), so only those grow the stack.
+    (let (v (eval-expected (list-get items index) env
+                (if (i32.eq index (i32.sub (list-len items) 1)) depth (i32.add depth 1)) top
                 (if (i32.eq index (i32.sub (list-len items) 1)) expected "")))
       (if (failed? v) v
         (eval-body-expected items (i32.add index 1) env depth top v expected)))))
 
 (fn eval-args ((items (list value)) (index s32) (env (list binding)) (depth s32) (args (list value)) (callee value)) value
   (if (i32.ge_s index (list-len items)) (sequence args)
-    (let (v (eval-expected (list-get items index) env depth 0
+    (let (v (eval-expected (list-get items index) env (i32.add depth 1) 0
               (operand-hint callee (list-get items index) env (call-argument-type callee args (i32.sub index 1)))))
       (if (failed? v) v
         (eval-args items (i32.add index 1) env depth (list-push args v) callee)))))
@@ -231,7 +240,7 @@
       local)))
 
 (fn eval-call ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
-  (let (callee (eval (list-get items 0) env depth 0))
+  (let (callee (eval (list-get items 0) env (i32.add depth 1) 0))
     (if (failed? callee) callee
       (let (arguments (if (needs-inference? callee)
               (eval-inferred-args items 1 env depth (list-new value) callee (peek-types items 1 env 0 (list-new value)) expected)

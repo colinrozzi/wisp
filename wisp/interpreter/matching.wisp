@@ -29,7 +29,7 @@
 
 (fn eval-match ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.lt_s (list-len items) 3) (failure "match expects a value and arms")
-    (let (v (eval (list-get items 1) env depth 0))
+    (let (v (eval (list-get items 1) env (i32.add depth 1) 0))
       (value-case v
         ((failure message) v)
         ((compound ty case-name fields)
