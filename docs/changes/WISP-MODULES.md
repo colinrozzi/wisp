@@ -1,6 +1,6 @@
 # Wisp Modules (Racket-modeled)
 
-**Status**: Design draft — not yet implemented (iterating before build)
+**Status**: Agreed — ready to implement (decisions settled 2026-10-11; v1 scope below)
 **Started**: 2026-10-11
 **Related**: [../../wisp/interpreter/](../../wisp/interpreter/) (the interpreter this
 extends), the Wisp dual-back-end direction (a module is the compilation unit the future
@@ -132,18 +132,18 @@ phase story Wisp settles on); re-export; submodules; versioning + fetch/registry
 a library's *source* reaches the bundle in the first place — the separate "distribution
 layer").
 
-## Open decisions (want Colin's steer)
+## Decisions (agreed 2026-10-11)
 
-1. **`require` default** — unqualified-with-conflict-error (Racket; my lean), or
-   qualified-by-default (`list/map`, collision-free but less Racket-like)? Either way
-   the core supports both; this is just the default of bare `(require m)`.
-2. **Qualifier/prefix character** — if/when `prefix-in` lands, prefixes like `list/` or
-   `str:` put a separator inside a symbol, so the **reader must allow it in symbol
-   constituents**. Pick `/` (reads path-like) or `:` (Racket-ish). Minor reader change.
-3. **Locating a module's source** — does `(require m)` find `m` by registered name
-   resolved to a bundle path (like `include` resolution), or by explicit path
-   `(require "list.wisp")`? (Lean: by name → bundle path, so programs don't hardcode
-   file layout.)
-4. **Macros across modules in v1** — support `provide` of a macro now, or defer to the
-   layer phase and keep v1 to functions/values? (Lean: defer; Wisp's macro/phase story
-   needs its own think, and values+functions cover the first libraries.)
+1. **`require` default — Racket semantics: unqualified, with conflict = error.**
+   `(require m)` brings `m`'s provided names in unqualified; two imports of the same
+   name is an error, resolved with the layered `only-in`/`prefix-in`/`rename-in`/
+   `except-in` forms. A local `define` may shadow an import (REPL ergonomics); two
+   *imports* colliding is the error case. The core resolver supports qualified access
+   too — it's just spelled `(require (prefix-in …))` once that layer lands.
+2. **Qualifier/prefix character — deferred with `prefix-in` (not a v1 blocker).**
+   When `prefix-in` lands it needs the reader to allow the separator in symbol
+   constituents; leaning `:` (Racket-ish). Revisit at that layer.
+3. **Locating a module's source — by name → bundle path** (like `include`
+   resolution), not an explicit file path, so programs don't hardcode file layout.
+4. **Macros across modules — deferred.** v1 provides functions/values only; `provide`
+   of a macro waits for Wisp's macro/phase story to get its own design pass.
