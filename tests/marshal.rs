@@ -781,6 +781,57 @@ fn test_repl_interface_qualified_collision() {
 }
 
 #[test]
+fn test_marshal_container_spec_env_and_cmd() {
+    // podman-run forwards env (list<tuple<string,string>>) and cmd (list<string>)
+    // into the container-spec record. The host must decode a populated env tuple and
+    // a cmd element — the plumbing an agent needs to receive its board URL etc.
+    let mut g = Guest::new();
+    let got = g.call(
+        "m-container",
+        Value::Tuple(vec![
+            Value::String("localhost/agent:latest".into()),
+            Value::String("agent-1".into()),
+            Value::String("BOARD_URL".into()),
+            Value::String("http://board".into()),
+            Value::String("serve".into()),
+        ]),
+    );
+    let Value::Record { type_name, fields } = got else {
+        panic!("expected container-spec record, got {got:?}")
+    };
+    assert_eq!(type_name, "container-spec");
+    let get = |n: &str| fields.iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    assert_eq!(
+        get("image"),
+        Some(&Value::String("localhost/agent:latest".into()))
+    );
+    assert_eq!(get("name"), Some(&Value::String("agent-1".into())));
+    // env is a single tuple(BOARD_URL, http://board).
+    assert_eq!(
+        get("env"),
+        Some(&Value::List {
+            elem_type: ValueType::Tuple(vec![ValueType::String, ValueType::String]),
+            items: vec![Value::Tuple(vec![
+                Value::String("BOARD_URL".into()),
+                Value::String("http://board".into()),
+            ])],
+        }),
+        "env: {:?}",
+        get("env")
+    );
+    // cmd carries the one element we passed.
+    assert_eq!(
+        get("cmd"),
+        Some(&Value::List {
+            elem_type: ValueType::String,
+            items: vec![Value::String("serve".into())],
+        }),
+        "cmd: {:?}",
+        get("cmd")
+    );
+}
+
+#[test]
 fn test_marshal_http_request_record_arg() {
     // The record-valued argument path: build an http-request record (empty headers,
     // none body) and marshal it; the host decodes it to a Record with the right

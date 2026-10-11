@@ -692,25 +692,55 @@
       (failure "tcp-receive expects a connection id and an integer max-bytes"))))
 
 ; --- podman ----------------------------------------------------------------
-; A minimal container-spec: image + name, empty env/mounts/cmd, tty/interactive
-; off. The empty collections carry their element type descriptors.
-(fn container-spec-blob ((image string) (nm string)) any
+; container-spec: image + name, plus env (list<tuple<string,string>>) and cmd
+; (list<string>) forwarded from the REPL; mounts empty, tty/interactive off.
+(fn env-tuple-type () value
+  (sequence (list-push (list-push (list-push (list-new value) (symbol "tuple")) (symbol "string")) (symbol "string"))))
+; Each Wisp env pair is a 2-element (list key value); emit it as a tuple<string,string>.
+(fn build-env-items ((pairs (list value)) (i s32) (out (list value))) (list value)
+  (if (i32.ge_s i (list-len pairs)) out
+    (build-env-items pairs (i32.add i 1)
+      (list-push out (compound (env-tuple-type) "tuple" (items-of (list-get pairs i)))))))
+(fn all-text-items? ((items (list value)) (i s32)) s32
+  (if (i32.ge_s i (list-len items)) 1
+    (if (string-arg? (list-get items i)) (all-text-items? items (i32.add i 1)) 0)))
+(fn string-list? ((v value)) s32
+  (value-case v ((sequence items) (all-text-items? items 0)) (else 0)))
+(fn all-string-pairs? ((items (list value)) (i s32)) s32
+  (if (i32.ge_s i (list-len items)) 1
+    (value-case (list-get items i)
+      ((sequence pair)
+        (if (i32.and (i32.eq (list-len pair) 2) (i32.and (string-arg? (list-get pair 0)) (string-arg? (list-get pair 1))))
+          (all-string-pairs? items (i32.add i 1)) 0))
+      (else 0))))
+(fn env-pairs? ((v value)) s32
+  (value-case v ((sequence items) (all-string-pairs? items 0)) (else 0)))
+(fn container-spec-blob ((image string) (nm string) (env-items (list value)) (cmd-items (list value))) any
   (marshal-record "container-spec"
     (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
       (symbol "image")) (symbol "name")) (symbol "env")) (symbol "mounts")) (symbol "cmd")) (symbol "tty")) (symbol "interactive"))
     (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
       (text image)) (text nm))
-      (typed-list (sequence (list-push (list-push (list-push (list-new value) (symbol "tuple")) (symbol "string")) (symbol "string"))) (list-new value)))
+      (typed-list (env-tuple-type) env-items))
       (typed-list (symbol "mount-spec") (list-new value)))
-      (typed-list (symbol "string") (list-new value)))
+      (typed-list (symbol "string") cmd-items))
       (boolean (i32.const 0)))
       (boolean (i32.const 0)))))
+; (podman-run image name) | (… env) | (… env cmd). env = ((KEY VAL) …) string pairs,
+; cmd = (arg …) strings. Both default empty, so the 2-arg form is unchanged.
 (fn apply-podman-run ((args (list value))) value
-  (if (i32.ne (list-len args) 2) (failure "podman-run expects (podman-run image name)")
-    (if (all-strings? args 0)
-      (unmarshal (raw-invoke "theater:simple/podman" "run"
-        (container-spec-blob (as-string (list-get args 0)) (as-string (list-get args 1)))))
-      (failure "podman-run expects image and name strings"))))
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 2) (i32.gt_s n 4)) (failure "podman-run expects (podman-run image name [env [cmd]])")
+      (if (i32.eq (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) 0)
+        (failure "podman-run expects image and name strings")
+        (let (env-val (if (i32.ge_s n 3) (list-get args 2) (sequence (list-new value))))
+          (let (cmd-val (if (i32.ge_s n 4) (list-get args 3) (sequence (list-new value))))
+            (if (i32.eq (env-pairs? env-val) 0) (failure "podman-run env must be a list of (key value) string pairs")
+              (if (i32.eq (string-list? cmd-val) 0) (failure "podman-run cmd must be a list of strings")
+                (unmarshal (raw-invoke "theater:simple/podman" "run"
+                  (container-spec-blob (as-string (list-get args 0)) (as-string (list-get args 1))
+                    (build-env-items (items-of env-val) 0 (list-new value))
+                    (items-of cmd-val))))))))))))
 (fn apply-podman-stop ((args (list value))) value
   (if (one-str? args) (unmarshal (raw-invoke "theater:simple/podman" "stop" (marshal (list-get args 0)))) (failure "podman-stop expects a name")))
 (fn apply-podman-rm ((args (list value))) value
@@ -766,7 +796,7 @@
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\n"
-                      (string-append "podman:    (podman-run image name) (podman-stop name) (podman-rm name force) (podman-list)\n"
+                      (string-append "podman:    (podman-run image name [env [cmd]])  env=((K V)...) cmd=(a b...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events) to drain   see (help \"triggers\")\n"
                           "topics:    (help \"tcp\")   (help \"triggers\")")))))))))))))
