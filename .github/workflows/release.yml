@@ -41,8 +41,11 @@ jobs:
             wisp/actor/legacy-host
 
       - name: Build the actor (embeds into the binary)
-        # The compiler (granite) is a host tool; build it for the native (glibc) target.
-        run: cargo run --release -- compile wisp/actor/actor.wisp wisp/actor/actor
+        # The compiler (granite) is a host tool built for the native (glibc) target.
+        # A debug build is fine and much faster: the emitted actor.wasm doesn't depend
+        # on granite's own optimization level (this is exactly what wisp/actor/build.sh
+        # does locally), so skip a release build of the compiler.
+        run: cargo run -- compile wisp/actor/actor.wisp wisp/actor/actor
 
       - name: Build theater-repl (static musl)
         working-directory: wisp/actor/legacy-host
