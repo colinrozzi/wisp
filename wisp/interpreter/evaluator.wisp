@@ -332,6 +332,7 @@
         (global.set $current-exports (list-new string))
         (global.set $current-imports (list-new binding))
         (global.set $types (list-new named-type))
+        (register-mount-spec)
         (global.set $session-globals (list-new global-binding))
         (global.set $session-macros (list-new binding))
         (global.set $traits (list-new trait-definition))

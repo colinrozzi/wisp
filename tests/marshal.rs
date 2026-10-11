@@ -786,6 +786,9 @@ fn test_marshal_container_spec_env_and_cmd() {
     // into the container-spec record. The host must decode a populated env tuple and
     // a cmd element — the plumbing an agent needs to receive its board URL etc.
     let mut g = Guest::new();
+    // Init the session so mount-spec is registered in $types (mounts marshal via
+    // the aggregate path, which reads the record schema from $types).
+    g.call("evaluate", Value::String("".into()));
     let got = g.call(
         "m-container",
         Value::Tuple(vec![
@@ -794,6 +797,8 @@ fn test_marshal_container_spec_env_and_cmd() {
             Value::String("BOARD_URL".into()),
             Value::String("http://board".into()),
             Value::String("serve".into()),
+            Value::String("/host/data".into()),
+            Value::String("/data".into()),
         ]),
     );
     let Value::Record { type_name, fields } = got else {
@@ -828,6 +833,23 @@ fn test_marshal_container_spec_env_and_cmd() {
         }),
         "cmd: {:?}",
         get("cmd")
+    );
+    // mounts is a single mount-spec record {source, target, read-only=false}.
+    assert_eq!(
+        get("mounts"),
+        Some(&Value::List {
+            elem_type: ValueType::Record("mount-spec".into()),
+            items: vec![Value::Record {
+                type_name: "mount-spec".into(),
+                fields: vec![
+                    ("source".into(), Value::String("/host/data".into())),
+                    ("target".into(), Value::String("/data".into())),
+                    ("read-only".into(), Value::Bool(false)),
+                ],
+            }],
+        }),
+        "mounts: {:?}",
+        get("mounts")
     );
 }
 
