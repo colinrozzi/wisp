@@ -115,11 +115,49 @@
           (failure (string-append "cannot read source: " path))))
       (else (failure (string-append "cannot read source: " path))))))
 
-; Load an explicit source file as a module and evaluate its forms at top level. A
+; Read source text from a URL through the actor's HTTP-CLIENT capability
+; (theater:simple/http-client request). Same boundary story as the filesystem: deny
+; the capability and the fetch fails, so the actor cannot pull remote code. GET the
+; url; request yields (result http-response string); on ok, the http-response's body
+; (option (list u8), field index 2) is decoded to a string. There is no cache — the
+; module lives in memory once loaded (load-once), so this is a one-time read.
+(fn http-response-body ((resp value) (url string)) value
+  (value-case resp
+    ((aggregate name id case-name fields)
+      (if (i32.ge_s (list-len fields) 3)
+        (value-case (list-get fields 2)
+          ((compound oty ocase ofields)
+            (if (i32.and (string=? ocase "some") (i32.ge_s (list-len ofields) 1))
+              (apply-bytes-to-string (list-push (list-new value) (list-get ofields 0)))
+              (failure (string-append "empty response body: " url))))
+          (else (failure (string-append "unexpected response body: " url))))
+        (failure (string-append "unexpected response: " url))))
+    (else (failure (string-append "unexpected response: " url)))))
+(fn read-source-from-url ((url string)) value
+  (let (res (unmarshal (raw-invoke "theater:simple/http-client" "request" (http-request-blob "GET" url))))
+    (value-case res
+      ((compound ty case-name fields)
+        (if (i32.and (string=? case-name "ok") (i32.ge_s (list-len fields) 1))
+          (http-response-body (list-get fields 0) url)
+          (failure (string-append "cannot fetch source: " url))))
+      (else (failure (string-append "cannot fetch source: " url))))))
+
+; The source locator's form selects the capability: an http(s) URL fetches over the
+; network, anything else is a filesystem path. (No resolver — the locator is explicit.)
+(fn char-at ((s string) (i s32)) s32
+  (if (i32.lt_s i (string-len s)) (string-ref s i) -1))
+(fn url-source? ((s string)) s32
+  (i32.and (i32.eq (char-at s 0) 104)
+    (i32.and (i32.eq (char-at s 1) 116)
+      (i32.and (i32.eq (char-at s 2) 116) (i32.eq (char-at s 3) 112)))))
+(fn read-source-at ((source string)) value
+  (if (url-source? source) (read-source-from-url source) (read-source-from-path source)))
+
+; Load an explicit source as a module and evaluate its forms at top level. A
 ; well-formed file defines (module NAME ...), which registers NAME in $modules on
 ; completion.
 (fn load-module-source ((path string)) value
-  (let (source (read-source-from-path path))
+  (let (source (read-source-at path))
     (value-case source
       ((text text-source)
         (let (forms (expand-source text-source path 0))

@@ -1,6 +1,6 @@
 # Wisp Distribution (capability-bounded, explicit-source)
 
-**Status**: Brick 1 done (filesystem). Network tier + registry later.
+**Status**: Bricks 1–2 done (filesystem + network). Registry/versioning later.
 **Started**: 2026-10-11
 **Related**: [WISP-MODULES.md](WISP-MODULES.md) (the module boundary this delivers to);
 `wisp/interpreter/modules.wisp` (the implementation); `wisp/actor/` (the capabilities).
@@ -77,9 +77,13 @@ In `wisp/interpreter/modules.wisp`:
   (the Brick B import algebra: idempotent per source module, conflict on a *different*
   module providing the same name, privates never bound).
 
-Because the filesystem handler in the daemon is sandboxed to the `serve` cwd, the
-natural local store today is **project-local** — write `lib/foo.wisp`, then
-`(require foo "lib/foo.wisp")` from a session in that directory.
+The daemon's filesystem handler is sandboxed to a managed directory (`new_dir: true`),
+and paths are sandbox-relative (absolute paths are rejected). So a library is any
+`.wisp` file the actor's filesystem capability can reach — authored in-session via the
+write capability, or placed in a directory the deployment roots the handler at. Dogfood
+(v0.1.8): `(fs-write "greet.wisp" "(module greet (provide …) …)")` then
+`(require greet "greet.wisp")` — authored and loaded entirely inside the actor's
+sandbox, no privileged channel.
 
 The old `wisp-source` bundle (`resolve-path`/`read-source`) is **no longer** on the
 `require` path; it remains only for `(include …)` and built-in/image modules. This
@@ -102,13 +106,32 @@ algebra from the module campaign. Tested: engine suite loads a module from an ex
 path via a mocked `read-file` and reuses it (load-once); unit suite covers the no-source
 and non-string-source errors.
 
+### No caching, no store (deliberate)
+
+`require` is a **one-time cold read**, not a hot path: the module registry (`$modules`)
+already gives in-memory load-once, so `(require greet …)` reads the source once and every
+later `(require greet)` reuses the in-memory instance. A fresh session re-reads once —
+cheap, and not worth a disk cache + invalidation surface. The **`SOURCE` is the source of
+truth** (a path or a URL); there is nothing to "install" and no store to keep in sync.
+
+The dogfood surfaced one nuance that is **not** caching: the daemon's `FileSystemHandler`
+uses `new_dir: true`, so its sandbox is an ephemeral empty directory. For *local-file*
+libraries to persist across sessions, the deployment points the actor's filesystem
+capability at a real directory — a per-actor manifest/daemon-config choice. That is the
+capability boundary ("where may this actor read"), not a cache. URL libraries sidestep it
+entirely: the library *is* the URL, fetched once per session.
+
+**Brick 2 (done):** `SOURCE` as an `http`/`https` URL fetches via `http-client`
+(`read-source-from-url`), decoding the `http-response` body (`option (list u8)`) to a
+string and evaluating it — in memory, no write-back. The locator's form selects the
+capability (`url-source?`: a leading `http`), so a library can be shared simply as a
+URL. Tested in the engine suite: `(require netmod "https://…")` fetches over a mocked
+`request` and binds its provides.
+
 **Later layers (hang off this core, no rebuild):**
-- **Network tier** — `SOURCE` as a URL via `http-client`; fetch a library's source.
-- **Local store + write-back** — caching a fetched library to disk (`write-file`), so a
-  URL require installs it for next time; a conventional store dir / `$WISP_PATH`.
-- **A registry/catalog** — name → source resolution as a *library*, not core (keeps the
-  "no implicit resolver in the core" stance; any resolver is opt-in sugar over
+- **A registry/catalog** — name → source resolution as an *opt-in library*, not core
+  (keeps the "no implicit resolver in the core" stance; any resolver is sugar over
   `(require NAME SOURCE)`).
-- **Versioning** — a version alongside `NAME` in identity + store layout.
+- **Versioning** — a version alongside `NAME` in identity.
 - **The compiled path** — a module compiled to a Pack package as the distribution
   artifact (the dual-back-end direction), sharing this same `require` boundary.
