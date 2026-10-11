@@ -62,7 +62,7 @@
     ((symbol s) s)
     ((identifier name key) name)
     ((sequence items) (show-list-at items 0 "(" depth))
-    ((closure params body env) "#<closure>")
+    ((closure params body env home) "#<closure>")
     ((typed-function params result body) "#<function>")
     ((generic-function params result body vars constraints) "#<generic-function>")
     ((trait-method trait method) (string-append "#<method " (string-append method ">")))
