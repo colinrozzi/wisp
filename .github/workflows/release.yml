@@ -38,19 +38,19 @@ jobs:
         with:
           workspaces: |
             .
-            actors/wisp-repl/legacy-host
+            wisp/actor/legacy-host
 
       - name: Build the actor (embeds into the binary)
-        # The compiler is a host tool; build it for the native (glibc) target.
-        run: cargo run --release -- compile actors/wisp-repl/actor.wisp actors/wisp-repl/actor
+        # The compiler (granite) is a host tool; build it for the native (glibc) target.
+        run: cargo run --release -- compile wisp/actor/actor.wisp wisp/actor/actor
 
       - name: Build theater-repl (static musl)
-        working-directory: actors/wisp-repl/legacy-host
+        working-directory: wisp/actor/legacy-host
         run: cargo build --release --target "$TARGET"
 
       - name: Stage asset
         run: |
-          install -m755 "actors/wisp-repl/legacy-host/target/$TARGET/release/theater-repl" theater-repl-linux-x86_64
+          install -m755 "wisp/actor/legacy-host/target/$TARGET/release/theater-repl" theater-repl-linux-x86_64
           strip theater-repl-linux-x86_64 || true
           file theater-repl-linux-x86_64
           ./theater-repl-linux-x86_64 --help
