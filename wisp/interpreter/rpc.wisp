@@ -692,8 +692,11 @@
       (failure "tcp-receive expects a connection id and an integer max-bytes"))))
 
 ; --- podman ----------------------------------------------------------------
-; container-spec: image + name, plus env (list<tuple<string,string>>) and cmd
-; (list<string>) forwarded from the REPL; mounts empty, tty/interactive off.
+; container-spec: image + name, plus env (list<tuple<string,string>>), mounts
+; (list<mount-spec>), and cmd (list<string>) forwarded from the REPL; tty/
+; interactive off. mount-spec is registered in $types at session init so its
+; record values marshal with the field names the handler reads (source/target/
+; read-only).
 (fn env-tuple-type () value
   (sequence (list-push (list-push (list-push (list-new value) (symbol "tuple")) (symbol "string")) (symbol "string"))))
 ; Each Wisp env pair is a 2-element (list key value); emit it as a tuple<string,string>.
@@ -715,32 +718,71 @@
       (else 0))))
 (fn env-pairs? ((v value)) s32
   (value-case v ((sequence items) (all-string-pairs? items 0)) (else 0)))
-(fn container-spec-blob ((image string) (nm string) (env-items (list value)) (cmd-items (list value))) any
+; Register the mount-spec record type (once) so mount records marshal via the
+; aggregate path with field names source/target/read-only.
+(fn mount-field ((name string) (ty string)) value
+  (sequence (list-push (list-push (list-new value) (symbol name)) (symbol ty))))
+(fn register-mount-spec () value
+  (if (i32.ge_s (type-index "mount-spec") 0) (nil)
+    (begin
+      (global.set $types (list-push (global.get $types)
+        (named-type "mount-spec" (list-len (global.get $types)) 0
+          (list-push (list-push (list-push (list-new value)
+            (mount-field "source" "string")) (mount-field "target" "string")) (mount-field "read-only" "bool")))))
+      (nil))))
+; A Wisp mount is (source target) or (source target read-only-bool); emit a
+; mount-spec record value, read-only defaulting to false.
+(fn mount-aggregate ((m (list value))) value
+  (aggregate "mount-spec" (type-index "mount-spec") "mount-spec"
+    (list-push (list-push (list-push (list-new value)
+      (list-get m 0)) (list-get m 1))
+      (if (i32.ge_s (list-len m) 3) (list-get m 2) (boolean (i32.const 0))))))
+(fn build-mount-items ((mounts (list value)) (i s32) (out (list value))) (list value)
+  (if (i32.ge_s i (list-len mounts)) out
+    (build-mount-items mounts (i32.add i 1)
+      (list-push out (mount-aggregate (items-of (list-get mounts i)))))))
+(fn valid-mount? ((v value)) s32
+  (value-case v
+    ((sequence m)
+      (if (i32.and (i32.or (i32.eq (list-len m) 2) (i32.eq (list-len m) 3))
+            (i32.and (string-arg? (list-get m 0)) (string-arg? (list-get m 1))))
+        (if (i32.eq (list-len m) 3) (bool-arg? (list-get m 2)) 1) 0))
+    (else 0)))
+(fn all-mounts? ((items (list value)) (i s32)) s32
+  (if (i32.ge_s i (list-len items)) 1
+    (if (valid-mount? (list-get items i)) (all-mounts? items (i32.add i 1)) 0)))
+(fn mount-list? ((v value)) s32
+  (value-case v ((sequence items) (all-mounts? items 0)) (else 0)))
+(fn container-spec-blob ((image string) (nm string) (env-items (list value)) (mount-items (list value)) (cmd-items (list value))) any
   (marshal-record "container-spec"
     (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
       (symbol "image")) (symbol "name")) (symbol "env")) (symbol "mounts")) (symbol "cmd")) (symbol "tty")) (symbol "interactive"))
     (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
       (text image)) (text nm))
       (typed-list (env-tuple-type) env-items))
-      (typed-list (symbol "mount-spec") (list-new value)))
+      (typed-list (symbol "mount-spec") mount-items))
       (typed-list (symbol "string") cmd-items))
       (boolean (i32.const 0)))
       (boolean (i32.const 0)))))
-; (podman-run image name) | (… env) | (… env cmd). env = ((KEY VAL) …) string pairs,
-; cmd = (arg …) strings. Both default empty, so the 2-arg form is unchanged.
+; (podman-run image name) | (… env) | (… env cmd) | (… env cmd mounts).
+; env = ((KEY VAL) …), cmd = (arg …), mounts = ((SRC TGT [read-only]) …). All
+; default empty, so the shorter forms are unchanged.
 (fn apply-podman-run ((args (list value))) value
   (let (n (list-len args))
-    (if (i32.or (i32.lt_s n 2) (i32.gt_s n 4)) (failure "podman-run expects (podman-run image name [env [cmd]])")
+    (if (i32.or (i32.lt_s n 2) (i32.gt_s n 5)) (failure "podman-run expects (podman-run image name [env [cmd [mounts]]])")
       (if (i32.eq (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) 0)
         (failure "podman-run expects image and name strings")
         (let (env-val (if (i32.ge_s n 3) (list-get args 2) (sequence (list-new value))))
           (let (cmd-val (if (i32.ge_s n 4) (list-get args 3) (sequence (list-new value))))
-            (if (i32.eq (env-pairs? env-val) 0) (failure "podman-run env must be a list of (key value) string pairs")
-              (if (i32.eq (string-list? cmd-val) 0) (failure "podman-run cmd must be a list of strings")
-                (unmarshal (raw-invoke "theater:simple/podman" "run"
-                  (container-spec-blob (as-string (list-get args 0)) (as-string (list-get args 1))
-                    (build-env-items (items-of env-val) 0 (list-new value))
-                    (items-of cmd-val))))))))))))
+            (let (mount-val (if (i32.ge_s n 5) (list-get args 4) (sequence (list-new value))))
+              (if (i32.eq (env-pairs? env-val) 0) (failure "podman-run env must be a list of (key value) string pairs")
+                (if (i32.eq (string-list? cmd-val) 0) (failure "podman-run cmd must be a list of strings")
+                  (if (i32.eq (mount-list? mount-val) 0) (failure "podman-run mounts must be a list of (source target [read-only]) entries")
+                    (unmarshal (raw-invoke "theater:simple/podman" "run"
+                      (container-spec-blob (as-string (list-get args 0)) (as-string (list-get args 1))
+                        (build-env-items (items-of env-val) 0 (list-new value))
+                        (build-mount-items (items-of mount-val) 0 (list-new value))
+                        (items-of cmd-val))))))))))))))
 (fn apply-podman-stop ((args (list value))) value
   (if (one-str? args) (unmarshal (raw-invoke "theater:simple/podman" "stop" (marshal (list-get args 0)))) (failure "podman-stop expects a name")))
 (fn apply-podman-rm ((args (list value))) value
@@ -796,7 +838,7 @@
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\n"
-                      (string-append "podman:    (podman-run image name [env [cmd]])  env=((K V)...) cmd=(a b...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
+                      (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events) to drain   see (help \"triggers\")\n"
                           "topics:    (help \"tcp\")   (help \"triggers\")")))))))))))))
