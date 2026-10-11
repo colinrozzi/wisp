@@ -114,12 +114,32 @@ later `(require greet)` reuses the in-memory instance. A fresh session re-reads 
 cheap, and not worth a disk cache + invalidation surface. The **`SOURCE` is the source of
 truth** (a path or a URL); there is nothing to "install" and no store to keep in sync.
 
-The dogfood surfaced one nuance that is **not** caching: the daemon's `FileSystemHandler`
-uses `new_dir: true`, so its sandbox is an ephemeral empty directory. For *local-file*
-libraries to persist across sessions, the deployment points the actor's filesystem
-capability at a real directory — a per-actor manifest/daemon-config choice. That is the
-capability boundary ("where may this actor read"), not a cache. URL libraries sidestep it
-entirely: the library *is* the URL, fetched once per session.
+The dogfood surfaced one nuance that is **not** caching: by default the daemon's
+`FileSystemHandler` uses `new_dir: true`, so its sandbox is an ephemeral empty directory.
+For *local-file* libraries to persist across sessions, the deployment points the actor's
+filesystem capability at a real directory. That is the capability boundary ("where may
+this actor read"), not a cache. URL libraries sidestep it entirely: the library *is* the
+URL, fetched once per session.
+
+### Granting a persistent filesystem root (config)
+
+A `theater-repl` **config file** (TOML) grants the REPL actor's filesystem capability —
+the human's slice of what an actor manifest declares in real Theater:
+
+```toml
+[filesystem]
+root = "~/wisp/lib"    # the directory require may read libraries from
+# read = true          # optional (default true)
+# write = true         # optional (default true)
+```
+
+Resolution: `--config <path>`, else `~/.config/theater-repl/config.toml` if it exists,
+else **no config → the historical ephemeral sandbox** (opt-in, so existing users see no
+new filesystem exposure). With a `root`, the sandbox becomes that real directory
+(`new_dir: false`), created if missing, and persists across sessions and restarts. Then
+dropping `foo.wisp` in the root and `(require foo "foo.wisp")` just works — proven live
+against a locally-built daemon (v0.1.8+config). This only affects `serve`/`repl`; client
+commands talk to an already-running daemon.
 
 **Brick 2 (done):** `SOURCE` as an `http`/`https` URL fetches via `http-client`
 (`read-source-from-url`), decoding the `http-response` body (`option (list u8)`) to a

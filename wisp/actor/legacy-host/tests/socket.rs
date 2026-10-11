@@ -9,7 +9,7 @@ use wisp_interpreter_actor::{Runtime, adapter, source::SourceBundle, transport};
 async fn test_socket_framing_session_and_disconnect() -> anyhow::Result<()> {
     let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/socket-test");
     let wasm = adapter::build(&output)?;
-    let runtime = Runtime::new(SourceBundle::default()).await?;
+    let runtime = Runtime::new(SourceBundle::default(), Default::default()).await?;
     // Mirror serve's resident actor so the node survives its last disconnect.
     let _listener_actor = runtime.spawn(wasm.clone()).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;

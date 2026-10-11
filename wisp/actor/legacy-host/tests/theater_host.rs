@@ -49,7 +49,7 @@ async fn live_actor_ids(commands: UnboundedSender<TheaterCommand>) -> anyhow::Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_reaches_live_runtime_through_theater_host() -> anyhow::Result<()> {
-    let runtime = Runtime::new(SourceBundle::new(BTreeMap::new())?).await?;
+    let runtime = Runtime::new(SourceBundle::new(BTreeMap::new())?, Default::default()).await?;
 
     // Nothing spawned yet: the interpreter's (list-actors) sees an empty runtime.
     assert!(live_actor_ids(runtime.commands.clone()).await?.is_empty());
@@ -71,7 +71,7 @@ async fn eval_reaches_live_runtime_through_theater_host() -> anyhow::Result<()> 
 // session on the same interpreter the local REPL uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_session_runs_on_shared_interpreter() -> anyhow::Result<()> {
-    let runtime = Runtime::new(SourceBundle::new(BTreeMap::new())?).await?;
+    let runtime = Runtime::new(SourceBundle::new(BTreeMap::new())?, Default::default()).await?;
     let wasm = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../actor.wasm"))?;
     let session_actor = runtime.spawn(wasm).await?;
     let expected_id = session_actor.id.to_string();

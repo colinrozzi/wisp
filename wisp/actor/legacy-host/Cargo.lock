@@ -4597,6 +4597,7 @@ dependencies = [
  "anyhow",
  "clap",
  "granite",
+ "serde",
  "serde_json",
  "theater",
  "theater-handler-assembler",
@@ -4614,6 +4615,7 @@ dependencies = [
  "theater-handler-timer",
  "theater-native",
  "tokio",
+ "toml",
  "tracing-subscriber",
 ]
 
