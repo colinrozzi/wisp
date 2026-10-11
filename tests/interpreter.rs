@@ -240,3 +240,52 @@ fn test_interpreter_bytes_string_bridge() {
         "error: string->bytes expects a string",
     );
 }
+
+#[test]
+fn test_interpreter_modules_encapsulate_definitions() {
+    let mut s = session();
+    // A module's forms evaluate; the whole form yields the empty value.
+    eval(
+        &mut s,
+        "(module m (provide double) (define double (lambda (x) (+ x x))))",
+        "()",
+    );
+    // Its definitions do NOT leak into the requiring (main) module.
+    eval(&mut s, "double", "error: unbound symbol: double");
+
+    // Main's own definitions persist across a module form.
+    eval(&mut s, "(define x 40)", "40");
+    eval(&mut s, "(module n (define y 99))", "()");
+    eval(&mut s, "x", "40");
+    eval(&mut s, "y", "error: unbound symbol: y");
+}
+
+#[test]
+fn test_interpreter_modules_isolate_from_main() {
+    let mut s = session();
+    eval(&mut s, "(define shared 7)", "7");
+    // A module cannot see main's bindings: referencing one is unbound, and the
+    // error restores the main module context rather than corrupting it.
+    eval(
+        &mut s,
+        "(module m (define probe shared))",
+        "error: unbound symbol: shared",
+    );
+    eval(&mut s, "shared", "7");
+}
+
+#[test]
+fn test_interpreter_provide_requires_symbols() {
+    let mut s = session();
+    eval(
+        &mut s,
+        "(module m (provide 5))",
+        "error: provide expects symbols",
+    );
+    // provide is top-level only: inside a called lambda body (top = 0) it errors.
+    eval(
+        &mut s,
+        "((lambda () (provide f)))",
+        "error: provide is only supported at top level",
+    );
+}
