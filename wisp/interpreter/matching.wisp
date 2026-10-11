@@ -40,9 +40,18 @@
                   (if (failed? checked) checked (match-arms arms 0 case-name fields env depth expected)))))))
         ((aggregate name id case-name fields)
           (let (ty (list-get (global.get $types) id))
-            (if (named-type.variant? ty)
-              (let (arms (declaration-tail items))
-                (let (checked (validate-arms arms 0 (named-type.schema ty)))
-                  (if (failed? checked) checked (match-arms arms 0 case-name fields env depth expected))))
-              (failure "match expects a variant"))))
-        (else (failure "match expects a variant"))))))
+            (let (arms (declaration-tail items))
+              (let (cases (if (named-type.variant? ty) (named-type.schema ty) (record-cases name (named-type.schema ty))))
+                (let (checked (validate-arms arms 0 cases))
+                  (if (failed? checked) checked (match-arms arms 0 case-name fields env depth expected)))))))
+        (else (failure "match expects an option, result, variant, or record"))))))
+
+; A record matches a single synthetic case named after the record, carrying its
+; field types in order: (record-name field-type ...). So (match r ((Rec a b) …))
+; destructures a record the same way a one-case variant would.
+(fn record-field-types ((schema (list value)) (index s32) (acc (list value))) (list value)
+  (if (i32.ge_s index (list-len schema)) acc
+    (record-field-types schema (i32.add index 1) (list-push acc (field-type (list-get schema index))))))
+(fn record-cases ((name string) (schema (list value))) (list value)
+  (list-push (list-new value)
+    (sequence (record-field-types schema 0 (list-push (list-new value) (symbol name))))))

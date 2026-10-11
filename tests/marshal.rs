@@ -536,6 +536,14 @@ fn test_unmarshal_record_register_on_arrival() {
     ]);
     assert_eq!(g.call("u-remarshal", v.clone()), v);
 
+    // On arrival the record's field accessors are published, so host-returned
+    // records are readable in code, not just printable (F2). Referencing one
+    // resolves to a field reader (arity error) rather than being unbound.
+    assert_eq!(
+        g.call("evaluate", Value::String("(item.id)".into())),
+        Value::String("error: field access expects one argument".into())
+    );
+
     // Seeing the same type again reuses the registration (name+shape identity);
     // and a nested record round-trips too.
     let nested = rec(vec![
@@ -728,6 +736,26 @@ fn test_marshal_string_as_byte_list_args() {
             },
         ]),
         "args blob did not decode to tuple(string, list<u8>): {got:?}"
+    );
+}
+
+#[test]
+fn test_marshal_byte_list_passthrough() {
+    // str-to-bytes applied to an existing byte list must preserve the bytes (F5):
+    // feeding its own output back through yields the same list<u8>, not an empty
+    // one — so tcp-send can relay the bytes an on-data event just delivered.
+    let mut g = Guest::new();
+    let got = g.call("m-bytes-passthrough", Value::String("hi".into()));
+    assert_eq!(
+        got,
+        Value::Tuple(vec![
+            Value::String("id".into()),
+            Value::List {
+                elem_type: ValueType::U8,
+                items: vec![Value::U8(b'h'), Value::U8(b'i')],
+            },
+        ]),
+        "byte list was not passed through str-to-bytes intact: {got:?}"
     );
 }
 
