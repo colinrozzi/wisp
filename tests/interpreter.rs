@@ -350,6 +350,18 @@ fn test_interpreter_require_edge_cases() {
         "((lambda () (require c)))",
         "error: require is only supported at top level",
     );
+    // Without an explicit source, an unloaded module does not resolve by name.
+    eval(
+        &mut s,
+        "(require nope)",
+        "error: module is not loaded; give its source like (require name \"path\"): nope",
+    );
+    // A non-string source is rejected before any load is attempted.
+    eval(
+        &mut s,
+        "(require nope 5)",
+        "error: require source must be a string path",
+    );
 }
 
 #[test]
