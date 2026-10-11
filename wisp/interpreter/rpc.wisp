@@ -364,6 +364,9 @@
   (value-case v
     ((text s) (typed-list (symbol "u8")
                 (str-bytes s (i32.const 0) (i32.load (string-addr s)) (list-new value))))
+    ; An existing byte list passes through, so the very bytes an on-data event
+    ; delivered can be relayed without a lossy round-trip through a string.
+    ((typed-list element items) (typed-list (symbol "u8") items))
     (else (typed-list (symbol "u8") (list-new value)))))
 
 
@@ -672,11 +675,15 @@
   (if (two-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "transfer-async" (arg-tuple args))) (failure "tcp-transfer-async expects connection id and target actor")))
 (fn apply-tcp-tls-client ((args (list value))) value
   (if (two-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "upgrade-to-tls-client" (arg-tuple args))) (failure "tcp-tls-client expects connection id and server name")))
+; The WIT send takes (connection-id string) (data (list u8)), so data may be a
+; string (sugar) or a byte list — e.g. the bytes an on-data event just delivered.
+(fn tcp-data-arg? ((v value)) s32
+  (value-case v ((text s) 1) ((typed-list element items) 1) (else 0)))
 (fn apply-tcp-send ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "tcp-send expects (tcp-send conn-id data)")
-    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+    (if (i32.and (string-arg? (list-get args 0)) (tcp-data-arg? (list-get args 1)))
       (unmarshal (raw-invoke "theater:simple/tcp" "send" (str-bytes-tuple (list-get args 0) (list-get args 1))))
-      (failure "tcp-send expects two strings: connection id and data"))))
+      (failure "tcp-send expects a connection id (string) and data (string or byte list)"))))
 (fn apply-tcp-receive ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "tcp-receive expects (tcp-receive conn-id max-bytes)")
     (if (string-arg? (list-get args 0))
@@ -743,9 +750,9 @@
 (fn help-topic ((topic string)) string
   (cond
     ((string=? topic "tcp")
-      "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (sequence conn-id bytes)\n    (define on-close      (lambda (e) e))       ; e = (sequence conn-id reason)\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
+      "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (conn-id bytes): (car e), (car (cdr e))\n    (define on-close      (lambda (e) e))       ; e = (conn-id reason): (car e), (car (cdr e))\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
     ((string=? topic "triggers")
-      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(seq bytes)\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(seq conn-id bytes)\n  on-close      (lambda (e) ...)      TCP closed; e=(seq conn-id reason)\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name event handler-result). Redefine any handler\nmid-stream to change behavior.  See also: (help \"tcp\")")
+      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(seq bytes)\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name event handler-result). Redefine any handler\nmid-stream to change behavior.  See also: (help \"tcp\")")
     (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\")")))))
 
 (fn apply-help ((args (list value))) value

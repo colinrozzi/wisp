@@ -351,3 +351,30 @@ fn test_interpreter_require_edge_cases() {
         "error: require is only supported at top level",
     );
 }
+
+#[test]
+fn test_interpreter_match_destructures_records() {
+    let mut s = session();
+    // A record can be destructured positionally in match, like a one-case variant (F3).
+    eval(
+        &mut s,
+        "(record point (x s32) (y s32)) (define p (point 3 4)) (match p ((point a b) (+ a b)))",
+        "7",
+    );
+    // The fall-through error now names records as a matchable shape, too.
+    eval(
+        &mut s,
+        "(match 5 ((point a b) a))",
+        "error: match expects an option, result, variant, or record",
+    );
+}
+
+#[test]
+fn test_interpreter_help_tcp_event_shape() {
+    // (help "tcp") must describe on-data/on-close as 2-element lists, not the
+    // misleading "(sequence conn-id bytes)" that reads as a 3-element list (F8).
+    let mut s = session();
+    let out = s.evaluate("(help \"tcp\")").unwrap();
+    assert!(out.contains("(conn-id bytes)"), "{out}");
+    assert!(!out.contains("(sequence conn-id bytes)"), "{out}");
+}

@@ -535,15 +535,18 @@
             (i32.and (string=? (named-type.name nt) name) (names-match (named-type.schema nt) names 0)))
         (named-type.id nt)
         (find-record name names (i32.sub index 1))))))
-; Reuse or register (name+shape identity); return the type id.
+; Reuse or register (name+shape identity); return the type id. A newly registered
+; arriving record also publishes field accessors (type.field), so host-returned
+; records can be read in code, not just printed.
 (fn register-record ((name string) (names (list value)) (values (list value))) s32
   (let (existing (find-record name names (i32.sub (list-len (global.get $types)) (i32.const 1))))
     (if (i32.ge_s existing 0) existing
       (let (id (list-len (global.get $types)))
-        (begin
-          (global.set $types (list-push (global.get $types)
-            (named-type name id 0 (build-schema names values 0 (list-new value)))))
-          id)))))
+        (let (schema (build-schema names values 0 (list-new value)))
+          (begin
+            (global.set $types (list-push (global.get $types) (named-type name id 0 schema)))
+            (add-accessors name id schema 0)
+            id))))))
 
 ; Record node (0x09): [name][field_count][field-names][child-indices].
 (fn unmarshal-record ((cgrf s32) (payload s32)) value
