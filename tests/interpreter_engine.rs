@@ -31,6 +31,8 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             };
             Ok(source_result(if path == "library.wisp" {
                 Ok("/bundle/library.wisp".into())
+            } else if path == "greet.wisp" {
+                Ok("/bundle/greet.wisp".into())
             } else {
                 Err("source is not in the actor bundle".into())
             }))
@@ -48,6 +50,8 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
                 calls.lock().unwrap().push(path.clone());
                 Ok(source_result(if path == "/bundle/library.wisp" {
                     Ok("(fn increment ((x s32)) s32 (i32.add x 1))".into())
+                } else if path == "/bundle/greet.wisp" {
+                    Ok("(module greet (provide greeting) (define greeting 7))".into())
                 } else {
                     Err("source is not in the actor bundle".into())
                 }))
@@ -292,6 +296,26 @@ async fn engine_session() {
     assert!(evaluate(&mut first, "marker").await.contains("unbound"));
     assert_eq!(evaluate(&mut first, "(add-two 40)").await, "42");
     assert!(evaluate(&mut first, "(/ 1 0)").await.starts_with("error:"));
+    // require resolves a module by name -> bundle path, loads its source once,
+    // and binds only its provides.
+    assert_eq!(evaluate(&mut first, "(require greet) greeting").await, "7");
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .contains(&"/bundle/greet.wisp".to_string())
+    );
+    // A second require reuses the loaded instance (no second read).
+    assert_eq!(evaluate(&mut first, "(require greet) greeting").await, "7");
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == "/bundle/greet.wisp")
+            .count(),
+        1
+    );
     let mut second = engine.instantiate(&module, imports(calls)).await.unwrap();
     assert!(
         evaluate(&mut second, "(add-two 40)")

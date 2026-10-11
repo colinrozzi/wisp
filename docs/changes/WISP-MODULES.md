@@ -175,16 +175,22 @@ untouched and make `$bindings` hold the *current* module's env, backed by a regi
 
 ### Bricks
 
-- **A — registry + `(module …)` + `(provide …)` (the structural brick).** Add the
-  registry + `main` module + `enter/exit-module`. `(module NAME body…)` runs `body`
-  under `enter-module NAME`; `(provide …)` records exports on the current module.
-  Test: a module's defines **do not leak** into `main` (encapsulation), and
-  `main`-only programs behave identically (all existing interpreter tests stay green).
-- **B — `(require m)`.** Resolve `m`'s source by name → bundle path (reusing
-  `loading.wisp`'s `resolve-path`/`read-source` + the `include-seen` load-once/cycle
-  pattern), instantiate it as a module, bind its `provide`d names into the requiring
-  module **unqualified**, erroring on an import/import conflict. Test: cross-module
-  use, privates invisible, conflict errors, load-once.
+- **A — registry + `(module …)` + `(provide …)` (the structural brick). DONE (#50).**
+  `wisp/interpreter/modules.wisp`: the `module` record + registry (`$modules`), the
+  current-module globals, `switch-module` (save/restore at module boundaries), and the
+  `module`/`provide` dispatch. `(module NAME body…)` runs `body` in a fresh env and
+  restores on exit (even on error); `(provide …)` records exports. `publish`/`lookup`
+  are untouched — `$bindings` simply *is* the current module's env. Tested:
+  encapsulation, isolation, and the top-level/symbol guards.
+- **B — `(require m)`. DONE.** `require` instantiates `m` once — reusing an already
+  loaded instance from `$modules`, else resolving `m`'s source by name → bundle path
+  (`loading.wisp`'s `resolve-path`/`read-source`, a `$loading` cycle guard) and
+  evaluating it — then binds `m`'s `provide`d names into the requiring module
+  **unqualified**. Imports are tracked per module (`Module.imports`), so re-requiring
+  the same module is idempotent and only a *different* module providing the same name
+  is a conflict; privates are never bound; a provided-but-undefined name errors.
+  Tested: cross-module use, privates invisible, conflict errors, idempotent reload,
+  the require-self guard, and file-based load-once (engine suite).
 - **Later layers** (separate bricks, no core rebuild): `only-in`/`prefix-in`/
   `rename-in`/`except-in`; `provide` of macros; re-export; the distribution layer
   (how a library's source reaches the bundle: fetch/registry/versioning).

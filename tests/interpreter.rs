@@ -289,3 +289,65 @@ fn test_interpreter_provide_requires_symbols() {
         "error: provide is only supported at top level",
     );
 }
+
+#[test]
+fn test_interpreter_require_binds_provided_names() {
+    let mut s = session();
+    // A module defined in-session registers itself; require binds its provides.
+    eval(
+        &mut s,
+        "(module math (provide square) (define square (lambda (x) (* x x))) (define secret 42))",
+        "()",
+    );
+    // Before require, main cannot see the module's names.
+    eval(&mut s, "square", "error: unbound symbol: square");
+    eval(&mut s, "(require math)", "()");
+    // The provided name is now bound, unqualified.
+    eval(&mut s, "(square 9)", "81");
+    // A private (non-provided) name stays invisible.
+    eval(&mut s, "secret", "error: unbound symbol: secret");
+    // Re-requiring the same module is idempotent, not a conflict.
+    eval(&mut s, "(require math)", "()");
+    eval(&mut s, "(square 3)", "9");
+}
+
+#[test]
+fn test_interpreter_require_conflicting_imports_error() {
+    let mut s = session();
+    eval(&mut s, "(module a (provide dup) (define dup 1))", "()");
+    eval(&mut s, "(module b (provide dup) (define dup 2))", "()");
+    eval(&mut s, "(require a)", "()");
+    eval(&mut s, "dup", "1");
+    // b provides a name already imported from a: a conflict, not silent shadowing.
+    eval(
+        &mut s,
+        "(require b)",
+        "error: conflicting import: dup from a and b",
+    );
+    // The failed require left the existing import intact.
+    eval(&mut s, "dup", "1");
+}
+
+#[test]
+fn test_interpreter_require_edge_cases() {
+    let mut s = session();
+    // Providing a name the module never defines is caught at require time.
+    eval(&mut s, "(module c (provide missing))", "()");
+    eval(
+        &mut s,
+        "(require c)",
+        "error: module c provides undefined name missing",
+    );
+    // A module cannot require itself (main is the implicit top-level module).
+    eval(
+        &mut s,
+        "(require main)",
+        "error: module cannot require itself: main",
+    );
+    // require is top-level only.
+    eval(
+        &mut s,
+        "((lambda () (require c)))",
+        "error: require is only supported at top level",
+    );
+}
