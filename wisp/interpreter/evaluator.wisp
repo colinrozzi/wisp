@@ -174,7 +174,7 @@
     (value-case (list-get items 1)
       ((sequence params)
         (let (checked (check-params params 0))
-          (if (failed? checked) checked (closure params (list-get items 2) env))))
+          (if (failed? checked) checked (closure params (list-get items 2) env (global.get $current-module)))))
       (else (failure "lambda expects a parameter list")))))
 
 ; Support both (let (name value) body) and (let (name : type value) body).
@@ -241,9 +241,20 @@
           (else arguments))))))
 (fn apply-value ((callee value) (args (list value)) (depth s32) (expected string)) value
   (value-case callee
-    ((closure params body captured)
+    ; A closure carries its home module. Top-level names in the body (sibling defs,
+    ; private helpers) resolve against $bindings, so during the call we switch to the
+    ; home module and restore after — otherwise a function called from another module
+    ; would see the caller's env. Same-module calls skip the switch (no churn).
+    ((closure params body captured home)
       (if (i32.ne (list-len params) (list-len args)) (failure "wrong number of arguments")
-        (eval-expected body (bind-args params args 0 (copy-env captured 0 (list-new binding))) depth 0 expected)))
+        (let (call-env (bind-args params args 0 (copy-env captured 0 (list-new binding))))
+          (if (i32.or (string=? home (global.get $current-module)) (i32.eq (module-loaded? home) 0))
+            (eval-expected body call-env depth 0 expected)
+            (let (previous (global.get $current-module))
+              (begin
+                (switch-module home)
+                (let (result (eval-expected body call-env depth 0 expected))
+                  (begin (switch-module previous) result))))))))
     ((builtin name)
       (if (host-builtin? name) (apply-host-builtin name args)
         (if (collection-builtin? name) (apply-collection name args)

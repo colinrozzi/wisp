@@ -11,7 +11,7 @@
     (else (nil))))
 (fn callable? ((v value)) s32
   (value-case v
-    ((closure params body env) 1) ((typed-function params result body) 1)
+    ((closure params body env home) 1) ((typed-function params result body) 1)
     ((generic-function params result body vars constraints) 1)
     ((checked-function target params result) 1) ((trait-method trait method) 1)
     ((builtin name) 1) ((constructor name id case-name types) 1) ((field-reader name id index) 1)
@@ -21,7 +21,7 @@
     (let (actual (callable-type v))
       (if (unknown-type? actual)
         (value-case v
-          ((closure params body env) (i32.eq (list-len params) (list-len (function-params ty))))
+          ((closure params body env home) (i32.eq (list-len params) (list-len (function-params ty))))
           ((generic-function params result body vars constraints)
             (let (solution (unify-type (function-type (schema-types params 0 (list-new value)) result) ty vars (empty-solution)))
               (i32.eq (string-len (type-solution.error solution)) 0)))

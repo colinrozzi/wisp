@@ -390,3 +390,46 @@ fn test_interpreter_help_tcp_event_shape() {
     assert!(out.contains("(conn-id bytes)"), "{out}");
     assert!(!out.contains("(sequence conn-id bytes)"), "{out}");
 }
+
+#[test]
+fn test_interpreter_module_function_closes_over_home_module() {
+    let mut s = session();
+    // A module's provided function uses a PRIVATE helper. When required and called
+    // from another module (main), the function must still see its home module's env.
+    eval(
+        &mut s,
+        "(module a (provide f) (define helper (lambda (x) (* x 2))) (define f (lambda (x) (helper x))))",
+        "()",
+    );
+    eval(&mut s, "(require a)", "()");
+    // f runs in main, but (helper x) must resolve in a — not in main.
+    eval(&mut s, "(f 21)", "42");
+    // The private helper itself stays invisible in main.
+    eval(&mut s, "helper", "error: unbound symbol: helper");
+}
+
+#[test]
+fn test_interpreter_cross_module_call_chain_restores_scope() {
+    let mut s = session();
+    // base.g uses a private helper bh. mid.f calls base.g (imported). Calling f from
+    // main must switch main->mid->base and unwind correctly, each level seeing its
+    // own module's env.
+    eval(
+        &mut s,
+        "(module base (provide g) (define bh (lambda (x) (+ x 100))) (define g (lambda (x) (bh x))))",
+        "()",
+    );
+    eval(
+        &mut s,
+        "(module mid (require base) (provide f) (define f (lambda (x) (g x))))",
+        "()",
+    );
+    eval(&mut s, "(require mid)", "()");
+    eval(&mut s, "(f 5)", "105");
+    // Neither base's private helper nor base.g leaked into main (mid only provided f).
+    eval(&mut s, "bh", "error: unbound symbol: bh");
+    eval(&mut s, "g", "error: unbound symbol: g");
+    // And main still works normally afterward (scope restored).
+    eval(&mut s, "(define x 7)", "7");
+    eval(&mut s, "(f x)", "107");
+}
