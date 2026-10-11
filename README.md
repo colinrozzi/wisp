@@ -9,7 +9,7 @@ linearity, unforgeable capabilities, and type-state. It has S-expression *syntax
 not Lisp *semantics* (no runtime `eval`, no closures). Granite is the compiler at the
 repo root (the `granite` crate + `granite` CLI).
 
-**Wisp** is a dynamic **Scheme** (closures, a runtime reader, dynamic eval, runtime
+**Wisp** is a small dynamic **Lisp** (closures, a runtime reader, dynamic eval, runtime
 macros) written *in* Granite and compiled by it. It lives under `wisp/` and runs as a
 Theater actor. This is the actual Lisp. Both languages are first-class.
 
@@ -75,9 +75,9 @@ See [examples/](examples/), [test fixtures](tests/fixtures/), and the
 [standard library](std/) for executable examples. Features in the Rust and
 self-hosted compilers are tested separately; support is not identical.
 
-## Wisp — the interpreted Scheme
+## Wisp — the interpreted Lisp
 
-**Wisp** is a dynamic Scheme written in Granite (`wisp/interpreter/`), running inside
+**Wisp** is a small dynamic Lisp written in Granite (`wisp/interpreter/`), running inside
 one persistent Wasm instance:
 
 ```sh
@@ -99,6 +99,11 @@ Persistent `defmacro` templates support quasiquotation and splicing; hygienic
 `syntax-case-lambda` adds guards and computation during expansion.
 Source files can be loaded as command-line arguments, with relative `include`
 directives resolved from each file's directory.
+
+Wisp is deliberately *not* a full Scheme: no `set!`, `call/cc`, `letrec`/named-let,
+varargs/`apply`, or numeric tower (fixed-width numerics only). It is closures + macros
++ runtime `eval` over a tagged dynamic value, shaped to echo Granite's surface.
+
 The [Wisp Theater actor](wisp/actor/README.md) runs the same evaluator through a real
 actor mailbox, with a local socket REPL and RPC discovery — the `theater-repl` daemon
 drives it. See [wisp/interpreter/README.md](wisp/interpreter/README.md).
@@ -149,7 +154,7 @@ integrations remain a separate migration; see the [runtime migration notes](docs
 | `std/` | Granite standard library sources |
 | `tests/` | Granite language + self-hosting integration tests |
 | `wisp-repl/` | Granite's host-side typed REPL |
-| `wisp/interpreter/` | **Wisp** — the dynamic Scheme, written in Granite |
+| `wisp/interpreter/` | **Wisp** — the dynamic Lisp, written in Granite |
 | `wisp/actor/` | The Wisp Theater actor + the `theater-repl` daemon |
 | `crates/`, `wisp-actor/` | Legacy/experimental, excluded from the workspace |
 | `docs/changes/`, `docs/proposals/` | Implementation notes and design proposals |
