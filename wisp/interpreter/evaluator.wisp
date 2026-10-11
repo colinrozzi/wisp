@@ -321,7 +321,6 @@
     (global.set $steps 0)
     (global.set $include-seen (list-new string))
     (global.set $loading (list-new string))
-    (global.set $source-base base)
     (if (string-len base) (begin (global.set $include-seen (list-push (global.get $include-seen) base)) 0) 0)
     (if (i32.gt_s (string-len source) (if (string-len base) 65536 4096)) "error: source exceeds input limit"
       (let (forms (expand-source source base 0))

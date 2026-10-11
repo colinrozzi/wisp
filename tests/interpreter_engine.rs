@@ -19,6 +19,9 @@ fn source_result(result: Result<String, String>) -> Value {
 
 fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
     let mut imports = HostImports::new();
+    // Clone before the read-source closure moves `calls`; the filesystem read-file
+    // mock (what `require` loads through) logs its reads here too.
+    let fs_calls = calls.clone();
     imports.define(
         "wisp-source",
         "resolve-path",
@@ -31,8 +34,6 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             };
             Ok(source_result(if path == "library.wisp" {
                 Ok("/bundle/library.wisp".into())
-            } else if path == "greet.wisp" {
-                Ok("/bundle/greet.wisp".into())
             } else {
                 Err("source is not in the actor bundle".into())
             }))
@@ -50,8 +51,6 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
                 calls.lock().unwrap().push(path.clone());
                 Ok(source_result(if path == "/bundle/library.wisp" {
                     Ok("(fn increment ((x s32)) s32 (i32.add x 1))".into())
-                } else if path == "/bundle/greet.wisp" {
-                    Ok("(module greet (provide greeting) (define greeting 7))".into())
                 } else {
                     Err("source is not in the actor bundle".into())
                 }))
@@ -146,8 +145,43 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("timer not exercised".into())) }),
         );
     }
+    // read-file is the capability `require` loads module source through. Serve a
+    // greet module for "lib/greet.wisp" as ok(list<u8>); log the reads so the test
+    // can assert load-once. Everything else is an exist-only stub.
+    {
+        let calls = fs_calls.clone();
+        imports.define(
+            "theater:simple/filesystem",
+            "read-file",
+            host_fn(move |input| {
+                let calls = calls.clone();
+                async move {
+                    let Value::String(path) = input else {
+                        panic!("read-file input: {input:?}")
+                    };
+                    calls.lock().unwrap().push(path.clone());
+                    let bytes = |s: &str| Value::Result {
+                        ok_type: ValueType::List(Box::new(ValueType::U8)),
+                        err_type: ValueType::String,
+                        value: Ok(Box::new(Value::List {
+                            elem_type: ValueType::U8,
+                            items: s.bytes().map(Value::U8).collect(),
+                        })),
+                    };
+                    Ok(if path == "lib/greet.wisp" {
+                        bytes("(module greet (provide greeting) (define greeting 7))")
+                    } else {
+                        Value::Result {
+                            ok_type: ValueType::List(Box::new(ValueType::U8)),
+                            err_type: ValueType::String,
+                            value: Err(Box::new(Value::String("no such file".into()))),
+                        }
+                    })
+                }
+            }),
+        );
+    }
     for name in [
-        "read-file",
         "exists",
         "list-dir",
         "metadata",
@@ -296,23 +330,26 @@ async fn engine_session() {
     assert!(evaluate(&mut first, "marker").await.contains("unbound"));
     assert_eq!(evaluate(&mut first, "(add-two 40)").await, "42");
     assert!(evaluate(&mut first, "(/ 1 0)").await.starts_with("error:"));
-    // require resolves a module by name -> bundle path, loads its source once,
-    // and binds only its provides.
-    assert_eq!(evaluate(&mut first, "(require greet) greeting").await, "7");
+    // require loads a module from an EXPLICIT source read through the filesystem
+    // capability (not the bundle), and binds only its provides.
+    assert_eq!(
+        evaluate(&mut first, "(require greet \"lib/greet.wisp\") greeting").await,
+        "7"
+    );
     assert!(
         calls
             .lock()
             .unwrap()
-            .contains(&"/bundle/greet.wisp".to_string())
+            .contains(&"lib/greet.wisp".to_string())
     );
-    // A second require reuses the loaded instance (no second read).
+    // A second require reuses the loaded instance (no second read) — load-once.
     assert_eq!(evaluate(&mut first, "(require greet) greeting").await, "7");
     assert_eq!(
         calls
             .lock()
             .unwrap()
             .iter()
-            .filter(|p| p.as_str() == "/bundle/greet.wisp")
+            .filter(|p| p.as_str() == "lib/greet.wisp")
             .count(),
         1
     );
