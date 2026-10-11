@@ -210,11 +210,61 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("terminal not exercised".into())) }),
         );
     }
-    imports.define(
-        "theater:simple/http-client",
-        "request",
-        host_fn(|_input| async move { Ok(Value::String("http-client not exercised".into())) }),
-    );
+    // request is the capability `require` fetches a URL library through. Serve a
+    // netmod module as the response body (ok http-response, option body = some);
+    // log the fetched url so the test can assert it went over the network.
+    {
+        let calls = fs_calls.clone();
+        imports.define(
+            "theater:simple/http-client",
+            "request",
+            host_fn(move |input| {
+                let calls = calls.clone();
+                async move {
+                    let url = match &input {
+                        Value::Record { fields, .. } => fields
+                            .iter()
+                            .find(|(n, _)| n == "url")
+                            .and_then(|(_, v)| match v {
+                                Value::String(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    calls.lock().unwrap().push(format!("GET {url}"));
+                    let src = "(module netmod (provide answer) (define answer 42))";
+                    Ok(Value::Result {
+                        ok_type: ValueType::Record("http-response".into()),
+                        err_type: ValueType::String,
+                        value: Ok(Box::new(Value::Record {
+                            type_name: "http-response".into(),
+                            fields: vec![
+                                ("status".into(), Value::U16(200)),
+                                (
+                                    "headers".into(),
+                                    Value::List {
+                                        elem_type: ValueType::Record("http-header".into()),
+                                        items: vec![],
+                                    },
+                                ),
+                                (
+                                    "body".into(),
+                                    Value::Option {
+                                        inner_type: ValueType::List(Box::new(ValueType::U8)),
+                                        value: Some(Box::new(Value::List {
+                                            elem_type: ValueType::U8,
+                                            items: src.bytes().map(Value::U8).collect(),
+                                        })),
+                                    },
+                                ),
+                            ],
+                        })),
+                    })
+                }
+            }),
+        );
+    }
     for name in [
         "connect",
         "listen",
@@ -352,6 +402,21 @@ async fn engine_session() {
             .filter(|p| p.as_str() == "lib/greet.wisp")
             .count(),
         1
+    );
+    // A URL source fetches over the http-client capability instead of the filesystem.
+    assert_eq!(
+        evaluate(
+            &mut first,
+            "(require netmod \"https://example.test/netmod.wisp\") answer"
+        )
+        .await,
+        "42"
+    );
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .contains(&"GET https://example.test/netmod.wisp".to_string())
     );
     let mut second = engine.instantiate(&module, imports(calls)).await.unwrap();
     assert!(
