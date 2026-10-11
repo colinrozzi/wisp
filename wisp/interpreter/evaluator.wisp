@@ -10,6 +10,7 @@
 (include "floats.wisp")
 (include "collections.wisp")
 (include "globals.wisp")
+(include "modules.wisp")
 (include "loading.wisp")
 (include "macros.wisp")
 (include "syntax-rules.wisp")
@@ -129,7 +130,9 @@
     (eval-named-declaration name items env depth top expected)))
 
 (fn eval-named-declaration ((name string) (items (list value)) (env (list binding)) (depth s32) (top s32) (expected string)) value
-  (if (string=? name "trait") (declare-trait items top)
+  (if (string=? name "module") (eval-module items depth top)
+   (if (string=? name "provide") (eval-provide items top)
+    (if (string=? name "trait") (declare-trait items top)
     (if (string=? name "derive") (eval-derive items top)
       (if (string=? name "instance") (declare-instance items top)
         (if (string=? name "fn") (eval-fn items top)
@@ -137,7 +140,7 @@
             (if (string=? name "variant") (eval-variant items top)
               (if (string=? name "match") (eval-match items env depth expected)
                 (if (string=? name "export") (eval-export items env depth top)
-                  (eval-call items env depth expected))))))))))
+                  (eval-call items env depth expected))))))))))))
 
 (fn eval-if ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.ne (list-len items) 4) (failure "if expects condition, then, else")
@@ -303,6 +306,9 @@
     (if (global.get $started) 0
       (begin
         (global.set $bindings (list-new binding))
+        (global.set $modules (list-new module))
+        (global.set $current-module "main")
+        (global.set $current-exports (list-new string))
         (global.set $types (list-new named-type))
         (global.set $session-globals (list-new global-binding))
         (global.set $session-macros (list-new binding))
