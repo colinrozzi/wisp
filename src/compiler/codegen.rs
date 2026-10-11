@@ -3170,7 +3170,12 @@ pub(crate) fn program_pack_typedefs(prog: &Program) -> Vec<pack::types::TypeDef>
 /// checking at runtime.
 pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
     use pack::types::{Arena, Function, Param};
-    use std::collections::HashMap;
+    // BTreeMap, not HashMap: we iterate these maps to emit interface arenas into the
+    // metadata, so their order ends up in the embedded CGRF bytes. HashMap iteration
+    // order is nondeterministic, which made the compiled wasm (and its WAT) differ
+    // byte-for-byte between otherwise-identical builds. Sorting by interface name
+    // gives a canonical, reproducible order; per-interface hashes don't depend on it.
+    use std::collections::BTreeMap;
 
     // Named-type definitions, registered on every interface arena so that refs in
     // signatures resolve structurally during hashing (see program_pack_typedefs).
@@ -3180,7 +3185,7 @@ pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 
     // Build imports section - group by interface (module) name
     let mut imports_section = Arena::new("imports");
-    let mut import_by_interface: HashMap<String, Vec<Function>> = HashMap::new();
+    let mut import_by_interface: BTreeMap<String, Vec<Function>> = BTreeMap::new();
 
     for imp in &prog.imports {
         // For unit return type, use empty results vec (not vec![Type::Tuple(vec![])])
@@ -3218,7 +3223,7 @@ pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 
     // Build exports section - group by interface name
     let mut exports_section = Arena::new("exports");
-    let mut export_by_interface: HashMap<String, Vec<Function>> = HashMap::new();
+    let mut export_by_interface: BTreeMap<String, Vec<Function>> = BTreeMap::new();
 
     for exp in &prog.exports {
         if let Some(func) = prog.functions.iter().find(|f| f.name == exp.func_name) {
