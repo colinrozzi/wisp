@@ -18,7 +18,7 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
             "(fn increment ((x s32)) s32 (i32.add x 1))".into(),
         ),
     ]))?;
-    let runtime = Runtime::new(bundle).await?;
+    let runtime = Runtime::new(bundle, Default::default()).await?;
     let first = runtime.spawn(wasm.clone()).await?;
     assert_eq!(
         first

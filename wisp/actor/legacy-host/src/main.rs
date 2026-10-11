@@ -33,6 +33,11 @@ struct Args {
     /// JSON object mapping bundle paths to source strings; overrides the built-in bundle.
     #[arg(long, global = true)]
     bundle: Option<PathBuf>,
+    /// Path to a theater-repl config file (TOML). Without one, the default config
+    /// path (~/.config/theater-repl/config.toml) is used if it exists; otherwise the
+    /// REPL's filesystem capability is an ephemeral sandbox. Only `serve`/`repl` use it.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     /// Which daemon to talk to (loopback port). Resolves: this flag, then
     /// $THEATER_REPL_PORT, then 7777.
     #[arg(
@@ -84,8 +89,21 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let port = args.port;
     match args.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve(load(&args.actor_dir, &args.bundle)?, port).await,
-        Command::Repl => repl(load(&args.actor_dir, &args.bundle)?).await,
+        Command::Serve => {
+            serve(
+                load(&args.actor_dir, &args.bundle)?,
+                load_config(&args.config)?,
+                port,
+            )
+            .await
+        }
+        Command::Repl => {
+            repl(
+                load(&args.actor_dir, &args.bundle)?,
+                load_config(&args.config)?,
+            )
+            .await
+        }
         Command::Version => {
             println!("{VERSION}");
             Ok(())
@@ -149,9 +167,84 @@ fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<Loaded>
     })
 }
 
-async fn new_runtime(loaded: &Loaded) -> Result<Runtime> {
+// ---- config ---------------------------------------------------------------
+
+/// theater-repl config (TOML). For now its one job is granting the REPL actor's
+/// filesystem capability — a root directory it may read/write. This is the human's
+/// slice of the actor manifest; other capability knobs can grow here later.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReplConfig {
+    filesystem: FilesystemConfig,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FilesystemConfig {
+    /// The directory the REPL's filesystem capability is rooted at. A leading `~/`
+    /// expands to $HOME. Absent → an ephemeral sandbox (the historical behavior).
+    root: Option<PathBuf>,
+    read: bool,
+    write: bool,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            root: None,
+            read: true,
+            write: true,
+        }
+    }
+}
+
+fn default_config_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/theater-repl/config.toml"))
+}
+
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path,
+    }
+}
+
+/// Resolve config: an explicit `--config`, else the default path if it exists, else
+/// the default (ephemeral filesystem). An explicit path that is missing is an error;
+/// a missing default path is not.
+fn load_config(explicit: &Option<PathBuf>) -> Result<ReplConfig> {
+    let path = match explicit {
+        Some(p) => Some(p.clone()),
+        None => default_config_path().filter(|p| p.exists()),
+    };
+    let Some(path) = path else {
+        return Ok(ReplConfig::default());
+    };
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    let mut config: ReplConfig =
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    config.filesystem.root = config.filesystem.root.map(expand_tilde);
+    Ok(config)
+}
+
+fn fs_access(config: &ReplConfig) -> Result<wisp_interpreter_actor::FsAccess> {
+    if let Some(root) = &config.filesystem.root {
+        // Create the configured library root up front so first use is smooth.
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("creating filesystem root {}", root.display()))?;
+        eprintln!("filesystem root: {}", root.display());
+    }
+    Ok(wisp_interpreter_actor::FsAccess {
+        root: config.filesystem.root.clone(),
+        read: config.filesystem.read,
+        write: config.filesystem.write,
+    })
+}
+
+async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
     let sources: BTreeMap<String, String> = serde_json::from_str(&loaded.bundle_json)?;
-    Runtime::new(SourceBundle::new(sources)?).await
+    Runtime::new(SourceBundle::new(sources)?, fs_access(config)?).await
 }
 
 // ---- the daemon -----------------------------------------------------------
@@ -165,8 +258,8 @@ struct Entry {
 }
 type Registry = BTreeMap<String, Entry>;
 
-async fn serve(loaded: Loaded, port: u16) -> Result<()> {
-    let runtime = Arc::new(new_runtime(&loaded).await?);
+async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
+    let runtime = Arc::new(new_runtime(&loaded, &config).await?);
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -414,8 +507,8 @@ async fn follow(port: u16, id: String) -> Result<()> {
 // ---- the human REPL -------------------------------------------------------
 
 /// Interactive stdin/stdout prompt against one private session.
-async fn repl(loaded: Loaded) -> Result<()> {
-    let runtime = new_runtime(&loaded).await?;
+async fn repl(loaded: Loaded, config: ReplConfig) -> Result<()> {
+    let runtime = new_runtime(&loaded, &config).await?;
     let session = runtime
         .spawn_with_manifest(loaded.wasm, loaded.manifest)
         .await?;
@@ -441,4 +534,50 @@ async fn repl(loaded: Loaded) -> Result<()> {
     session.shutdown().await?;
     runtime.shutdown().await?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults_to_ephemeral_filesystem() {
+        let c = ReplConfig::default();
+        assert!(c.filesystem.root.is_none());
+        assert!(c.filesystem.read && c.filesystem.write);
+    }
+
+    #[test]
+    fn config_parses_filesystem_root_and_perms() {
+        let c: ReplConfig =
+            toml::from_str("[filesystem]\nroot = \"/srv/wisp-libs\"\nread = true\nwrite = false\n")
+                .unwrap();
+        assert_eq!(
+            c.filesystem.root.unwrap().to_str().unwrap(),
+            "/srv/wisp-libs"
+        );
+        assert!(c.filesystem.read);
+        assert!(!c.filesystem.write);
+    }
+
+    #[test]
+    fn config_empty_filesystem_table_keeps_defaults() {
+        let c: ReplConfig = toml::from_str("[filesystem]\n").unwrap();
+        assert!(c.filesystem.root.is_none());
+        assert!(c.filesystem.read && c.filesystem.write);
+    }
+
+    #[test]
+    fn expand_tilde_rewrites_leading_home() {
+        // SAFETY: single-threaded test setting an env var for the expansion check.
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        assert_eq!(
+            expand_tilde(PathBuf::from("~/wisp/lib")),
+            PathBuf::from("/home/tester/wisp/lib")
+        );
+        assert_eq!(
+            expand_tilde(PathBuf::from("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+    }
 }

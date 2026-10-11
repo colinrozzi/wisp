@@ -22,13 +22,34 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const MANIFEST: &str = include_str!("../../manifest.toml");
 
+/// How the REPL actor's filesystem capability is granted. The default is the
+/// historical behavior: an ephemeral sandbox in the `serve` cwd. A configured
+/// `root` makes the sandbox a real, persistent directory, so `require` can load
+/// libraries from disk across sessions. This is the human granting the actor its
+/// filesystem capability — the role an actor manifest plays in real Theater.
+pub struct FsAccess {
+    pub root: Option<std::path::PathBuf>,
+    pub read: bool,
+    pub write: bool,
+}
+
+impl Default for FsAccess {
+    fn default() -> Self {
+        Self {
+            root: None,
+            read: true,
+            write: true,
+        }
+    }
+}
+
 pub struct Runtime {
     pub commands: mpsc::UnboundedSender<TheaterCommand>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl Runtime {
-    pub async fn new(bundle: source::SourceBundle) -> Result<Self> {
+    pub async fn new(bundle: source::SourceBundle, fs: FsAccess) -> Result<Self> {
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
@@ -63,20 +84,24 @@ impl Runtime {
         ));
         // WAT -> wasm assembly (wisp:assembler/runtime).
         handlers.register(theater_handler_assembler::AssemblerHandler::new());
-        // Filesystem access, sandboxed to the directory `serve` runs in, with full
-        // read/write (the REPL is a developer tool).
+        // Filesystem access. With a configured root the sandbox is that real
+        // directory (persistent across sessions); with none it falls back to the
+        // historical ephemeral sandbox in the `serve` cwd. `new_dir` is only true in
+        // the ephemeral case — a configured root is used as-is, not replaced.
+        let fs_ephemeral = fs.root.is_none();
+        let fs_path = fs.root.clone().or_else(|| std::env::current_dir().ok());
         handlers.register(theater_handler_filesystem::FileSystemHandler::new(
             theater::config::actor_manifest::FileSystemHandlerConfig {
-                path: std::env::current_dir().ok(),
-                new_dir: Some(true),
+                path: fs_path,
+                new_dir: Some(fs_ephemeral),
                 allowed_commands: None,
             },
             Some(theater::config::permissions::FileSystemPermissions {
-                read: true,
-                write: true,
+                read: fs.read,
+                write: fs.write,
                 execute: false,
                 allowed_commands: None,
-                new_dir: Some(true),
+                new_dir: Some(fs_ephemeral),
                 allowed_paths: Some(vec!["/".to_string()]),
             }),
         ));
