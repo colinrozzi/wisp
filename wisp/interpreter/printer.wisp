@@ -39,13 +39,14 @@
 ; a "... <k> more)" marker for the remainder. Lists of <= 64 elements render
 ; exactly as before (the length check fires before the cap).
 (fn show-list-at ((items (list value)) (index s32) (out string) (depth s32)) string
-  (if (i32.ge_s index (list-len items)) (string-append out ")")
-    (if (i32.ge_s index 64)
-      (string-append out (string-append "  ... "
-        (string-append (show-integer (i32.sub (list-len items) index)) " more)")))
-      (show-list-at items (i32.add index 1)
-        (string-append (if (i32.eq index 0) out (string-append out " "))
-          (show-at (list-get items index) (i32.add depth 1))) depth))))
+  (let (n (list-len items))
+    (if (i32.ge_s index n) (string-append out ")")
+      (if (i32.ge_s index 64)
+        (string-append out (string-append " ... "
+          (string-append (show-integer (i32.sub n index)) " more)")))
+        (show-list-at items (i32.add index 1)
+          (string-append (if (i32.eq index 0) out (string-append out " "))
+            (show-at (list-get items index) (i32.add depth 1))) depth)))))
 
 (fn show ((v value)) string
   (show-at v 0))
