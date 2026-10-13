@@ -175,6 +175,19 @@
 (import theater:simple/tcp close-listener ((listener-id string)) (result unit string))
 (import theater:simple/tcp upgrade-to-tls-server ((connection-id string)) (result unit string))
 (import theater:simple/tcp upgrade-to-tls-client ((connection-id string) (server-name string)) (result unit string))
+; udp: raw datagram sockets (theater:simple/udp). bind -> socket-id; send-to/recv-from
+; for connectionless, or connect()+send()/recv-from() to filter a single peer.
+(import theater:simple/udp bind ((address string)) (result string string))
+(import theater:simple/udp close ((socket-id string)) (result unit string))
+(import theater:simple/udp connect ((socket-id string) (peer string)) (result unit string))
+(import theater:simple/udp disconnect ((socket-id string)) (result unit string))
+(import theater:simple/udp local-addr ((socket-id string)) (result string string))
+(import theater:simple/udp connected-peer ((socket-id string)) (result (option string) string))
+(import theater:simple/udp send-to ((socket-id string) (peer string) (data (list u8))) (result u64 string))
+(import theater:simple/udp send ((socket-id string) (data (list u8))) (result u64 string))
+(import theater:simple/udp recv-from ((socket-id string) (max-bytes u32)) (result (tuple (list u8) string) string))
+(import theater:simple/udp set-active ((socket-id string) (mode string)) (result unit string))
+(import theater:simple/udp set-recv-timeout ((socket-id string) (timeout-ms u64)) (result unit string))
 
 ; podman: container management. run takes a container-spec record (built via
 ; marshal-record); list returns container-info records.
@@ -255,7 +268,20 @@
     ((string=? name "http-req") 1)
     ((string=? name "poll-events") 1)
     ((string=? name "help") 1)
+    ((string=? name "marshal") 1)
+    ((string=? name "unmarshal") 1)
     ((string=? name "tcp-connect") 1)
+    ((string=? name "udp-bind") 1)
+    ((string=? name "udp-close") 1)
+    ((string=? name "udp-connect") 1)
+    ((string=? name "udp-disconnect") 1)
+    ((string=? name "udp-local-addr") 1)
+    ((string=? name "udp-connected-peer") 1)
+    ((string=? name "udp-send-to") 1)
+    ((string=? name "udp-send") 1)
+    ((string=? name "udp-recv-from") 1)
+    ((string=? name "udp-set-active") 1)
+    ((string=? name "udp-set-recv-timeout") 1)
     ((string=? name "tcp-listen") 1)
     ((string=? name "tcp-accept") 1)
     ((string=? name "tcp-activate") 1)
@@ -526,6 +552,25 @@
     (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "wisp:assembler/runtime" "wat-to-wasm" (marshal (list-get args 0))))
       (failure "wat-to-wasm expects a string of WAT"))))
 
+; (marshal value) -> list<u8>: the Pack `any` CGRF blob ([len:u32][cgrf]) as bytes.
+; (unmarshal bytes) -> value: decode such a blob back to a Wisp value. These expose
+; the interpreter's own codec so Wisp can speak CGRF v3 wires directly (e.g. framed
+; pact payloads over tcp). marshal/read-bytes/write-bytes/any-* live in marshal.wisp.
+(fn apply-marshal ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "marshal expects (marshal value)")
+    (let (addr (any-addr (marshal (list-get args 0))))
+      (typed-list (symbol "u8")
+        (read-bytes addr (i32.add (i32.const 4) (i32.load addr)) (i32.const 0) (list-new value))))))
+(fn unmarshal-bytevals ((items (list value))) value
+  (let (buf (heap-alloc (i32.add (list-len items) (i32.const 16))))
+    (begin (write-bytes buf items (i32.const 0)) (unmarshal (any-from-addr buf)))))
+(fn apply-unmarshal ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "unmarshal expects (unmarshal bytes)")
+    (value-case (list-get args 0)
+      ((typed-list elem items) (unmarshal-bytevals items))
+      ((sequence items) (unmarshal-bytevals items))
+      (else (failure "unmarshal expects a list<u8> (bytes)")))))
+
 ; --- timer -----------------------------------------------------------------
 (fn as-u64 ((v value)) value
   (value-case v
@@ -691,6 +736,48 @@
         (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (as-u32 (list-get args 1)))))))
       (failure "tcp-receive expects a connection id and an integer max-bytes"))))
 
+; --- udp -------------------------------------------------------------------
+; raw UDP datagram sockets. Mirrors tcp's arg shapes: one-str?/two-str? guards;
+; send/send-to take data as a byte list OR a string (sugar, via str-to-bytes);
+; recv-from takes a u32 max-bytes; set-recv-timeout takes a u64 ms.
+(fn apply-udp-bind ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/udp" "bind" (marshal (list-get args 0)))) (failure "udp-bind expects a local address")))
+(fn apply-udp-close ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/udp" "close" (marshal (list-get args 0)))) (failure "udp-close expects a socket id")))
+(fn apply-udp-disconnect ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/udp" "disconnect" (marshal (list-get args 0)))) (failure "udp-disconnect expects a socket id")))
+(fn apply-udp-local-addr ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/udp" "local-addr" (marshal (list-get args 0)))) (failure "udp-local-addr expects a socket id")))
+(fn apply-udp-connected-peer ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/udp" "connected-peer" (marshal (list-get args 0)))) (failure "udp-connected-peer expects a socket id")))
+(fn apply-udp-connect ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/udp" "connect" (arg-tuple args))) (failure "udp-connect expects a socket id and peer")))
+(fn apply-udp-set-active ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/udp" "set-active" (arg-tuple args))) (failure "udp-set-active expects a socket id and mode")))
+(fn apply-udp-send ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "udp-send expects (udp-send socket-id data)")
+    (if (i32.and (string-arg? (list-get args 0)) (tcp-data-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "theater:simple/udp" "send" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "udp-send expects a socket id (string) and data (string or byte list)"))))
+(fn apply-udp-send-to ((args (list value))) value
+  (if (i32.ne (list-len args) 3) (failure "udp-send-to expects (udp-send-to socket-id peer data)")
+    (if (i32.and (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) (tcp-data-arg? (list-get args 2)))
+      (unmarshal (raw-invoke "theater:simple/udp" "send-to"
+        (marshal (sequence (list-push (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1)) (str-to-bytes (list-get args 2)))))))
+      (failure "udp-send-to expects socket-id, peer (strings) and data (string or byte list)"))))
+(fn apply-udp-recv-from ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "udp-recv-from expects (udp-recv-from socket-id max-bytes)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "theater:simple/udp" "recv-from"
+        (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (as-u32 (list-get args 1)))))))
+      (failure "udp-recv-from expects a socket id and an integer max-bytes"))))
+(fn apply-udp-set-recv-timeout ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "udp-set-recv-timeout expects (udp-set-recv-timeout socket-id timeout-ms)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "theater:simple/udp" "set-recv-timeout"
+        (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (as-u64 (list-get args 1)))))))
+      (failure "udp-set-recv-timeout expects a socket id and an integer ms"))))
+
 ; --- podman ----------------------------------------------------------------
 ; container-spec: image + name, plus env (list<tuple<string,string>>), mounts
 ; (list<mount-spec>), and cmd (list<string>) forwarded from the REPL; tty/
@@ -837,7 +924,7 @@
               (string-append "files:     (fs-read p) (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
-                    (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\n"
+                    (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events) to drain   see (help \"triggers\")\n"
@@ -882,6 +969,8 @@
     ((string=? name "msg-send-channel") (apply-msg-send-channel args))
     ((string=? name "msg-close-channel") (apply-msg-close-channel args))
     ((string=? name "wat-to-wasm") (apply-wat-to-wasm args))
+    ((string=? name "marshal") (apply-marshal args))
+    ((string=? name "unmarshal") (apply-unmarshal args))
     ((string=? name "now") (apply-timer-now args))
     ((string=? name "set-interval") (apply-timer-set args))
     ((string=? name "clear-interval") (apply-timer-clear args))
@@ -904,6 +993,17 @@
     ((string=? name "poll-events") (apply-poll-events args))
     ((string=? name "help") (apply-help args))
     ((string=? name "tcp-connect") (apply-tcp-connect args))
+    ((string=? name "udp-bind") (apply-udp-bind args))
+    ((string=? name "udp-close") (apply-udp-close args))
+    ((string=? name "udp-connect") (apply-udp-connect args))
+    ((string=? name "udp-disconnect") (apply-udp-disconnect args))
+    ((string=? name "udp-local-addr") (apply-udp-local-addr args))
+    ((string=? name "udp-connected-peer") (apply-udp-connected-peer args))
+    ((string=? name "udp-send-to") (apply-udp-send-to args))
+    ((string=? name "udp-send") (apply-udp-send args))
+    ((string=? name "udp-recv-from") (apply-udp-recv-from args))
+    ((string=? name "udp-set-active") (apply-udp-set-active args))
+    ((string=? name "udp-set-recv-timeout") (apply-udp-set-recv-timeout args))
     ((string=? name "tcp-listen") (apply-tcp-listen args))
     ((string=? name "tcp-accept") (apply-tcp-accept args))
     ((string=? name "tcp-activate") (apply-tcp-activate args))
