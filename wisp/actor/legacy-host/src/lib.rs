@@ -121,9 +121,12 @@ impl Runtime {
                 ],
             },
         ));
-        // Raw TCP sockets and Podman container control.
+        // Raw TCP + UDP sockets and Podman container control.
         handlers.register(theater_handler_tcp::TcpHandler::new(
             theater_handler_tcp::TcpHandlerConfig::default(),
+        ));
+        handlers.register(theater_handler_udp::UdpHandler::new(
+            theater_handler_udp::UdpHandlerConfig::default(),
         ));
         handlers.register(theater_handler_podman::PodmanHandler::new(
             theater_handler_podman::PodmanHandlerConfig {},
