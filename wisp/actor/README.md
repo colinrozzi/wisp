@@ -122,6 +122,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
 | tcp⁴ | `(tcp-connect addr)` · `(tcp-send conn data)` → bytes · `(tcp-receive conn max)`⁵ · `(tcp-close conn)` · `(tcp-peer conn)` · `(tcp-is-tls conn)` · `(tcp-listen addr)`⁶ · `(tcp-accept lst)`⁶ · `(tcp-activate conn)` · `(tcp-set-active conn mode)` · `(tcp-transfer conn actor)` · `(tcp-transfer-async conn actor)` · `(tcp-tls-client conn name)` · `(tcp-tls-server conn)` · `(tcp-close-listener lst)` |
+| udp⁸ | `(udp-bind addr)` → socket id · `(udp-send-to sock peer data)` → bytes · `(udp-recv-from sock max)` → `(bytes peer)` · `(udp-send sock data)` → bytes · `(udp-connect sock peer)` · `(udp-disconnect sock)` · `(udp-connected-peer sock)` → `option<addr>` · `(udp-local-addr sock)` · `(udp-set-active sock mode)` · `(udp-set-recv-timeout sock ms)` · `(udp-close sock)` |
 | podman | `(podman-run image name)` · `(podman-stop name)` · `(podman-rm name force)` · `(podman-list)` |
 | lifecycle⁷ | `(monitor id)` · `(unmonitor id)` · `(link id)` · `(unlink id)` |
 | meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(poll-events)` |
@@ -162,6 +163,16 @@ fate-shares instead (no callback — if the subject dies, you are stopped);
 `"wasm"` events (call + result)** plus one per host-call it makes, so it is chatty —
 route on `event-type` (e.g. `"terminated"`) in your handler. (A host-side
 `monitor-filtered` + the raw `data` payload are follow-ups.)
+
+⁸ UDP is raw datagram sockets (`theater:simple/udp`). `(udp-bind addr)` → a socket
+id. **Connectionless:** `(udp-send-to sock peer data)` → byte count and
+`(udp-recv-from sock max)` → `(list<u8> peer-addr)`. **Connected:**
+`(udp-connect sock peer)` pins one peer so `(udp-send sock data)` sends to it and
+receives filter to it; `(udp-disconnect sock)` clears it and `(udp-connected-peer
+sock)` → `option<string>` reports it. `data` is a string or byte list; `max` is a
+`u32` and `ms` a `u64`. `(udp-local-addr sock)` → the bound address;
+`(udp-set-active sock mode)` toggles push mode; `(udp-set-recv-timeout sock ms)`
+bounds blocking receives; `(udp-close sock)` tears the socket down.
 
 ## Observing Theater — inbound triggers as live handlers
 
