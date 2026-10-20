@@ -100,6 +100,15 @@
 (import theater:simple/runtime subscribe-to-spawns () (result unit runtime-error))
 (import theater:simple/runtime unsubscribe-from-spawns () (result unit runtime-error))
 (import theater:simple/runtime shutdown-runtime () (result unit runtime-error))
+; spawn a NEW actor into this (the daemon's) runtime — load a foreign .wasm by
+; manifest, optionally with inline wasm-bytes; it lands in the same runtime so it can
+; message REPL sessions by actor-id. Signature MUST match the pact exactly (incl.
+; init-state: option<value> = (option any)): the runtime handler gates actor
+; instantiation on the full runtime-interface hash, so a divergent type here fails to
+; load the whole session. The REPL only ever sends init-state as none (encoded as an
+; empty option, which a structural decode reads as None regardless of inner tag).
+; (spawn-and-wait is a follow-up.)
+(import theater:simple/runtime spawn ((manifest string) (init-state (option any)) (wasm-bytes (option (list u8)))) (result string runtime-error))
 
 ; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
 ; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
@@ -269,6 +278,7 @@
     ((string=? name "subscribe-spawns") 1)
     ((string=? name "unsubscribe-spawns") 1)
     ((string=? name "shutdown-runtime") 1)
+    ((string=? name "spawn-actor") 1)
     ((string=? name "msg-register") 1)
     ((string=? name "msg-send") 1)
     ((string=? name "msg-request") 1)
@@ -547,6 +557,30 @@
 (fn apply-runtime-shutdown ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "shutdown-runtime expects no arguments")
     (unmarshal (raw-invoke "theater:simple/runtime" "shutdown-runtime" (arg-tuple (list-new value))))))
+; option<list<u8>> helpers (init-state / wasm-bytes). none, or some wrapping bytes
+; (a string is coerced to bytes via str-to-bytes, so wasm can be passed inline).
+(fn opt-bytes-none () value
+  (compound (unary-type "option" (unary-type "list" (symbol "u8"))) "none" (list-new value)))
+(fn opt-bytes-some ((v value)) value
+  (compound (unary-type "option" (unary-type "list" (symbol "u8"))) "some"
+    (list-push (list-new value) (str-to-bytes v))))
+; (spawn-actor manifest-ref [wasm-bytes]) -> actor-id. Loads a NEW actor into the
+; daemon runtime. manifest-ref is a REFERENCE the runtime resolves (a path to a
+; .toml — not inline TOML); the manifest's `package` is likewise resolved unless
+; wasm-bytes are supplied inline (a byte list, e.g. from fs-read, or a string), which
+; bypass package resolution. Relative paths aren't resolved, so use absolute ones.
+; init-state is always none here. The actor shares this runtime, so it can message
+; REPL sessions (and vice versa) by actor-id.
+(fn apply-spawn-actor ((args (list value))) value
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 1) (i32.gt_s n 2)) (failure "spawn-actor expects (spawn-actor manifest-ref [wasm-bytes])")
+      (if (i32.eq (string-arg? (list-get args 0)) (i32.const 0)) (failure "spawn-actor expects a manifest reference (path to a .toml)")
+        (let (wasm-opt (if (i32.ge_s n 2) (opt-bytes-some (list-get args 1)) (opt-bytes-none)))
+          (unmarshal (raw-invoke "theater:simple/runtime" "spawn"
+            (marshal (sequence (list-push (list-push (list-push (list-new value)
+              (list-get args 0))
+              (opt-bytes-none))
+              wasm-opt))))))))))
 
 ; --- message-server --------------------------------------------------------
 ; Shared shapes: (string, message) -> Tuple(String, list<u8>); a single string
@@ -1132,7 +1166,7 @@
     (text (string-append "Wisp REPL — a live session that drives and observes Theater.\nDefinitions accumulate: (define x ...) / (define f (lambda ...)) persist.\n\n"
       (string-append "self/rpc:  (self) (log msg) (describe id) (exports id) (implements id iface) (call id fn arg...)\n"
         (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
-          (string-append "runtime:   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\n"
+          (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
@@ -1173,6 +1207,7 @@
     ((string=? name "subscribe-spawns") (apply-runtime-subscribe args))
     ((string=? name "unsubscribe-spawns") (apply-runtime-unsubscribe args))
     ((string=? name "shutdown-runtime") (apply-runtime-shutdown args))
+    ((string=? name "spawn-actor") (apply-spawn-actor args))
     ((string=? name "msg-register") (apply-msg-register args))
     ((string=? name "msg-send") (apply-msg-send args))
     ((string=? name "msg-request") (apply-msg-request args))

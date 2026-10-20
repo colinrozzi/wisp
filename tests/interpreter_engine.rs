@@ -97,6 +97,7 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
     }
     // runtime bridge — likewise only needs to exist for this preflight.
     for name in [
+        "spawn",
         "list-actors",
         "get-actor-status",
         "get-actor-state",
