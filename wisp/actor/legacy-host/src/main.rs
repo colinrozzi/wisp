@@ -70,6 +70,8 @@ enum Command {
     Status { id: Option<String> },
     /// End a session and reclaim its heap.
     Stop { id: String },
+    /// Stop the daemon itself: end all sessions and exit (frees the port).
+    Down,
     /// Interactive stdin/stdout prompt against a private session (for a human).
     Repl,
     /// Print the installed version.
@@ -275,18 +277,32 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
     eprintln!("theater-repl daemon on {address}");
     eprintln!("create a session:  theater-repl new{hint}");
 
+    // Triggered by the `shutdown` op (the `theater-repl down` client command), so
+    // the daemon can be brought down cleanly over the socket — no pid-hunting.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let mut connections = tokio::task::JoinSet::new();
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
     loop {
         tokio::select! {
             _ = &mut stop => break,
+            _ = shutdown.notified() => {
+                eprintln!("theater-repl daemon going down");
+                break;
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let (registry, runtime, wasm, manifest) =
-                    (registry.clone(), runtime.clone(), wasm.clone(), manifest.clone());
+                let (registry, runtime, wasm, manifest, shutdown) = (
+                    registry.clone(),
+                    runtime.clone(),
+                    wasm.clone(),
+                    manifest.clone(),
+                    shutdown.clone(),
+                );
                 connections.spawn(async move {
-                    if let Err(error) = handle(stream, registry, runtime, wasm, manifest).await {
+                    if let Err(error) =
+                        handle(stream, registry, runtime, wasm, manifest, shutdown).await
+                    {
                         eprintln!("connection error: {error}");
                     }
                 });
@@ -304,13 +320,14 @@ async fn handle(
     runtime: Arc<Runtime>,
     wasm: Arc<Vec<u8>>,
     manifest: Arc<theater::ManifestConfig>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let Some(line) = transport::read_line(&mut reader).await? else {
         return Ok(());
     };
     let request: Value = serde_json::from_str(&line).unwrap_or_else(|_| json!({}));
-    let (ok, text) = dispatch(&request, &registry, &runtime, &wasm, &manifest).await;
+    let (ok, text) = dispatch(&request, &registry, &runtime, &wasm, &manifest, &shutdown).await;
     let mut stream = reader.into_inner();
     let response = json!({ "ok": ok, "text": text }).to_string();
     stream.write_all(response.as_bytes()).await?;
@@ -336,8 +353,14 @@ async fn dispatch(
     runtime: &Arc<Runtime>,
     wasm: &Arc<Vec<u8>>,
     manifest: &Arc<theater::ManifestConfig>,
+    shutdown: &Arc<tokio::sync::Notify>,
 ) -> (bool, String) {
     match field(request, "op") {
+        // `theater-repl down`: reply first, then wake the serve loop to exit.
+        "shutdown" => {
+            shutdown.notify_one();
+            (true, "daemon going down".to_string())
+        }
         "new" => {
             let name = request
                 .get("name")
@@ -450,6 +473,7 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
         Command::Read { id } => send(port, json!({ "op": "read", "id": id })).await,
         Command::Status { id } => send(port, json!({ "op": "status", "id": id })).await,
         Command::Stop { id } => send(port, json!({ "op": "stop", "id": id })).await,
+        Command::Down => send(port, json!({ "op": "shutdown" })).await,
         Command::Follow { id } => follow(port, id).await,
         Command::Serve | Command::Repl | Command::Version | Command::Upgrade => {
             unreachable!("handled in main")
