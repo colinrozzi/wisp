@@ -37,6 +37,25 @@
 (export "theater:simple/message-server-client.handle-send"
   (fn handle-send ((raw any)) string
     (begin (dispatch-event "on-message" (unmarshal raw)) "ok")))
+; Channel callbacks (same interface). After a peer (msg-open target initial-msg),
+; Theater delivers the open/messages/close here — dispatched to on-channel-open /
+; on-channel-message / on-channel-close for (poll-events). open/message arrive as a
+; Tuple (channel-id message-bytes); close as (channel-id). handle-channel-open must
+; return a channel-accept {accepted message} — the host reads field 0 (accepted) to
+; decide whether to open; we always accept (true, none). The others' returns are
+; ignored, so a plain string is fine (by-name delivery, not has_export-gated).
+(export "theater:simple/message-server-client.handle-channel-open"
+  (fn handle-channel-open ((raw any))
+    (tuple bool (option (list u8)))
+    (begin
+      (dispatch-event "on-channel-open" (unmarshal raw))
+      (tuple (bool 1) (none (list u8))))))
+(export "theater:simple/message-server-client.handle-channel-message"
+  (fn handle-channel-message ((raw any)) string
+    (begin (dispatch-event "on-channel-message" (unmarshal raw)) "ok")))
+(export "theater:simple/message-server-client.handle-channel-close"
+  (fn handle-channel-close ((raw any)) string
+    (begin (dispatch-event "on-channel-close" (unmarshal raw)) "ok")))
 
 ; TCP server callbacks (theater:simple/tcp-client). After (tcp-listen addr),
 ; Theater runs a background accept loop and delivers events by CALLING these
