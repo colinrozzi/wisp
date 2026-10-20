@@ -288,6 +288,47 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("tcp not exercised".into())) }),
         );
     }
+    for name in [
+        "bind",
+        "close",
+        "connect",
+        "disconnect",
+        "local-addr",
+        "connected-peer",
+        "send-to",
+        "send",
+        "recv-from",
+        "set-active",
+        "set-recv-timeout",
+    ] {
+        imports.define(
+            "theater:simple/udp",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("udp not exercised".into())) }),
+        );
+    }
+    for name in [
+        "spawn",
+        "run",
+        "write-stdin",
+        "close-stdin",
+        "read",
+        "set-active",
+        "signal",
+        "kill",
+        "status",
+        "wait",
+        "os-pid",
+        "list",
+        "close",
+        "transfer",
+    ] {
+        imports.define(
+            "theater:simple/process",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("process not exercised".into())) }),
+        );
+    }
     for name in ["run", "stop", "rm", "list"] {
         imports.define(
             "theater:simple/podman",
