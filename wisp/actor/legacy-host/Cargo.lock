@@ -2614,8 +2614,8 @@ dependencies = [
 
 [[package]]
 name = "theater"
-version = "0.3.29"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+version = "0.3.30"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2646,7 +2646,7 @@ dependencies = [
 [[package]]
 name = "theater-chain"
 version = "0.3.11"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "console",
  "hex",
@@ -2659,7 +2659,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-assembler"
 version = "0.3.11"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "theater",
@@ -2669,8 +2669,8 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-filesystem"
-version = "0.3.0"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+version = "0.3.1"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "theater",
@@ -2682,7 +2682,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-http-client"
 version = "0.3.0"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -2693,7 +2693,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-lifecycle"
 version = "0.3.14"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "theater",
@@ -2704,7 +2704,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-message-server"
 version = "0.3.13"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2719,7 +2719,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-podman"
 version = "0.3.13"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2730,9 +2730,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "theater-handler-process"
+version = "0.1.0"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "theater",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "theater-handler-rpc"
-version = "0.3.11"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+version = "0.3.12"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2744,7 +2758,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-runtime"
 version = "0.3.0"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2758,7 +2772,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-self"
 version = "0.3.14"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2770,7 +2784,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-store"
 version = "0.3.12"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2783,8 +2797,8 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-tcp"
-version = "0.3.22"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+version = "0.3.23"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "rustls 0.23.45",
@@ -2801,7 +2815,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-terminal"
 version = "0.3.11"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2817,7 +2831,7 @@ dependencies = [
 [[package]]
 name = "theater-handler-timer"
 version = "0.3.13"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2828,8 +2842,8 @@ dependencies = [
 
 [[package]]
 name = "theater-handler-udp"
-version = "0.3.0"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+version = "0.3.1"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "serde",
@@ -2843,7 +2857,7 @@ dependencies = [
 [[package]]
 name = "theater-native"
 version = "0.1.0"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "theater",
  "tokio",
@@ -2852,7 +2866,7 @@ dependencies = [
 [[package]]
 name = "theater-store"
 version = "0.1.0"
-source = "git+https://github.com/colinrozzi/theater.git?rev=8d42f42f6152a5860173ac85f58951e5ca4af65d#8d42f42f6152a5860173ac85f58951e5ca4af65d"
+source = "git+https://github.com/colinrozzi/theater.git?rev=cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98#cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98"
 dependencies = [
  "anyhow",
  "hex",
@@ -4620,6 +4634,7 @@ dependencies = [
  "theater-handler-lifecycle",
  "theater-handler-message-server",
  "theater-handler-podman",
+ "theater-handler-process",
  "theater-handler-rpc",
  "theater-handler-runtime",
  "theater-handler-self",

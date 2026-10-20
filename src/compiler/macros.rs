@@ -549,7 +549,12 @@ pub(crate) fn expand_all_macros(forms: Vec<SExpr>, macros: &CollectedMacros) -> 
 
 // Expand macros in a single S-expression
 pub(crate) fn expand_macros(expr: SExpr, macros: &CollectedMacros, depth: usize) -> SExpr {
-    const MAX_EXPANSION_DEPTH: usize = 100;
+    // Linear recursion here is normal, not pathological: the REPL's host-verb
+    // dispatch is a deliberately flat `cond` that expands one `if` level per
+    // clause (see wisp/interpreter/rpc.wisp), so the ceiling scales with the
+    // host-verb count, not with any real recursion. Keep ample headroom above
+    // that; a genuine infinite expansion still trips it well before stack limits.
+    const MAX_EXPANSION_DEPTH: usize = 512;
     if depth > MAX_EXPANSION_DEPTH {
         panic!("Macro expansion depth exceeded (possible infinite recursion)");
     }
