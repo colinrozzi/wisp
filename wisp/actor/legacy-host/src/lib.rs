@@ -128,6 +128,12 @@ impl Runtime {
         handlers.register(theater_handler_udp::UdpHandler::new(
             theater_handler_udp::UdpHandlerConfig::default(),
         ));
+        // Native OS processes (pipes + PTY). Default config = any program,
+        // unlimited, inherit env — the permissive dev-REPL stance the other
+        // handlers take; isolation comes from WHAT you spawn, not this handler.
+        handlers.register(theater_handler_process::ProcessHandler::new(
+            theater_handler_process::ProcessHandlerConfig::default(),
+        ));
         handlers.register(theater_handler_podman::PodmanHandler::new(
             theater_handler_podman::PodmanHandlerConfig {},
         ));

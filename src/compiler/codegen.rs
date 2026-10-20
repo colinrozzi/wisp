@@ -4831,7 +4831,8 @@ pub(crate) fn generate_load_inner_value(
         out.push_str("    i32.add\n");
     }
     match inner_ty {
-        Type::S64 => {
+        // U64 is i64-width in wasm, same as S64 (cf. the 496/553 store/load sites).
+        Type::S64 | Type::U64 => {
             out.push_str("    i64.load\n");
             out.push_str("    local.set $enc_tmp_i64\n");
         }
@@ -4854,7 +4855,7 @@ pub(crate) fn generate_load_inner_value(
 /// Get the local name for a value of a given type.
 pub(crate) fn enc_local_for_type(ty: &Type) -> &'static str {
     match ty {
-        Type::S64 => "$enc_tmp_i64",
+        Type::S64 | Type::U64 => "$enc_tmp_i64",
         Type::F32 => "$enc_tmp_f32",
         Type::F64 => "$enc_tmp_f64",
         _ => "$enc_tmp",

@@ -189,6 +189,35 @@
 (import theater:simple/udp set-active ((socket-id string) (mode string)) (result unit string))
 (import theater:simple/udp set-recv-timeout ((socket-id string) (timeout-ms u64)) (result unit string))
 
+; process: native OS processes (theater:simple/process). spawn takes a spawn-spec
+; record (built via marshal-record, like podman's container-spec); run takes
+; (spawn-spec, stdin bytes, option<u64> timeout), so there the spec rides as a
+; registered aggregate (element 0 of the arg tuple) — the (record spawn-spec ...)
+; decl registers it, and packr decodes a Record node structurally whether it is the
+; sole arg or nested. The rest are string/bytes/int shapes on an opaque process-id.
+; PTY (the pty field + resize) is deferred — it needs a u16 marshal path; pty always
+; crosses as none. Records declared so the import interface hashes match the pact.
+(record spawn-spec (program string) (args (list string)) (cwd (option string))
+  (env (list (tuple string string))) (clear-env bool) (pty (option (tuple u16 u16)))
+  (stdin string) (stdout string) (stderr string))
+(record process-status (running bool) (exit-code (option s32)) (signal (option s32)))
+(record output-chunk (stream string) (data (list u8)))
+(record run-output (status process-status) (stdout (list u8)) (stderr (list u8)) (truncated bool))
+(import theater:simple/process spawn ((spec spawn-spec)) (result string string))
+(import theater:simple/process run ((spec spawn-spec) (input (list u8)) (timeout-ms (option u64))) (result run-output string))
+(import theater:simple/process write-stdin ((process-id string) (data (list u8))) (result u64 string))
+(import theater:simple/process close-stdin ((process-id string)) (result unit string))
+(import theater:simple/process read ((process-id string) (max-bytes u32) (timeout-ms (option u64))) (result (option output-chunk) string))
+(import theater:simple/process set-active ((process-id string) (mode string)) (result unit string))
+(import theater:simple/process signal ((process-id string) (sig s32)) (result unit string))
+(import theater:simple/process kill ((process-id string)) (result unit string))
+(import theater:simple/process status ((process-id string)) (result process-status string))
+(import theater:simple/process wait ((process-id string) (timeout-ms (option u64))) (result process-status string))
+(import theater:simple/process os-pid ((process-id string)) (result u32 string))
+(import theater:simple/process list () (result (list string) string))
+(import theater:simple/process close ((process-id string)) (result unit string))
+(import theater:simple/process transfer ((process-id string) (target-actor string)) (result unit string))
+
 ; podman: container management. run takes a container-spec record (built via
 ; marshal-record); list returns container-info records.
 (record mount-spec (source string) (target string) (read-only bool))
@@ -282,6 +311,20 @@
     ((string=? name "udp-recv-from") 1)
     ((string=? name "udp-set-active") 1)
     ((string=? name "udp-set-recv-timeout") 1)
+    ((string=? name "process-spawn") 1)
+    ((string=? name "process-run") 1)
+    ((string=? name "process-write-stdin") 1)
+    ((string=? name "process-close-stdin") 1)
+    ((string=? name "process-read") 1)
+    ((string=? name "process-set-active") 1)
+    ((string=? name "process-signal") 1)
+    ((string=? name "process-kill") 1)
+    ((string=? name "process-status") 1)
+    ((string=? name "process-wait") 1)
+    ((string=? name "process-os-pid") 1)
+    ((string=? name "process-list") 1)
+    ((string=? name "process-close") 1)
+    ((string=? name "process-transfer") 1)
     ((string=? name "tcp-listen") 1)
     ((string=? name "tcp-accept") 1)
     ((string=? name "tcp-activate") 1)
@@ -895,6 +938,133 @@
 (fn apply-unlink ((args (list value))) value
   (if (one-str? args) (unmarshal (raw-invoke "theater:simple/lifecycle" "unlink" (marshal (list-get args 0)))) (failure "unlink expects a subject actor id")))
 
+; --- process ---------------------------------------------------------------
+; Native OS processes. spawn-spec is built field-for-field like container-spec;
+; cwd/pty cross as option values, env as list<tuple<string,string>> (reusing the
+; podman env helpers). spawn marshals the record alone (marshal-record); run needs
+; the spec INSIDE a tuple with stdin bytes + an option timeout, so there it crosses
+; as a registered aggregate (the (record spawn-spec ...) decl registers it in $types).
+; pty is always none for now — a SOME pty needs a u16 value form the codec lacks.
+(fn num-arg? ((v value)) s32 (value-case v ((integer n) 1) ((wide-integer n) 1) (else 0)))
+(fn opt-str-none () value (compound (unary-type "option" (symbol "string")) "none" (list-new value)))
+(fn opt-str-some ((s string)) value (compound (unary-type "option" (symbol "string")) "some" (list-push (list-new value) (text s))))
+; A cwd arg: a non-empty string -> some, anything else (absent/"") -> none (the
+; runtime's own cwd).
+(fn cwd-opt ((v value)) value
+  (value-case v
+    ((text s) (if (i32.gt_s (i32.load (string-addr s)) (i32.const 0)) (opt-str-some s) (opt-str-none)))
+    (else (opt-str-none))))
+(fn opt-u64-none () value (compound (unary-type "option" (symbol "u64")) "none" (list-new value)))
+(fn opt-u64-some ((v value)) value (compound (unary-type "option" (symbol "u64")) "some" (list-push (list-new value) (as-u64 v))))
+(fn pty-tuple-ty () value
+  (sequence (list-push (list-push (list-push (list-new value) (symbol "tuple")) (symbol "u16")) (symbol "u16"))))
+(fn pty-none () value (compound (unary-type "option" (pty-tuple-ty)) "none" (list-new value)))
+(fn spawn-spec-names () (list value)
+  (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+    (symbol "program")) (symbol "args")) (symbol "cwd")) (symbol "env")) (symbol "clear-env"))
+    (symbol "pty")) (symbol "stdin")) (symbol "stdout")) (symbol "stderr")))
+; The 9 spawn-spec field VALUES in pact order. clear-env off, pty none, stdio piped.
+(fn spawn-spec-values ((program string) (arg-items (list value)) (cwd value) (env-items (list value))) (list value)
+  (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+    (text program))
+    (typed-list (symbol "string") arg-items))
+    cwd)
+    (typed-list (env-tuple-type) env-items))
+    (boolean (i32.const 0)))
+    (pty-none))
+    (text "pipe")) (text "pipe")) (text "pipe")))
+(fn spawn-spec-blob ((program string) (arg-items (list value)) (cwd value) (env-items (list value))) any
+  (marshal-record "spawn-spec" (spawn-spec-names) (spawn-spec-values program arg-items cwd env-items)))
+; spawn-spec as an aggregate VALUE (for run, where the spec is one element of the
+; arg tuple rather than the sole arg). The interpreter's top-level (record ...) decls
+; don't populate the runtime $types, so register-record self-registers the schema on
+; first use (idempotent, returns the id) — the same path unmarshal-record uses to
+; rebuild host-returned records. enc-value then emits a proper Record node.
+(fn spawn-spec-agg ((program string) (arg-items (list value)) (cwd value) (env-items (list value))) value
+  (let (vals (spawn-spec-values program arg-items cwd env-items))
+    (aggregate "spawn-spec" (register-record "spawn-spec" (spawn-spec-names) vals) "spawn-spec" vals)))
+
+; (process-spawn program [args [cwd [env]]]) -> process-id. args = (a …) strings,
+; cwd = "" or a dir, env = ((KEY VAL) …). Shorter forms default empty/none.
+(fn apply-process-spawn ((args (list value))) value
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 1) (i32.gt_s n 4)) (failure "process-spawn expects (process-spawn program [args [cwd [env]]])")
+      (if (i32.eq (string-arg? (list-get args 0)) (i32.const 0)) (failure "process-spawn expects a program name string")
+        (let (args-val (if (i32.ge_s n 2) (list-get args 1) (sequence (list-new value))))
+          (let (cwd-val (if (i32.ge_s n 3) (cwd-opt (list-get args 2)) (opt-str-none)))
+            (let (env-val (if (i32.ge_s n 4) (list-get args 3) (sequence (list-new value))))
+              (if (i32.eq (string-list? args-val) (i32.const 0)) (failure "process-spawn args must be a list of strings")
+                (if (i32.eq (env-pairs? env-val) (i32.const 0)) (failure "process-spawn env must be a list of (key value) string pairs")
+                  (unmarshal (raw-invoke "theater:simple/process" "spawn"
+                    (spawn-spec-blob (as-string (list-get args 0)) (items-of args-val) cwd-val
+                      (build-env-items (items-of env-val) (i32.const 0) (list-new value))))))))))))))
+
+; (process-run program [args [input [cwd [env]]]]) -> run-output. One-shot: spawn,
+; feed `input` (string/bytes) to stdin, collect stdout/stderr, wait. The spec rides
+; as element 0 of the (spec, input, timeout-ms) arg tuple (aggregate value).
+(fn apply-process-run ((args (list value))) value
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 1) (i32.gt_s n 5)) (failure "process-run expects (process-run program [args [input [cwd [env]]]])")
+      (if (i32.eq (string-arg? (list-get args 0)) (i32.const 0)) (failure "process-run expects a program name string")
+        (let (args-val (if (i32.ge_s n 2) (list-get args 1) (sequence (list-new value))))
+          (let (input-val (if (i32.ge_s n 3) (list-get args 2) (text "")))
+            (let (cwd-val (if (i32.ge_s n 4) (cwd-opt (list-get args 3)) (opt-str-none)))
+              (let (env-val (if (i32.ge_s n 5) (list-get args 4) (sequence (list-new value))))
+                (if (i32.eq (string-list? args-val) (i32.const 0)) (failure "process-run args must be a list of strings")
+                  (if (i32.eq (env-pairs? env-val) (i32.const 0)) (failure "process-run env must be a list of (key value) string pairs")
+                    (unmarshal (raw-invoke "theater:simple/process" "run"
+                      (marshal (sequence (list-push (list-push (list-push (list-new value)
+                        (spawn-spec-agg (as-string (list-get args 0)) (items-of args-val) cwd-val
+                          (build-env-items (items-of env-val) (i32.const 0) (list-new value))))
+                        (str-to-bytes input-val))
+                        (opt-u64-none))))))))))))))))
+
+(fn apply-process-write-stdin ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "process-write-stdin expects (process-write-stdin process-id data)")
+    (if (string-arg? (list-get args 0))
+      (unmarshal (raw-invoke "theater:simple/process" "write-stdin" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "process-write-stdin expects a process id (string) and data (string or byte list)"))))
+(fn apply-process-close-stdin ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/process" "close-stdin" (marshal (list-get args 0)))) (failure "process-close-stdin expects a process id")))
+(fn apply-process-read ((args (list value))) value
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 2) (i32.gt_s n 3)) (failure "process-read expects (process-read process-id max-bytes [timeout-ms])")
+      (if (i32.and (string-arg? (list-get args 0)) (num-arg? (list-get args 1)))
+        (unmarshal (raw-invoke "theater:simple/process" "read"
+          (marshal (sequence (list-push (list-push (list-push (list-new value)
+            (list-get args 0)) (as-u32 (list-get args 1)))
+            (if (i32.ge_s n 3) (opt-u64-some (list-get args 2)) (opt-u64-none)))))))
+        (failure "process-read expects a process id and an integer max-bytes")))))
+(fn apply-process-set-active ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/process" "set-active" (arg-tuple args))) (failure "process-set-active expects a process id and mode")))
+(fn apply-process-signal ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "process-signal expects (process-signal process-id sig)")
+    (if (i32.and (string-arg? (list-get args 0)) (num-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "theater:simple/process" "signal"
+        (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1))))))
+      (failure "process-signal expects a process id and an integer signal"))))
+(fn apply-process-kill ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/process" "kill" (marshal (list-get args 0)))) (failure "process-kill expects a process id")))
+(fn apply-process-status ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/process" "status" (marshal (list-get args 0)))) (failure "process-status expects a process id")))
+(fn apply-process-wait ((args (list value))) value
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 1) (i32.gt_s n 2)) (failure "process-wait expects (process-wait process-id [timeout-ms])")
+      (if (string-arg? (list-get args 0))
+        (unmarshal (raw-invoke "theater:simple/process" "wait"
+          (marshal (sequence (list-push (list-push (list-new value) (list-get args 0))
+            (if (i32.ge_s n 2) (opt-u64-some (list-get args 1)) (opt-u64-none)))))))
+        (failure "process-wait expects a process id")))))
+(fn apply-process-os-pid ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/process" "os-pid" (marshal (list-get args 0)))) (failure "process-os-pid expects a process id")))
+(fn apply-process-list ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "process-list expects no arguments")
+    (unmarshal (raw-invoke "theater:simple/process" "list" (arg-tuple (list-new value))))))
+(fn apply-process-close ((args (list value))) value
+  (if (one-str? args) (unmarshal (raw-invoke "theater:simple/process" "close" (marshal (list-get args 0)))) (failure "process-close expects a process id")))
+(fn apply-process-transfer ((args (list value))) value
+  (if (two-str? args) (unmarshal (raw-invoke "theater:simple/process" "transfer" (arg-tuple args))) (failure "process-transfer expects a process id and target actor")))
+
 ; --- inbound events --------------------------------------------------------
 ; Drain the buffered triggers: each is (handler-name event result). Clears the
 ; buffer so you see only what fired since the last poll.
@@ -925,10 +1095,11 @@
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
+                      (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id) ...\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events) to drain   see (help \"triggers\")\n"
-                          "topics:    (help \"tcp\")   (help \"triggers\")")))))))))))))
+                          "topics:    (help \"tcp\")   (help \"triggers\")"))))))))))))))
     (if (string-arg? (list-get args 0))
       (text (help-topic (as-string (list-get args 0))))
       (failure "help expects an optional topic string"))))
@@ -1004,6 +1175,20 @@
     ((string=? name "udp-recv-from") (apply-udp-recv-from args))
     ((string=? name "udp-set-active") (apply-udp-set-active args))
     ((string=? name "udp-set-recv-timeout") (apply-udp-set-recv-timeout args))
+    ((string=? name "process-spawn") (apply-process-spawn args))
+    ((string=? name "process-run") (apply-process-run args))
+    ((string=? name "process-write-stdin") (apply-process-write-stdin args))
+    ((string=? name "process-close-stdin") (apply-process-close-stdin args))
+    ((string=? name "process-read") (apply-process-read args))
+    ((string=? name "process-set-active") (apply-process-set-active args))
+    ((string=? name "process-signal") (apply-process-signal args))
+    ((string=? name "process-kill") (apply-process-kill args))
+    ((string=? name "process-status") (apply-process-status args))
+    ((string=? name "process-wait") (apply-process-wait args))
+    ((string=? name "process-os-pid") (apply-process-os-pid args))
+    ((string=? name "process-list") (apply-process-list args))
+    ((string=? name "process-close") (apply-process-close args))
+    ((string=? name "process-transfer") (apply-process-transfer args))
     ((string=? name "tcp-listen") (apply-tcp-listen args))
     ((string=? name "tcp-accept") (apply-tcp-accept args))
     ((string=? name "tcp-activate") (apply-tcp-activate args))
