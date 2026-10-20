@@ -27,6 +27,7 @@
   (boolean s32)
   (u64-value s64)
   (u32-value s32)
+  (u16-value s32)
   (open-variant string string s32 (list value)))
 
 (record binding (name string) (item value))
@@ -65,6 +66,7 @@
         ((boolean ignored-bool) fallback)
         ((u64-value ignored-u64) fallback)
         ((u32-value ignored-u32) fallback)
+        ((u16-value ignored-u16) fallback)
         ((open-variant ignored-tn ignored-cn ignored-tag ignored-fields) fallback)))))
 
 (fn failed? ((v value)) s32

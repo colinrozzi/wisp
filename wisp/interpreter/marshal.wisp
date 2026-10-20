@@ -231,6 +231,9 @@
     ((u32-value n)
       (let (cur (emit-scalar-header (i32.const 14) (i32.const 4)))   ; CGRF U32 = 0x0E
         (begin (i32.store (i32.add cur (i32.const 8)) n) (take-node (i32.const 12)))))
+    ((u16-value n)
+      (let (cur (emit-scalar-header (i32.const 13) (i32.const 2)))   ; CGRF U16 = 0x0D
+        (begin (i32.store16 (i32.add cur (i32.const 8)) n) (take-node (i32.const 10)))))
     ((single f)
       (let (cur (emit-scalar-header (i32.const 4) (i32.const 4)))
         (begin (f32.store (i32.add cur (i32.const 8)) f) (take-node (i32.const 12)))))

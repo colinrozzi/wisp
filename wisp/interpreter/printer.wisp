@@ -60,6 +60,7 @@
     ((byte-value n) (string-append "#<u8 " (string-append (show-integer n) ">")))
     ((wide-integer n) (show-wide n))
     ((u32-value n) (string-append (show-integer n) "u32"))
+    ((u16-value n) (string-append (show-integer n) "u16"))
     ((integer-literal n) "#<integer-literal>")
     ((single n) (show-float (f64.promote_f32 n) 9 "f32"))
     ((double n) (show-float n 17 "f64"))
