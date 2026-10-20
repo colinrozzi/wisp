@@ -314,6 +314,7 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
         "close-stdin",
         "read",
         "set-active",
+        "resize",
         "signal",
         "kill",
         "status",

@@ -195,8 +195,10 @@
 ; registered aggregate (element 0 of the arg tuple) — the (record spawn-spec ...)
 ; decl registers it, and packr decodes a Record node structurally whether it is the
 ; sole arg or nested. The rest are string/bytes/int shapes on an opaque process-id.
-; PTY (the pty field + resize) is deferred — it needs a u16 marshal path; pty always
-; crosses as none. Records declared so the import interface hashes match the pact.
+; PTY: process-spawn-pty sets spawn-spec.pty = some(cols,rows) and process-resize
+; sends (u16,u16) — u16 crosses via the u16-value marshal path (see as-u16). Active
+; output/exit arrive via the process-client exports (on-output/on-exit, see
+; actor.wisp) drained by poll-events. Records declared so import hashes match the pact.
 (record spawn-spec (program string) (args (list string)) (cwd (option string))
   (env (list (tuple string string))) (clear-env bool) (pty (option (tuple u16 u16)))
   (stdin string) (stdout string) (stderr string))
@@ -209,6 +211,7 @@
 (import theater:simple/process close-stdin ((process-id string)) (result unit string))
 (import theater:simple/process read ((process-id string) (max-bytes u32) (timeout-ms (option u64))) (result (option output-chunk) string))
 (import theater:simple/process set-active ((process-id string) (mode string)) (result unit string))
+(import theater:simple/process resize ((process-id string) (cols u16) (rows u16)) (result unit string))
 (import theater:simple/process signal ((process-id string) (sig s32)) (result unit string))
 (import theater:simple/process kill ((process-id string)) (result unit string))
 (import theater:simple/process status ((process-id string)) (result process-status string))
@@ -317,6 +320,8 @@
     ((string=? name "process-close-stdin") 1)
     ((string=? name "process-read") 1)
     ((string=? name "process-set-active") 1)
+    ((string=? name "process-spawn-pty") 1)
+    ((string=? name "process-resize") 1)
     ((string=? name "process-signal") 1)
     ((string=? name "process-kill") 1)
     ((string=? name "process-status") 1)
@@ -629,6 +634,14 @@
     ((wide-integer n) (u32-value (i32.wrap_i64 n)))
     ((u64-value n) (u32-value (i32.wrap_i64 n)))
     (else (u32-value (i32.const 0)))))
+; Coerce a REPL integer to a CGRF u16 argument (pty cols/rows, process-resize).
+(fn as-u16 ((v value)) value
+  (value-case v
+    ((integer n) (u16-value n))
+    ((wide-integer n) (u16-value (i32.wrap_i64 n)))
+    ((u64-value n) (u16-value (i32.wrap_i64 n)))
+    ((u32-value n) (u16-value n))
+    (else (u16-value (i32.const 0)))))
 (fn apply-timer-now ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "now expects no arguments")
     (unmarshal (raw-invoke "theater:simple/timer" "now" (arg-tuple (list-new value))))))
@@ -959,29 +972,36 @@
 (fn pty-tuple-ty () value
   (sequence (list-push (list-push (list-push (list-new value) (symbol "tuple")) (symbol "u16")) (symbol "u16"))))
 (fn pty-none () value (compound (unary-type "option" (pty-tuple-ty)) "none" (list-new value)))
+; option<tuple<u16,u16>> = some (cols rows). The inner value is a 2-element tuple of
+; u16s; cols/rows coerce from REPL integers via as-u16.
+(fn pty-some ((cols value) (rows value)) value
+  (compound (unary-type "option" (pty-tuple-ty)) "some"
+    (list-push (list-new value)
+      (sequence (list-push (list-push (list-new value) (as-u16 cols)) (as-u16 rows))))))
 (fn spawn-spec-names () (list value)
   (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
     (symbol "program")) (symbol "args")) (symbol "cwd")) (symbol "env")) (symbol "clear-env"))
     (symbol "pty")) (symbol "stdin")) (symbol "stdout")) (symbol "stderr")))
-; The 9 spawn-spec field VALUES in pact order. clear-env off, pty none, stdio piped.
-(fn spawn-spec-values ((program string) (arg-items (list value)) (cwd value) (env-items (list value))) (list value)
+; The 9 spawn-spec field VALUES in pact order. clear-env off, stdio piped; `pty` is
+; a caller-supplied option value (pty-none, or pty-some cols rows).
+(fn spawn-spec-values ((program string) (arg-items (list value)) (cwd value) (env-items (list value)) (pty value)) (list value)
   (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
     (text program))
     (typed-list (symbol "string") arg-items))
     cwd)
     (typed-list (env-tuple-type) env-items))
     (boolean (i32.const 0)))
-    (pty-none))
+    pty)
     (text "pipe")) (text "pipe")) (text "pipe")))
-(fn spawn-spec-blob ((program string) (arg-items (list value)) (cwd value) (env-items (list value))) any
-  (marshal-record "spawn-spec" (spawn-spec-names) (spawn-spec-values program arg-items cwd env-items)))
+(fn spawn-spec-blob ((program string) (arg-items (list value)) (cwd value) (env-items (list value)) (pty value)) any
+  (marshal-record "spawn-spec" (spawn-spec-names) (spawn-spec-values program arg-items cwd env-items pty)))
 ; spawn-spec as an aggregate VALUE (for run, where the spec is one element of the
 ; arg tuple rather than the sole arg). The interpreter's top-level (record ...) decls
 ; don't populate the runtime $types, so register-record self-registers the schema on
 ; first use (idempotent, returns the id) — the same path unmarshal-record uses to
 ; rebuild host-returned records. enc-value then emits a proper Record node.
-(fn spawn-spec-agg ((program string) (arg-items (list value)) (cwd value) (env-items (list value))) value
-  (let (vals (spawn-spec-values program arg-items cwd env-items))
+(fn spawn-spec-agg ((program string) (arg-items (list value)) (cwd value) (env-items (list value)) (pty value)) value
+  (let (vals (spawn-spec-values program arg-items cwd env-items pty))
     (aggregate "spawn-spec" (register-record "spawn-spec" (spawn-spec-names) vals) "spawn-spec" vals)))
 
 ; (process-spawn program [args [cwd [env]]]) -> process-id. args = (a …) strings,
@@ -997,7 +1017,7 @@
                 (if (i32.eq (env-pairs? env-val) (i32.const 0)) (failure "process-spawn env must be a list of (key value) string pairs")
                   (unmarshal (raw-invoke "theater:simple/process" "spawn"
                     (spawn-spec-blob (as-string (list-get args 0)) (items-of args-val) cwd-val
-                      (build-env-items (items-of env-val) (i32.const 0) (list-new value))))))))))))))
+                      (build-env-items (items-of env-val) (i32.const 0) (list-new value)) (pty-none)))))))))))))
 
 ; (process-run program [args [input [cwd [env]]]]) -> run-output. One-shot: spawn,
 ; feed `input` (string/bytes) to stdin, collect stdout/stderr, wait. The spec rides
@@ -1015,7 +1035,7 @@
                     (unmarshal (raw-invoke "theater:simple/process" "run"
                       (marshal (sequence (list-push (list-push (list-push (list-new value)
                         (spawn-spec-agg (as-string (list-get args 0)) (items-of args-val) cwd-val
-                          (build-env-items (items-of env-val) (i32.const 0) (list-new value))))
+                          (build-env-items (items-of env-val) (i32.const 0) (list-new value)) (pty-none)))
                         (str-to-bytes input-val))
                         (opt-u64-none))))))))))))))))
 
@@ -1037,6 +1057,29 @@
         (failure "process-read expects a process id and an integer max-bytes")))))
 (fn apply-process-set-active ((args (list value))) value
   (if (two-str? args) (unmarshal (raw-invoke "theater:simple/process" "set-active" (arg-tuple args))) (failure "process-set-active expects a process id and mode")))
+; (process-spawn-pty program cols rows [args [cwd [env]]]) -> id. Like process-spawn
+; but on a PTY of (cols,rows): one combined output stream, stdin via the pty.
+(fn apply-process-spawn-pty ((args (list value))) value
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 3) (i32.gt_s n 6)) (failure "process-spawn-pty expects (process-spawn-pty program cols rows [args [cwd [env]]])")
+      (if (i32.eq (i32.and (string-arg? (list-get args 0)) (i32.and (num-arg? (list-get args 1)) (num-arg? (list-get args 2)))) (i32.const 0))
+        (failure "process-spawn-pty expects a program (string) and integer cols, rows")
+        (let (args-val (if (i32.ge_s n 4) (list-get args 3) (sequence (list-new value))))
+          (let (cwd-val (if (i32.ge_s n 5) (cwd-opt (list-get args 4)) (opt-str-none)))
+            (let (env-val (if (i32.ge_s n 6) (list-get args 5) (sequence (list-new value))))
+              (if (i32.eq (string-list? args-val) (i32.const 0)) (failure "process-spawn-pty args must be a list of strings")
+                (if (i32.eq (env-pairs? env-val) (i32.const 0)) (failure "process-spawn-pty env must be a list of (key value) string pairs")
+                  (unmarshal (raw-invoke "theater:simple/process" "spawn"
+                    (spawn-spec-blob (as-string (list-get args 0)) (items-of args-val) cwd-val
+                      (build-env-items (items-of env-val) (i32.const 0) (list-new value))
+                      (pty-some (list-get args 1) (list-get args 2))))))))))))))
+(fn apply-process-resize ((args (list value))) value
+  (if (i32.ne (list-len args) 3) (failure "process-resize expects (process-resize process-id cols rows)")
+    (if (i32.and (string-arg? (list-get args 0)) (i32.and (num-arg? (list-get args 1)) (num-arg? (list-get args 2))))
+      (unmarshal (raw-invoke "theater:simple/process" "resize"
+        (marshal (sequence (list-push (list-push (list-push (list-new value)
+          (list-get args 0)) (as-u16 (list-get args 1))) (as-u16 (list-get args 2)))))))
+      (failure "process-resize expects a process id and integer cols, rows"))))
 (fn apply-process-signal ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "process-signal expects (process-signal process-id sig)")
     (if (i32.and (string-arg? (list-get args 0)) (num-arg? (list-get args 1)))
@@ -1095,7 +1138,7 @@
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
-                      (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id) ...\n"
+                      (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events) to drain   see (help \"triggers\")\n"
@@ -1181,6 +1224,8 @@
     ((string=? name "process-close-stdin") (apply-process-close-stdin args))
     ((string=? name "process-read") (apply-process-read args))
     ((string=? name "process-set-active") (apply-process-set-active args))
+    ((string=? name "process-spawn-pty") (apply-process-spawn-pty args))
+    ((string=? name "process-resize") (apply-process-resize args))
     ((string=? name "process-signal") (apply-process-signal args))
     ((string=? name "process-kill") (apply-process-kill args))
     ((string=? name "process-status") (apply-process-status args))

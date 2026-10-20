@@ -60,6 +60,23 @@
   (fn tcp-on-close ((raw any)) string
     (begin (dispatch-event "on-close" (unmarshal raw)) "ok")))
 
+; Process callbacks (theater:simple/process-client). After (process-set-active id
+; "active"|"once"), Theater pushes each output chunk here as on-output and the final
+; on-exit — delivered by CALLING these exports (by name, not has_export-gated, like
+; tcp), so observing a process is just defining on-output / on-exit / on-process-
+; transfer handlers and draining (poll-events). on-output arrives as a Tuple
+; (process-id stream data) and on-exit as (process-id status-record), taken raw as
+; `any` and unmarshalled to a sequence; handle-process-transfer gets a bare id.
+(export "theater:simple/process-client.on-output"
+  (fn process-on-output ((raw any)) string
+    (begin (dispatch-event "on-output" (unmarshal raw)) "ok")))
+(export "theater:simple/process-client.on-exit"
+  (fn process-on-exit ((raw any)) string
+    (begin (dispatch-event "on-exit" (unmarshal raw)) "ok")))
+(export "theater:simple/process-client.handle-process-transfer"
+  (fn process-on-transfer ((process-id string)) string
+    (begin (dispatch-event "on-process-transfer" (text process-id)) "ok")))
+
 ; Lifecycle monitoring (theater:simple/lifecycle-handlers). After (monitor id),
 ; Theater delivers every chain event of the monitored actor here, dispatched to a
 ; user on-actor-event handler as (sequence subject event-type data) — route on
