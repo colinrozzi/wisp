@@ -1,5 +1,6 @@
 //! Preflight for Theater's engine/host-import boundary. This deliberately does
 //! not claim actor lifecycle or chain replay coverage.
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +18,11 @@ fn source_result(result: Result<String, String>) -> Value {
     }
 }
 
-fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
+// Editable source files the read-file mock serves (path -> text), so a test can
+// change a library between reads; consulted before the fixed greet module.
+type Files = Arc<Mutex<HashMap<String, String>>>;
+
+fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
     let mut imports = HostImports::new();
     // Clone before the read-source closure moves `calls`; the filesystem read-file
     // mock (what `require` loads through) logs its reads here too.
@@ -156,6 +161,7 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
             "read-file",
             host_fn(move |input| {
                 let calls = calls.clone();
+                let files = files.clone();
                 async move {
                     let Value::String(path) = input else {
                         panic!("read-file input: {input:?}")
@@ -169,7 +175,10 @@ fn imports(calls: Arc<Mutex<Vec<String>>>) -> HostImports {
                             items: s.bytes().map(Value::U8).collect(),
                         })),
                     };
-                    Ok(if path == "lib/greet.wisp" {
+                    let edited = files.lock().unwrap().get(&path).cloned();
+                    Ok(if let Some(text) = edited {
+                        bytes(&text)
+                    } else if path == "lib/greet.wisp" {
                         bytes("(module greet (provide greeting) (define greeting 7))")
                     } else {
                         Value::Result {
@@ -401,8 +410,9 @@ async fn engine_session() {
     let engine = WasmtimeEngine::new();
     let module = engine.compile(&wasm).await.unwrap();
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let files = Files::default();
     let mut first = engine
-        .instantiate(&module, imports(calls.clone()))
+        .instantiate(&module, imports(calls.clone(), files.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -461,11 +471,105 @@ async fn engine_session() {
             .unwrap()
             .contains(&"GET https://example.test/netmod.wisp".to_string())
     );
-    let mut second = engine.instantiate(&module, imports(calls)).await.unwrap();
+    let mut second = engine
+        .instantiate(&module, imports(calls.clone(), Files::default()))
+        .await
+        .unwrap();
     assert!(
         evaluate(&mut second, "(add-two 40)")
             .await
             .contains("unbound")
     );
     assert_eq!(evaluate(&mut first, "(increment 41)").await, "42");
+    reload_session(&mut first, &files, &calls).await;
+}
+
+// (reload NAME) re-reads a loaded module from its original source and refreshes
+// every importer in the session; a failed reload changes nothing.
+async fn reload_session(
+    first: &mut WasmtimeInstance,
+    files: &Files,
+    calls: &Arc<Mutex<Vec<String>>>,
+) {
+    let path = "lib/counter.wisp";
+    let set = |text: &str| {
+        files
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), text.to_string());
+    };
+    let reads = || calls.lock().unwrap().iter().filter(|p| *p == path).count();
+    set(
+        "(module counter (provide value bump) (define value 1) (define bump (lambda (x) (+ x value))))",
+    );
+    assert_eq!(
+        evaluate(first, "(require counter \"lib/counter.wisp\") (bump 1)").await,
+        "2"
+    );
+    // A second importer, besides main: user holds its own copy of bump.
+    assert_eq!(
+        evaluate(
+            first,
+            "(module user (require counter) (provide via) (define via (lambda () (bump 2)))) (require user) (via)"
+        )
+        .await,
+        "3"
+    );
+    // A hand copy is not an import, so reload leaves it on the old code (its body
+    // still resolves top-level names in counter's current env).
+    evaluate(first, "(define copied bump)").await;
+    // require stays load-once: the edit is not seen until reload.
+    set(
+        "(module counter (provide value bump) (define value 10) (define bump (lambda (x) (* x value))))",
+    );
+    assert_eq!(evaluate(first, "(require counter) value").await, "1");
+    assert_eq!(reads(), 1);
+    // reload re-reads the remembered path and rebinds main's AND user's copies.
+    assert_eq!(evaluate(first, "(reload counter)").await, "()");
+    assert_eq!(reads(), 2);
+    assert_eq!(evaluate(first, "value").await, "10");
+    assert_eq!(evaluate(first, "(bump 1)").await, "10");
+    assert_eq!(evaluate(first, "(via)").await, "20");
+    assert_eq!(evaluate(first, "(copied 1)").await, "11");
+    // A name the new version no longer provides is unbound everywhere and reported.
+    set("(module counter (provide value) (define value 20))");
+    assert_eq!(evaluate(first, "(reload counter)").await, "(bump)");
+    assert_eq!(evaluate(first, "value").await, "20");
+    assert!(
+        evaluate(first, "bump")
+            .await
+            .contains("unbound symbol: bump")
+    );
+    assert!(
+        evaluate(first, "(via)")
+            .await
+            .contains("unbound symbol: bump")
+    );
+    // Failed reloads leave the old module and every binding untouched.
+    for (text, error) in [
+        (
+            "(module counter (provide value) (define value (car 5)))",
+            "error:",
+        ),
+        ("42", "error: source did not define module counter"),
+        (
+            "(module counter (provide value missing) (define value 30))",
+            "error: module counter provides undefined name missing",
+        ),
+    ] {
+        set(text);
+        let result = evaluate(first, "(reload counter)").await;
+        assert!(result.starts_with(error), "{text}: {result}");
+        assert_eq!(evaluate(first, "value").await, "20", "{text}");
+    }
+    files.lock().unwrap().remove(path);
+    assert_eq!(
+        evaluate(first, "(reload counter)").await,
+        "error: cannot read source: lib/counter.wisp"
+    );
+    assert_eq!(evaluate(first, "value").await, "20");
+    // The old module is still registered and reloadable once the source is fixed.
+    set("(module counter (provide value) (define value 40))");
+    assert_eq!(evaluate(first, "(reload counter)").await, "()");
+    assert_eq!(evaluate(first, "value").await, "40");
 }

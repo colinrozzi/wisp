@@ -9,12 +9,15 @@
 ; `exports` names made public via provide. `imports` pairs each name brought in by
 ; require with the module it came from (stored as (binding name (symbol module))),
 ; so re-requiring the same module is idempotent and only a DIFFERENT module
-; providing the same name is a conflict.
-(record module (name string) (env (list binding)) (exports (list string)) (imports (list binding)))
+; providing the same name is a conflict, and so (reload NAME) can find every copy.
+; `source` is the explicit path/URL the module was loaded from, or "" for a module
+; defined in-session; reload re-reads it.
+(record module (name string) (env (list binding)) (exports (list string)) (imports (list binding)) (source string))
 (global $modules (list module) mut 0)
 (global $current-module string mut 0)
 (global $current-exports (list string) mut 0)
 (global $current-imports (list binding) mut 0)
+(global $current-source string mut 0)
 ; Cycle guard listing modules whose source is being evaluated right now.
 (global $loading (list string) mut 0)
 
@@ -52,13 +55,14 @@
   (begin
     (global.set $modules
       (list-push (drop-module (global.get $modules) 0 (global.get $current-module) (list-new module))
-        (module (global.get $current-module) (global.get $bindings) (global.get $current-exports) (global.get $current-imports))))
+        (module (global.get $current-module) (global.get $bindings) (global.get $current-exports) (global.get $current-imports) (global.get $current-source))))
     (let (index (find-module (global.get $modules) (i32.sub (list-len (global.get $modules)) 1) name))
       (if (i32.lt_s index 0)
         (begin
           (global.set $bindings (list-new binding))
           (global.set $current-exports (list-new string))
           (global.set $current-imports (list-new binding))
+          (global.set $current-source "")
           (global.set $current-module name)
           (nil))
         (let (target (list-get (global.get $modules) index))
@@ -66,6 +70,7 @@
             (global.set $bindings (module.env target))
             (global.set $current-exports (module.exports target))
             (global.set $current-imports (module.imports target))
+            (global.set $current-source (module.source target))
             (global.set $current-module name)
             (global.set $modules (drop-module (global.get $modules) 0 name (list-new module)))
             (nil)))))))
@@ -181,8 +186,19 @@
               (begin
                 (global.set $loading (drop-name (global.get $loading) 0 name (list-new string)))
                 (if (failed? loaded) loaded
-                  (if (module-loaded? name) (nil)
+                  (if (module-loaded? name) (set-module-source name path)
                     (failure (string-append "source did not define module " name))))))))))))
+
+; Remember where a just-loaded (suspended) module came from, for (reload NAME).
+(fn set-module-source ((name string) (path string)) value
+  (let (index (find-module (global.get $modules) (i32.sub (list-len (global.get $modules)) 1) name))
+    (if (i32.lt_s index 0) (nil)
+      (let (m (list-get (global.get $modules) index))
+        (begin
+          (global.set $modules
+            (list-push (drop-module (global.get $modules) 0 name (list-new module))
+              (module name (module.env m) (module.exports m) (module.imports m) path)))
+          (nil))))))
 
 ; The module a name was imported from, or "" if it is not an import.
 (fn import-source ((imports (list binding)) (index s32) (name string)) string
@@ -235,3 +251,120 @@
           ((text path) (require-named (list-get items 1) path))
           (else (failure "require source must be a string path")))
         (failure "require expects (require name) or (require name \"source\")")))))
+
+; (reload NAME) re-reads an already-loaded module from the source it was loaded
+; from, evaluates it into a fresh env that replaces the old one (so definitions
+; removed from the file disappear), then rebinds the copies that EVERY importer in
+; the session holds. Shallow: NAME's own requires are already loaded, so they are
+; reused, not re-read. If the new source fails (read, eval, no module, a provided
+; but undefined name) the old module stays registered and no importer is touched.
+; Returns the names importers lost because the new version no longer provides them.
+; A value copied by hand (`(define f imported-f)`) is not an import and keeps the
+; old version (a copied closure keeps its old body, though top-level names in it
+; still resolve in NAME's current env).
+(fn eval-reload ((items (list value)) (top s32)) value
+  (if (i32.eq top 0) (failure "reload is only supported at top level")
+    (if (i32.ne (list-len items) 2) (failure "reload expects (reload name)")
+      (if (symbol? (list-get items 1))
+        (reload-named (symbol-name (list-get items 1)))
+        (failure "reload expects a symbol module name")))))
+
+(fn reload-named ((name string)) value
+  (if (string=? name (global.get $current-module)) (failure (string-append "module cannot reload itself: " name))
+    (if (name-member? (global.get $loading) 0 name) (failure (string-append "module dependency cycle: " name))
+      (let (index (find-module (global.get $modules) (i32.sub (list-len (global.get $modules)) 1) name))
+        (if (i32.lt_s index 0) (failure (string-append "module is not loaded: " name))
+          (let (old (list-get (global.get $modules) index))
+            (if (i32.eq (string-len (module.source old)) 0)
+              (failure (string-append "module has no source to reload (it was defined in-session): " name))
+              (begin
+                ; Unregister NAME so its (module NAME ...) form starts from an empty env.
+                (global.set $modules (drop-module (global.get $modules) 0 name (list-new module)))
+                (global.set $loading (list-push (global.get $loading) name))
+                (let (loaded (load-module-source (module.source old)))
+                  (begin
+                    (global.set $loading (drop-name (global.get $loading) 0 name (list-new string)))
+                    (if (failed? loaded) (restore-module name old loaded)
+                      (install-reloaded name old))))))))))))
+
+; The new source evaluated cleanly; check it defined NAME with every provided name
+; bound, then commit: keep the old source path and refresh the importers.
+(fn install-reloaded ((name string) (old module)) value
+  (let (found (find-module (global.get $modules) (i32.sub (list-len (global.get $modules)) 1) name))
+    (if (i32.lt_s found 0) (restore-module name old (failure (string-append "source did not define module " name)))
+      (let (fresh (list-get (global.get $modules) found))
+        (let (missing (undefined-export (module.env fresh) (module.exports fresh) 0))
+          (if (string-len missing)
+            (restore-module name old
+              (failure (string-append "module " (string-append name (string-append " provides undefined name " missing)))))
+            (begin
+              (set-module-source name (module.source old))
+              (rebind-importers name (module.env fresh) (module.exports fresh)))))))))
+
+; Put the old module back, discarding whatever the failed reload registered.
+(fn restore-module ((name string) (old module) (error value)) value
+  (begin
+    (global.set $modules (list-push (drop-module (global.get $modules) 0 name (list-new module)) old))
+    error))
+
+; The first provided name that the env does not define, or "".
+(fn undefined-export ((env (list binding)) (exports (list string)) (index s32)) string
+  (if (i32.ge_s index (list-len exports)) ""
+    (if (failed? (lookup-local (list-get exports index) env (i32.sub (list-len env) 1))) (list-get exports index)
+      (undefined-export env exports (i32.add index 1)))))
+
+(fn drop-binding ((env (list binding)) (index s32) (name string) (out (list binding))) (list binding)
+  (if (i32.ge_s index (list-len env)) out
+    (drop-binding env (i32.add index 1) name
+      (if (string=? name (binding.name (list-get env index))) out
+        (list-push out (list-get env index))))))
+
+; One importer's env/imports after a reload, plus the names dropped so far.
+(record rebound (env (list binding)) (imports (list binding)) (dropped (list string)))
+
+; Walk one importer's imports. An import from SOURCE-NAME that the new version
+; still provides is overwritten with the new value (the overwrite path require's
+; idempotent skip lacks); one it no longer provides is unbound and reported.
+; Imports from other modules pass through. drop-binding copies, so the importer's
+; original env list is never mutated.
+(fn rebind-imports ((source-name string) (env (list binding)) (exports (list string)) (imports (list binding)) (index s32) (acc rebound)) rebound
+  (if (i32.ge_s index (list-len imports)) acc
+    (let (entry (list-get imports index))
+      (let (n (binding.name entry))
+        (rebind-imports source-name env exports imports (i32.add index 1)
+          (if (string=? source-name (symbol-name (binding.item entry)))
+            (if (name-member? exports 0 n)
+              (rebound
+                (list-push (drop-binding (rebound.env acc) 0 n (list-new binding))
+                  (binding n (lookup-local n env (i32.sub (list-len env) 1))))
+                (list-push (rebound.imports acc) entry)
+                (rebound.dropped acc))
+              (rebound
+                (drop-binding (rebound.env acc) 0 n (list-new binding))
+                (rebound.imports acc)
+                (if (name-member? (rebound.dropped acc) 0 n) (rebound.dropped acc)
+                  (list-push (rebound.dropped acc) n))))
+            (rebound (rebound.env acc) (list-push (rebound.imports acc) entry) (rebound.dropped acc))))))))
+
+; Refresh every suspended module in the registry; returns the dropped names.
+(fn rebind-modules ((mods (list module)) (index s32) (source-name string) (env (list binding)) (exports (list string)) (out (list module)) (dropped (list string))) (list string)
+  (if (i32.ge_s index (list-len mods))
+    (begin (global.set $modules out) dropped)
+    (let (m (list-get mods index))
+      (let (r (rebind-imports source-name env exports (module.imports m) 0 (rebound (module.env m) (list-new binding) dropped)))
+        (rebind-modules mods (i32.add index 1) source-name env exports
+          (list-push out (module (module.name m) (rebound.env r) (module.exports m) (rebound.imports r) (module.source m)))
+          (rebound.dropped r))))))
+
+(fn name-symbols ((names (list string)) (index s32) (out (list value))) value
+  (if (i32.ge_s index (list-len names)) (sequence out)
+    (name-symbols names (i32.add index 1) (list-push out (symbol (list-get names index))))))
+
+; Refresh the suspended modules, then the current one (which lives in the globals).
+(fn rebind-importers ((name string) (env (list binding)) (exports (list string))) value
+  (let (dropped (rebind-modules (global.get $modules) 0 name env exports (list-new module) (list-new string)))
+    (let (r (rebind-imports name env exports (global.get $current-imports) 0 (rebound (global.get $bindings) (list-new binding) dropped)))
+      (begin
+        (global.set $bindings (rebound.env r))
+        (global.set $current-imports (rebound.imports r))
+        (name-symbols (rebound.dropped r) 0 (list-new value))))))

@@ -543,3 +543,42 @@ fn test_interpreter_tail_recursion_is_not_depth_limited() {
     eval(&mut s, "(count 0 500)", "500");
     eval(&mut s, "(count 0 5000)", "5000");
 }
+
+#[test]
+fn test_interpreter_reload_edge_cases() {
+    let mut s = session();
+    // Reloading a module that was never loaded is an error.
+    eval(&mut s, "(reload nope)", "error: module is not loaded: nope");
+    // A module defined in-session has no source to re-read.
+    eval(&mut s, "(module m (provide x) (define x 1))", "()");
+    eval(
+        &mut s,
+        "(reload m)",
+        "error: module has no source to reload (it was defined in-session): m",
+    );
+    eval(
+        &mut s,
+        "(reload main)",
+        "error: module cannot reload itself: main",
+    );
+    eval(
+        &mut s,
+        "(reload 5)",
+        "error: reload expects a symbol module name",
+    );
+    eval(&mut s, "(reload)", "error: reload expects (reload name)");
+    eval(
+        &mut s,
+        "((lambda () (reload m)))",
+        "error: reload is only supported at top level",
+    );
+}
+
+#[test]
+fn test_interpreter_help_documents_reload() {
+    let mut s = session();
+    let out = s.evaluate("(help)").unwrap();
+    assert!(out.contains("(reload NAME)"), "{out}");
+    let out = s.evaluate("(help \"modules\")").unwrap();
+    assert!(out.contains("(reload greet)"), "{out}");
+}

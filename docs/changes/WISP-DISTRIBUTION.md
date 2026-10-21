@@ -35,6 +35,7 @@ install.
 ```lisp
 (require NAME SOURCE)   ; load NAME from exactly SOURCE (once), bind its provides
 (require NAME)          ; reuse an already-loaded NAME; nothing resolves by name
+(reload NAME)           ; re-read NAME from its SOURCE and refresh every importer
 ```
 
 - **`NAME`** is the module's identity — what load-once keys on and whose `provide`d
@@ -132,6 +133,40 @@ For *local-file* libraries to persist across sessions, the deployment points the
 filesystem capability at a real directory. That is the capability boundary ("where may
 this actor read"), not a cache. URL libraries sidestep it entirely: the library *is* the
 URL, fetched once per session.
+
+### Reloading an edited module: `(reload NAME)`
+
+Load-once means editing a library does not change a session that already loaded it.
+Rather than modification-time checks, the session picks up an edit **explicitly**:
+
+```lisp
+(require counter "lib/counter.wisp")   ; first load; the module remembers its SOURCE
+;; ... edit lib/counter.wisp ...
+(reload counter)                        ; -> () or the list of dropped names, e.g. (bump)
+```
+
+- **Same source.** `reload` re-reads the path/URL the module was originally loaded
+  from (the module record keeps it). Reloading a module that is not loaded is an
+  error, and so is reloading one defined in-session with `(module …)` (it has no
+  source), or the current module. `require` itself stays load-once.
+- **Fresh environment.** The new source is evaluated into an empty module env that
+  replaces the old one, so definitions removed from the file disappear.
+- **Every importer is refreshed.** Each module in the session that imported `NAME`
+  (the `imports` lists record each name's source module) has its copies overwritten
+  with the new values, not just the module that called `reload`.
+- **Dropped names.** If the new version no longer provides a name an importer had, it
+  is unbound there, and `reload` returns the dropped names (`()` when none). Names the
+  new version *adds* are not bound automatically; `(require NAME)` again picks them up.
+- **Shallow.** `NAME`'s own dependencies are already loaded and are reused, not re-read;
+  reload them first if they changed too.
+- **All or nothing.** If the new source fails (unreadable, an eval error, no
+  `(module NAME …)`, or a provided name it does not define), the old module and every
+  binding stay as they were and `reload` returns the error.
+
+Known limit: a value copied by hand, e.g. `(define f some-imported-fn)`, is not an
+import, so `reload` does not touch it; `f` keeps the old code. (Top-level names inside
+a copied closure still resolve in the module's current env, since a closure finds its
+home module by name.)
 
 ### Granting a persistent filesystem root (config)
 

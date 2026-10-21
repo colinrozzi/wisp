@@ -140,6 +140,7 @@
   (if (string=? name "module") (eval-module items depth top)
    (if (string=? name "provide") (eval-provide items top)
    (if (string=? name "require") (eval-require items top)
+   (if (string=? name "reload") (eval-reload items top)
     (if (string=? name "trait") (declare-trait items top)
     (if (string=? name "derive") (eval-derive items top)
       (if (string=? name "instance") (declare-instance items top)
@@ -148,7 +149,7 @@
             (if (string=? name "variant") (eval-variant items top)
               (if (string=? name "match") (eval-match items env depth expected)
                 (if (string=? name "export") (eval-export items env depth top)
-                  (eval-call items env depth expected)))))))))))))
+                  (eval-call items env depth expected))))))))))))))
 
 (fn eval-if ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.ne (list-len items) 4) (failure "if expects condition, then, else")
@@ -364,6 +365,7 @@
         (global.set $current-module "main")
         (global.set $current-exports (list-new string))
         (global.set $current-imports (list-new binding))
+        (global.set $current-source "")
         (global.set $types (list-new named-type))
         (register-mount-spec)
         (global.set $session-globals (list-new global-binding))
