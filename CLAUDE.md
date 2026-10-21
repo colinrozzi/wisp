@@ -148,6 +148,7 @@ Imports/Exports: `(import module func ((param type) ...) return-type)`; `(export
 **WASM ops (explicit, exact-type):** arithmetic `(i32.add a b)`; comparisons `(i32.lt_s a b)` (→ s32 0/1); constants `(i32.const 42)`; conversions `(i64.extend_i32_s x)`; memory `(i32.load addr)`, `(memory.grow pages)`.
 Conditionals: `(if cond then else)` — cond must be s32. Let: `(let (name value) body)`.
 Casts: `(s32 expr)`, `(f64 expr)`, … Includes: `(include "path.wisp")` (relative to the including file; e.g. `(include "std/num.wisp")`). Comments: `; to end of line`.
+Strings: `"..."` with escapes `\n \t \r \e \0 \" \\` and `\xHH`. The compiler keeps literals as UTF-8 text, so `\x80`–`\xFF` become the two-byte UTF-8 encoding of U+0080–U+00FF, not one raw byte (the Wisp reader gives one raw byte).
 
 ### Type system notes
 - Numeric literal defaults: integers `s32`, floats `f64`. Suffixes: `42s64`, `3.14f32`.

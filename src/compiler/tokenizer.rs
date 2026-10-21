@@ -178,6 +178,8 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                                 'r' => content.push('\r'),
                                 '"' => content.push('"'),
                                 '\\' => content.push('\\'),
+                                'e' => content.push('\x1b'),
+                                '0' => content.push('\0'),
                                 'x' => {
                                     // \xHH hex escape
                                     let mut hex = String::new();

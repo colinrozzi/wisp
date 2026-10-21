@@ -67,6 +67,42 @@
       (if (string=? s "false") (boolean 0)
         (if (numeric-token? s) (read-number s) (symbol s))))))
 
+; A one-byte string holding `code` (0-255). A string is a [len:u32][bytes]
+; buffer, so build that buffer and reinterpret it via string-from-addr.
+(fn byte->string ((code s32)) string
+  (let (buf (heap-alloc 5))
+    (begin
+      (i32.store buf 1)
+      (i32.store8 (i32.add buf 4) code)
+      (string-from-addr buf))))
+
+; The value of hex digit `c` (0-9, a-f, A-F), or -1.
+(fn hex-digit ((c s32)) s32
+  (if (digit? c) (i32.sub c 48)
+    (if (i32.and (i32.ge_s c 97) (i32.le_s c 102)) (i32.sub c 87)
+      (if (i32.and (i32.ge_s c 65) (i32.le_s c 70)) (i32.sub c 55) -1))))
+
+; The byte that the one-letter escape `\e` stands for, or -1 if it is unknown.
+; \x is not here: it reads two more characters (see read-hex-escape).
+(fn simple-escape ((e s32)) s32
+  (if (i32.eq e 110) 10                 ; \n newline
+    (if (i32.eq e 116) 9                ; \t tab
+      (if (i32.eq e 114) 13             ; \r carriage return
+        (if (i32.eq e 101) 27           ; \e escape (ESC)
+          (if (i32.eq e 48) 0           ; \0 NUL
+            (if (i32.or (i32.eq e 34) (i32.eq e 92)) e -1)))))))  ; \" and \\
+
+; `\xHH` at `pos` (the backslash): exactly two hex digits, any byte value.
+(fn read-hex-escape ((src string) (pos s32) (acc string)) read-result
+  (if (i32.ge_s (i32.add pos 3) (string-len src))
+    (read-result (failure "\\x escape needs two hex digits") pos)
+    (let (hi (hex-digit (string-ref src (i32.add pos 2))))
+      (let (lo (hex-digit (string-ref src (i32.add pos 3))))
+        (if (i32.or (i32.lt_s hi 0) (i32.lt_s lo 0))
+          (read-result (failure "\\x escape needs two hex digits") pos)
+          (read-string src (i32.add pos 4)
+            (string-append acc (byte->string (i32.add (i32.mul hi 16) lo)))))))))
+
 (fn read-string ((src string) (pos s32) (acc string)) read-result
   (if (i32.ge_s pos (string-len src))
     (read-result (failure "unterminated string") pos)
@@ -76,15 +112,12 @@
           (if (i32.ge_s (i32.add pos 1) (string-len src))
             (read-result (failure "unterminated string escape") pos)
             (let (e (string-ref src (i32.add pos 1)))
-              (let (decoded
-                (if (i32.eq e 110) "\n"
-                  (if (i32.eq e 116) "\t"
-                    (if (i32.eq e 114) "\r"
-                      (substring src (i32.add pos 1) (i32.add pos 2))))))
-                (if (i32.or (i32.or (i32.eq e 110) (i32.eq e 116))
-                      (i32.or (i32.eq e 114) (i32.or (i32.eq e 34) (i32.eq e 92))))
-                  (read-string src (i32.add pos 2) (string-append acc decoded))
-                  (read-result (failure "unknown string escape") pos)))))
+              (if (i32.eq e 120) (read-hex-escape src pos acc)
+                (let (code (simple-escape e))
+                  (if (i32.lt_s code 0)
+                    (read-result (failure "unknown string escape") pos)
+                    (read-string src (i32.add pos 2)
+                      (string-append acc (byte->string code))))))))
           (read-string src (i32.add pos 1)
             (string-append acc (substring src pos (i32.add pos 1)))))))))
 

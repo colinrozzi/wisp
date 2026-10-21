@@ -47,6 +47,25 @@ The compiler's `i32` and `i64` constants, arithmetic, bitwise, shift/rotate, and
 operations are available. Comparisons return s32. String operations are `string-len`, `string-ref`,
 `string-append`, `string=?`, and `substring`; positions and lengths count bytes.
 
+A string literal is written in double quotes and accepts these escapes:
+
+| Escape | Byte |
+|--------|------|
+| `\n` | newline (10) |
+| `\t` | tab (9) |
+| `\r` | carriage return (13) |
+| `\e` | escape, ESC (27) |
+| `\0` | NUL (0) |
+| `\xHH` | the byte `HH`: exactly two hex digits, either case (`\x1b`, `\xFF`) |
+| `\"` | double quote |
+| `\\` | backslash |
+
+Each escape is one byte, so `(string-len "\e[1m")` is 4. Any other escape, or
+`\x` without two hex digits, is a reader error. The printer writes control
+bytes back as escapes (`"\e[0m"`, `"\x01"`), so printed strings read back
+unchanged. `\xHH` can make bytes that are not valid UTF-8; `string->bytes`
+shows them exactly.
+
 Use an `s64` suffix for an explicit wide integer; the printer preserves that suffix.
 Unsuffixed integers default to s32 and must fit its range. A literal can instead
 adopt s64, f32, or f64 from a typed return, parameter, field, annotated let, cast, or instruction
