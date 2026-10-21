@@ -1144,11 +1144,39 @@
 
 ; --- inbound events --------------------------------------------------------
 ; Drain the buffered triggers: each is (handler-name event result). Clears the
-; buffer so you see only what fired since the last poll.
+; buffer so you see only what fired since the last poll. (poll-events "text")
+; drains the same buffer into readable text instead: one "handler: result" per
+; firing, the event dropped, a string result shown raw (for theater-repl read).
 (fn apply-poll-events ((args (list value))) value
-  (if (i32.ne (list-len args) 0) (failure "poll-events expects no arguments")
-    (let (evs (global.get $events))
-      (begin (global.set $events (list-new value)) (sequence evs)))))
+  (let (n (list-len args))
+    (if (i32.gt_s n 1) (failure "poll-events expects no argument or \"text\"")
+      (if (i32.and (i32.eq n 1) (i32.eq (text-mode? (list-get args 0)) 0))
+        (failure "poll-events expects no argument or \"text\"")
+        (let (evs (global.get $events))
+          (begin (global.set $events (list-new value))
+            (if (i32.eq n 1) (text (show-firings evs 0 "")) (sequence evs))))))))
+
+(fn text-mode? ((v value)) s32
+  (if (string-arg? v) (string=? (as-string v) "text") 0))
+
+; One "handler: result" line per (handler event result) firing.
+(fn show-firings ((evs (list value)) (index s32) (out string)) string
+  (if (i32.ge_s index (list-len evs)) out
+    (show-firings evs (i32.add index 1)
+      (string-append (if (i32.eq index 0) out (string-append out "\n"))
+        (show-firing (list-get evs index))))))
+
+(fn show-firing ((firing value)) string
+  (value-case firing
+    ((sequence items)
+      (if (i32.ne (list-len items) 3) (show firing)
+        (string-append (show-raw (list-get items 0))
+          (string-append ": " (show-raw (list-get items 2))))))
+    (else (show firing))))
+
+; A string as its bare contents; any other value as show prints it.
+(fn show-raw ((v value)) string
+  (if (string-arg? v) (as-string v) (show v)))
 
 ; Live catalog of the Theater host verbs, so a session can discover them cold.
 ; Deeper, in-shell docs for the parts that need more than one line — reachable as
@@ -1158,7 +1186,7 @@
     ((string=? topic "tcp")
       "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (conn-id bytes): (car e), (car (cdr e))\n    (define on-close      (lambda (e) e))       ; e = (conn-id reason): (car e), (car (cdr e))\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
     ((string=? topic "triggers")
-      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name event handler-result). Redefine any handler\nmid-stream to change behavior.  See also: (help \"tcp\")")
+      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name event handler-result); (poll-events) returns\nthose lists. (poll-events \"text\") returns one \"handler: result\" line per firing\ninstead (event dropped, a string result raw); theater-repl read/follow print that,\nand read --full / follow --full print the lists. Scripts should parse --full: a raw\nresult can span lines. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
     ((string=? topic "modules")
       "Modules — load a library with (require NAME \"path\") at top level.\n\n  (require greet \"lib/greet.wisp\")   ; read the file, bind greet's provides\n  (hi \"bob\")                          ; provided names come in UNQUALIFIED (not greet.hi)\n  (require greet)                     ; reuse an already-loaded greet\n  (reload greet)                      ; re-read lib/greet.wisp after editing it\n\nrequire loads a module once per session: requiring an already-loaded NAME does\nnot re-read the file. To pick up an edit, (reload NAME) re-reads the source NAME\nwas loaded from into a fresh module env and rebinds the copies in EVERY module of\nthis session that imported it. It returns the names the new version no longer\nprovides (now unbound; () if none); newly provided names need (require NAME)\nagain. Shallow: NAME's own requires are not reloaded. If the new source fails,\nnothing changes and reload returns the error. A value copied by hand, like\n(define f hi), is not an import and keeps the old code.")
     (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\"), (help \"modules\")")))))
@@ -1178,7 +1206,7 @@
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n"
-                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events) to drain   see (help \"triggers\")\n"
+                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events [\"text\"]) to drain   see (help \"triggers\")\n"
                         (string-append "modules:   (require NAME \"path\") load once, bind provides unqualified   (reload NAME) re-read an edited module   see (help \"modules\")\n"
                           "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")"))))))))))))))))
     (if (string-arg? (list-get args 0))

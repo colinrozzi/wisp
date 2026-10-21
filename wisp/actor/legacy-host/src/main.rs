@@ -78,11 +78,31 @@ enum Command {
     /// List the daemon's sessions.
     List,
     /// Evaluate a form in a session. FORM may be omitted or "-" to read stdin.
-    Eval { id: String, form: Option<String> },
+    /// A string result prints raw (its text, real newlines); other values print
+    /// as Wisp. For scripts, parse --literal output.
+    Eval {
+        id: String,
+        form: Option<String>,
+        /// Print every result as a Wisp literal, strings quoted and escaped.
+        #[arg(short, long)]
+        literal: bool,
+    },
     /// Drain a session's buffered events (inbound triggers: on-tick, on-message, …).
-    Read { id: String },
-    /// Stream a session's events live until Ctrl-C.
-    Follow { id: String },
+    /// Prints "handler: result" per firing, a string result raw. For scripts,
+    /// parse --full output.
+    Read {
+        id: String,
+        /// Print the firings as a Wisp list of (handler event result).
+        #[arg(long)]
+        full: bool,
+    },
+    /// Stream a session's events live until Ctrl-C (same format as read).
+    Follow {
+        id: String,
+        /// Print the firings as a Wisp list of (handler event result).
+        #[arg(long)]
+        full: bool,
+    },
     /// Show a session (with id) or the daemon (without).
     Status { id: Option<String> },
     /// End a session and reclaim its heap.
@@ -485,7 +505,15 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
             (true, format!("new sessions now start from {origin}"))
         }
         "eval" => run(registry, field(request, "id"), field(request, "form")).await,
-        "read" => run(registry, field(request, "id"), "(poll-events)").await,
+        // Clients that predate "text" get the full (handler event result) list.
+        "read" => {
+            let form = if request.get("text").and_then(Value::as_bool) == Some(true) {
+                "(poll-events \"text\")"
+            } else {
+                "(poll-events)"
+            };
+            run(registry, field(request, "id"), form).await
+        }
         "list" => {
             let map = registry.lock().await;
             if map.is_empty() {
@@ -584,15 +612,23 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
             .await
         }
         Command::List => send(port, json!({ "op": "list" })).await,
-        Command::Eval { id, form } => {
+        Command::Eval { id, form, literal } => {
             let form = read_form(form).await?;
-            send(port, json!({ "op": "eval", "id": id, "form": form })).await
+            let request = json!({ "op": "eval", "id": id, "form": form });
+            if literal {
+                send(port, request).await
+            } else {
+                send_raw(port, request).await
+            }
         }
-        Command::Read { id } => send(port, json!({ "op": "read", "id": id })).await,
+        Command::Read { id, full: true } => send(port, json!({ "op": "read", "id": id })).await,
+        Command::Read { id, full: false } => {
+            send_raw(port, json!({ "op": "read", "id": id, "text": true })).await
+        }
         Command::Status { id } => send(port, json!({ "op": "status", "id": id })).await,
         Command::Stop { id } => send(port, json!({ "op": "stop", "id": id })).await,
         Command::Down => send(port, json!({ "op": "shutdown" })).await,
-        Command::Follow { id } => follow(port, id).await,
+        Command::Follow { id, full } => follow(port, id, full).await,
         Command::Serve | Command::Repl | Command::Version | Command::Upgrade => {
             unreachable!("handled in main")
         }
@@ -621,6 +657,53 @@ async fn send(port: u16, request: Value) -> Result<()> {
     }
 }
 
+/// Like `send`, but a string result prints raw: its text, ending in exactly one
+/// newline. An empty string prints nothing; other values print as `send` does.
+async fn send_raw(port: u16, request: Value) -> Result<()> {
+    let (ok, text) = transport::request(port, request).await?;
+    if ok {
+        print!("{}", raw_output(&text));
+        Ok(())
+    } else {
+        eprintln!("{text}");
+        std::process::exit(1);
+    }
+}
+
+/// What `send_raw` prints for a printed value.
+fn raw_output(printed: &str) -> String {
+    let text = unquote(printed).unwrap_or_else(|| printed.to_string());
+    if text.is_empty() || text.ends_with('\n') {
+        text
+    } else {
+        text + "\n"
+    }
+}
+
+/// The contents of a Wisp string literal as the printer writes it (escapes
+/// \" \\ \n \t \r), or None when `printed` is not a string literal.
+fn unquote(printed: &str) -> Option<String> {
+    let body = printed.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            return None;
+        }
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'r' => out.push('\r'),
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
 /// A form from the CLI arg, or from stdin when omitted or "-".
 async fn read_form(form: Option<String>) -> Result<String> {
     match form {
@@ -633,17 +716,22 @@ async fn read_form(form: Option<String>) -> Result<String> {
     }
 }
 
-async fn follow(port: u16, id: String) -> Result<()> {
+async fn follow(port: u16, id: String, full: bool) -> Result<()> {
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
     loop {
         tokio::select! {
             _ = &mut stop => return Ok(()),
             _ = tokio::time::sleep(std::time::Duration::from_millis(1000)) => {
-                let (ok, text) = transport::request(port, json!({ "op": "read", "id": id })).await?;
+                let request = json!({ "op": "read", "id": id, "text": !full });
+                let (ok, text) = transport::request(port, request).await?;
                 if !ok {
                     eprintln!("{text}");
                     std::process::exit(1);
+                }
+                if !full {
+                    print!("{}", raw_output(&text));
+                    continue;
                 }
                 let text = text.trim();
                 if !text.is_empty() && text != "()" {
@@ -689,6 +777,23 @@ async fn repl(loaded: Loaded, config: ReplConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_output_prints_string_contents() {
+        assert_eq!(raw_output(r#""a\nb""#), "a\nb\n");
+        assert_eq!(raw_output(r#""say \"hi\"\t\\ok""#), "say \"hi\"\t\\ok\n");
+        assert_eq!(raw_output(r#""done\n""#), "done\n");
+        assert_eq!(raw_output(r#""""#), "");
+    }
+
+    #[test]
+    fn raw_output_keeps_other_values() {
+        assert_eq!(raw_output("42"), "42\n");
+        assert_eq!(raw_output(r#"("x" 1)"#), "(\"x\" 1)\n");
+        assert_eq!(raw_output("#<closure>"), "#<closure>\n");
+        // Not one literal: quotes at both ends, but an unescaped one inside.
+        assert_eq!(raw_output(r#""a" "b""#), "\"a\" \"b\"\n");
+    }
 
     #[test]
     fn config_defaults_to_ephemeral_filesystem() {

@@ -54,14 +54,22 @@ LISP
 | `new [name] [--manifest M]` | create a session, print its id; with `--manifest`, that session runs the actor `M` names |
 | `set-default <M>` / `set-default --reset` | change the actor later `new` sessions start from (checked first; running sessions keep theirs) |
 | `list` | list the daemon's sessions, with each one's actor source |
-| `eval <id> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result |
-| `read <id>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …) |
-| `follow <id>` | stream a session's events live until Ctrl-C |
+| `eval [-l] <id> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result. A string result prints raw (its text); `--literal`/`-l` prints it as a Wisp literal |
+| `read [--full] <id>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …), one `handler: result` per firing; `--full` prints the `(handler event result)` lists |
+| `follow [--full] <id>` | stream a session's events live until Ctrl-C (same format as `read`) |
 | `status [id]` | show a session (with id) or the daemon (without) |
 | `stop <id>` | end a session and reclaim its heap |
 | `repl` | interactive stdin/stdout prompt against a private session (for a human) |
 | `version` | print the installed version (also `--version`) |
 | `upgrade` | download the latest release and replace this binary in place |
+
+**Output for reading vs. parsing.** By default `eval` prints a top-level string
+result raw — real newlines, no quotes or escapes, ending in one newline — so a
+string like `(tickets)`'s table reads as a table; other values print as Wisp. `read`
+and `follow` print one `handler: result` line per firing, the event dropped and a
+string result raw. These defaults are for reading: a raw string can span lines or
+look like any other value. Scripts should parse `eval --literal` and `read --full`
+/ `follow --full`, which print exactly what the session's printer writes.
 
 Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
 `$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated
@@ -199,14 +207,16 @@ literally a `(define …)`:
 ```
 
 Each firing is buffered as `(handler-name event result)`. `(poll-events)` drains
-the buffer — and that is exactly what **`theater-repl read <id>`** calls, with
+the buffer as those lists; `(poll-events "text")` drains it as one `handler: result`
+line per firing (event dropped, a string result raw). The latter is what
+**`theater-repl read <id>`** calls (the former with `--full`), with
 **`theater-repl follow <id>`** polling it in a loop to stream firings live. So from
 the shell:
 
 ```sh
 theater-repl eval $id '(define on-tick (lambda (n) (string-append "fired: " n)))'
 theater-repl eval $id '(set-interval "beat" 1000)'
-theater-repl follow $id        # fired: beat … (Ctrl-C to stop)
+theater-repl follow $id        # on-tick: fired: beat … (Ctrl-C to stop)
 ```
 
 Redefine a handler any time to change behavior mid-stream. Triggers wired today:
