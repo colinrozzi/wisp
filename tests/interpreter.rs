@@ -159,6 +159,29 @@ fn test_interpreter_length_null_and_error() {
         "#<closure>",
     );
     eval(&mut s, "(sum '(10 20 12))", "42");
+    // car/cdr also walk typed lists, keeping the element type on the tail.
+    eval(
+        &mut s,
+        "(sum (list-push (list-push (list-new s32) 40) 2))",
+        "42",
+    );
+    eval(
+        &mut s,
+        "(cdr (list-push (list-push (list-new s32) 1) 2))",
+        "#<list s32 (2)>",
+    );
+    // Byte lists, as on-message delivers them.
+    eval(
+        &mut s,
+        "(define count (lambda (xs) (if (null? xs) 0 (+ 1 (count (cdr xs))))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(count (string->bytes \"hello\"))", "5");
+    eval(
+        &mut s,
+        "(car (list-new s32))",
+        "error: car/cdr expects a nonempty list",
+    );
     eval(
         &mut s,
         "(define head (lambda (xs) (if (null? xs) (error \"head of empty list\") (car xs))))",
@@ -167,7 +190,10 @@ fn test_interpreter_length_null_and_error() {
     eval(&mut s, "(head nil)", "error: head of empty list");
     // The bare (help) catalog points at them, so a cold session can find them.
     let help = s.evaluate("(help)").unwrap();
-    assert!(help.contains("(length xs) (null? xs)"), "{help}");
+    assert!(
+        help.contains("(length xs) (null? xs) (cons x quoted-xs)"),
+        "{help}"
+    );
     assert!(help.contains("(error msg)"), "{help}");
 }
 

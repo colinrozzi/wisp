@@ -1541,7 +1541,7 @@ fn test_typed_list_aliases_and_failed_mutation_recover() {
         "(list-get (list-new s32) 0)",
         "(list-len '(1 2))",
         "(list-push '(1) 2)",
-        "(car xs)",
+        "(cdr (list-new s32))",
     ] {
         let output = s.evaluate(source).unwrap();
         assert!(output.starts_with("error:"), "{source}: {output}");

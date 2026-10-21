@@ -333,6 +333,12 @@
             (if (i32.eq (list-len items) 0) (failure "car/cdr expects a nonempty list")
               (if (string=? name "car") (list-get items 0)
                 (sequence (copy-list items 1 (list-new value))))))
+          ; A typed list's cdr keeps its element type, so a walk over (list u8)
+          ; bytes stays a byte list all the way down.
+          ((typed-list element items)
+            (if (i32.eq (list-len items) 0) (failure "car/cdr expects a nonempty list")
+              (if (string=? name "car") (list-get items 0)
+                (typed-list element (copy-list items 1 (list-new value))))))
           (else (failure "car/cdr expects a list"))))
       (if (i32.ne (list-len args) 2) (failure "expected two arguments")
         (if (string=? name "cons")
