@@ -33,7 +33,8 @@
 (export "theater:simple/runtime-handlers.handle-actor-spawn"
   (fn handle-actor-spawn ((raw any)) string
     (begin (dispatch-event "on-spawn" (unmarshal raw)) "ok")))
-; After (msg-register): on-message receives (sequence message-bytes).
+; After (msg-register): on-message receives a 1-element list (message-bytes);
+; a handler reads the text with (bytes->string (car e)).
 (export "theater:simple/message-server-client.handle-send"
   (fn handle-send ((raw any)) string
     (begin (dispatch-event "on-message" (unmarshal raw)) "ok")))
