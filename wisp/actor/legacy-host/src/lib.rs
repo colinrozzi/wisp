@@ -1,4 +1,5 @@
 pub mod eval_session;
+pub mod sessions;
 pub mod source;
 pub mod theater_host;
 pub mod transport;
@@ -45,6 +46,8 @@ impl Default for FsAccess {
 
 pub struct Runtime {
     pub commands: mpsc::UnboundedSender<TheaterCommand>,
+    /// The sessions the daemon holds; readable by every actor via `wisp-sessions`.
+    pub sessions: sessions::Sessions,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -53,6 +56,8 @@ impl Runtime {
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
+        let sessions = sessions::Sessions::default();
+        handlers.register(sessions.clone());
         handlers.register(theater_handler_rpc::RpcHandler::new(commands.clone()));
         // Per-interface handlers the local runtime provides. Each is one line;
         // real Theater deployments enable handlers via the actor manifest.
@@ -152,7 +157,11 @@ impl Runtime {
         )
         .await?;
         let task = tokio::spawn(async move { runtime.run().await });
-        Ok(Self { commands, task })
+        Ok(Self {
+            commands,
+            sessions,
+            task,
+        })
     }
 
     pub async fn spawn(&self, wasm: Vec<u8>) -> Result<Session> {
