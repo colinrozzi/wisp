@@ -133,6 +133,45 @@ fn test_interpreter_data_and_reader() {
 }
 
 #[test]
+fn test_interpreter_length_null_and_error() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(length '(1 2 3))", "3"),
+        ("(length nil)", "0"),
+        ("(length (list-push (list-new s32) 7))", "1"),
+        ("(null? nil)", "true"),
+        ("(null? '())", "true"),
+        ("(null? (list 1))", "false"),
+        ("(null? (list-new string))", "true"),
+        ("(error \"boom\")", "error: boom"),
+        ("(error 'oops)", "error: oops"),
+        ("(+ 1 (error \"inner\"))", "error: inner"),
+        ("(length 5)", "error: length expects a list"),
+        ("(null? \"x\")", "error: null? expects a list"),
+        ("(length)", "error: length expects one argument"),
+    ] {
+        eval(&mut s, source, expected);
+    }
+    // A recursive walk over a list, the case that was awkward without null?.
+    eval(
+        &mut s,
+        "(define sum (lambda (xs) (if (null? xs) 0 (+ (car xs) (sum (cdr xs))))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(sum '(10 20 12))", "42");
+    eval(
+        &mut s,
+        "(define head (lambda (xs) (if (null? xs) (error \"head of empty list\") (car xs))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(head nil)", "error: head of empty list");
+    // The bare (help) catalog points at them, so a cold session can find them.
+    let help = s.evaluate("(help)").unwrap();
+    assert!(help.contains("(length xs) (null? xs)"), "{help}");
+    assert!(help.contains("(error msg)"), "{help}");
+}
+
+#[test]
 fn test_interpreter_errors_preserve_existing_definitions() {
     let mut s = session();
     eval(&mut s, "(define x 42)", "42");
