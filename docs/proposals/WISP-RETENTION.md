@@ -201,6 +201,16 @@ The 256 cap is ~4 minutes of a 1 Hz ticker. Without the event payload, each
 firing is about the size of its result, so at a typical small result the
 full buffer is tens of KB.
 
+`theater-repl read` and `follow` keep working unchanged. Both drain with
+`(poll-events ...)`, which still returns every buffered firing, plus the drop
+line when there were drops. One interaction is new. `follow` drains once a
+second, so a burst of more than 256 firings in that second (for example, a
+process writing quickly to stdout) drops the oldest firings before `follow`
+sees them. The drop line makes the loss visible, but the firings are gone.
+Handlers have already run on them, so only the record is lost, not the
+handling. A session that must see every firing in such a burst should raise
+the limit with `(event-buffer N)`.
+
 ### 2.4 Modules and `(reload NAME)`
 
 What exists today, and what this proposal keeps:
@@ -456,15 +466,17 @@ These figures come from the layout in §1.1, not from a collector run:
 
 ## 5. Problems found outside this ticket
 
-These are for the PR description; I have not fixed them:
+These are for the PR description; I have not fixed them. Items 1 and 2 are
+**do first, independent of 0011**: they are the largest sources of garbage,
+and fixing them needs no collector.
 
-1. **`list-push` reallocates the whole data array on every push**
+1. **(Do first, independent of 0011.) `list-push` reallocates the whole data array on every push**
    (`codegen.rs`, "simplified version that reallocates every time"). Building
    an n-element list costs O(n²) bytes and time. This is the largest single
    source of garbage: 1 KB message → 2 MB, 9 KB module → 215 MB. Growing the
    capacity by doubling (the header already has a cap field) fixes it whatever
    0011 decides.
-2. **`marshal` allocates a fixed 16,388-byte buffer on every host call**
+2. **(Do first, independent of 0011.) `marshal` allocates a fixed 16,388-byte buffer on every host call**
    (`marshal.wisp`, TODO).
 3. **`reload` fails for modules that declare `record`, `variant` or `trait`**:
    `$types` is session-wide.
