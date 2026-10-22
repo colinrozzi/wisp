@@ -111,8 +111,9 @@
 (import theater:simple/runtime spawn ((manifest string) (init-state (option any)) (wasm-bytes (option (list u8)))) (result string runtime-error))
 
 ; wisp-sessions: the theater-repl daemon's session directory (a custom interface the
-; daemon provides, like wisp-source). One record per live REPL session: short id,
-; name, actor id (the address msg-send takes), and age in seconds.
+; daemon provides, like wisp-source). One record per interpreter actor in the
+; runtime, however it was spawned: short id, name, actor id (the address msg-send
+; takes), and age in seconds (0 if the daemon did not spawn it).
 (record session-info (id string) (name string) (actor string) (age-secs u64))
 (import wisp-sessions list-sessions () (list session-info))
 
@@ -577,7 +578,10 @@
 ; wasm-bytes are supplied inline (a byte list, e.g. from fs-read, or a string), which
 ; bypass package resolution. Relative paths aren't resolved, so use absolute ones.
 ; init-state is always none here. The actor shares this runtime, so it can message
-; REPL sessions (and vice versa) by actor-id.
+; REPL sessions (and vice versa) by actor-id. The runtime names the actor after the
+; manifest's `name`; if it is an interpreter, that name is how `theater-repl eval
+; NAME` reaches it, so give each manifest you spawn its own name (several spawns of
+; one manifest share a name, and only their ids tell them apart).
 (fn apply-spawn-actor ((args (list value))) value
   (let (n (list-len args))
     (if (i32.or (i32.lt_s n 1) (i32.gt_s n 2)) (failure "spawn-actor expects (spawn-actor manifest-ref [wasm-bytes])")
@@ -590,7 +594,7 @@
               wasm-opt))))))))))
 
 ; (sessions) -> #<list session-info ((session-info id name actor age-secs) ...)>,
-; the daemon's live REPL sessions in id order. Can't fail, so no (ok ...) wrapper.
+; every interpreter actor in the runtime, in id order. Can't fail, so no (ok ...) wrapper.
 (fn apply-sessions ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "sessions expects no arguments")
     (unmarshal (raw-invoke "wisp-sessions" "list-sessions" (arg-tuple (list-new value))))))

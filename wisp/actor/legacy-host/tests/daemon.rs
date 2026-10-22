@@ -162,3 +162,104 @@ fn sessions_start_from_a_manifest_and_the_default_can_change() {
     assert!(daemon.ok(&["status"]).contains("default actor: built-in"));
     daemon.fails(&["set-default"]);
 }
+
+/// An interpreter the daemon did not make (here, `spawn-actor` inside a session)
+/// is a session like any other: `list` shows it, and `eval`/`read`/`status`/`stop`
+/// reach it by full id, id prefix, or name. The runtime is the directory.
+#[test]
+fn every_interpreter_in_the_runtime_is_a_session() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-any", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    // spawn-actor does not resolve a relative `package`, so name it absolutely.
+    let package = std::fs::canonicalize(actor.join("actor.wasm")).unwrap();
+    let manifest = std::fs::read_to_string(actor.join("manifest.toml"))
+        .unwrap()
+        .replace(
+            "package = \"./actor.wasm\"",
+            &format!("package = \"{}\"", package.display()),
+        )
+        .replace("name = \"wisp-interpreter\"", "name = \"spawned\"");
+    let manifest_path = root.join("spawned.toml");
+    std::fs::write(&manifest_path, manifest).unwrap();
+
+    let daemon = Daemon::start(&root);
+    let host = daemon.ok(&["new", "host"]);
+    let spawned = daemon.ok(&[
+        "eval",
+        &host,
+        &format!("(spawn-actor \"{}\")", manifest_path.display()),
+    ]);
+    assert!(!spawned.contains("error"), "{spawned}");
+
+    // `list` finds it through the runtime; the daemon knows no age or source for it.
+    let list = daemon.ok(&["list"]);
+    let row = list.lines().find(|l| l.contains(" spawned ")).expect(&list);
+    let words: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(&words[2..3], ["-"]);
+    let (short, full) = (words[0].to_string(), words[3].to_string());
+    assert!(
+        full.starts_with(&short) && spawned.contains(&full),
+        "{spawned}"
+    );
+    assert!(list.lines().any(|l| l.starts_with(&host)));
+
+    // Definitions live in the actor, whichever way it is named.
+    daemon.ok(&["eval", "spawned", "(define y 5)"]);
+    assert_eq!(daemon.ok(&["eval", &full, "(+ y 1)"]), "6");
+    assert_eq!(daemon.ok(&["eval", &short, "y"]), "5");
+    // Its trigger firings are buffered in the actor itself, so `read` (which
+    // evaluates (poll-events) in it) drains them like any session's.
+    assert_eq!(daemon.ok(&["read", "spawned"]), "");
+    daemon.ok(&[
+        "eval",
+        "spawned",
+        "(define on-tick (lambda (n) (string-append \"fired: \" n)))",
+    ]);
+    daemon.ok(&["eval", "spawned", "(set-interval \"beat\" 100)"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = daemon.ok(&["read", &short]);
+        if events.contains("fired: ") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no tick read: {events}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let status = daemon.ok(&["status", "spawned"]);
+    assert!(
+        status.contains(&full) && status.contains("source: -"),
+        "{status}"
+    );
+    assert!(daemon.ok(&["status"]).contains("2 session(s)"));
+
+    // Names are addresses now: `new` refuses a taken one, and a shared one is an error.
+    assert!(daemon.fails(&["new", "spawned"]).contains("already exists"));
+    let unnamed = daemon.ok(&["new"]);
+    let again = daemon.ok(&["new"]);
+    assert!(
+        daemon
+            .fails(&["eval", "wisp-interpreter", "1"])
+            .contains("spawn-actor names an actor after its manifest")
+    );
+    assert_eq!(daemon.ok(&["eval", &again, "1"]), "1");
+    assert!(
+        daemon
+            .fails(&["eval", "nobody", "1"])
+            .contains("no such session")
+    );
+
+    // `stop` ends it in the runtime, so every view of it is gone.
+    daemon.ok(&["stop", "spawned"]);
+    assert!(!daemon.ok(&["list"]).contains(&full));
+    assert!(
+        daemon
+            .fails(&["eval", &full, "y"])
+            .contains("no such session")
+    );
+    daemon.ok(&["stop", &unnamed]);
+    assert_eq!(daemon.ok(&["eval", "wisp-interpreter", "2"]), "2");
+}
