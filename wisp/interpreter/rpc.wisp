@@ -110,6 +110,12 @@
 ; (spawn-and-wait is a follow-up.)
 (import theater:simple/runtime spawn ((manifest string) (init-state (option any)) (wasm-bytes (option (list u8)))) (result string runtime-error))
 
+; wisp-sessions: the theater-repl daemon's session directory (a custom interface the
+; daemon provides, like wisp-source). One record per live REPL session: short id,
+; name, actor id (the address msg-send takes), and age in seconds.
+(record session-info (id string) (name string) (actor string) (age-secs u64))
+(import wisp-sessions list-sessions () (list session-info))
+
 ; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
 ; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
 ; actor, so they need a peer to exercise; register/list-requests are self-contained.)
@@ -279,6 +285,7 @@
     ((string=? name "unsubscribe-spawns") 1)
     ((string=? name "shutdown-runtime") 1)
     ((string=? name "spawn-actor") 1)
+    ((string=? name "sessions") 1)
     ((string=? name "msg-register") 1)
     ((string=? name "msg-send") 1)
     ((string=? name "msg-request") 1)
@@ -581,6 +588,12 @@
               (list-get args 0))
               (opt-bytes-none))
               wasm-opt))))))))))
+
+; (sessions) -> #<list session-info ((session-info id name actor age-secs) ...)>,
+; the daemon's live REPL sessions in id order. Can't fail, so no (ok ...) wrapper.
+(fn apply-sessions ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "sessions expects no arguments")
+    (unmarshal (raw-invoke "wisp-sessions" "list-sessions" (arg-tuple (list-new value))))))
 
 ; --- message-server --------------------------------------------------------
 ; Shared shapes: (string, message) -> Tuple(String, list<u8>); a single string
@@ -1196,7 +1209,7 @@
     (text (string-append "Wisp REPL — a live session that drives and observes Theater.\nDefinitions accumulate: (define x ...) / (define f (lambda ...)) persist.\n\n"
       (string-append "self/rpc:  (self) (log msg) (describe id) (exports id) (implements id iface) (call id fn arg...)\n"
         (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
-          (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\n"
+          (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
@@ -1240,6 +1253,7 @@
     ((string=? name "unsubscribe-spawns") (apply-runtime-unsubscribe args))
     ((string=? name "shutdown-runtime") (apply-runtime-shutdown args))
     ((string=? name "spawn-actor") (apply-spawn-actor args))
+    ((string=? name "sessions") (apply-sessions args))
     ((string=? name "msg-register") (apply-msg-register args))
     ((string=? name "msg-send") (apply-msg-send args))
     ((string=? name "msg-request") (apply-msg-request args))

@@ -8,7 +8,12 @@ use std::time::Instant;
 use theater::messages::TheaterCommand;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-use wisp_interpreter_actor::{MANIFEST, Runtime, Session, source::SourceBundle, transport};
+use wisp_interpreter_actor::{
+    MANIFEST, Runtime,
+    sessions::{Entry, Sessions},
+    source::SourceBundle,
+    transport,
+};
 
 /// The actor built into the binary (produced by actors/wisp-repl/build.sh). A
 /// released theater-repl is self-contained: it carries its own actor + bundle.
@@ -313,21 +318,11 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
 
 // ---- the daemon -----------------------------------------------------------
 
-/// A live session held by the daemon.
-struct Entry {
-    session: Arc<Session>,
-    name: String,
-    actor: String,
-    /// Where its actor came from (an `ActorSource` origin).
-    source: String,
-    since: Instant,
-}
-type Registry = BTreeMap<String, Entry>;
-
-/// Everything a connection can touch. `default` is what `new` starts sessions
-/// from; `startup` is the actor the daemon was launched with, for `set-default --reset`.
+/// Everything a connection can touch. The session registry is `runtime.sessions`
+/// (shared with the actors, for `(sessions)`). `default` is what `new` starts
+/// sessions from; `startup` is the actor the daemon was launched with, for
+/// `set-default --reset`.
 struct Daemon {
-    registry: Mutex<Registry>,
     runtime: Runtime,
     default: Mutex<ActorSource>,
     startup: ActorSource,
@@ -341,7 +336,6 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
         .await
         .with_context(|| format!("binding {address} (is a daemon already on this port?)"))?;
     let daemon = Arc::new(Daemon {
-        registry: Mutex::new(BTreeMap::new()),
         runtime,
         default: Mutex::new(loaded.actor.clone()),
         startup: loaded.actor,
@@ -404,14 +398,6 @@ fn field<'a>(request: &'a Value, key: &str) -> &'a str {
     request.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-async fn lookup(registry: &Mutex<Registry>, id: &str) -> Option<Arc<Session>> {
-    registry
-        .lock()
-        .await
-        .get(id)
-        .map(|entry| entry.session.clone())
-}
-
 /// The actor a request names with `manifest`, or the daemon's current default.
 async fn requested_actor(request: &Value, daemon: &Daemon) -> Result<ActorSource> {
     match request.get("manifest").and_then(Value::as_str) {
@@ -435,7 +421,7 @@ async fn probe(runtime: &Runtime, actor: &ActorSource) -> Result<()> {
 }
 
 async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
-    let registry = &daemon.registry;
+    let registry = &daemon.runtime.sessions;
     match field(request, "op") {
         // `theater-repl down`: reply first, then wake the serve loop to exit.
         "shutdown" => {
@@ -459,23 +445,25 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
                 Ok(session) => {
                     let actor_id = session.id.to_string();
                     let short: String = actor_id.chars().take(8).collect();
-                    let mut map = registry.lock().await;
-                    let id = if map.contains_key(&short) {
-                        actor_id.clone()
-                    } else {
-                        short
-                    };
-                    let name = name.unwrap_or_else(|| id.clone());
-                    map.insert(
-                        id.clone(),
-                        Entry {
-                            session: Arc::new(session),
-                            name,
-                            actor: actor_id,
-                            source: actor.origin,
-                            since: Instant::now(),
-                        },
-                    );
+                    let id = registry.with(|map| {
+                        let id = if map.contains_key(&short) {
+                            actor_id.clone()
+                        } else {
+                            short
+                        };
+                        let name = name.unwrap_or_else(|| id.clone());
+                        map.insert(
+                            id.clone(),
+                            Entry {
+                                session: Arc::new(session),
+                                name,
+                                actor: actor_id,
+                                source: actor.origin,
+                                since: Instant::now(),
+                            },
+                        );
+                        id
+                    });
                     (true, id)
                 }
                 Err(error) => (false, format!("error: could not create session: {error}")),
@@ -514,8 +502,7 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
             };
             run(registry, field(request, "id"), form).await
         }
-        "list" => {
-            let map = registry.lock().await;
+        "list" => registry.with(|map| {
             if map.is_empty() {
                 return (
                     true,
@@ -538,10 +525,11 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
                 ));
             }
             (true, out)
-        }
+        }),
         "status" => {
-            let map = registry.lock().await;
-            match request.get("id").and_then(Value::as_str) {
+            // Read the default before taking the (sync) registry lock.
+            let default = daemon.default.lock().await.origin.clone();
+            registry.with(|map| match request.get("id").and_then(Value::as_str) {
                 Some(id) => match map.get(id) {
                     Some(entry) => (
                         true,
@@ -560,14 +548,14 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
                     format!(
                         "daemon up — {} session(s)\n  default actor: {}",
                         map.len(),
-                        daemon.default.lock().await.origin
+                        default
                     ),
                 ),
-            }
+            })
         }
         "stop" => {
             let id = field(request, "id");
-            let entry = registry.lock().await.remove(id);
+            let entry = registry.with(|map| map.remove(id));
             match entry {
                 Some(entry) => {
                     let _ = entry.session.stop().await;
@@ -581,8 +569,8 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
 }
 
 /// Evaluate `form` in session `id`; `ok` is false when the result is a diagnostic.
-async fn run(registry: &Mutex<Registry>, id: &str, form: &str) -> (bool, String) {
-    match lookup(registry, id).await {
+async fn run(registry: &Sessions, id: &str, form: &str) -> (bool, String) {
+    match registry.get(id) {
         Some(session) => match session.evaluate(form).await {
             Ok(output) => (!output.starts_with("error:"), output),
             Err(error) => (false, format!("error: {error}")),
