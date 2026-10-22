@@ -52,6 +52,18 @@ install.
 (require list)                    ; later: already loaded, just rebind its provides
 ```
 
+What a user sees in practice:
+
+- **Provided names come in unqualified.** After
+  `(require sessions "experiment/lib/sessions.wisp")` you call `(session-actor "bob")`,
+  not `sessions.session-actor`; there is no `NAME.` prefix. (Qualified access is the
+  planned `prefix-in` layer from [WISP-MODULES.md](WISP-MODULES.md), not yet built.)
+- **An already-loaded module is not re-read, even with a source.** Load-once is keyed
+  on `NAME`, so a second `(require NAME "path")` in the same session reuses the
+  in-memory instance and ignores the file. If you edit a library, the session that
+  already loaded it keeps the old definitions; test the edit in a fresh session.
+- The REPL documents both under `(help "modules")`.
+
 The `SOURCE` form selects the capability:
 
 - **Brick 1 — filesystem path** → `theater:simple/filesystem read-file`. Done.
