@@ -1,7 +1,7 @@
 # Proposal: Memory Management for Granite
 
 **Status:** Design (ticket 0011). Not implemented.
-**Related:** [WISP-RETENTION.md](WISP-RETENTION.md) (ticket 0012: what the Wisp
+**Related:** [WISP-RETENTION.md](WISP-RETENTION.md) (ticket 0012, PR #80: what the Wisp
 interpreter keeps alive on purpose),
 [changes/SELF-HOSTED-COMPILER.md](../changes/SELF-HOSTED-COMPILER.md) ("GC or arena per
 compilation?"), [changes/LIVE-REPL-DYNAMIC-LINKING.md](../changes/LIVE-REPL-DYNAMIC-LINKING.md)
@@ -458,6 +458,8 @@ so the waste is small. If measurements show fragmentation, replace this with TLS
   out-of-bounds trap far from the cause).
 - Wasm memory cannot shrink. A peak stays committed; freed blocks are reused. This is
   acceptable for actors whose live set is stable, and stage 5 measures it.
+- So a REPL session's committed memory is set by its largest single evaluation (for
+  example a big `require`), not by its steady state.
 
 ### 5.5 Debug support (the same code with a flag)
 
@@ -556,6 +558,15 @@ below the heap; a literal evaluates to its address. Nothing writes into strings 
 so sharing them is safe. Tests: string suites; a test that a literal evaluated in a loop
 allocates nothing.
 
+**Stage 0c: the interpreter's own cheap wins (Wisp side, ticket 0012).** `marshal.wisp`
+allocates a fresh 16,388-byte buffer for every marshal (`marshal.wisp:299, 319`), about
+16 KB of a host call's 22-33 KB. Keep one buffer in a global and reuse it. The other
+interpreter-side fixes are in [WISP-RETENTION.md](WISP-RETENTION.md): §2.1 (`$bindings`
+and `$session-macros` upsert on redefine, so they are bounded by distinct names) and
+§2.3 (`$events` becomes a bounded buffer with a drop counter). They need no compiler
+change and can land any time. The combined order is stages 0a, 0b, 0c, then 1. Tests:
+the host-call bytes in `memory_baseline` drop by about 16 KB per call.
+
 **Stage 1: the allocator and growable memory.** §5: header, size classes, large
 buckets, frontier, `memory.grow` without a maximum, a real `__pack_free`, stats export,
 debug poisoning. Nothing in compiled code frees yet except `__pack_free`. Tests:
@@ -578,6 +589,10 @@ Tests: a leak test that calls a host import 10,000 times; the Wisp `(sessions)` 
 it cannot prove the list is unique (no RC yet, so: copies unless the list operand is a
 local's last use, a simple syntactic check). Run the whole suite and the interpreter
 with the flag on to find any code that depends on the in-place write; fix those sites.
+Performance with the flag on: every push that is not a last use copies the whole list,
+O(n) per push, so loops over lists held in globals (`$bindings`, `$events`) go back to
+O(n²). The flag is for finding dependencies only. It must stay off by default until
+stage 4 gives it a uniqueness test.
 Tests: a new codegen test that `(list-push xs v)` leaves `xs` unchanged, matching
 `granite eval` (the back-ends agree for the first time).
 
