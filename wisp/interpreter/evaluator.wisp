@@ -40,7 +40,8 @@
       (i32.or (string=? name "*") (string=? name "/")))
     (i32.or (i32.or (string=? name "=") (string=? name "<"))
       (i32.or (string=? name "list")
-        (i32.or (string=? name "car") (i32.or (string=? name "cdr") (string=? name "cons")))))))
+        (i32.or (i32.or (string=? name "car") (i32.or (string=? name "cdr") (string=? name "cons")))
+          (i32.or (list-query? name) (string=? name "error")))))))
 
 (fn lookup ((name string) (env (list binding))) value
   (let (local (lookup-local name env (i32.sub (list-len env) 1)))
@@ -297,8 +298,34 @@
   (if (i32.ge_s index (list-len items)) out
     (copy-list items (i32.add index 1) (list-push out (list-get items index)))))
 
+; length/null? accept both quoted lists and typed lists, so dynamic code can
+; walk either without first checking which kind of list it has.
+(fn list-query? ((name string)) s32
+  (i32.or (string=? name "length") (string=? name "null?")))
+
+(fn list-count ((v value)) s32
+  (value-case v
+    ((sequence items) (list-len items))
+    ((typed-list element items) (list-len items))
+    (else -1)))
+
+(fn apply-list-query ((name string) (args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure (string-append name " expects one argument"))
+    (let (count (list-count (list-get args 0)))
+      (if (i32.lt_s count 0) (failure (string-append name " expects a list"))
+        (if (string=? name "length") (integer count) (boolean (i32.eq count 0)))))))
+
+; (error message) produces a failure, which aborts evaluation like any other error.
+(fn apply-error ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "error expects one argument")
+    (value-case (list-get args 0)
+      ((text message) (failure message))
+      (else (failure (show (list-get args 0)))))))
+
 (fn apply-builtin ((name string) (args (list value))) value
   (if (string=? name "list") (sequence args)
+    (if (list-query? name) (apply-list-query name args)
+    (if (string=? name "error") (apply-error args)
     (if (i32.or (string=? name "car") (string=? name "cdr"))
       (if (i32.ne (list-len args) 1) (failure "car/cdr expects one argument")
         (value-case (list-get args 0)
@@ -306,13 +333,19 @@
             (if (i32.eq (list-len items) 0) (failure "car/cdr expects a nonempty list")
               (if (string=? name "car") (list-get items 0)
                 (sequence (copy-list items 1 (list-new value))))))
+          ; A typed list's cdr keeps its element type, so a walk over (list u8)
+          ; bytes stays a byte list all the way down.
+          ((typed-list element items)
+            (if (i32.eq (list-len items) 0) (failure "car/cdr expects a nonempty list")
+              (if (string=? name "car") (list-get items 0)
+                (typed-list element (copy-list items 1 (list-new value))))))
           (else (failure "car/cdr expects a list"))))
       (if (i32.ne (list-len args) 2) (failure "expected two arguments")
         (if (string=? name "cons")
           (value-case (list-get args 1)
             ((sequence items) (sequence (copy-list items 0 (list-push (list-new value) (list-get args 0)))))
             (else (failure "cons expects a list as its second argument")))
-          (apply-numeric-builtin name (list-get args 0) (list-get args 1)))))))
+          (apply-numeric-builtin name (list-get args 0) (list-get args 1)))))))))
 
 ; A minimal local REPL boundary: source in, printed value (or diagnostic) out.
 ; Actual values and closures stay in the session heap. A Theater adapter can
