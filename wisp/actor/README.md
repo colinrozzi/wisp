@@ -31,7 +31,7 @@ theater-repl serve &                 # daemon on 127.0.0.1:7777 (holds sessions)
 id=$(theater-repl new)               # create a session, capture its id
 theater-repl eval $id '(define double (lambda (x) (i32.mul x (i32.const 2))))'
 theater-repl eval $id '(double (i32.const 21))'        # => 42  (same live image)
-theater-repl list                    # sessions on the daemon
+theater-repl list                    # every session in the runtime
 theater-repl eval $id '(help)'       # catalog of Theater host verbs
 ```
 
@@ -51,14 +51,14 @@ LISP
 | Command | Does |
 | --- | --- |
 | `serve` | run the daemon (default when no subcommand is given) |
-| `new [name] [--manifest M]` | create a session, print its id; with `--manifest`, that session runs the actor `M` names |
+| `new [name] [--manifest M]` | spawn an interpreter actor named `name`, print its id; with `--manifest`, it runs the actor `M` names |
 | `set-default <M>` / `set-default --reset` | change the actor later `new` sessions start from (checked first; running sessions keep theirs) |
-| `list` | list the daemon's sessions, with each one's actor source |
-| `eval [-l] <id> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result. A string result prints raw (its text); `--literal`/`-l` prints it as a Wisp literal |
-| `read [--full] <id>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …), one `handler: result` per firing; `--full` prints the `(handler event result)` lists |
-| `follow [--full] <id>` | stream a session's events live until Ctrl-C (same format as `read`) |
-| `status [id]` | show a session (with id) or the daemon (without) |
-| `stop <id>` | end a session and reclaim its heap |
+| `list` | list every interpreter actor in the runtime, however it was spawned |
+| `eval [-l] <s> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result. A string result prints raw (its text); `--literal`/`-l` prints it as a Wisp literal |
+| `read [--full] <s>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …), one `handler: result` per firing; `--full` prints the `(handler event result)` lists |
+| `follow [--full] <s>` | stream a session's events live until Ctrl-C (same format as `read`) |
+| `status [s]` | show a session (with one) or the daemon (without) |
+| `stop <s>` | stop the session's actor and reclaim its heap |
 | `repl` | interactive stdin/stdout prompt against a private session (for a human) |
 | `version` | print the installed version (also `--version`) |
 | `upgrade` | download the latest release and replace this binary in place |
@@ -70,6 +70,22 @@ and `follow` print one `handler: result` line per firing, the event dropped and 
 string result raw. These defaults are for reading: a raw string can span lines or
 look like any other value. Scripts should parse `eval --literal` and `read --full`
 / `follow --full`, which print exactly what the session's printer writes.
+
+A **session** is any interpreter actor in the runtime: an actor that exports
+`theater:simple/wisp.evaluate`, whether `new` made it or another actor spawned it
+with `(spawn-actor …)`. The daemon asks the runtime each time and keeps no session
+table, so `<s>` can be a full actor id, an id prefix (what `list` and `new` print),
+or the actor's name (the name `new` gave it, or for `spawn-actor` the manifest's
+`name`). A name or prefix that matches several sessions is an error that lists them,
+and `new` refuses a name another session already has. `spawn-actor` cannot be
+told a name: the runtime names the actor after its manifest, so every spawn of the
+stock `manifest.toml` is called `wisp-interpreter`. To reach a spawned interpreter
+by name, give its manifest its own `name`; otherwise use its id. `list` shows AGE
+and SOURCE only for the sessions this daemon made; the runtime does not record them.
+
+`read` evaluates `(poll-events)` in the actor, and `follow` repeats that `read`
+once a second. The events are buffered by the actor itself, not by the daemon, so
+both work the same for any session, including ones the daemon did not spawn.
 
 Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
 `$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated

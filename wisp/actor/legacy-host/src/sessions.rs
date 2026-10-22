@@ -1,60 +1,103 @@
-//! The daemon's session registry, shared with the actors it holds: the daemon
-//! adds and removes sessions; the `wisp-sessions` interface lets any actor in the
-//! runtime read the directory (the `(sessions)` REPL verb).
-use crate::Session;
+//! The session directory, shared with the actors: a session is any interpreter
+//! actor in the runtime (see `crate::interpreters`), so the directory is the
+//! runtime itself. The `wisp-sessions` interface lets any actor read it (the
+//! `(sessions)` REPL verb), and the daemon reads it for `list`.
+//!
+//! What the runtime does not know, when an actor started and which manifest the
+//! daemon loaded it from, the daemon notes here for the actors it spawns. Notes
+//! are for display only; finding a session never reads them.
+use crate::{Interpreter, interpreters, short_id};
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use theater::TheaterId;
 use theater::handler::{Handler, HandlerContext};
-use theater::pack_bridge::{HostImports, InterfaceImpl, Value, ValueType, host_fn, parse_pact};
+use theater::messages::TheaterCommand;
+use theater::pack_bridge::{
+    HostError, HostImports, InterfaceImpl, Value, ValueType, host_fn, parse_pact,
+};
+use tokio::sync::mpsc::UnboundedSender;
 
-/// A live session held by the daemon.
-pub struct Entry {
-    pub session: Arc<Session>,
-    pub name: String,
-    pub actor: String,
+/// What the daemon knows about an actor it spawned.
+#[derive(Clone)]
+pub struct Note {
     /// Where its actor came from (an `ActorSource` origin).
     pub source: String,
     pub since: Instant,
 }
 
-/// Sessions by short id. Cloning shares the same registry.
-#[derive(Clone, Default)]
-pub struct Sessions(Arc<Mutex<BTreeMap<String, Entry>>>);
+/// The runtime's command channel plus the daemon's notes. Cloning shares both.
+#[derive(Clone)]
+pub struct Sessions {
+    commands: UnboundedSender<TheaterCommand>,
+    notes: Arc<Mutex<HashMap<TheaterId, Note>>>,
+}
 
 impl Sessions {
-    /// Run `f` with the registry locked. Never hold the lock across an await.
-    pub fn with<R>(&self, f: impl FnOnce(&mut BTreeMap<String, Entry>) -> R) -> R {
-        f(&mut self.0.lock().unwrap_or_else(|poison| poison.into_inner()))
+    pub fn new(commands: UnboundedSender<TheaterCommand>) -> Self {
+        Self {
+            commands,
+            notes: Arc::default(),
+        }
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.with(|map| map.get(id).map(|entry| entry.session.clone()))
+    fn notes(&self) -> std::sync::MutexGuard<'_, HashMap<TheaterId, Note>> {
+        self.notes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// The directory as `list<session-info>`, in id order.
-    fn to_value(&self) -> Value {
-        let items = self.with(|map| {
-            map.iter()
-                .map(|(id, entry)| Value::Record {
-                    type_name: "session-info".to_string(),
-                    fields: vec![
-                        ("id".to_string(), Value::String(id.clone())),
-                        ("name".to_string(), Value::String(entry.name.clone())),
-                        ("actor".to_string(), Value::String(entry.actor.clone())),
-                        (
-                            "age-secs".to_string(),
-                            Value::U64(entry.since.elapsed().as_secs()),
+    pub fn note(&self, id: TheaterId, note: Note) {
+        self.notes().insert(id, note);
+    }
+
+    /// The note for `id`, if the daemon spawned it.
+    pub fn noted(&self, id: &TheaterId) -> Option<Note> {
+        self.notes().get(id).cloned()
+    }
+
+    /// Every session, in id order. Notes for actors that have stopped, however
+    /// they stopped, are dropped on the way.
+    pub async fn list(&self) -> Result<Vec<Interpreter>> {
+        let found = interpreters(&self.commands).await?;
+        self.notes()
+            .retain(|id, _| found.iter().any(|interpreter| interpreter.id == *id));
+        Ok(found)
+    }
+
+    /// The directory as `list<session-info>`, in id order. `age-secs` is 0 for a
+    /// session the daemon did not spawn (the runtime does not record start times).
+    async fn to_value(&self) -> Result<Value> {
+        let found = self.list().await?;
+        let items = found
+            .iter()
+            .map(|interpreter| Value::Record {
+                type_name: "session-info".to_string(),
+                fields: vec![
+                    (
+                        "id".to_string(),
+                        Value::String(short_id(&found, &interpreter.id)),
+                    ),
+                    ("name".to_string(), Value::String(interpreter.name.clone())),
+                    (
+                        "actor".to_string(),
+                        Value::String(interpreter.id.to_string()),
+                    ),
+                    (
+                        "age-secs".to_string(),
+                        Value::U64(
+                            self.noted(&interpreter.id)
+                                .map_or(0, |note| note.since.elapsed().as_secs()),
                         ),
-                    ],
-                })
-                .collect()
-        });
-        Value::List {
+                    ),
+                ],
+            })
+            .collect();
+        Ok(Value::List {
             elem_type: ValueType::Record("session-info".to_string()),
             items,
-        }
+        })
     }
 }
 
@@ -96,7 +139,12 @@ impl Handler for Sessions {
             "list-sessions",
             host_fn(move |_input| {
                 let sessions = sessions.clone();
-                async move { Ok(sessions.to_value()) }
+                async move {
+                    sessions
+                        .to_value()
+                        .await
+                        .map_err(|error| HostError(format!("{error:#}")))
+                }
             }),
         );
         ctx.mark_satisfied("wisp-sessions");

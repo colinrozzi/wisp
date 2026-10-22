@@ -9,10 +9,7 @@ use theater::messages::TheaterCommand;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use wisp_interpreter_actor::{
-    MANIFEST, Runtime,
-    sessions::{Entry, Sessions},
-    source::SourceBundle,
-    transport,
+    MANIFEST, Runtime, resolve, sessions::Note, short_id, source::SourceBundle, transport,
 };
 
 /// The actor built into the binary (produced by actors/wisp-repl/build.sh). A
@@ -61,7 +58,7 @@ struct Args {
 enum Command {
     /// Run the daemon: a long-running Theater runtime that holds sessions (default).
     Serve,
-    /// Create a new session on the daemon and print its id.
+    /// Spawn an interpreter actor (a session) named NAME and print its id.
     New {
         name: Option<String>,
         /// Start this session from the actor this manifest names, instead of the
@@ -80,7 +77,7 @@ enum Command {
         #[arg(long, group = "target")]
         reset: bool,
     },
-    /// List the daemon's sessions.
+    /// List every interpreter actor in the runtime.
     List,
     /// Evaluate a form in a session. FORM may be omitted or "-" to read stdin.
     /// A string result prints raw (its text, real newlines); other values print
@@ -110,7 +107,7 @@ enum Command {
     },
     /// Show a session (with id) or the daemon (without).
     Status { id: Option<String> },
-    /// End a session and reclaim its heap.
+    /// Stop a session's actor and reclaim its heap.
     Stop { id: String },
     /// Stop the daemon itself: end all sessions and exit (frees the port).
     Down,
@@ -421,54 +418,16 @@ async fn probe(runtime: &Runtime, actor: &ActorSource) -> Result<()> {
 }
 
 async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
-    let registry = &daemon.runtime.sessions;
     match field(request, "op") {
         // `theater-repl down`: reply first, then wake the serve loop to exit.
         "shutdown" => {
             daemon.shutdown.notify_one();
             (true, "daemon going down".to_string())
         }
-        "new" => {
-            let name = request
-                .get("name")
-                .and_then(Value::as_str)
-                .map(String::from);
-            let actor = match requested_actor(request, daemon).await {
-                Ok(actor) => actor,
-                Err(error) => return (false, format!("error: could not load actor: {error:#}")),
-            };
-            match daemon
-                .runtime
-                .spawn_with_manifest((*actor.wasm).clone(), actor.manifest.clone())
-                .await
-            {
-                Ok(session) => {
-                    let actor_id = session.id.to_string();
-                    let short: String = actor_id.chars().take(8).collect();
-                    let id = registry.with(|map| {
-                        let id = if map.contains_key(&short) {
-                            actor_id.clone()
-                        } else {
-                            short
-                        };
-                        let name = name.unwrap_or_else(|| id.clone());
-                        map.insert(
-                            id.clone(),
-                            Entry {
-                                session: Arc::new(session),
-                                name,
-                                actor: actor_id,
-                                source: actor.origin,
-                                since: Instant::now(),
-                            },
-                        );
-                        id
-                    });
-                    (true, id)
-                }
-                Err(error) => (false, format!("error: could not create session: {error}")),
-            }
-        }
+        "new" => match new_session(request, daemon).await {
+            Ok(id) => (true, id),
+            Err(error) => (false, format!("error: {error:#}")),
+        },
         "set-default" => {
             let actor = if request.get("reset").and_then(Value::as_bool) == Some(true) {
                 daemon.startup.clone()
@@ -492,7 +451,7 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
             *daemon.default.lock().await = actor;
             (true, format!("new sessions now start from {origin}"))
         }
-        "eval" => run(registry, field(request, "id"), field(request, "form")).await,
+        "eval" => run(daemon, field(request, "id"), field(request, "form")).await,
         // Clients that predate "text" get the full (handler event result) list.
         "read" => {
             let form = if request.get("text").and_then(Value::as_bool) == Some(true) {
@@ -500,10 +459,14 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
             } else {
                 "(poll-events)"
             };
-            run(registry, field(request, "id"), form).await
+            run(daemon, field(request, "id"), form).await
         }
-        "list" => registry.with(|map| {
-            if map.is_empty() {
+        "list" => {
+            let interpreters = match daemon.runtime.sessions.list().await {
+                Ok(interpreters) => interpreters,
+                Err(error) => return (false, format!("error: {error:#}")),
+            };
+            if interpreters.is_empty() {
                 return (
                     true,
                     "no sessions — create one with: theater-repl new".into(),
@@ -514,68 +477,126 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
                 "{:<9} {:<16} {:>5}  {:<36}  {}",
                 "ID", "NAME", "AGE", "ACTOR", "SOURCE"
             );
-            for (id, entry) in map.iter() {
+            for interpreter in &interpreters {
+                let (age, source) = shown(daemon.runtime.sessions.noted(&interpreter.id).as_ref());
                 out.push_str(&format!(
-                    "\n{:<9} {:<16} {:>4}s  {:<36}  {}",
-                    id,
-                    entry.name,
-                    entry.since.elapsed().as_secs(),
-                    entry.actor,
-                    entry.source
+                    "\n{:<9} {:<16} {:>5}  {:<36}  {}",
+                    short_id(&interpreters, &interpreter.id),
+                    interpreter.name,
+                    age,
+                    interpreter.id,
+                    source
                 ));
             }
             (true, out)
-        }),
-        "status" => {
-            // Read the default before taking the (sync) registry lock.
-            let default = daemon.default.lock().await.origin.clone();
-            registry.with(|map| match request.get("id").and_then(Value::as_str) {
-                Some(id) => match map.get(id) {
-                    Some(entry) => (
-                        true,
-                        format!(
-                            "session {id}\n  name:   {}\n  actor:  {}\n  source: {}\n  age:    {}s",
-                            entry.name,
-                            entry.actor,
-                            entry.source,
-                            entry.since.elapsed().as_secs()
-                        ),
-                    ),
-                    None => (false, format!("no such session: {id}")),
-                },
-                None => (
+        }
+        "status" => match request.get("id").and_then(Value::as_str) {
+            Some(target) => {
+                let interpreters = match daemon.runtime.interpreters().await {
+                    Ok(interpreters) => interpreters,
+                    Err(error) => return (false, format!("error: {error:#}")),
+                };
+                match resolve(&interpreters, target) {
+                    Ok(interpreter) => {
+                        let (age, source) =
+                            shown(daemon.runtime.sessions.noted(&interpreter.id).as_ref());
+                        (
+                            true,
+                            format!(
+                                "session {}\n  name:   {}\n  actor:  {}\n  source: {source}\n  age:    {age}",
+                                short_id(&interpreters, &interpreter.id),
+                                interpreter.name,
+                                interpreter.id,
+                            ),
+                        )
+                    }
+                    Err(error) => (false, error.to_string()),
+                }
+            }
+            None => match daemon.runtime.interpreters().await {
+                Ok(interpreters) => (
                     true,
                     format!(
                         "daemon up — {} session(s)\n  default actor: {}",
-                        map.len(),
-                        default
+                        interpreters.len(),
+                        daemon.default.lock().await.origin
                     ),
                 ),
-            })
-        }
+                Err(error) => (false, format!("error: {error:#}")),
+            },
+        },
         "stop" => {
-            let id = field(request, "id");
-            let entry = registry.with(|map| map.remove(id));
-            match entry {
-                Some(entry) => {
-                    let _ = entry.session.stop().await;
-                    (true, format!("stopped {id}"))
-                }
-                None => (false, format!("no such session: {id}")),
+            let target = field(request, "id");
+            match daemon.runtime.find(target).await {
+                Ok(session) => match session.stop().await {
+                    Ok(()) => (true, format!("stopped {target}")),
+                    Err(error) => (false, format!("error: could not stop {target}: {error:#}")),
+                },
+                Err(error) => (false, error.to_string()),
             }
         }
         other => (false, format!("unknown op: {other}")),
     }
 }
 
-/// Evaluate `form` in session `id`; `ok` is false when the result is a diagnostic.
-async fn run(registry: &Sessions, id: &str, form: &str) -> (bool, String) {
-    match registry.get(id) {
-        Some(session) => match session.evaluate(form).await {
+/// `new`: spawn an interpreter actor under the requested name, and print its id.
+/// The runtime holds the name, so it is the address from now on; a name another
+/// interpreter already has is refused rather than made ambiguous.
+async fn new_session(request: &Value, daemon: &Daemon) -> Result<String> {
+    let actor = requested_actor(request, daemon)
+        .await
+        .context("could not load actor")?;
+    let name = match request.get("name").and_then(Value::as_str) {
+        Some(name) => {
+            if let Some(taken) = daemon
+                .runtime
+                .interpreters()
+                .await?
+                .into_iter()
+                .find(|interpreter| interpreter.name == name)
+            {
+                anyhow::bail!("a session named {name} already exists: {}", taken.id);
+            }
+            name.to_string()
+        }
+        None => actor.manifest.name.clone(),
+    };
+    let session = daemon
+        .runtime
+        .spawn_named((*actor.wasm).clone(), actor.manifest.clone(), name)
+        .await
+        .context("could not create session")?;
+    daemon.runtime.sessions.note(
+        session.id,
+        Note {
+            source: actor.origin,
+            since: Instant::now(),
+        },
+    );
+    let interpreters = daemon.runtime.interpreters().await?;
+    Ok(short_id(&interpreters, &session.id))
+}
+
+/// A note's age and source as `list`/`status` show them; "-" when there is none.
+fn shown(note: Option<&Note>) -> (String, String) {
+    match note {
+        Some(note) => (
+            format!("{}s", note.since.elapsed().as_secs()),
+            note.source.clone(),
+        ),
+        None => ("-".into(), "-".into()),
+    }
+}
+
+/// Evaluate `form` in the session `target` names; `ok` is false when the result is
+/// a diagnostic.
+async fn run(daemon: &Daemon, target: &str, form: &str) -> (bool, String) {
+    match daemon.runtime.find(target).await {
+        Ok(session) => match session.evaluate(form).await {
             Ok(output) => (!output.starts_with("error:"), output),
             Err(error) => (false, format!("error: {error}")),
         },
-        None => (false, format!("no such session: {id}")),
+        Err(error) => (false, error.to_string()),
     }
 }
 
