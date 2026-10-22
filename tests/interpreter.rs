@@ -279,6 +279,34 @@ fn test_interpreter_u64_literals() {
 }
 
 #[test]
+fn test_interpreter_control_character_escapes() {
+    let mut s = session();
+    for (source, expected) in [
+        // \e is ESC (27), \0 is NUL, \xHH is any byte; each reads as one byte.
+        (r#"(string->bytes "\e")"#, "#<list u8 (#<u8 27>)>"),
+        (r#"(string->bytes "\0")"#, "#<list u8 (#<u8 0>)>"),
+        (
+            r#"(string->bytes "\x41\x7f\xff\x00")"#,
+            "#<list u8 (#<u8 65> #<u8 127> #<u8 255> #<u8 0>)>",
+        ),
+        (r#"(string->bytes "\xAb")"#, "#<list u8 (#<u8 171>)>"),
+        (r#"(string-len "\e[31mred\e[0m")"#, "12"),
+        (r#"(string=? "\e" "\x1b")"#, "1"),
+        (r#"(string-ref "a\0b" 2)"#, "98"),
+        // The printer writes control bytes as escapes, so its output reads back.
+        (r#""\e[1m\0\x01\x7f""#, r#""\e[1m\0\x01\x7f""#),
+        (r#"(bytes->string (string->bytes "\x1B"))"#, r#""\e""#),
+        // A malformed escape is a reader error.
+        (r#""\x4""#, "error: \\x escape needs two hex digits"),
+        (r#""\xg1""#, "error: \\x escape needs two hex digits"),
+        (r#""\x"#, "error: \\x escape needs two hex digits"),
+        (r#""\q""#, "error: unknown string escape"),
+    ] {
+        eval(&mut s, source, expected);
+    }
+}
+
+#[test]
 fn test_interpreter_bytes_string_bridge() {
     let mut s = session();
     // string->bytes yields a u8 byte list; the byte codes are UTF-8 of "Hi".

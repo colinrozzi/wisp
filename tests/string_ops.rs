@@ -273,3 +273,26 @@ fn test_string_eq_one_empty() {
 "#;
     assert_eq!(compile_and_run(source), 0); // false
 }
+
+// === Control-character escapes ===
+
+#[test]
+fn test_string_escape_esc_nul_hex() {
+    for (lit, index, byte) in [
+        (r#""\e""#, 0, 27),
+        (r#""\0""#, 0, 0),
+        (r#""\x41""#, 0, 65),
+        (r#""\x1b[0m""#, 0, 27),
+        (r#""a\eb""#, 1, 27),
+        (r#""a\0b""#, 2, 98),
+    ] {
+        let source =
+            format!("(export (fn test-func () s32 (string-ref {lit} (i32.const {index}))))");
+        assert_eq!(compile_and_run(&source), byte, "{lit}[{index}]");
+    }
+    // Each escape is one byte: "a\0b" has 3 bytes, "\e[0m" has 4.
+    for (lit, len) in [(r#""a\0b""#, 3), (r#""\e[0m""#, 4), (r#""\x00\x7f""#, 2)] {
+        let source = format!("(export (fn test-func () s32 (string-len {lit})))");
+        assert_eq!(compile_and_run(&source), len, "{lit}");
+    }
+}

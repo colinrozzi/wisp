@@ -30,8 +30,18 @@
           (if (i32.eq c 92) "\\\\"
             (if (i32.eq c 10) "\\n"
               (if (i32.eq c 9) "\\t"
-                (if (i32.eq c 13) "\\r" (substring s pos (i32.add pos 1))))))))
+                (if (i32.eq c 13) "\\r"
+                  (if (i32.eq c 27) "\\e"
+                    (if (i32.eq c 0) "\\0"
+                      ; other control bytes print as \xHH, so the reader reads them back
+                      (if (i32.or (i32.lt_s c 32) (i32.eq c 127))
+                        (string-append "\\x"
+                          (string-append (hex-nibble (i32.shr_u c 4)) (hex-nibble (i32.and c 15))))
+                        (substring s pos (i32.add pos 1)))))))))))
         (escape-text s (i32.add pos 1) (string-append out part))))))
+
+(fn hex-nibble ((n s32)) string
+  (substring "0123456789abcdef" n (i32.add n 1)))
 
 ; Granite has no tail-call optimization, so this recurses once per list element
 ; and would overflow the wasm stack on a long list (e.g. a (list u8) of hundreds
