@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use theater::messages::TheaterCommand;
@@ -57,7 +57,24 @@ enum Command {
     /// Run the daemon: a long-running Theater runtime that holds sessions (default).
     Serve,
     /// Create a new session on the daemon and print its id.
-    New { name: Option<String> },
+    New {
+        name: Option<String>,
+        /// Start this session from the actor this manifest names, instead of the
+        /// daemon's default. Other sessions are not affected.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
+    /// Change the actor that later `new` sessions start from. Running sessions keep
+    /// theirs. The daemon tries the actor first and keeps the old default if it fails.
+    #[command(group = clap::ArgGroup::new("target").required(true))]
+    SetDefault {
+        /// Manifest of the new default actor.
+        #[arg(group = "target")]
+        manifest: Option<PathBuf>,
+        /// Go back to the actor the daemon started with.
+        #[arg(long, group = "target")]
+        reset: bool,
+    },
     /// List the daemon's sessions.
     List,
     /// Evaluate a form in a session. FORM may be omitted or "-" to read stdin.
@@ -134,39 +151,64 @@ fn upgrade() -> Result<()> {
 
 // ---- actor artifacts ------------------------------------------------------
 
-struct Loaded {
+/// An actor a session can start from: a manifest and the wasm package it names.
+/// `origin` says where it came from, for `list`/`status`.
+#[derive(Clone)]
+struct ActorSource {
     manifest: theater::ManifestConfig,
-    wasm: Vec<u8>,
+    wasm: Arc<Vec<u8>>,
+    origin: String,
+}
+
+impl ActorSource {
+    fn built_in() -> Result<Self> {
+        Ok(Self {
+            manifest: theater::ManifestConfig::from_toml_str(MANIFEST)?,
+            wasm: Arc::new(EMBEDDED_WASM.to_vec()),
+            origin: format!("built-in {VERSION}"),
+        })
+    }
+
+    /// Read a manifest and the package it names, resolved against the manifest's
+    /// directory (so `package = "./actor.wasm"` means the file beside it).
+    fn from_manifest(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading manifest {}", path.display()))?;
+        let manifest = theater::ManifestConfig::from_toml_str(&text)
+            .with_context(|| format!("parsing manifest {}", path.display()))?;
+        let package = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(&manifest.package);
+        let wasm = std::fs::read(&package)
+            .with_context(|| format!("reading package {} (is it built?)", package.display()))?;
+        Ok(Self {
+            manifest,
+            wasm: Arc::new(wasm),
+            origin: path.display().to_string(),
+        })
+    }
+}
+
+struct Loaded {
+    actor: ActorSource,
     bundle_json: String,
 }
 
 /// Where the actor comes from: the built-in copies, or `--actor-dir` on disk.
 fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<Loaded> {
-    let (manifest_str, wasm, mut bundle_json) = match actor_dir {
-        Some(dir) => {
-            let manifest_str = std::fs::read_to_string(dir.join("manifest.toml"))?;
-            let package = theater::ManifestConfig::from_toml_str(&manifest_str)?.package;
-            let wasm = std::fs::read(dir.join(&package))
-                .context("actor is not built; run actors/wisp-repl/build.sh first")?;
-            let bundle = std::fs::read_to_string(dir.join("sources.json"))?;
-            (manifest_str, wasm, bundle)
-        }
-        None => (
-            MANIFEST.to_string(),
-            EMBEDDED_WASM.to_vec(),
-            EMBEDDED_SOURCES.to_string(),
+    let (actor, mut bundle_json) = match actor_dir {
+        Some(dir) => (
+            ActorSource::from_manifest(&dir.join("manifest.toml"))?,
+            std::fs::read_to_string(dir.join("sources.json"))?,
         ),
+        None => (ActorSource::built_in()?, EMBEDDED_SOURCES.to_string()),
     };
     if let Some(path) = bundle {
         bundle_json = std::fs::read_to_string(path)
             .with_context(|| format!("reading bundle {}", path.display()))?;
     }
-    let manifest = theater::ManifestConfig::from_toml_str(&manifest_str)?;
-    Ok(Loaded {
-        manifest,
-        wasm,
-        bundle_json,
-    })
+    Ok(Loaded { actor, bundle_json })
 }
 
 // ---- config ---------------------------------------------------------------
@@ -256,19 +298,35 @@ struct Entry {
     session: Arc<Session>,
     name: String,
     actor: String,
+    /// Where its actor came from (an `ActorSource` origin).
+    source: String,
     since: Instant,
 }
 type Registry = BTreeMap<String, Entry>;
 
+/// Everything a connection can touch. `default` is what `new` starts sessions
+/// from; `startup` is the actor the daemon was launched with, for `set-default --reset`.
+struct Daemon {
+    registry: Mutex<Registry>,
+    runtime: Runtime,
+    default: Mutex<ActorSource>,
+    startup: ActorSource,
+    shutdown: tokio::sync::Notify,
+}
+
 async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
-    let runtime = Arc::new(new_runtime(&loaded, &config).await?);
+    let runtime = new_runtime(&loaded, &config).await?;
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("binding {address} (is a daemon already on this port?)"))?;
-    let registry: Arc<Mutex<Registry>> = Arc::new(Mutex::new(BTreeMap::new()));
-    let wasm = Arc::new(loaded.wasm);
-    let manifest = Arc::new(loaded.manifest);
+    let daemon = Arc::new(Daemon {
+        registry: Mutex::new(BTreeMap::new()),
+        runtime,
+        default: Mutex::new(loaded.actor.clone()),
+        startup: loaded.actor,
+        shutdown: tokio::sync::Notify::new(),
+    });
     let hint = if port == 7777 {
         String::new()
     } else {
@@ -279,30 +337,21 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
 
     // Triggered by the `shutdown` op (the `theater-repl down` client command), so
     // the daemon can be brought down cleanly over the socket — no pid-hunting.
-    let shutdown = Arc::new(tokio::sync::Notify::new());
     let mut connections = tokio::task::JoinSet::new();
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
     loop {
         tokio::select! {
             _ = &mut stop => break,
-            _ = shutdown.notified() => {
+            _ = daemon.shutdown.notified() => {
                 eprintln!("theater-repl daemon going down");
                 break;
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let (registry, runtime, wasm, manifest, shutdown) = (
-                    registry.clone(),
-                    runtime.clone(),
-                    wasm.clone(),
-                    manifest.clone(),
-                    shutdown.clone(),
-                );
+                let daemon = daemon.clone();
                 connections.spawn(async move {
-                    if let Err(error) =
-                        handle(stream, registry, runtime, wasm, manifest, shutdown).await
-                    {
+                    if let Err(error) = handle(stream, &daemon).await {
                         eprintln!("connection error: {error}");
                     }
                 });
@@ -310,24 +359,20 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
-    let _ = runtime.commands.send(TheaterCommand::ShutdownRuntime);
+    let _ = daemon
+        .runtime
+        .commands
+        .send(TheaterCommand::ShutdownRuntime);
     Ok(())
 }
 
-async fn handle(
-    stream: tokio::net::TcpStream,
-    registry: Arc<Mutex<Registry>>,
-    runtime: Arc<Runtime>,
-    wasm: Arc<Vec<u8>>,
-    manifest: Arc<theater::ManifestConfig>,
-    shutdown: Arc<tokio::sync::Notify>,
-) -> Result<()> {
+async fn handle(stream: tokio::net::TcpStream, daemon: &Daemon) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let Some(line) = transport::read_line(&mut reader).await? else {
         return Ok(());
     };
     let request: Value = serde_json::from_str(&line).unwrap_or_else(|_| json!({}));
-    let (ok, text) = dispatch(&request, &registry, &runtime, &wasm, &manifest, &shutdown).await;
+    let (ok, text) = dispatch(&request, daemon).await;
     let mut stream = reader.into_inner();
     let response = json!({ "ok": ok, "text": text }).to_string();
     stream.write_all(response.as_bytes()).await?;
@@ -339,7 +384,7 @@ fn field<'a>(request: &'a Value, key: &str) -> &'a str {
     request.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-async fn lookup(registry: &Arc<Mutex<Registry>>, id: &str) -> Option<Arc<Session>> {
+async fn lookup(registry: &Mutex<Registry>, id: &str) -> Option<Arc<Session>> {
     registry
         .lock()
         .await
@@ -347,18 +392,34 @@ async fn lookup(registry: &Arc<Mutex<Registry>>, id: &str) -> Option<Arc<Session
         .map(|entry| entry.session.clone())
 }
 
-async fn dispatch(
-    request: &Value,
-    registry: &Arc<Mutex<Registry>>,
-    runtime: &Arc<Runtime>,
-    wasm: &Arc<Vec<u8>>,
-    manifest: &Arc<theater::ManifestConfig>,
-    shutdown: &Arc<tokio::sync::Notify>,
-) -> (bool, String) {
+/// The actor a request names with `manifest`, or the daemon's current default.
+async fn requested_actor(request: &Value, daemon: &Daemon) -> Result<ActorSource> {
+    match request.get("manifest").and_then(Value::as_str) {
+        Some(path) => ActorSource::from_manifest(Path::new(path)),
+        None => Ok(daemon.default.lock().await.clone()),
+    }
+}
+
+/// Start an actor, check that it answers `evaluate`, then stop it. `set-default`
+/// runs this so a broken build can't become everyone's next session.
+async fn probe(runtime: &Runtime, actor: &ActorSource) -> Result<()> {
+    let session = runtime
+        .spawn_with_manifest((*actor.wasm).clone(), actor.manifest.clone())
+        .await?;
+    let answer = session.evaluate("(+ 1 2)").await;
+    let _ = session.stop().await;
+    match answer? {
+        output if output == "3" => Ok(()),
+        output => anyhow::bail!("(+ 1 2) gave {output:?}, expected 3"),
+    }
+}
+
+async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
+    let registry = &daemon.registry;
     match field(request, "op") {
         // `theater-repl down`: reply first, then wake the serve loop to exit.
         "shutdown" => {
-            shutdown.notify_one();
+            daemon.shutdown.notify_one();
             (true, "daemon going down".to_string())
         }
         "new" => {
@@ -366,16 +427,21 @@ async fn dispatch(
                 .get("name")
                 .and_then(Value::as_str)
                 .map(String::from);
-            match runtime
-                .spawn_with_manifest((**wasm).clone(), (**manifest).clone())
+            let actor = match requested_actor(request, daemon).await {
+                Ok(actor) => actor,
+                Err(error) => return (false, format!("error: could not load actor: {error:#}")),
+            };
+            match daemon
+                .runtime
+                .spawn_with_manifest((*actor.wasm).clone(), actor.manifest.clone())
                 .await
             {
                 Ok(session) => {
-                    let actor = session.id.to_string();
-                    let short: String = actor.chars().take(8).collect();
+                    let actor_id = session.id.to_string();
+                    let short: String = actor_id.chars().take(8).collect();
                     let mut map = registry.lock().await;
                     let id = if map.contains_key(&short) {
-                        actor.clone()
+                        actor_id.clone()
                     } else {
                         short
                     };
@@ -385,7 +451,8 @@ async fn dispatch(
                         Entry {
                             session: Arc::new(session),
                             name,
-                            actor,
+                            actor: actor_id,
+                            source: actor.origin,
                             since: Instant::now(),
                         },
                     );
@@ -393,6 +460,29 @@ async fn dispatch(
                 }
                 Err(error) => (false, format!("error: could not create session: {error}")),
             }
+        }
+        "set-default" => {
+            let actor = if request.get("reset").and_then(Value::as_bool) == Some(true) {
+                daemon.startup.clone()
+            } else if request.get("manifest").and_then(Value::as_str).is_some() {
+                match requested_actor(request, daemon).await {
+                    Ok(actor) => actor,
+                    Err(error) => {
+                        return (false, format!("error: could not load actor: {error:#}"));
+                    }
+                }
+            } else {
+                return (false, "error: set-default needs a manifest or reset".into());
+            };
+            if let Err(error) = probe(&daemon.runtime, &actor).await {
+                return (
+                    false,
+                    format!("error: actor failed its check, default unchanged: {error:#}"),
+                );
+            }
+            let origin = actor.origin.clone();
+            *daemon.default.lock().await = actor;
+            (true, format!("new sessions now start from {origin}"))
         }
         "eval" => run(registry, field(request, "id"), field(request, "form")).await,
         "read" => run(registry, field(request, "id"), "(poll-events)").await,
@@ -404,14 +494,19 @@ async fn dispatch(
                     "no sessions — create one with: theater-repl new".into(),
                 );
             }
-            let mut out = format!("{:<9} {:<16} {:>5}  {}", "ID", "NAME", "AGE", "ACTOR");
+            // SOURCE stays last: lib/sessions.wisp reads ACTOR as the 4th word.
+            let mut out = format!(
+                "{:<9} {:<16} {:>5}  {:<36}  {}",
+                "ID", "NAME", "AGE", "ACTOR", "SOURCE"
+            );
             for (id, entry) in map.iter() {
                 out.push_str(&format!(
-                    "\n{:<9} {:<16} {:>4}s  {}",
+                    "\n{:<9} {:<16} {:>4}s  {:<36}  {}",
                     id,
                     entry.name,
                     entry.since.elapsed().as_secs(),
-                    entry.actor
+                    entry.actor,
+                    entry.source
                 ));
             }
             (true, out)
@@ -423,15 +518,23 @@ async fn dispatch(
                     Some(entry) => (
                         true,
                         format!(
-                            "session {id}\n  name:  {}\n  actor: {}\n  age:   {}s",
+                            "session {id}\n  name:   {}\n  actor:  {}\n  source: {}\n  age:    {}s",
                             entry.name,
                             entry.actor,
+                            entry.source,
                             entry.since.elapsed().as_secs()
                         ),
                     ),
                     None => (false, format!("no such session: {id}")),
                 },
-                None => (true, format!("daemon up — {} session(s)", map.len())),
+                None => (
+                    true,
+                    format!(
+                        "daemon up — {} session(s)\n  default actor: {}",
+                        map.len(),
+                        daemon.default.lock().await.origin
+                    ),
+                ),
             }
         }
         "stop" => {
@@ -450,7 +553,7 @@ async fn dispatch(
 }
 
 /// Evaluate `form` in session `id`; `ok` is false when the result is a diagnostic.
-async fn run(registry: &Arc<Mutex<Registry>>, id: &str, form: &str) -> (bool, String) {
+async fn run(registry: &Mutex<Registry>, id: &str, form: &str) -> (bool, String) {
     match lookup(registry, id).await {
         Some(session) => match session.evaluate(form).await {
             Ok(output) => (!output.starts_with("error:"), output),
@@ -464,7 +567,22 @@ async fn run(registry: &Arc<Mutex<Registry>>, id: &str, form: &str) -> (bool, St
 
 async fn run_client(command: Command, port: u16) -> Result<()> {
     match command {
-        Command::New { name } => send(port, json!({ "op": "new", "name": name })).await,
+        Command::New { name, manifest } => {
+            let manifest = manifest.map(|path| absolute(&path)).transpose()?;
+            send(
+                port,
+                json!({ "op": "new", "name": name, "manifest": manifest }),
+            )
+            .await
+        }
+        Command::SetDefault { manifest, reset } => {
+            let manifest = manifest.map(|path| absolute(&path)).transpose()?;
+            send(
+                port,
+                json!({ "op": "set-default", "manifest": manifest, "reset": reset }),
+            )
+            .await
+        }
         Command::List => send(port, json!({ "op": "list" })).await,
         Command::Eval { id, form } => {
             let form = read_form(form).await?;
@@ -479,6 +597,14 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
             unreachable!("handled in main")
         }
     }
+}
+
+/// The daemon has its own working directory, so send it an absolute path. A
+/// missing file fails here, before anything reaches the daemon.
+fn absolute(path: &Path) -> Result<String> {
+    let path = std::fs::canonicalize(path)
+        .with_context(|| format!("no such manifest: {}", path.display()))?;
+    Ok(path.display().to_string())
 }
 
 /// Send one request and print the response (stdout on ok, stderr + exit 1 otherwise).
@@ -534,7 +660,7 @@ async fn follow(port: u16, id: String) -> Result<()> {
 async fn repl(loaded: Loaded, config: ReplConfig) -> Result<()> {
     let runtime = new_runtime(&loaded, &config).await?;
     let session = runtime
-        .spawn_with_manifest(loaded.wasm, loaded.manifest)
+        .spawn_with_manifest((*loaded.actor.wasm).clone(), loaded.actor.manifest)
         .await?;
     eprintln!("Wisp Theater actor {} — :quit to exit", session.id);
     let result = async {

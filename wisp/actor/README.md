@@ -51,8 +51,9 @@ LISP
 | Command | Does |
 | --- | --- |
 | `serve` | run the daemon (default when no subcommand is given) |
-| `new [name]` | create a session, print its id |
-| `list` | list the daemon's sessions |
+| `new [name] [--manifest M]` | create a session, print its id; with `--manifest`, that session runs the actor `M` names |
+| `set-default <M>` / `set-default --reset` | change the actor later `new` sessions start from (checked first; running sessions keep theirs) |
+| `list` | list the daemon's sessions, with each one's actor source |
 | `eval <id> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result |
 | `read <id>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …) |
 | `follow <id>` | stream a session's events live until Ctrl-C |
@@ -66,6 +67,23 @@ Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
 `$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated
 runtime and pass `-p 3333` to the others — nothing is remembered between commands,
 so the port (or the default) is how a command finds its daemon.
+
+### Running new Wisp without a restart
+
+A session runs the actor it was created from, for its whole life. To try a
+rebuilt interpreter in a running daemon, start a session from its manifest; to
+move everyone over, make it the default:
+
+```sh
+bash wisp/actor/build.sh                                  # rebuild actor.wasm
+theater-repl new trial --manifest wisp/actor/manifest.toml   # just this session
+theater-repl set-default wisp/actor/manifest.toml            # all later sessions
+```
+
+`set-default` starts the actor once and checks that it evaluates `(+ 1 2)`; if it
+does not, the default stays as it was. The daemon reads the files when you run the
+command, so rebuilding afterwards does not change running sessions or the default.
+Changes to the host itself (this crate) still need a daemon restart.
 
 ### Build from source (for hacking on the REPL itself)
 
