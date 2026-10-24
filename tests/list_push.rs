@@ -1,7 +1,8 @@
 // Tests for amortized `list-push` (docs/proposals/MEMORY.md, stage 0a): the
 // data buffer grows by doubling, so n pushes allocate O(n) bytes, and push
-// still updates the list in place. Allocation is measured with the bump
-// pointer, read through `__pack_alloc(0)` before and after the call.
+// still updates the list in place. Allocation is measured as the growth of
+// live heap bytes (`__granite_heap_stats`) across the call: compiled code does
+// not free yet, so that is every byte the call allocated.
 
 use granite::compiler;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,11 +40,21 @@ fn run_measured(source: &str) -> (i32, i64) {
         .get_memory(&mut store, "memory")
         .expect("memory not found");
 
+    let stats: TypedFunc<(), i32> = instance
+        .get_typed_func(&mut store, "__granite_heap_stats")
+        .expect("__granite_heap_stats not exported");
+    let live_bytes = |store: &mut Store<()>| {
+        let s = stats.call(&mut *store, ()).unwrap() as usize;
+        let mut b = [0u8; 4];
+        memory.read(&*store, s, &mut b).unwrap();
+        u32::from_le_bytes(b) as i64
+    };
+
     let slots = alloc.call(&mut store, 8).unwrap();
-    let before = alloc.call(&mut store, 0).unwrap() as i64;
+    let before = live_bytes(&mut store);
     func.call(&mut store, (0, 0, slots, slots + 4))
         .expect("call failed");
-    let after = alloc.call(&mut store, 0).unwrap() as i64;
+    let after = live_bytes(&mut store);
 
     let mut buf = [0u8; 4];
     memory.read(&store, slots as usize, &mut buf).unwrap();

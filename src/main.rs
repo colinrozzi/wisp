@@ -34,6 +34,10 @@ enum Command {
         /// Also write the `.pact` text interface (already embedded in the wasm).
         #[arg(long = "emit-pact")]
         emit_pact: bool,
+        /// Build the debug heap: poison freed blocks, trap on a double free or a
+        /// write to a free block's header.
+        #[arg(long = "debug-heap")]
+        debug_heap: bool,
     },
     /// Evaluate a source file directly with the tree-walking interpreter — no
     /// compile-to-wasm step. Runs the shared front/middle (so the full type system
@@ -91,12 +95,14 @@ fn main() -> Result<()> {
             out,
             emit_wat,
             emit_pact,
+            debug_heap,
         } => run_compile(
             &source,
             out.as_deref(),
             compiler::EmitOptions {
                 wat: emit_wat,
                 pact: emit_pact,
+                debug_heap,
             },
         )?,
         Command::Eval { source, entry } => run_eval(&source, &entry)?,

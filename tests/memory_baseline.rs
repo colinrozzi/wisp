@@ -33,7 +33,19 @@ struct Inst {
     store: Store<()>,
     memory: Memory,
     alloc: TypedFunc<i32, i32>,
+    free: TypedFunc<(i32, i32), ()>,
+    stats: TypedFunc<(), i32>,
     instance: Instance,
+}
+
+/// Heap counters from `__granite_heap_stats`.
+#[derive(Clone, Copy)]
+struct Heap {
+    /// Bytes ever allocated, block headers included.
+    total: i64,
+    /// Bytes in live blocks.
+    live: i64,
+    pages: i64,
 }
 
 fn load(path: &PathBuf, max_stack: usize) -> Inst {
@@ -48,18 +60,36 @@ fn load(path: &PathBuf, max_stack: usize) -> Inst {
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     let alloc = instance.get_typed_func(&mut store, "__pack_alloc").unwrap();
+    let free = instance.get_typed_func(&mut store, "__pack_free").unwrap();
+    let stats = instance
+        .get_typed_func(&mut store, "__granite_heap_stats")
+        .unwrap();
     Inst {
         store,
         memory,
         alloc,
+        free,
+        stats,
         instance,
     }
 }
 
 impl Inst {
-    fn heap(&mut self) -> i64 {
-        self.alloc.call(&mut self.store, 0).unwrap() as i64
+    fn heap(&mut self) -> Heap {
+        let s = self.stats.call(&mut self.store, ()).unwrap() as usize;
+        let mut b = [0u8; 16];
+        self.memory.read(&self.store, s + 12, &mut b).unwrap();
+        let word = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as i64;
+        let mut live = [0u8; 4];
+        self.memory.read(&self.store, s, &mut live).unwrap();
+        Heap {
+            total: word(4) | word(8) << 32,
+            live: u32::from_le_bytes(live) as i64,
+            pages: word(0),
+        }
     }
+    /// Call an export the way the packr host does, freeing the input and output
+    /// buffers after the call.
     fn call_str(&mut self, func: &str, input: pack::abi::Value) -> String {
         let f: TypedFunc<(i32, i32, i32, i32), i32> =
             self.instance.get_typed_func(&mut self.store, func).unwrap();
@@ -82,10 +112,14 @@ impl Inst {
             .unwrap();
         let p = u32::from_le_bytes(pl[..4].try_into().unwrap()) as usize;
         let l = u32::from_le_bytes(pl[4..].try_into().unwrap()) as usize;
-        match pack::decode(&self.memory.data(&self.store)[p..p + l]).unwrap() {
+        let out = match pack::decode(&self.memory.data(&self.store)[p..p + l]).unwrap() {
             pack::abi::Value::String(s) => s,
             v => format!("{v:?}"),
+        };
+        for (ptr, len) in [(ptr, bytes.len() as i32), (p as i32, l as i32), (slots, 8)] {
+            self.free.call(&mut self.store, (ptr, len)).unwrap();
         }
+        out
     }
 }
 
@@ -106,7 +140,12 @@ fn interpreter_growth() {
     big(move || {
         let mut i = load(&wasm, 512 << 20);
         let h0 = i.heap();
-        println!("evaluator: heap after instantiate = {h0}");
+        println!(
+            "evaluator: live after instantiate = {}, {} pages",
+            h0.live, h0.pages
+        );
+        // allocated: every block allocated per eval; retained: what stays live
+        // (the host's __pack_free reclaims the input and output buffers).
         let row = |i: &mut Inst, label: &str, src: &str, n: usize| {
             let first = eval(i, src);
             let a = i.heap();
@@ -117,8 +156,9 @@ fn interpreter_growth() {
             let dt = t.elapsed();
             let b = i.heap();
             println!(
-                "{label:<40} -> {first:<14} {:>10} bytes/eval  {:>8.1} us/eval",
-                (b - a) / n as i64,
+                "{label:<40} -> {first:<14} {:>10} allocated/eval {:>10} retained/eval  {:>8.1} us/eval",
+                (b.total - a.total) / n as i64,
+                (b.live - a.live) / n as i64,
                 dt.as_secs_f64() * 1e6 / n as f64
             );
         };
@@ -143,7 +183,11 @@ fn interpreter_growth() {
             "(on-message (list 1 2))",
             1000,
         );
-        println!("evaluator: heap at end = {}", i.heap());
+        let h = i.heap();
+        println!(
+            "evaluator: at end {} allocated, {} live, {} pages",
+            h.total, h.live, h.pages
+        );
     });
 }
 
@@ -163,12 +207,11 @@ fn self_compile() {
         let dt = t.elapsed();
         let h1 = i.heap();
         println!(
-            "self-compile: source {} B, output {} B, heap {} -> {} ({:.1} MiB allocated), {:.2} s",
+            "self-compile: source {} B, output {} B, {:.1} MiB allocated, {} pages, {:.2} s",
             source.len(),
             wat.len(),
-            h0,
-            h1,
-            (h1 - h0) as f64 / 1048576.0,
+            (h1.total - h0.total) as f64 / 1048576.0,
+            h1.pages,
             dt.as_secs_f64()
         );
     });
