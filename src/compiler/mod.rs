@@ -751,6 +751,14 @@ pub enum Expr {
     HeapAlloc {
         size: Box<Expr>,
     },
+    /// Free a block from heap-alloc: (heap-free p) -> s32 (0). Pointers that are
+    /// not heap blocks (static data, 0) are ignored.
+    HeapFree {
+        ptr: Box<Expr>,
+    },
+    /// The address of the allocator's stats record (`__granite_heap_stats`):
+    /// (heap-stats) -> s32. Live bytes are at +0, live blocks at +4.
+    HeapStats,
     /// Reinterpret an `any` as the address of its [len:u32][cgrf] blob:
     /// (any-addr x) -> s32. The inverse of any-from-addr.
     AnyAddr {
@@ -1199,7 +1207,7 @@ fn expr_uses_heap(expr: &Expr) -> bool {
         Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
         Expr::AnyFromS32 { .. } | Expr::AnyFromString { .. } => true, // allocate a CGRF blob
         Expr::AnyToS32 { value } | Expr::AnyToString { value } => expr_uses_heap(value),
-        Expr::HeapAlloc { .. } => true, // allocates
+        Expr::HeapAlloc { .. } | Expr::HeapFree { .. } | Expr::HeapStats => true,
         Expr::AnyAddr { value }
         | Expr::AnyFromAddr { value }
         | Expr::StringAddr { value }

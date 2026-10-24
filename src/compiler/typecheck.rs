@@ -75,6 +75,7 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
         | Expr::Var(_)
         | Expr::GlobalGet { .. }
         | Expr::None { .. }
+        | Expr::HeapStats
         | Expr::ListNew { .. } => vec![],
         Expr::Ascribe { expr, .. }
         | Expr::RecordAccess { expr, .. }
@@ -87,6 +88,7 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
         | Expr::AnyFromString { value: expr }
         | Expr::AnyToString { value: expr }
         | Expr::HeapAlloc { size: expr }
+        | Expr::HeapFree { ptr: expr }
         | Expr::AnyAddr { value: expr }
         | Expr::AnyFromAddr { value: expr }
         | Expr::StringAddr { value: expr }
@@ -1040,6 +1042,14 @@ pub(crate) fn check_expr(
             }
             Ok(Type::S32)
         }
+        Expr::HeapFree { ptr } => {
+            let ty = check_expr(ptr, env, signatures, globals, records, variants)?;
+            if ty != Type::S32 {
+                bail!("heap-free expects an s32 pointer, got {:?}", ty);
+            }
+            Ok(Type::S32)
+        }
+        Expr::HeapStats => Ok(Type::S32),
         Expr::AnyAddr { value } => {
             let ty = check_expr(value, env, signatures, globals, records, variants)?;
             if ty != Type::Any {

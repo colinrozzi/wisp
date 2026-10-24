@@ -1694,6 +1694,27 @@ pub(crate) fn parse_expr(
                         size: Box::new(size),
                     })
                 }
+                SExpr::Sym(sym, _sym_span) if sym == "heap-free" => {
+                    if items.len() != 2 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'heap-free' expression",
+                            list_span,
+                            "expected: (heap-free ptr-expr)",
+                        ));
+                    }
+                    let ptr = parse_expr(&items[1], vars, functions, records, variants, ctx)?;
+                    Ok(Expr::HeapFree { ptr: Box::new(ptr) })
+                }
+                SExpr::Sym(sym, _sym_span) if sym == "heap-stats" => {
+                    if items.len() != 1 {
+                        return Err(ctx.error_with_note(
+                            "invalid 'heap-stats' expression",
+                            list_span,
+                            "expected: (heap-stats)",
+                        ));
+                    }
+                    Ok(Expr::HeapStats)
+                }
                 SExpr::Sym(sym, _sym_span) if sym == "any-addr" => {
                     if items.len() != 2 {
                         return Err(ctx.error_with_note(

@@ -1,15 +1,16 @@
 // Tests for the heap allocator (docs/proposals/MEMORY.md §5, stage 1): block
 // headers, size classes, large buckets, reuse after free, memory growth, the
 // `__granite_heap_stats` record, the debug heap, and the host protocol's
-// `__pack_free` keeping an export's memory flat.
+// `__pack_free` keeping an export's memory flat; and stage 2's frees at obvious
+// owners (import buffers, raw-invoke, list-push growth, heap-free).
 
 use granite::compiler;
 use pack::abi::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::{
-    Config, Engine, ExternType, Instance, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
-    TypedFunc,
+    Caller, Config, Engine, ExternType, Instance, Linker, Memory, Module, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc,
 };
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -93,7 +94,9 @@ impl Heap {
         let limits = StoreLimitsBuilder::new().memory_size(max_bytes).build();
         let mut store = Store::new(&engine, limits);
         store.limiter(|l| l);
-        let instance = Instance::new(&mut store, &module, &[]).unwrap();
+        let mut linker = Linker::new(&engine);
+        add_test_host(&mut linker);
+        let instance = linker.instantiate(&mut store, &module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
         let alloc = instance.get_typed_func(&mut store, "__pack_alloc").unwrap();
         let free = instance.get_typed_func(&mut store, "__pack_free").unwrap();
@@ -196,6 +199,80 @@ impl Heap {
         self.free(out_ptr, out_len);
         self.free(slots, 8);
         value
+    }
+}
+
+/// Where a test host import puts its result (MEMORY.md §4).
+#[derive(Clone, Copy)]
+enum Reply {
+    /// In a buffer from the guest's `__pack_alloc`; status 1, the guest frees it.
+    GuestOwned,
+    /// In the host's fixed scratch area at 0x4008; status 0, the guest must not.
+    Scratch,
+}
+
+/// Host imports for the stage 2 tests, with packr's raw calling convention
+/// `(in_ptr, in_len, out_ptr_ptr, out_len_ptr) -> status`:
+/// `host.bump(x) = x + 1` and `host.echo(s) = s` reply in a guest-owned buffer,
+/// `host.bump-scratch(x) = x + 1` in the scratch area.
+fn add_test_host(linker: &mut Linker<StoreLimits>) {
+    fn bump(v: Value) -> Value {
+        match v {
+            Value::S32(x) => Value::S32(x + 1),
+            other => panic!("bump: {other:?}"),
+        }
+    }
+    type HostFn = fn(Value) -> Value;
+    let imports: [(&str, Reply, HostFn); 3] = [
+        ("bump", Reply::GuestOwned, bump),
+        ("bump-scratch", Reply::Scratch, bump),
+        ("echo", Reply::GuestOwned, |v| v),
+    ];
+    for (name, reply, f) in imports {
+        linker
+            .func_wrap(
+                "host",
+                name,
+                move |mut caller: Caller<'_, StoreLimits>,
+                      in_ptr: i32,
+                      in_len: i32,
+                      out_ptr_ptr: i32,
+                      out_len_ptr: i32|
+                      -> i32 {
+                    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                    let input = {
+                        let data = memory.data(&caller);
+                        pack::decode(&data[in_ptr as usize..(in_ptr + in_len) as usize]).unwrap()
+                    };
+                    let bytes = pack::encode(&f(input)).unwrap();
+                    let (ptr, status) = match reply {
+                        Reply::GuestOwned => {
+                            let alloc = caller
+                                .get_export("__pack_alloc")
+                                .unwrap()
+                                .into_func()
+                                .unwrap()
+                                .typed::<i32, i32>(&caller)
+                                .unwrap();
+                            (alloc.call(&mut caller, bytes.len() as i32).unwrap(), 1)
+                        }
+                        Reply::Scratch => (0x4008, 0),
+                    };
+                    memory.write(&mut caller, ptr as usize, &bytes).unwrap();
+                    memory
+                        .write(&mut caller, out_ptr_ptr as usize, &ptr.to_le_bytes())
+                        .unwrap();
+                    memory
+                        .write(
+                            &mut caller,
+                            out_len_ptr as usize,
+                            &(bytes.len() as i32).to_le_bytes(),
+                        )
+                        .unwrap();
+                    status
+                },
+            )
+            .unwrap();
     }
 }
 
@@ -471,4 +548,98 @@ fn actor_memory_is_growable() {
     assert_eq!(memory.maximum(), None);
     assert!(memory.minimum() <= 64, "{} initial pages", memory.minimum());
     assert!(module.exports().any(|e| e.name() == "__granite_heap_stats"));
+}
+
+// ---- Stage 2: frees at obvious owners ----
+
+const IMPORTS: &str = r#"
+(import host bump ((x s32)) s32)
+(import host bump-scratch ((x s32)) s32)
+(import host echo ((s string)) string)
+(export (fn call-bump ((x s32)) s32 (bump x)))
+(export (fn call-scratch ((x s32)) s32 (bump-scratch x)))
+(export (fn call-echo ((x s32)) s32
+  (let (r (echo "hello from the guest"))
+    (let (n (string-len r))
+      (begin (heap-free (string-addr r)) n)))))
+(export (fn call-raw ((x s32)) s32
+  (let (arg (any-s32 x))
+    (let (r (raw-invoke "host" "bump" arg))
+      (let (y (any-as-s32 r))
+        (begin (heap-free (any-addr arg)) (heap-free (any-addr r)) y))))))
+(export (fn push-n ((n s32)) s32
+  (push-loop (list-new s32) (i32.const 0) n)))
+(fn push-loop ((xs (list s32)) (i s32) (n s32)) s32
+  (if (i32.ge_s i n) (list-len xs)
+    (push-loop (list-push xs i) (i32.add i (i32.const 1)) n)))
+(export (fn live-bytes ((x s32)) s32 (i32.load (heap-stats))))
+(export (fn live-blocks ((x s32)) s32 (i32.load (i32.add (heap-stats) (i32.const 4)))))
+(export (fn alloc-free ((n s32)) s32 (heap-free (heap-alloc n))))
+"#;
+
+/// Calling a host import frees its argument buffer and result slots, and the
+/// result buffer when the host says the guest owns it, so 10,000 calls run in
+/// flat memory. Under the debug heap a free before decoding would poison the
+/// result, so the values also check the order.
+#[test]
+fn import_called_10000_times_keeps_memory_flat() {
+    for debug in [false, true] {
+        let mut h = Heap::new(&compile(IMPORTS, debug));
+        for name in ["call-bump", "call-scratch", "call-echo", "call-raw"] {
+            let expect = |i: i32| match name {
+                "call-echo" => "hello from the guest".len() as i32,
+                _ => i + 1,
+            };
+            for i in 0..100 {
+                assert_eq!(h.call(name, Value::S32(i)), Value::S32(expect(i)));
+            }
+            let warm = h.stats();
+            for i in 0..10_000 {
+                assert_eq!(h.call(name, Value::S32(i)), Value::S32(expect(i)));
+            }
+            let after = h.stats();
+            assert_eq!(after.live_bytes, warm.live_bytes, "{name}: live bytes");
+            assert_eq!(after.live_blocks, warm.live_blocks, "{name}: live blocks");
+            assert_eq!(after.frontier, warm.frontier, "{name}: frontier");
+            assert_eq!(after.pages, warm.pages, "{name}: pages");
+        }
+    }
+}
+
+/// list-push frees the old data buffer when it grows: after n pushes only the
+/// header and the last buffer are live, not every buffer on the way.
+#[test]
+fn list_push_frees_the_old_buffer() {
+    for debug in [false, true] {
+        let mut h = Heap::new(&compile(IMPORTS, debug));
+        let before = h.stats();
+        assert_eq!(h.call("push-n", Value::S32(10_000)), Value::S32(10_000));
+        let after = h.stats();
+        let header = expected_block(12);
+        let data = expected_block(4 * 10_000);
+        assert_eq!(after.live_bytes - before.live_bytes, header + data);
+        assert_eq!(after.live_blocks - before.live_blocks, 2);
+    }
+}
+
+/// heap-stats reads the same record as `__granite_heap_stats`, and heap-free
+/// returns a block to its class.
+#[test]
+fn heap_stats_and_heap_free_from_granite() {
+    let mut h = Heap::new(&compile(IMPORTS, true));
+    // The export's own buffers are live while it runs: the input (16 bytes,
+    // a 24-byte block) and the slots; the output comes after the read.
+    let Value::S32(live) = h.call("live-bytes", Value::S32(0)) else {
+        panic!()
+    };
+    let Value::S32(blocks) = h.call("live-blocks", Value::S32(0)) else {
+        panic!()
+    };
+    let s = h.stats();
+    assert!(live as u32 > s.live_bytes && blocks as u32 > s.live_blocks);
+    let before = h.stats();
+    for n in [8, 100, 5000] {
+        assert_eq!(h.call("alloc-free", Value::S32(n)), Value::S32(0));
+    }
+    assert_eq!(h.stats().live_bytes, before.live_bytes);
 }
