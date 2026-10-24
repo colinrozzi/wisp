@@ -1,4 +1,5 @@
 pub mod eval_session;
+pub mod events;
 pub mod sessions;
 pub mod source;
 pub mod theater_host;
@@ -49,6 +50,8 @@ pub struct Runtime {
     /// The session directory (the runtime's interpreter actors, plus the daemon's
     /// notes); readable by every actor via `wisp-sessions`.
     pub sessions: sessions::Sessions,
+    /// Each session's newest trigger-firing seq, for `wait` and `follow`.
+    pub events: events::EventWatch,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -59,6 +62,8 @@ impl Runtime {
         handlers.register(bundle);
         let sessions = sessions::Sessions::new(commands.clone());
         handlers.register(sessions.clone());
+        let events = events::EventWatch::default();
+        handlers.register(events.clone());
         handlers.register(theater_handler_rpc::RpcHandler::new(commands.clone()));
         // Per-interface handlers the local runtime provides. Each is one line;
         // real Theater deployments enable handlers via the actor manifest.
@@ -161,6 +166,7 @@ impl Runtime {
         Ok(Self {
             commands,
             sessions,
+            events,
             task,
         })
     }

@@ -89,24 +89,41 @@ enum Command {
         #[arg(short, long)]
         literal: bool,
     },
-    /// Drain a session's buffered events (inbound triggers: on-tick, on-message, …).
-    /// Prints "handler: result" per firing, a string result raw. For scripts,
-    /// parse --full output.
+    /// Print a session's trigger firings (on-tick, on-message, …) since this
+    /// reader's cursor, then move the cursor past them. Reading removes nothing:
+    /// other readers (follow, wait, the session's own poll-events) still see
+    /// them. Prints "handler: result" per firing, a string result raw. For
+    /// scripts, parse --full output.
     Read {
         id: String,
-        /// Print the firings as a Wisp list of (handler result), or (handler event
-        /// result) when unhandled; a drop count comes first after drops.
-        #[arg(long)]
-        full: bool,
+        #[command(flatten)]
+        from: ReadFrom,
     },
-    /// Stream a session's events live until Ctrl-C (same format as read).
+    /// Stream a session's firings until Ctrl-C (same format as read), resuming
+    /// from where the last follow with this cursor stopped.
     Follow {
         id: String,
-        /// Print the firings as a Wisp list of (handler result), or (handler event
-        /// result) when unhandled; a drop count comes first after drops.
+        #[command(flatten)]
+        from: ReadFrom,
+        /// Start at the newest firing: skip what is already buffered.
         #[arg(long)]
-        full: bool,
+        from_now: bool,
     },
+    /// Wait until the session has a firing after this cursor, print every one
+    /// there is, move the cursor past them, and exit. The wake-on-message
+    /// monitor: run it in the background and start it again after each wake.
+    /// Nothing it did not print is acknowledged, so nothing is lost.
+    Wait {
+        id: String,
+        #[command(flatten)]
+        from: ReadFrom,
+        /// Give up after this many seconds: exit 2 with nothing printed.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// List a session's event cursors: NAME, the seq it has acknowledged, and how
+    /// many firings it is behind.
+    Cursors { id: String },
     /// Show a session (with id) or the daemon (without).
     Status { id: Option<String> },
     /// Stop a session's actor and reclaim its heap.
@@ -119,6 +136,36 @@ enum Command {
     Version,
     /// Download the latest release and replace this binary in place.
     Upgrade,
+}
+
+/// Where a reader (read, follow, wait) starts, and how it prints.
+#[derive(clap::Args)]
+struct ReadFrom {
+    /// Read after this cursor. Each verb has its own by default (read, follow,
+    /// wait), so they never take firings from each other.
+    #[arg(long, conflicts_with = "after")]
+    cursor: Option<String>,
+    /// Read the firings after seq N, without a cursor (nothing is acknowledged).
+    /// --after 0 shows everything still buffered.
+    #[arg(long)]
+    after: Option<u64>,
+    /// Read without acknowledging: the cursor does not move.
+    #[arg(long)]
+    peek: bool,
+    /// Print the Wisp list (next lost (seq handler result) ...), with
+    /// (seq handler event result) for an unhandled firing.
+    #[arg(long)]
+    full: bool,
+}
+
+impl ReadFrom {
+    /// The cursor to read and acknowledge, unless --after names a seq instead.
+    fn cursor(&self, default: &str) -> Option<String> {
+        match self.after {
+            Some(_) => None,
+            None => Some(self.cursor.clone().unwrap_or_else(|| default.to_string())),
+        }
+    }
 }
 
 #[tokio::main]
@@ -454,15 +501,26 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
             (true, format!("new sessions now start from {origin}"))
         }
         "eval" => run(daemon, field(request, "id"), field(request, "form")).await,
-        // Clients that predate "text" get the full list of firings.
-        "read" => {
-            let form = if request.get("text").and_then(Value::as_bool) == Some(true) {
-                "(poll-events \"text\")"
-            } else {
-                "(poll-events)"
-            };
-            run(daemon, field(request, "id"), form).await
-        }
+        // A read names a cursor or a seq. Clients that predate cursors name
+        // neither and get the old poll-events read (and those that predate "text"
+        // get the full list of firings).
+        "read" => match reader_form(request) {
+            Some(form) => run(daemon, field(request, "id"), &form).await,
+            None => {
+                let form = if request.get("text").and_then(Value::as_bool) == Some(true) {
+                    "(poll-events \"text\")"
+                } else {
+                    "(poll-events)"
+                };
+                run(daemon, field(request, "id"), form).await
+            }
+        },
+        "ack" => match ack_form(request) {
+            Some(form) => run(daemon, field(request, "id"), &form).await,
+            None => (false, "error: ack needs a cursor and a seq".into()),
+        },
+        "wait" => wait(daemon, request).await,
+        "cursors" => cursors(daemon, field(request, "id")).await,
         "list" => {
             let interpreters = match daemon.runtime.sessions.list().await {
                 Ok(interpreters) => interpreters,
@@ -602,6 +660,180 @@ async fn run(daemon: &Daemon, target: &str, form: &str) -> (bool, String) {
     }
 }
 
+// ---- event readers (daemon side) -----------------------------------------
+//
+// The session numbers its trigger firings and never removes one when it is read
+// (wisp docs/proposals/SESSION-INBOX.md). A reader asks for the firings after a
+// cursor or a seq, and the client acknowledges a cursor only after it printed.
+
+/// A Wisp string literal for `s`.
+fn wisp_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The form that reads what a `read`/`wait` request names: a cursor, or the seq
+/// in `after`. "text" requests get the daemon's "wire" text (a `next lost` line
+/// first). None when the request names neither (an old client).
+fn reader_form(request: &Value) -> Option<String> {
+    let max = request
+        .get("max")
+        .and_then(Value::as_u64)
+        .map(|max| format!(" {max}"))
+        .unwrap_or_default();
+    let mode = if request.get("text").and_then(Value::as_bool) == Some(true) {
+        " \"wire\""
+    } else {
+        ""
+    };
+    if let Some(cursor) = request.get("cursor").and_then(Value::as_str) {
+        Some(format!("(event-read {}{max}{mode})", wisp_string(cursor)))
+    } else {
+        let after = request.get("after").and_then(Value::as_u64)?;
+        Some(format!("(events-after {after}{max}{mode})"))
+    }
+}
+
+/// `(event-ack CURSOR SEQ)` for an ack request; `"seq": "head"` acknowledges
+/// everything recorded so far.
+fn ack_form(request: &Value) -> Option<String> {
+    let cursor = request.get("cursor").and_then(Value::as_str)?;
+    let seq = match request.get("seq")? {
+        Value::String(head) if head == "head" => "(event-head)".to_string(),
+        seq => seq.as_u64()?.to_string(),
+    };
+    Some(format!("(event-ack {} {seq})", wisp_string(cursor)))
+}
+
+/// A seq as the session prints it: a plain integer, or with an `s64` suffix
+/// once it no longer fits an s32.
+fn parse_seq(printed: &str) -> Option<u64> {
+    printed.trim_end_matches("s64").parse().ok()
+}
+
+/// The `(next, lost)` a reader result starts with, and whether it carries
+/// anything to show (firings, or a report of lost ones). `text` results are the
+/// "wire" string; the others the `(next lost firing...)` list.
+fn reader_head(printed: &str, text: bool) -> Option<(u64, u64, bool)> {
+    if text {
+        let wire = unquote(printed)?;
+        let (head, body) = wire.split_once('\n').unwrap_or((&wire, ""));
+        let (next, lost) = head.split_once(' ')?;
+        let (next, lost) = (parse_seq(next)?, parse_seq(lost)?);
+        Some((next, lost, lost > 0 || !body.is_empty()))
+    } else {
+        let mut parts = printed.strip_prefix('(')?.splitn(3, [' ', ')']);
+        let next = parse_seq(parts.next()?)?;
+        let lost = parse_seq(parts.next()?)?;
+        let rest = parts.next().unwrap_or("").trim();
+        Some((next, lost, lost > 0 || !rest.is_empty()))
+    }
+}
+
+/// Block until the session has firings after the request's cursor (or seq),
+/// then answer with them, like `read`. Waiting costs no evaluation: the
+/// session reports each new seq through `wisp-events.event-recorded`.
+async fn wait(daemon: &Daemon, request: &Value) -> (bool, String) {
+    let target = field(request, "id");
+    let Some(form) = reader_form(request) else {
+        return (false, "error: wait needs a cursor or a seq".into());
+    };
+    let text = request.get("text").and_then(Value::as_bool) == Some(true);
+    let session = match daemon.runtime.find(target).await {
+        Ok(session) => session,
+        Err(error) => return (false, error.to_string()),
+    };
+    // The previous batch's acknowledgement rides on the next wait (follow).
+    if let Some(ack) = request.get("ack").and_then(|_| {
+        let mut ack = request.clone();
+        ack["seq"] = request["ack"].clone();
+        ack_form(&ack)
+    }) {
+        let (ok, output) = run(daemon, target, &ack).await;
+        if !ok {
+            return (false, output);
+        }
+    }
+    let deadline = request
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .filter(|ms| *ms > 0)
+        .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
+    // Subscribe before the first read, so nothing recorded after it is missed.
+    let mut recorded = daemon.runtime.events.subscribe(session.id);
+    loop {
+        let (ok, output) = match session.evaluate(&form).await {
+            Ok(output) => (!output.starts_with("error:"), output),
+            Err(error) => (false, format!("error: {error}")),
+        };
+        if !ok {
+            return (false, output);
+        }
+        match reader_head(&output, text) {
+            Some((_, _, true)) => return (true, output),
+            Some(_) => {}
+            None => return (false, format!("error: unexpected reader output: {output}")),
+        }
+        // Sleep until a firing is recorded, the deadline passes, or the session
+        // stops (checked every few seconds; a stopped session records nothing).
+        loop {
+            let timeout = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                changed = recorded.changed() => {
+                    if changed.is_err() {
+                        recorded = daemon.runtime.events.subscribe(session.id);
+                    }
+                    // A burst of firings comes back as one batch.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    break;
+                }
+                _ = timeout => return (true, output),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    if daemon.runtime.attach(session.id).await.is_err() {
+                        daemon.runtime.events.forget(&session.id);
+                        return (false, format!("error: session {target} stopped"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `NAME SEQ BEHIND` for each of a session's cursors.
+async fn cursors(daemon: &Daemon, target: &str) -> (bool, String) {
+    let (ok, head) = run(daemon, target, "(event-head)").await;
+    if !ok {
+        return (false, head);
+    }
+    let (ok, list) = run(daemon, target, "(event-cursors)").await;
+    if !ok {
+        return (false, list);
+    }
+    let head = parse_seq(&head).unwrap_or(0);
+    let mut out = format!("{:<16} {:>8} {:>8}", "NAME", "SEQ", "BEHIND");
+    // (("name" seq) ...): names are written as Wisp strings.
+    for entry in list.split("(\"").skip(1) {
+        let Some((name, rest)) = entry.split_once("\" ") else {
+            continue;
+        };
+        let seq = parse_seq(rest.split(')').next().unwrap_or("")).unwrap_or(0);
+        out.push_str(&format!(
+            "\n{:<16} {:>8} {:>8}",
+            name.replace("\\\"", "\"").replace("\\\\", "\\"),
+            seq,
+            head.saturating_sub(seq)
+        ));
+    }
+    if out.lines().count() == 1 {
+        out.push_str(&format!("\n(no cursors; head is {head})"));
+    }
+    (true, out)
+}
+
 // ---- the client -----------------------------------------------------------
 
 async fn run_client(command: Command, port: u16) -> Result<()> {
@@ -632,14 +864,13 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
                 send_raw(port, request).await
             }
         }
-        Command::Read { id, full: true } => send(port, json!({ "op": "read", "id": id })).await,
-        Command::Read { id, full: false } => {
-            send_raw(port, json!({ "op": "read", "id": id, "text": true })).await
-        }
+        Command::Read { id, from } => read(port, id, from).await,
         Command::Status { id } => send(port, json!({ "op": "status", "id": id })).await,
         Command::Stop { id } => send(port, json!({ "op": "stop", "id": id })).await,
         Command::Down => send(port, json!({ "op": "shutdown" })).await,
-        Command::Follow { id, full } => follow(port, id, full).await,
+        Command::Follow { id, from, from_now } => follow(port, id, from, from_now).await,
+        Command::Wait { id, from, timeout } => wait_once(port, id, from, timeout).await,
+        Command::Cursors { id } => send(port, json!({ "op": "cursors", "id": id })).await,
         Command::Serve | Command::Repl | Command::Version | Command::Upgrade => {
             unreachable!("handled in main")
         }
@@ -727,7 +958,197 @@ async fn read_form(form: Option<String>) -> Result<String> {
     }
 }
 
-async fn follow(port: u16, id: String, full: bool) -> Result<()> {
+// ---- event readers (client side) -----------------------------------------
+
+/// The read/wait request for `from`, starting at `cursor` or at `--after`.
+fn reader_request(
+    op: &str,
+    id: &str,
+    from: &ReadFrom,
+    cursor: Option<&str>,
+    after: Option<u64>,
+) -> Value {
+    let mut request = json!({ "op": op, "id": id, "text": !from.full });
+    match cursor {
+        Some(cursor) => request["cursor"] = json!(cursor),
+        None => request["after"] = json!(after.unwrap_or(0)),
+    }
+    request
+}
+
+/// A session whose actor predates cursors answers a cursor read with an
+/// unbound-symbol error.
+fn predates_cursors(output: &str) -> bool {
+    output.contains("unbound symbol: event-") || output.contains("unbound symbol: events-")
+}
+
+/// Print a reader result: the text after the `next lost` line, or with --full
+/// the whole list. Fails if stdout is closed (e.g. `| head`): the caller then
+/// must not acknowledge, so the firings are read again next time.
+fn emit(output: &str, full: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = if full {
+        format!("{output}\n")
+    } else {
+        let wire = unquote(output).unwrap_or_default();
+        let body = wire.split_once('\n').map(|(_, body)| body).unwrap_or("");
+        if body.is_empty() || body.ends_with('\n') {
+            body.to_string()
+        } else {
+            format!("{body}\n")
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
+}
+
+/// Request, check, and parse one reader result: (output, next, has firings).
+async fn reader_round(port: u16, request: Value, full: bool) -> Result<(String, u64, bool)> {
+    let (ok, output) = transport::request(port, request).await?;
+    if !ok {
+        anyhow::bail!("{output}");
+    }
+    let (next, _, has) = reader_head(&output, !full)
+        .with_context(|| format!("unexpected reader output: {output}"))?;
+    Ok((output, next, has))
+}
+
+async fn ack(port: u16, id: &str, cursor: &str, seq: Value) -> Result<()> {
+    let (ok, output) = transport::request(
+        port,
+        json!({ "op": "ack", "id": id, "cursor": cursor, "seq": seq }),
+    )
+    .await?;
+    if !ok {
+        anyhow::bail!("{output}");
+    }
+    Ok(())
+}
+
+/// Print the result, then acknowledge it (unless --peek or --after). A failed
+/// print exits 1 without acknowledging.
+async fn print_and_ack(
+    port: u16,
+    id: &str,
+    from: &ReadFrom,
+    cursor: Option<&str>,
+    output: &str,
+    next: u64,
+) -> Result<()> {
+    if emit(output, from.full).is_err() {
+        std::process::exit(1);
+    }
+    match cursor {
+        Some(cursor) if !from.peek => ack(port, id, cursor, json!(next)).await,
+        _ => Ok(()),
+    }
+}
+
+fn fail(error: anyhow::Error) -> ! {
+    eprintln!("{error:#}");
+    std::process::exit(1);
+}
+
+async fn read(port: u16, id: String, from: ReadFrom) -> Result<()> {
+    let cursor = from.cursor("read");
+    let request = reader_request("read", &id, &from, cursor.as_deref(), from.after);
+    match reader_round(port, request, from.full).await {
+        Ok((output, next, _)) => {
+            print_and_ack(port, &id, &from, cursor.as_deref(), &output, next).await
+        }
+        Err(error) if predates_cursors(&error.to_string()) => {
+            eprintln!("theater-repl: session {id} predates event cursors; this read drains it");
+            let request = json!({ "op": "read", "id": id, "text": !from.full });
+            if from.full {
+                send(port, request).await
+            } else {
+                send_raw(port, request).await
+            }
+        }
+        Err(error) => fail(error),
+    }
+}
+
+async fn wait_once(port: u16, id: String, from: ReadFrom, timeout: Option<u64>) -> Result<()> {
+    let cursor = from.cursor("wait");
+    let mut request = reader_request("wait", &id, &from, cursor.as_deref(), from.after);
+    if let Some(seconds) = timeout {
+        request["timeout_ms"] = json!(seconds.saturating_mul(1000));
+    }
+    match reader_round(port, request, from.full).await {
+        Ok((_, _, false)) => std::process::exit(2),
+        Ok((output, next, true)) => {
+            print_and_ack(port, &id, &from, cursor.as_deref(), &output, next).await
+        }
+        Err(error) if predates_cursors(&error.to_string()) => fail(anyhow::anyhow!(
+            "session {id} predates event cursors; use experiment/lib/wait-message for it"
+        )),
+        Err(error) => fail(error),
+    }
+}
+
+/// A loop of waits. Each wait carries the previous batch's acknowledgement, so
+/// a steady stream costs one request per batch; Ctrl-C acknowledges the last.
+async fn follow(port: u16, id: String, from: ReadFrom, from_now: bool) -> Result<()> {
+    let cursor = from.cursor("follow");
+    let mut after = from.after;
+    if from_now {
+        match &cursor {
+            Some(cursor) => ack(port, &id, cursor, json!("head"))
+                .await
+                .unwrap_or_else(|e| fail(e)),
+            None => {
+                let (ok, head) = transport::request(
+                    port,
+                    json!({ "op": "eval", "id": id, "form": "(event-head)" }),
+                )
+                .await?;
+                after = Some(if ok { parse_seq(&head).unwrap_or(0) } else { 0 });
+            }
+        }
+    }
+    let stop = tokio::signal::ctrl_c();
+    tokio::pin!(stop);
+    let mut pending: Option<u64> = None;
+    loop {
+        let mut request = reader_request("wait", &id, &from, cursor.as_deref(), after);
+        if let (Some(seq), false) = (pending, from.peek) {
+            request["ack"] = json!(seq);
+        }
+        let round = tokio::select! {
+            _ = &mut stop => {
+                if let (Some(cursor), Some(seq), false) = (&cursor, pending, from.peek) {
+                    let _ = ack(port, &id, cursor, json!(seq)).await;
+                }
+                return Ok(());
+            }
+            round = reader_round(port, request, from.full) => round,
+        };
+        match round {
+            Ok((output, next, _)) => {
+                if emit(&output, from.full).is_err() {
+                    std::process::exit(1);
+                }
+                pending = cursor.as_ref().map(|_| next);
+                if cursor.is_none() {
+                    after = Some(next);
+                }
+            }
+            Err(error) if predates_cursors(&error.to_string()) => {
+                eprintln!(
+                    "theater-repl: session {id} predates event cursors; this follow drains it"
+                );
+                return legacy_follow(port, id, from.full).await;
+            }
+            Err(error) => fail(error),
+        }
+    }
+}
+
+/// The pre-cursor follow: drain with poll-events once a second. Only for a
+/// session whose actor predates cursors.
+async fn legacy_follow(port: u16, id: String, full: bool) -> Result<()> {
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
     loop {

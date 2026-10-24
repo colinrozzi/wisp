@@ -314,6 +314,13 @@ impl Guest {
             "self",
             Value::String("repl-self".into()),
         );
+        // wisp-events.event-recorded: each firing tells the host its seq (unit reply).
+        mock_import(
+            &mut linker,
+            "wisp-events",
+            "event-recorded",
+            Value::Tuple(vec![]),
+        );
         // Any other host import the evaluator declares (store.get/...) traps.
         linker.define_unknown_imports_as_traps(&module).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
