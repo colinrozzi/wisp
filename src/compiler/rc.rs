@@ -30,7 +30,7 @@
 // references reachable from the globals (`emit_verifier`).
 
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 
 pub(crate) fn rc_from_env() -> bool {
@@ -183,6 +183,12 @@ struct RcState {
     /// Counted operands of `string-addr`/`any-addr` kept alive to the end of their
     /// scope (§3.6), innermost scope last.
     addr_frames: Vec<Vec<(u32, Type)>>,
+    /// Per function, which parameters are borrowed (`infer_borrowed`).
+    borrowed: HashMap<String, Vec<bool>>,
+    /// Per function, the globals it may `global.set`, directly or through calls.
+    sets: HashMap<String, HashSet<String>>,
+    /// Per function, the globals it may `global.get`, directly or through calls.
+    reads: HashMap<String, HashSet<String>>,
 }
 
 thread_local! {
@@ -204,6 +210,9 @@ impl RcModuleScope {
                 liveness: Vec::new(),
                 drops: BTreeMap::new(),
                 addr_frames: Vec::new(),
+                borrowed: HashMap::new(),
+                sets: HashMap::new(),
+                reads: HashMap::new(),
             })
         });
         RcModuleScope
@@ -280,11 +289,525 @@ pub(crate) fn rc_live_in(body: &Expr) -> HashSet<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Borrowed reads (stage 5)
+
+thread_local! {
+    /// The `Var` node a reading operation borrows: its next emission skips the dup.
+    static BORROWED_VAR: Cell<*const Expr> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Whether `e` mentions the name `name` (ignoring shadowing: a conservative yes).
+fn mentions(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Var(n) | Expr::BorrowCap { name: n } => n == name,
+        _ => expr_children(e).into_iter().any(|c| mentions(c, name)),
+    }
+}
+
+/// RC: whether an operation that only reads its operand `e` can read it without
+/// taking a reference. It can when `e` is a variable used again later on its path
+/// (so the variable keeps the object alive past the operation) and no operand
+/// evaluated after `e` (`later`) mentions it (so nothing consumes it meanwhile);
+/// or a field or element of such a variable (`(binding.name entry)`,
+/// `(list-get xs i)`), which the variable's object keeps alive; or a string
+/// literal, which is static. When this returns
+/// true, emitting `e` skips its dup and the operation must not drop it.
+///
+/// `is_borrowed` says whether a name is a borrowed parameter of the function
+/// being emitted: those outlive the call, so they are always readable.
+///
+/// A `global.get` is readable when nothing evaluated after it (`later`, and the
+/// function `callee` when it is an argument) can `global.set` that global.
+pub(crate) fn rc_borrow_read(
+    e: &Expr,
+    later: &[&Expr],
+    is_borrowed: &dyn Fn(&str) -> bool,
+) -> bool {
+    rc_borrow_arg(e, later, None, is_borrowed)
+}
+
+/// `rc_borrow_read` for an argument to a borrowed parameter of `callee`.
+pub(crate) fn rc_borrow_arg(
+    e: &Expr,
+    later: &[&Expr],
+    callee: Option<&str>,
+    is_borrowed: &dyn Fn(&str) -> bool,
+) -> bool {
+    if !rc_on() || !borrowable(e, later, callee, is_borrowed) {
+        return false;
+    }
+    BORROWED_VAR.set(e as *const Expr);
+    true
+}
+
+/// Whether evaluating `e` may `global.set` the global `g`.
+fn may_set(e: &Expr, g: &str) -> bool {
+    match e {
+        Expr::GlobalSet { name, .. } if name == g => true,
+        Expr::Call { name, .. } if calls_set(name, g) => true,
+        _ => expr_children(e).into_iter().any(|c| may_set(c, g)),
+    }
+}
+
+fn calls_set(f: &str, g: &str) -> bool {
+    // A function the analysis does not know (an import) sets no Granite global.
+    with_rc(|s| s.sets.get(f).is_some_and(|set| set.contains(g))).unwrap_or(true)
+}
+
+fn borrowable(
+    e: &Expr,
+    later: &[&Expr],
+    callee: Option<&str>,
+    is_borrowed: &dyn Fn(&str) -> bool,
+) -> bool {
+    match e {
+        Expr::GlobalGet { name } => {
+            !later.iter().any(|l| may_set(l, name)) && callee.is_none_or(|f| !calls_set(f, name))
+        }
+        // A literal lives in static data: there is no count to take or give back.
+        Expr::StringLiteral(_) => true,
+        Expr::Var(name) => {
+            is_borrowed(name) || (!rc_is_last(e) && !later.iter().any(|l| mentions(l, name)))
+        }
+        Expr::RecordAccess { expr, .. } => {
+            matches!(expr.as_ref(), Expr::Var(_) | Expr::GlobalGet { .. })
+                && borrowable(expr, later, callee, is_borrowed)
+        }
+        Expr::ListGet { list, index } => {
+            let mut after: Vec<&Expr> = vec![index];
+            after.extend_from_slice(later);
+            matches!(list.as_ref(), Expr::Var(_) | Expr::GlobalGet { .. })
+                && borrowable(list, &after, callee, is_borrowed)
+        }
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Borrowed parameters (§3.3, stage 5)
+
+/// Whether parameter `i` of function `f` is borrowed.
+pub(crate) fn rc_param_borrowed(f: &str, i: usize) -> bool {
+    with_rc(|s| s.borrowed.get(f).and_then(|m| m.get(i).copied()))
+        .flatten()
+        .unwrap_or(false)
+}
+
+/// Infer which parameters are borrowed and record them for codegen.
+///
+/// A counted parameter is borrowed when its function only reads it (§3.3): every
+/// use is an operand of an operation that reads it (`list-len`, `list-get`'s
+/// list, a record field, the string operations, `any-as-*`), a `match`
+/// scrutinee, or an argument to another borrowed parameter. Anything else (a
+/// return, a store in a constructor or a global, a `list-push` operand, a `let`
+/// value, an owned argument) makes it owned. A fixpoint over the call graph,
+/// starting from "all borrowed".
+///
+/// Tail calls: a caller passing a borrowed parameter something it must drop
+/// afterwards could not make the call a tail call. So a parameter that some tail
+/// call passes such an argument (anything but a literal, or a borrowed parameter
+/// of the caller, or a field or element of one) is owned instead, and loops stay
+/// `return_call`.
+pub(crate) fn rc_infer_borrowed(functions: &[Function]) {
+    let Some(()) = with_rc(|_| ()) else {
+        return;
+    };
+    infer_global_sets(functions);
+    let mut modes: HashMap<String, Vec<bool>> = functions
+        .iter()
+        .map(|f| {
+            (
+                f.name.clone(),
+                f.params.iter().map(|p| is_counted(&p.ty)).collect(),
+            )
+        })
+        .collect();
+    loop {
+        let mut demote: Vec<(String, usize)> = Vec::new();
+        for f in functions {
+            let own: HashSet<String> = f
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| modes[&f.name][*i])
+                .map(|(_, p)| p.name.clone())
+                .collect();
+            let mut walk = BorrowWalk {
+                modes: &modes,
+                borrowed: own,
+                owned_uses: HashSet::new(),
+                demote: &mut demote,
+                types: f
+                    .params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.ty.clone()))
+                    .collect(),
+            };
+            walk.expr(&f.body, false, true);
+            let owned_uses = walk.owned_uses;
+            for (i, p) in f.params.iter().enumerate() {
+                if modes[&f.name][i] && owned_uses.contains(&p.name) {
+                    demote.push((f.name.clone(), i));
+                }
+            }
+        }
+        let mut changed = false;
+        for (f, i) in demote {
+            if let Some(m) = modes.get_mut(&f)
+                && m[i]
+            {
+                m[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    with_rc(|s| s.borrowed = modes);
+}
+
+/// Which globals each function may `global.set` and `global.get`, directly or
+/// through the functions it calls (fixpoints over the call graph).
+fn infer_global_sets(functions: &[Function]) {
+    fn direct(
+        e: &Expr,
+        sets: &mut HashSet<String>,
+        reads: &mut HashSet<String>,
+        calls: &mut HashSet<String>,
+    ) {
+        match e {
+            Expr::GlobalSet { name, .. } => {
+                sets.insert(name.clone());
+            }
+            Expr::GlobalGet { name } => {
+                reads.insert(name.clone());
+            }
+            Expr::Call { name, .. } => {
+                calls.insert(name.clone());
+            }
+            _ => {}
+        }
+        for c in expr_children(e) {
+            direct(c, sets, reads, calls);
+        }
+    }
+    let mut sets: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut reads: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut calls: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in functions {
+        let (mut s, mut r, mut c) = (HashSet::new(), HashSet::new(), HashSet::new());
+        direct(&f.body, &mut s, &mut r, &mut c);
+        sets.insert(f.name.clone(), s);
+        reads.insert(f.name.clone(), r);
+        calls.insert(f.name.clone(), c);
+    }
+    for table in [&mut sets, &mut reads] {
+        loop {
+            let mut changed = false;
+            for f in functions {
+                let mut add: HashSet<String> = HashSet::new();
+                for callee in &calls[&f.name] {
+                    if let Some(cs) = table.get(callee) {
+                        add.extend(cs.iter().cloned());
+                    }
+                }
+                let mine = table.get_mut(&f.name).unwrap();
+                let before = mine.len();
+                mine.extend(add);
+                changed |= mine.len() != before;
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    with_rc(|s| {
+        s.sets = sets;
+        s.reads = reads;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Drop-guided reuse (§3.4, stage 5)
+
+thread_local! {
+    /// The constructor node that may take a matched block, and the local holding
+    /// it (0 at run time when the scrutinee was not unique).
+    static REUSE: Cell<(*const Expr, u32)> = const { Cell::new((std::ptr::null(), 0)) };
+}
+
+/// Let the constructor `node` reuse the block in `local` (when non-zero).
+pub(crate) fn rc_offer_reuse(node: &Expr, local: u32) {
+    REUSE.set((node as *const Expr, local));
+}
+
+/// The local holding a block this constructor node may reuse.
+pub(crate) fn rc_take_reuse(node: &Expr) -> Option<u32> {
+    let (n, l) = REUSE.get();
+    if std::ptr::eq(n, node) {
+        REUSE.set((std::ptr::null(), 0));
+        Some(l)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The global take rule (§3.5, stage 5)
+
+thread_local! {
+    /// The `global.get` node whose value `global.set` moves out of its global.
+    static TAKEN_GLOBAL: Cell<*const Expr> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Whether evaluating `e` may read or set the global `g`.
+fn may_touch(e: &Expr, g: &str) -> bool {
+    match e {
+        Expr::GlobalSet { name, .. } | Expr::GlobalGet { name } if name == g => true,
+        Expr::Call { name, .. } if calls_touch(name, g) => true,
+        _ => expr_children(e).into_iter().any(|c| may_touch(c, g)),
+    }
+}
+
+fn calls_touch(f: &str, g: &str) -> bool {
+    with_rc(|s| {
+        s.sets.get(f).is_some_and(|set| set.contains(g))
+            || s.reads.get(f).is_some_and(|set| set.contains(g))
+    })
+    .unwrap_or(true)
+}
+
+/// `(global.set $g VALUE)`: if VALUE is `(list-push (global.get $g) x)`, or a call
+/// passing `(global.get $g)` to an owned parameter, and nothing else in VALUE (nor
+/// the called function) reads or sets `$g`, the `global.get` moves the value out
+/// of `$g` (leaving 0) instead of taking a second reference. Its count stays 1,
+/// so the push or the call can write in place instead of copying the whole list.
+pub(crate) fn rc_mark_take(g: &str, value: &Expr) {
+    if !rc_on() {
+        return;
+    }
+    let is_get = |e: &Expr| matches!(e, Expr::GlobalGet { name } if name == g);
+    let taken = match value {
+        Expr::ListPush { list, value: v } if is_get(list) && !may_touch(v, g) => {
+            Some(list.as_ref())
+        }
+        Expr::Call { name, args } if !calls_touch(name, g) => {
+            let mut hit = None;
+            for (i, a) in args.iter().enumerate() {
+                if is_get(a) && hit.is_none() && !rc_param_borrowed(name, i) {
+                    hit = Some(a);
+                } else if may_touch(a, g) {
+                    hit = None;
+                    break;
+                }
+            }
+            hit
+        }
+        _ => None,
+    };
+    if let Some(t) = taken {
+        TAKEN_GLOBAL.set(t as *const Expr);
+    }
+}
+
+/// Whether this `global.get` node is taken (see `rc_mark_take`).
+pub(crate) fn rc_take_global(e: &Expr) -> bool {
+    let taken = std::ptr::eq(TAKEN_GLOBAL.get(), e);
+    if taken {
+        TAKEN_GLOBAL.set(std::ptr::null());
+    }
+    taken
+}
+
+/// One pass over a function body for `rc_infer_borrowed`.
+struct BorrowWalk<'a> {
+    modes: &'a HashMap<String, Vec<bool>>,
+    /// The function's parameters still taken as borrowed, minus shadowed names.
+    borrowed: HashSet<String>,
+    /// Borrowed parameters used in a position that needs ownership.
+    owned_uses: HashSet<String>,
+    demote: &'a mut Vec<(String, usize)>,
+    /// The function's parameter types.
+    types: HashMap<String, Type>,
+}
+
+impl BorrowWalk<'_> {
+    /// `read`: the position only reads the value. `tail`: the position is a tail.
+    fn expr(&mut self, e: &Expr, read: bool, tail: bool) {
+        match e {
+            Expr::Var(name) => {
+                if !read && self.borrowed.contains(name) {
+                    self.owned_uses.insert(name.clone());
+                }
+            }
+            Expr::ListLen { list: x }
+            | Expr::RecordAccess { expr: x, .. }
+            | Expr::StringLen { string: x }
+            | Expr::AnyToS32 { value: x }
+            | Expr::AnyToString { value: x }
+            | Expr::StringFromBytes { bytes: x }
+            | Expr::StringToBytes { string: x }
+            | Expr::AnyFromString { value: x } => self.expr(x, true, false),
+            Expr::ListGet { list, index } => {
+                self.expr(list, true, false);
+                self.expr(index, false, false);
+            }
+            Expr::StringRef { string, index } => {
+                self.expr(string, true, false);
+                self.expr(index, false, false);
+            }
+            Expr::Substring { string, start, end } => {
+                self.expr(string, true, false);
+                self.expr(start, false, false);
+                self.expr(end, false, false);
+            }
+            Expr::StringAppend { left, right } | Expr::StringEq { left, right } => {
+                self.expr(left, true, false);
+                self.expr(right, true, false);
+            }
+            Expr::Call { name, args } => {
+                let callee = self.modes.get(name);
+                for (i, a) in args.iter().enumerate() {
+                    let borrowed = callee.and_then(|m| m.get(i).copied()).unwrap_or(false);
+                    if borrowed && tail && !self.free(a) {
+                        self.demote.push((name.clone(), i));
+                    }
+                    self.expr(a, borrowed, false);
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr(cond, false, false);
+                self.expr(then_branch, false, tail);
+                self.expr(else_branch, false, tail);
+            }
+            Expr::Begin { exprs } => {
+                for (i, x) in exprs.iter().enumerate() {
+                    self.expr(x, false, tail && i + 1 == exprs.len());
+                }
+            }
+            Expr::Let {
+                name, value, body, ..
+            } => {
+                self.expr(value, false, false);
+                self.scoped(std::slice::from_ref(name), body, tail);
+            }
+            Expr::WithCap { name, body, .. } => self.scoped(std::slice::from_ref(name), body, tail),
+            Expr::Match { expr, cases } => {
+                // A parameter matched by an arm that rebuilds the same variant is
+                // consumed: owned, its block can be reused (drop-guided reuse).
+                if let Expr::Var(p) = expr.as_ref()
+                    && self.borrowed.contains(p)
+                    && let Some(Type::Variant(v)) = self.types.get(p)
+                    && cases.iter().any(|a| {
+                        matches!(&a.body, Expr::VariantConstruct { variant_name, .. } if variant_name == v)
+                    })
+                {
+                    self.owned_uses.insert(p.clone());
+                }
+                self.expr(expr, true, false);
+                for arm in cases {
+                    self.scoped(&arm.bindings, &arm.body, tail);
+                }
+            }
+            _ => {
+                for c in expr_children(e) {
+                    self.expr(c, false, false);
+                }
+            }
+        }
+    }
+
+    fn scoped(&mut self, names: &[String], body: &Expr, tail: bool) {
+        let shadowed: Vec<String> = names
+            .iter()
+            .filter(|n| self.borrowed.remove(*n))
+            .cloned()
+            .collect();
+        self.expr(body, false, tail);
+        self.borrowed.extend(shadowed);
+    }
+
+    /// An argument the caller need not drop after the call: it holds no count.
+    fn free(&self, a: &Expr) -> bool {
+        match a {
+            Expr::StringLiteral(_) => true,
+            Expr::Var(n) => self.borrowed.contains(n),
+            Expr::RecordAccess { expr, .. } => self.free(expr),
+            Expr::ListGet { list, .. } => matches!(list.as_ref(), Expr::Var(_)) && self.free(list),
+            _ => false,
+        }
+    }
+}
+
+/// Whether the object `e` evaluates to (a variable, a global, or a field or
+/// element of one) stays alive through `scope`: a borrowed binding does (its
+/// owner outlives the function's use of it), and so does a global that `scope`
+/// cannot set. An owned variable does not count: its last use may be in `scope`.
+pub(crate) fn rc_outlives(e: &Expr, scope: &[&Expr], is_borrowed: &dyn Fn(&str) -> bool) -> bool {
+    match e {
+        Expr::Var(n) => is_borrowed(n),
+        Expr::GlobalGet { name } => !scope.iter().any(|s| may_set(s, name)),
+        Expr::RecordAccess { expr, .. } => rc_outlives(expr, scope, is_borrowed),
+        Expr::ListGet { list, .. } => rc_outlives(list, scope, is_borrowed),
+        _ => false,
+    }
+}
+
+/// RC: whether `(let (x VALUE) BODY)` binds a borrowed reference: VALUE is a
+/// field or element read of something that outlives BODY. Marks VALUE as a
+/// borrowed read when it is.
+pub(crate) fn rc_borrowed_let(
+    value: &Expr,
+    body: &Expr,
+    is_borrowed: &dyn Fn(&str) -> bool,
+) -> bool {
+    matches!(value, Expr::RecordAccess { .. } | Expr::ListGet { .. })
+        && rc_outlives(value, &[body], is_borrowed)
+        && rc_borrow_read(value, &[body], is_borrowed)
+}
+
+/// Whether this node (a `Var`, a field or an element) is being borrowed (see
+/// `rc_borrow_read`).
+pub(crate) fn rc_take_borrow(e: &Expr) -> bool {
+    let borrowed = std::ptr::eq(BORROWED_VAR.get(), e);
+    if borrowed {
+        BORROWED_VAR.set(std::ptr::null());
+    }
+    borrowed
+}
+
+// ---------------------------------------------------------------------------
 // Emitting dup and drop
 
 /// Dup the reference on top of the stack (it stays there).
+/// Release builds dup inline (stage 5): a compare against the heap start, then
+/// the count update. A scratch global carries the pointer through the
+/// straight-line sequence. Debug builds call `$__dup`, which checks.
+/// `HEAP_FLOOR` stands for the heap's first payload address, known only once the
+/// static data is placed; `emit_rc_runtime` substitutes it.
+const HEAP_FLOOR: &str = "__granite_heap_floor__";
+
+/// The heap's first payload address in emitted code (substituted at the end).
+pub(crate) fn heap_floor() -> &'static str {
+    HEAP_FLOOR
+}
+
 pub(crate) fn emit_dup(out: &mut String, pad: &str) {
-    out.push_str(&format!("{pad}call $__dup\n"));
+    if rc_debug() {
+        out.push_str(&format!("{pad}call $__dup\n"));
+        return;
+    }
+    out.push_str(&format!(
+        "{pad}global.set $__rc_p\n{pad}global.get $__rc_p\n{pad}i32.const {HEAP_FLOOR}\n{pad}i32.ge_u\n{pad}if\n\
+         {pad}  global.get $__rc_p\n{pad}  i32.const 8\n{pad}  i32.sub\n\
+         {pad}  global.get $__rc_p\n{pad}  i32.const 8\n{pad}  i32.sub\n{pad}  i32.load\n{pad}  i32.const 1\n{pad}  i32.add\n{pad}  i32.store\n\
+         {pad}end\n{pad}global.get $__rc_p\n"
+    ));
 }
 
 /// The drop function for `ty`, requested for emission.
@@ -294,7 +817,9 @@ pub(crate) fn drop_fn(ty: &Type) -> String {
     name
 }
 
-/// Drop the reference of type `ty` on top of the stack.
+/// Drop the reference of type `ty` on top of the stack. A call: inlining drops
+/// as well made the interpreter 45% larger for no measurable gain (literals,
+/// the cheap case, are not dropped at all; see `borrowable`).
 pub(crate) fn emit_drop(out: &mut String, pad: &str, ty: &Type) {
     out.push_str(&format!("{pad}call {}\n", drop_fn(ty)));
 }
@@ -427,6 +952,8 @@ pub(crate) fn emit_rc_runtime(
     let Some((debug, mut pending)) = with_rc(|s| (s.debug, s.drops.clone())) else {
         return;
     };
+    *out = out.replace(HEAP_FLOOR, &heap_payload.to_string());
+    out.push_str("  (global $__rc_p (mut i32) (i32.const 0))\n");
     for name in [
         "__granite_use_after_free",
         "__granite_rc_on_raw_block",

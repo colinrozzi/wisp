@@ -195,6 +195,8 @@ pub(crate) fn gen_expr(
     is_tail: bool, // True if this expression is in tail position
 ) -> Type {
     let pad = " ".repeat(indent);
+    // The node itself, for arms whose fields shadow `expr`.
+    let expr_node = expr;
     match expr {
         Expr::Int { value, ty } => {
             let instr = match ty {
@@ -265,7 +267,11 @@ pub(crate) fn gen_expr(
         Expr::Var(name) => {
             let (idx, ty) = env.lookup(name);
             out.push_str(&format!("{}local.get {}\n", pad, idx));
-            if rc_on() && is_counted(&ty) && !rc_is_last(expr) {
+            let borrowed = rc_take_borrow(expr);
+            // A borrowed parameter is never moved: each use that needs a
+            // reference takes one.
+            let moved = rc_is_last(expr) && !env.is_borrowed(name);
+            if rc_on() && is_counted(&ty) && !moved && !borrowed {
                 emit_dup(out, &pad);
             }
             ty
@@ -274,16 +280,32 @@ pub(crate) fn gen_expr(
             let sig = signatures
                 .get(name)
                 .unwrap_or_else(|| panic!("Missing signature for {}", name));
-            for arg in args {
-                gen_expr(
+            // RC: an argument for a borrowed parameter is read without a count
+            // when it can be (rc_borrow_read); otherwise the caller holds it for
+            // the call and drops it after, which rules out a tail call.
+            let mut after_call: Vec<(u32, Type)> = Vec::new();
+            for (i, arg) in args.iter().enumerate() {
+                let to_borrowed = rc_on() && rc_param_borrowed(name, i);
+                let later: Vec<&Expr> = args[i + 1..].iter().collect();
+                let read =
+                    to_borrowed && rc_borrow_arg(arg, &later, Some(name), &|n| env.is_borrowed(n));
+                let ty = gen_expr(
                     arg, out, indent, env, signatures, globals, records, variants, false,
                 );
+                if to_borrowed && !read && is_counted(&ty) {
+                    let l = env.declare_local(Type::S32);
+                    out.push_str(&format!("{}local.tee {}\n", pad, l));
+                    after_call.push((l, ty));
+                }
             }
             // Use return_call for tail position to enable tail call optimization
-            if is_tail {
+            if is_tail && after_call.is_empty() {
                 out.push_str(&format!("{}return_call ${}\n", pad, name));
             } else {
                 out.push_str(&format!("{}call ${}\n", pad, name));
+                for (l, ty) in &after_call {
+                    emit_drop_local(out, &pad, *l, ty);
+                }
             }
             sig.result.clone()
         }
@@ -347,6 +369,9 @@ pub(crate) fn gen_expr(
             if keeps_alive {
                 rc_push_addr_frame();
             }
+            // RC: a field or element of something that outlives the body binds a
+            // borrowed reference: no dup now, no drop later (rc_borrowed_let).
+            let borrow_let = rc_borrowed_let(value, body, &|n| env.is_borrowed(n));
             let value_ty = gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -356,7 +381,9 @@ pub(crate) fn gen_expr(
                 let idx = env.declare_local(value_ty.clone());
                 out.push_str(&format!("{}local.set {}\n", pad, idx));
                 env.push_binding(name.clone(), idx);
-                if rc_on() && is_counted(&value_ty) && !rc_live_in(body).contains(name) {
+                if borrow_let {
+                    env.mark_borrowed(idx);
+                } else if rc_on() && is_counted(&value_ty) && !rc_live_in(body).contains(name) {
                     emit_drop_local(out, &pad, idx, &value_ty);
                 }
             }
@@ -471,7 +498,10 @@ pub(crate) fn gen_expr(
         Expr::GlobalGet { name } => {
             out.push_str(&format!("{}global.get {}\n", pad, name));
             let (ty, _) = globals.get(name).expect("global should exist");
-            if rc_on() && is_counted(ty) {
+            if rc_on() && rc_take_global(expr_node) {
+                // Moved out: the global holds 0 until its global.set stores back.
+                out.push_str(&format!("{pad}i32.const 0\n{pad}global.set {name}\n"));
+            } else if rc_on() && is_counted(ty) && !rc_take_borrow(expr_node) {
                 emit_dup(out, &pad);
             }
             ty.clone()
@@ -479,6 +509,7 @@ pub(crate) fn gen_expr(
         Expr::GlobalSet { name, value } => {
             // Global.set consumes the value, so we save it to a local first
             // and restore it after to return the value for composability
+            rc_mark_take(name, value);
             let value_ty = gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -579,11 +610,14 @@ pub(crate) fn gen_expr(
                 .expect("field should exist");
             let offset = record_def.field_offset(field_idx);
 
-            // Evaluate the record expression (gives us the pointer)
+            // Evaluate the record expression (gives us the pointer). A borrowed
+            // field read borrows its record too (rc_borrow_read checked it can).
+            let field_borrowed = rc_take_borrow(expr_node);
+            let borrowed = rc_borrow_read(expr, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 expr, out, indent, env, signatures, globals, records, variants, false,
             );
-            let rec_local = rc_on().then(|| {
+            let rec_local = (rc_on() && !borrowed).then(|| {
                 let l = env.declare_local(Type::S32);
                 out.push_str(&format!("{}local.tee {}\n", pad, l));
                 l
@@ -618,10 +652,10 @@ pub(crate) fn gen_expr(
                 | Type::Any => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
+            if rc_on() && is_counted(&field_def.ty) && !field_borrowed {
+                emit_dup(out, &pad);
+            }
             if let Some(l) = rec_local {
-                if is_counted(&field_def.ty) {
-                    emit_dup(out, &pad);
-                }
                 emit_drop_local(out, &pad, l, &Type::Record(record_name.clone()));
             }
             field_def.ty.clone()
@@ -638,8 +672,14 @@ pub(crate) fn gen_expr(
             // Allocate the variant
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = alloc(size)
-            emit_alloc_const(out, &pad, size);
+            // ptr = alloc(size), or the matched block this arm may reuse (§3.4)
+            if let Some(tok) = rc_take_reuse(expr_node) {
+                out.push_str(&format!("{pad}local.get {tok}\n{pad}if (result i32)\n{pad}  local.get {tok}\n{pad}else\n"));
+                emit_alloc_const(out, &format!("{pad}  "), size);
+                out.push_str(&format!("{pad}end\n"));
+            } else {
+                emit_alloc_const(out, &pad, size);
+            }
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
 
             // Store discriminant (case index) at offset 0
@@ -703,6 +743,11 @@ pub(crate) fn gen_expr(
         } => {
             // Keep the checked language type, including pointer-backed values.
             let result_ty = expr_type(expr, env, signatures, globals, records, variants);
+            let arm_exprs: Vec<&Expr> = cases.iter().map(|a| &a.body).collect();
+            let scrutinee_borrowed = rc_borrow_read(scrutinee, &arm_exprs, &|n| env.is_borrowed(n));
+            // RC: the bindings borrow too when the scrutinee outlives every arm.
+            let bindings_borrowed =
+                scrutinee_borrowed && rc_outlives(scrutinee, &arm_exprs, &|n| env.is_borrowed(n));
             // Evaluate the expression to get the pointer
             let expr_ty = gen_expr(
                 scrutinee, out, indent, env, signatures, globals, records, variants, false,
@@ -804,13 +849,18 @@ pub(crate) fn gen_expr(
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
-                            rc_dup_binding(out, &pad, inner_ty, &arm.body, &arm.bindings[0]);
+                            if !bindings_borrowed {
+                                rc_dup_binding(out, &pad, inner_ty, &arm.body, &arm.bindings[0]);
+                            }
                             let idx = env.declare_local((**inner_ty).clone());
                             out.push_str(&format!("{}    local.set {}\n", pad, idx));
                             env.push_binding(arm.bindings[0].clone(), idx);
+                            if bindings_borrowed {
+                                env.mark_borrowed(idx);
+                            }
                         }
 
-                        if rc_on() {
+                        if rc_on() && !scrutinee_borrowed {
                             emit_drop_local(out, &format!("{pad}    "), value_ptr, &expr_ty);
                         }
                         // Generate arm body - inherits tail position
@@ -913,13 +963,18 @@ pub(crate) fn gen_expr(
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
-                            rc_dup_binding(out, &pad, &payload_ty, &arm.body, &arm.bindings[0]);
+                            if !bindings_borrowed {
+                                rc_dup_binding(out, &pad, &payload_ty, &arm.body, &arm.bindings[0]);
+                            }
                             let idx = env.declare_local(payload_ty.clone());
                             out.push_str(&format!("{}    local.set {}\n", pad, idx));
                             env.push_binding(arm.bindings[0].clone(), idx);
+                            if bindings_borrowed {
+                                env.mark_borrowed(idx);
+                            }
                         }
 
-                        if rc_on() {
+                        if rc_on() && !scrutinee_borrowed {
                             emit_drop_local(out, &format!("{pad}    "), value_ptr, &expr_ty);
                         }
                         // Generate arm body - inherits tail position
@@ -1000,6 +1055,11 @@ pub(crate) fn gen_expr(
                         emit_drop_names(out, &format!("{pad}    "), env, &arm_drops[i]);
                         let saved_binding_count = env.bindings.len();
                         let mut payload_offset = 4;
+                        // RC (§3.4): an owned scrutinee is specialized below on its
+                        // count, so the bindings load without a dup here.
+                        let specialize = rc_on() && !scrutinee_borrowed;
+                        let live = rc_live_in(&arm.body);
+                        let mut counted_bindings: Vec<(u32, Type, bool)> = Vec::new();
                         for (binding, payload_ty) in arm.bindings.iter().zip(case.payload.iter()) {
                             // Load payload value
                             out.push_str(&format!("{}    local.get {}\n", pad, value_ptr));
@@ -1028,16 +1088,69 @@ pub(crate) fn gen_expr(
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
-                            rc_dup_binding(out, &pad, payload_ty, &arm.body, binding);
+                            if !bindings_borrowed && !specialize {
+                                rc_dup_binding(out, &pad, payload_ty, &arm.body, binding);
+                            }
                             // Save to local
                             let idx = env.declare_local(payload_ty.clone());
                             out.push_str(&format!("{}    local.set {}\n", pad, idx));
                             env.push_binding(binding.clone(), idx);
+                            if bindings_borrowed {
+                                env.mark_borrowed(idx);
+                            }
+                            if specialize && is_counted(payload_ty) {
+                                counted_bindings.push((
+                                    idx,
+                                    payload_ty.clone(),
+                                    live.contains(binding),
+                                ));
+                            }
 
                             payload_offset += type_size(payload_ty);
                         }
 
-                        if rc_on() {
+                        if specialize {
+                            // Unique: the bindings take the children's references;
+                            // drop the unused ones, then the block is free, or the
+                            // arm's constructor reuses it. Shared: the bindings take
+                            // new references, and the scrutinee loses one.
+                            let p4 = format!("{pad}    ");
+                            let p6 = format!("{pad}      ");
+                            let reuse = matches!(&arm.body, Expr::VariantConstruct { variant_name: v, .. } if v == variant_name)
+                                .then(|| env.declare_local(Type::S32));
+                            out.push_str(&format!(
+                                "{p4}local.get {value_ptr}\n{p4}i32.const 8\n{p4}i32.sub\n{p4}i32.load\n{p4}i32.const 1\n{p4}i32.eq\n{p4}if\n"
+                            ));
+                            for (idx, ty, used) in &counted_bindings {
+                                if !used {
+                                    emit_drop_local(out, &p6, *idx, ty);
+                                }
+                            }
+                            match reuse {
+                                Some(tok) => out.push_str(&format!(
+                                    "{p6}local.get {value_ptr}\n{p6}local.set {tok}\n"
+                                )),
+                                None => out.push_str(&format!(
+                                    "{p6}local.get {value_ptr}\n{p6}call $__free\n"
+                                )),
+                            }
+                            out.push_str(&format!("{p4}else\n"));
+                            for (idx, _, used) in &counted_bindings {
+                                if *used {
+                                    out.push_str(&format!("{p6}local.get {idx}\n"));
+                                    emit_dup(out, &p6);
+                                    out.push_str(&format!("{p6}drop\n"));
+                                }
+                            }
+                            emit_drop_local(out, &p6, value_ptr, &expr_ty);
+                            if let Some(tok) = reuse {
+                                out.push_str(&format!("{p6}i32.const 0\n{p6}local.set {tok}\n"));
+                            }
+                            out.push_str(&format!("{p4}end\n"));
+                            if let Some(tok) = reuse {
+                                rc_offer_reuse(&arm.body, tok);
+                            }
+                        } else if rc_on() && !scrutinee_borrowed {
                             emit_drop_local(out, &format!("{pad}    "), value_ptr, &expr_ty);
                         }
                         // Generate arm body - inherits tail position
@@ -1457,6 +1570,8 @@ pub(crate) fn gen_expr(
         }
         // List: get - load element at index
         Expr::ListGet { list, index } => {
+            let elem_borrowed = rc_take_borrow(expr_node);
+            let borrowed = rc_borrow_read(list, &[index], &|n| env.is_borrowed(n));
             let list_ty = gen_expr(
                 list, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1497,19 +1612,22 @@ pub(crate) fn gen_expr(
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
             if rc_on() {
-                if is_counted(&elem_type) {
+                if is_counted(&elem_type) && !elem_borrowed {
                     emit_dup(out, &pad);
                 }
-                emit_drop_local(out, &pad, list_local, &list_ty);
+                if !borrowed {
+                    emit_drop_local(out, &pad, list_local, &list_ty);
+                }
             }
             elem_type
         }
         // List: len - return length
         Expr::ListLen { list } => {
+            let borrowed = rc_borrow_read(list, &[], &|n| env.is_borrowed(n));
             let operand_ty = gen_expr(
                 list, out, indent, env, signatures, globals, records, variants, false,
             );
-            let operand = rc_on().then(|| {
+            let operand = (rc_on() && !borrowed).then(|| {
                 let l = env.declare_local(Type::S32);
                 out.push_str(&format!("{}local.tee {}\n", pad, l));
                 l
@@ -1523,10 +1641,11 @@ pub(crate) fn gen_expr(
         }
         // String: len - return length
         Expr::StringLen { string } => {
+            let borrowed = rc_borrow_read(string, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 string, out, indent, env, signatures, globals, records, variants, false,
             );
-            let operand = rc_on().then(|| {
+            let operand = (rc_on() && !borrowed).then(|| {
                 let l = env.declare_local(Type::S32);
                 out.push_str(&format!("{}local.tee {}\n", pad, l));
                 l
@@ -1542,10 +1661,11 @@ pub(crate) fn gen_expr(
         Expr::StringRef { string, index } => {
             // String layout: 4 bytes len + data bytes
             // Result: byte at (string_ptr + 4 + index)
+            let borrowed = rc_borrow_read(string, &[index], &|n| env.is_borrowed(n));
             gen_expr(
                 string, out, indent, env, signatures, globals, records, variants, false,
             );
-            let operand = rc_on().then(|| {
+            let operand = (rc_on() && !borrowed).then(|| {
                 let l = env.declare_local(Type::S32);
                 out.push_str(&format!("{}local.tee {}\n", pad, l));
                 l
@@ -1566,6 +1686,7 @@ pub(crate) fn gen_expr(
         Expr::Substring { string, start, end } => {
             // Evaluate string pointer
             let str_local = env.declare_local(Type::S32);
+            let borrowed_str_local = rc_borrow_read(string, &[start, end], &|n| env.is_borrowed(n));
             gen_expr(
                 string, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1622,7 +1743,7 @@ pub(crate) fn gen_expr(
 
             // Return new string pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
-            if rc_on() {
+            if rc_on() && !borrowed_str_local {
                 emit_drop_local(out, &pad, str_local, &Type::Str);
             }
             Type::Str
@@ -1665,10 +1786,11 @@ pub(crate) fn gen_expr(
         }
         Expr::AnyToS32 { value } => {
             // The S32 payload sits at blob+28 (4 len prefix + 16 header + 8 node header).
+            let borrowed = rc_borrow_read(value, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
-            let operand = rc_on().then(|| {
+            let operand = (rc_on() && !borrowed).then(|| {
                 let l = env.declare_local(Type::S32);
                 out.push_str(&format!("{}local.tee {}\n", pad, l));
                 l
@@ -1685,6 +1807,7 @@ pub(crate) fn gen_expr(
             // string payload (at cgrf offset 24) is the same [len:u32][bytes]
             // layout, so the byte copy is a straight memcpy of the string body.
             let s_local = env.declare_local(Type::S32);
+            let borrowed_s_local = rc_borrow_read(value, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1742,7 +1865,7 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}memory.copy\n", pad));
             // Result: the `any` pointer.
             out.push_str(&format!("{}local.get {}\n", pad, ptr));
-            if rc_on() {
+            if rc_on() && !borrowed_s_local {
                 emit_drop_local(out, &pad, s_local, &Type::Str);
             }
             Type::Any
@@ -1750,6 +1873,7 @@ pub(crate) fn gen_expr(
         Expr::AnyToString { value } => {
             // A CGRF string payload [len:u32][bytes] sits at blob+28, the shape of a
             // Wisp string: copy it out (§3.6), then drop the blob.
+            let borrowed = rc_borrow_read(value, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1758,7 +1882,7 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}i32.const 28\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
             emit_copy_len_prefixed(out, &pad, env);
-            if rc_on() {
+            if rc_on() && !borrowed {
                 emit_drop_local(out, &pad, blob, &Type::Any);
             }
             Type::Str
@@ -1895,6 +2019,7 @@ pub(crate) fn gen_expr(
         Expr::StringAppend { left, right } => {
             // Evaluate left string pointer
             let left_local = env.declare_local(Type::S32);
+            let borrowed_left_local = rc_borrow_read(left, &[right], &|n| env.is_borrowed(n));
             gen_expr(
                 left, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1902,6 +2027,7 @@ pub(crate) fn gen_expr(
 
             // Evaluate right string pointer
             let right_local = env.declare_local(Type::S32);
+            let borrowed_right_local = rc_borrow_read(right, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 right, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1926,11 +2052,40 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}i32.add\n", pad));
             out.push_str(&format!("{}local.set {}\n", pad, total_len_local));
 
-            // Allocate space for new string: 4 bytes len + total_len bytes
+            // RC (§3.4): a left string held only here, in a block with room,
+            // takes the right one's bytes in place. Otherwise the new string gets
+            // half again the room it needs, so the next append to it fits.
             let new_ptr_local = env.declare_local(Type::S32);
+            let grow = rc_on() && !borrowed_left_local;
+            let in_place = env.declare_local(Type::S32);
+            if grow {
+                let floor = heap_floor();
+                out.push_str(&format!(
+                    "{pad}local.get {left_local}\n{pad}i32.const {floor}\n{pad}i32.ge_u\n{pad}if (result i32)\n\
+                     {pad}  local.get {left_local}\n{pad}  i32.const 8\n{pad}  i32.sub\n{pad}  i32.load\n{pad}  i32.const 1\n{pad}  i32.eq\n\
+                     {pad}  local.get {left_local}\n{pad}  i32.const 4\n{pad}  i32.sub\n{pad}  i32.load\n{pad}  i32.const {hdr}\n{pad}  i32.sub\n\
+                     {pad}  local.get {total_len_local}\n{pad}  i32.const 4\n{pad}  i32.add\n{pad}  i32.ge_u\n{pad}  i32.and\n\
+                     {pad}else\n{pad}  i32.const 0\n{pad}end\n{pad}local.set {in_place}\n",
+                    hdr = BLOCK_HEADER,
+                ));
+            }
+            out.push_str(&format!("{pad}local.get {in_place}\n{pad}if\n"));
+            // In place: append the right bytes after the left ones.
+            out.push_str(&format!(
+                "{pad}  local.get {left_local}\n{pad}  local.set {new_ptr_local}\n\
+                 {pad}  local.get {left_local}\n{pad}  local.get {total_len_local}\n{pad}  i32.store\n\
+                 {pad}  local.get {left_local}\n{pad}  i32.const 4\n{pad}  i32.add\n{pad}  local.get {left_len_local}\n{pad}  i32.add\n\
+                 {pad}  local.get {right_local}\n{pad}  i32.const 4\n{pad}  i32.add\n{pad}  local.get {right_len_local}\n{pad}  memory.copy\n{pad}else\n"
+            ));
+            let inner = format!("{pad}  ");
+            // Copy: allocate space for the new string, 4 bytes len + total_len bytes
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}local.get {}\n", pad, total_len_local));
             out.push_str(&format!("{}i32.add\n", pad));
+            if grow {
+                // size + size / 2
+                out.push_str(&format!("{pad}local.tee {new_ptr_local}\n{pad}local.get {new_ptr_local}\n{pad}i32.const 1\n{pad}i32.shr_u\n{pad}i32.add\n"));
+            }
             out.push_str(&format!("{}call $__alloc\n", pad));
             out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
 
@@ -1967,11 +2122,22 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, right_len_local));
             out.push_str(&format!("{}memory.copy\n", pad));
 
+            out.push_str(&format!("{pad}end\n"));
+
             // Return new string pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
             if rc_on() {
-                emit_drop_local(out, &pad, left_local, &Type::Str);
-                emit_drop_local(out, &pad, right_local, &Type::Str);
+                if !borrowed_left_local {
+                    // In place, the left string is the result.
+                    out.push_str(&format!(
+                        "{pad}local.get {in_place}\n{pad}i32.eqz\n{pad}if\n"
+                    ));
+                    emit_drop_local(out, &inner, left_local, &Type::Str);
+                    out.push_str(&format!("{pad}end\n"));
+                }
+                if !borrowed_right_local {
+                    emit_drop_local(out, &pad, right_local, &Type::Str);
+                }
             }
             Type::Str
         }
@@ -1979,6 +2145,7 @@ pub(crate) fn gen_expr(
         Expr::StringEq { left, right } => {
             // Evaluate left string pointer
             let left_local = env.declare_local(Type::S32);
+            let borrowed_left_local = rc_borrow_read(left, &[right], &|n| env.is_borrowed(n));
             gen_expr(
                 left, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1986,6 +2153,7 @@ pub(crate) fn gen_expr(
 
             // Evaluate right string pointer
             let right_local = env.declare_local(Type::S32);
+            let borrowed_right_local = rc_borrow_read(right, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 right, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -2063,8 +2231,12 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}  end ;; if\n", pad));
             out.push_str(&format!("{}end ;; string-eq outer\n", pad));
             if rc_on() {
-                emit_drop_local(out, &pad, left_local, &Type::Str);
-                emit_drop_local(out, &pad, right_local, &Type::Str);
+                if !borrowed_left_local {
+                    emit_drop_local(out, &pad, left_local, &Type::Str);
+                }
+                if !borrowed_right_local {
+                    emit_drop_local(out, &pad, right_local, &Type::Str);
+                }
             }
             Type::S32
         }
@@ -2072,6 +2244,7 @@ pub(crate) fn gen_expr(
         Expr::StringFromBytes { bytes } => {
             // Evaluate bytes list pointer
             let bytes_local = env.declare_local(Type::S32);
+            let borrowed_bytes_local = rc_borrow_read(bytes, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 bytes, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -2113,7 +2286,7 @@ pub(crate) fn gen_expr(
 
             // Return new string pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
-            if rc_on() {
+            if rc_on() && !borrowed_bytes_local {
                 emit_drop_local(out, &pad, bytes_local, &Type::List(Box::new(Type::U8)));
             }
             Type::Str
@@ -2122,6 +2295,7 @@ pub(crate) fn gen_expr(
         Expr::StringToBytes { string } => {
             // Evaluate string pointer
             let str_local = env.declare_local(Type::S32);
+            let borrowed_str_local = rc_borrow_read(string, &[], &|n| env.is_borrowed(n));
             gen_expr(
                 string, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -2163,7 +2337,7 @@ pub(crate) fn gen_expr(
 
             // Return new list pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
-            if rc_on() {
+            if rc_on() && !borrowed_str_local {
                 emit_drop_local(out, &pad, str_local, &Type::Str);
             }
             Type::List(Box::new(Type::U8))
@@ -2176,6 +2350,9 @@ pub(crate) struct CodegenEnv {
     param_count: u32,
     locals: Vec<Type>,
     param_types: Vec<Type>,
+    /// RC: which parameters and locals hold borrowed references (rc.rs): their
+    /// function never drops them, and every use that needs a reference dups it.
+    borrowed: Vec<bool>,
 }
 
 impl CodegenEnv {
@@ -2189,13 +2366,20 @@ impl CodegenEnv {
             param_count: params.len() as u32,
             locals: Vec::new(),
             param_types: params.iter().map(|p| p.ty.clone()).collect(),
+            borrowed: vec![false; params.len()],
         }
     }
 
     fn declare_local(&mut self, ty: Type) -> u32 {
         let idx = self.param_count + self.locals.len() as u32;
         self.locals.push(ty);
+        self.borrowed.push(false);
         idx
+    }
+
+    /// RC: the binding in local `idx` holds a borrowed reference.
+    fn mark_borrowed(&mut self, idx: u32) {
+        self.borrowed[idx as usize] = true;
     }
 
     fn push_binding(&mut self, name: String, idx: u32) {
@@ -2204,6 +2388,16 @@ impl CodegenEnv {
 
     fn pop_binding(&mut self) {
         self.bindings.pop();
+    }
+
+    /// Whether `name` (its innermost binding) holds a borrowed reference: a
+    /// borrowed parameter, or a borrowed `let` or `match` binding.
+    fn is_borrowed(&self, name: &str) -> bool {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .is_some_and(|(_, idx)| self.borrowed.get(*idx as usize).copied().unwrap_or(false))
     }
 
     /// The binding of `name`, if there is one.
@@ -2266,6 +2460,7 @@ fn emit_drop_names(out: &mut String, pad: &str, env: &CodegenEnv, names: &[Strin
     for n in names {
         if let Some((idx, ty)) = env.try_lookup(n)
             && is_counted(&ty)
+            && !env.is_borrowed(n)
         {
             emit_drop_local(out, pad, idx, &ty);
         }
@@ -3669,6 +3864,7 @@ pub(crate) fn generate_wat_pack(
     let debug_heap = emit.debug_heap || debug_heap_from_env();
     let rc = emit.rc || rc_from_env();
     let _rc = rc.then(|| RcModuleScope::enter(debug_heap));
+    rc_infer_borrowed(&prog.functions);
     let _static_strings = StaticStringsScope::enter();
     let mut out = String::new();
     out.push_str("(module\n");
@@ -3790,7 +3986,8 @@ pub(crate) fn generate_wat_pack(
             rc_enter_function(&func.body);
             let live = rc_live_in(&func.body);
             for (i, param) in func.params.iter().enumerate() {
-                if is_counted(&param.ty) && !live.contains(&param.name) {
+                env.borrowed[i] = rc_param_borrowed(&func.name, i);
+                if is_counted(&param.ty) && !live.contains(&param.name) && !env.borrowed[i] {
                     emit_drop_local(&mut body, "    ", i as u32, &param.ty);
                 }
             }
@@ -4140,6 +4337,15 @@ pub(crate) fn generate_pack_wrapper(
         out.push_str(&format!("    local.get $param_{}\n", param.name));
     }
     out.push_str(&format!("    call {}\n", internal_name));
+    // RC: the function only borrowed these; the wrapper's references go now.
+    if rc_on() {
+        for (i, param) in func.params.iter().enumerate() {
+            if is_counted(&param.ty) && rc_param_borrowed(&func.name, i) {
+                out.push_str(&format!("    local.get $param_{}\n", param.name));
+                emit_drop(out, "    ", &param.ty);
+            }
+        }
+    }
     // Only set $value if the function returns a non-unit type
     if !is_unit_type(&func.return_type) {
         out.push_str("    local.set $value\n");

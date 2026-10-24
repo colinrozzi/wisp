@@ -639,6 +639,38 @@ returns 1 (no cycle).
 verifier still passes; a test that a threaded `list-push` accumulator of 100,000
 elements does not copy (allocation count).
 
+*As built (ticket 0027, `src/compiler/rc.rs`), in the order measured:*
+1. **Borrowed reads.** An operation that only reads its operand (`list-len`,
+   `list-get`, a field, the string operations, `any-as-*`, a `match` scrutinee)
+   takes no reference when the operand outlives it: a variable used again later
+   and not by a later operand, a field or element of one, a string literal
+   (static: never counted), or a global nothing later can set.
+2. **Inline dups**, calls for drops: inlining drops too made the interpreter 45%
+   larger for no measured gain once literals are not dropped at all.
+3. **Borrowed parameters** (§3.3), a fixpoint over the call graph, with one
+   addition: a parameter that some tail call passes something it would have to
+   drop after the call is owned instead, so loops stay `return_call`. A
+   parameter matched by an arm that rebuilds the same variant is owned too (Koka
+   does the same), so its block can be reused.
+4. **Borrowed bindings:** a `let` of a field or element of something that
+   outlives the body, and `match` bindings of such a scrutinee, hold borrowed
+   references (no dup, no drop). This is what made sessions with many bindings
+   cheap: `lookup-local` takes no count per entry it scans.
+5. **The take rule** (§3.5), for `list-push` and for a call passing the global to
+   an owned parameter, with an effect analysis (which globals each function may
+   read or set, transitively).
+6. **`string-append` in place** when the left string's count is 1 and its block
+   has room; otherwise the new string gets half again the room it needs.
+7. **Drop-guided reuse** for variant matches: an owned scrutinee is specialized
+   on its count; unique, its bindings take the children's references and an arm
+   that directly builds the same variant reuses the block.
+
+Measured (release, min of 30 runs, interpreter RC on vs off): a session with 300
+bindings 0.99-1.16x; a fresh session 1.15x on loops, 1.19-1.28x on single short
+evaluations. Not done: removing `copy-env`/`copy-list`, which is only correct
+once RC is on by default (stage 4 PR B); with RC off those copies are what keep
+in-place pushes from changing shared environments.
+
 **Stage 6: clean up.** Remove the inline bump code and the 2 GiB comment; retire
 `generate_wat` (the non-Pack REPL path) or port it; mirror the runtime changes in the
 self-hosted compiler; document the "no mutable cells without a cycle plan" rule in the
