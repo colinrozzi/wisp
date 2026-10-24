@@ -392,6 +392,7 @@
       (global.set $events (list-new value))
       (global.set $event-limit 256)
       (global.set $handles (list-new host-handle))
+      (global.set $cursors (list-new event-cursor))
       (global.set $started 1) 0)))
 
 ; base is the canonical source file, or empty for interactive input. Each input

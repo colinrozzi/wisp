@@ -27,9 +27,27 @@
 ; handler failed). A handled event was delivered already, so it is not kept.
 ; The buffer keeps the newest $event-limit firings (256; (event-buffer N) changes
 ; it, 0 turns buffering off) and counts the older ones it drops.
+;
+; Every firing also gets a sequence number, 1, 2, 3, ... for the life of the
+; session ($event-seq is the newest). The buffer holds a run of consecutive
+; seqs ending at $event-seq, so a firing's seq is its position plus
+; (event-first-seq): no seq is stored. Reading never removes firings: readers
+; ask for the firings after a seq, usually through a named cursor ($cursors),
+; and acknowledge what they handled. Only the limit drops firings, and a
+; reader is told how many it lost. See docs/proposals/SESSION-INBOX.md.
 (global $events (list value) mut 0)
 (global $event-limit s32 mut 0)
 (global $events-dropped s32 mut 0)
+(global $event-seq s64 mut 0s64)
+
+; The daemon's wake-up hook: told the new seq after each firing, so a blocked
+; `theater-repl wait` can read without polling. Returns at once; it must never
+; call back into this actor.
+(import wisp-events event-recorded ((seq u64)) unit)
+
+; The seq of the oldest firing in the buffer ($event-seq + 1 when it is empty).
+(fn event-first-seq () s64
+  (i64.add (i64.sub (global.get $event-seq) (i64.extend_i32_s (list-len (global.get $events)))) 1s64))
 
 (fn firing ((handler string) (event value) (result value) (handled s32)) value
   (sequence
@@ -48,12 +66,19 @@
 
 ; Trimming copies the list, so it runs once the buffer holds twice the limit, not
 ; on every firing; poll-events and memory-stats trim before they report.
+; With buffering off (limit 0) the firing still takes a seq, so readers see it as
+; lost rather than never knowing it happened.
 (fn record-event ((handler string) (event value) (result value) (handled s32)) s32
-  (if (i32.le_s (global.get $event-limit) 0) 0
-    (begin
-      (global.set $events (list-push (global.get $events) (firing handler event result handled)))
-      (if (i32.gt_s (i32.sub (list-len (global.get $events)) (global.get $event-limit)) (global.get $event-limit))
-        (trim-events) 0))))
+  (begin
+    (global.set $event-seq (i64.add (global.get $event-seq) 1s64))
+    (if (i32.le_s (global.get $event-limit) 0)
+      (begin (global.set $events-dropped (i32.add (global.get $events-dropped) 1)) 0)
+      (begin
+        (global.set $events (list-push (global.get $events) (firing handler event result handled)))
+        (if (i32.gt_s (i32.sub (list-len (global.get $events)) (global.get $event-limit)) (global.get $event-limit))
+          (trim-events) 0)))
+    (event-recorded (u64 (global.get $event-seq)))
+    0))
 
 ; Dispatch an inbound event to a user handler named `handler` (a 1-arg function
 ; defined in the session). Resets the step budget (the handler runs fresh), applies
@@ -429,6 +454,13 @@
     ((string=? name "http-get") 1)
     ((string=? name "http-req") 1)
     ((string=? name "poll-events") 1)
+    ((string=? name "events-after") 1)
+    ((string=? name "event-head") 1)
+    ((string=? name "event-cursor") 1)
+    ((string=? name "event-ack") 1)
+    ((string=? name "event-read") 1)
+    ((string=? name "event-cursors") 1)
+    ((string=? name "event-cursor-drop") 1)
     ((string=? name "event-buffer") 1)
     ((string=? name "handles") 1)
     ((string=? name "memory-stats") 1)
@@ -1275,12 +1307,207 @@
   (if (two-str? args) (unmarshal (raw-invoke "theater:simple/process" "transfer" (arg-tuple args))) (failure "process-transfer expects a process id and target actor")))
 
 ; --- inbound events --------------------------------------------------------
-; Drain the buffered triggers (see $events). Clears the buffer so you see only
-; what fired since the last poll. When firings were dropped since then, the count
-; comes first: (N firing...) instead of (firing...). (poll-events "text") drains
-; the same buffer into readable text instead: a "(N earlier firings dropped)" line
-; when there were drops, then one "handler: result" per firing, the event left
-; out, a string result shown raw (for theater-repl read).
+; Reading the buffer (see $events). Nothing here removes a firing: a reader names
+; the last seq it has handled and gets what came after it.
+
+; A seq as a value: a plain integer while it fits, so it reads back as typed.
+(fn seq-value ((s s64)) value
+  (if (i64.le_s s 2147483647s64) (integer (i32.wrap_i64 s)) (wide-integer s)))
+
+(fn show-seq ((s s64)) string
+  (if (i64.eq s 0s64) "0" (wide-digits s "")))
+
+; A seq argument, or -1 when V is not an integer 0 or more.
+(fn seq-arg ((v value)) s64
+  (value-case v
+    ((integer n) (if (i32.lt_s n 0) (i64.sub 0s64 1s64) (i64.extend_i32_s n)))
+    ((wide-integer n) (if (i64.lt_s n 0s64) (i64.sub 0s64 1s64) n))
+    ((u64-value n) (if (i64.lt_s n 0s64) (i64.sub 0s64 1s64) n))
+    (else (i64.sub 0s64 1s64))))
+
+; The window of firings after seq AFTER: the buffer index it starts at, how many
+; it holds (at most MAX; MAX < 0 means all), the seq to resume from, and how many
+; firings after AFTER the limit already dropped.
+(fn window-start ((after s64)) s32
+  (let (first (event-first-seq))
+    (if (i64.lt_s after first) 0 (i32.wrap_i64 (i64.sub (i64.add after 1s64) first)))))
+
+(fn window-count ((start s32) (max s32)) s32
+  (let (avail (i32.sub (list-len (global.get $events)) start))
+    (if (i32.lt_s avail 0) 0
+      (if (i32.and (i32.ge_s max 0) (i32.lt_s max avail)) max avail))))
+
+; The seq of the last firing in the window, or the head when it is empty (so a
+; reader that lost firings moves past them).
+(fn window-next ((start s32) (count s32)) s64
+  (if (i32.gt_s count 0)
+    (i64.add (event-first-seq) (i64.extend_i32_s (i32.sub (i32.add start count) 1)))
+    (global.get $event-seq)))
+
+(fn lost-after ((after s64)) s64
+  (let (gap (i64.sub (i64.sub (event-first-seq) after) 1s64))
+    (if (i64.gt_s gap 0s64) gap 0s64)))
+
+; Firings START..END-1 with their seq in front: (seq handler result) or
+; (seq handler event result).
+(fn stamp-firings ((evs (list value)) (index s32) (end s32) (out (list value))) (list value)
+  (if (i32.ge_s index end) out
+    (stamp-firings evs (i32.add index 1) end
+      (list-push out (with-seq (i64.add (event-first-seq) (i64.extend_i32_s index)) (list-get evs index))))))
+
+(fn with-seq ((s s64) (f value)) value
+  (value-case f
+    ((sequence items) (sequence (copy-list items 0 (list-push (list-new value) (seq-value s)))))
+    (else f)))
+
+(fn copy-range ((evs (list value)) (index s32) (end s32) (out (list value))) (list value)
+  (if (i32.ge_s index end) out
+    (copy-range evs (i32.add index 1) end (list-push out (list-get evs index)))))
+
+; The firings after AFTER, in one of three forms:
+;   ""      (next lost firing...), each firing with its seq first
+;   "text"  the drop line if any, then one "handler: result" line per firing
+;   "wire"  "next lost" on the first line, then the text (for the daemon)
+; NEXT is the seq to acknowledge once these are handled.
+(fn render-events ((after s64) (max s32) (mode string)) value
+  (if (i64.lt_s after 0s64) (failure "expected a seq: an integer 0 or more")
+    (if (i64.gt_s after (global.get $event-seq))
+      (failure (string-append "cursor " (string-append (show-seq after)
+        (string-append " is after head " (show-seq (global.get $event-seq))))))
+      (begin
+        (trim-events)
+        (let (start (window-start after))
+          (let (count (window-count start max))
+            (let (next (window-next start count))
+              (let (lost (lost-after after))
+                (if (i32.eq (string-len mode) 0)
+                  (sequence (stamp-firings (global.get $events) start (i32.add start count)
+                    (list-push (list-push (list-new value) (seq-value next)) (seq-value lost))))
+                  (let (body (show-firings-range (global.get $events) start (i32.add start count)
+                               (dropped-line (i32.wrap_i64 lost))))
+                    (if (string=? mode "wire")
+                      (text (string-append (show-seq next) (string-append " "
+                        (string-append (show-seq lost) (string-append "\n" body)))))
+                      (text body))))))))))))
+
+; Optional arguments after the seq or cursor name: a count, and "text" or "wire".
+(fn read-events ((after s64) (args (list value)) (i s32) (max s32) (mode string)) value
+  (if (i32.ge_s i (list-len args)) (render-events after max mode)
+    (value-case (list-get args i)
+      ((integer m)
+        (if (i32.lt_s m 0) (failure "the count must be 0 or more")
+          (read-events after args (i32.add i 1) m mode)))
+      ((text s)
+        (if (i32.or (string=? s "text") (string=? s "wire"))
+          (read-events after args (i32.add i 1) max s)
+          (failure "the mode must be \"text\" or \"wire\"")))
+      (else (failure "expected a count and/or \"text\" or \"wire\"")))))
+
+; (events-after N [max] ["text"|"wire"]): the firings with seq > N. Removes nothing.
+(fn apply-events-after ((args (list value))) value
+  (if (i32.or (i32.lt_s (list-len args) 1) (i32.gt_s (list-len args) 3))
+    (failure "events-after expects (events-after N [max] [\"text\"|\"wire\"])")
+    (read-events (seq-arg (list-get args 0)) args 1 -1 "")))
+
+(fn apply-event-head ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "event-head expects no arguments")
+    (seq-value (global.get $event-seq))))
+
+; --- cursors ---------------------------------------------------------------
+; A cursor is a reader's name and the last seq it acknowledged. Readers each
+; keep their own, so they never take firings from one another. At most 16: a
+; new name past that replaces the least recently used one (which, if used again,
+; starts over at 0: duplicates, not loss).
+(record event-cursor (name string) (seq s64) (used s32))
+(global $cursors (list event-cursor) mut 0)
+(global $cursor-clock s32 mut 0)
+
+(fn cursor-index ((cs (list event-cursor)) (i s32) (name string)) s32
+  (if (i32.ge_s i (list-len cs)) -1
+    (if (string=? name (event-cursor.name (list-get cs i))) i
+      (cursor-index cs (i32.add i 1) name))))
+
+; The index of the least recently used cursor at or after I (BEST so far).
+(fn oldest-cursor ((cs (list event-cursor)) (i s32) (best s32)) s32
+  (if (i32.ge_s i (list-len cs)) best
+    (oldest-cursor cs (i32.add i 1)
+      (if (i32.lt_s (event-cursor.used (list-get cs i)) (event-cursor.used (list-get cs best))) i best))))
+
+(fn without-cursor ((cs (list event-cursor)) (i s32) (skip s32) (out (list event-cursor))) (list event-cursor)
+  (if (i32.ge_s i (list-len cs)) out
+    (without-cursor cs (i32.add i 1) skip (if (i32.eq i skip) out (list-push out (list-get cs i))))))
+
+(fn tick-cursor-clock () s32
+  (begin (global.set $cursor-clock (i32.add (global.get $cursor-clock) 1)) (global.get $cursor-clock)))
+
+; Set NAME to SEQ, creating it if needed; returns SEQ.
+(fn put-cursor ((name string) (seq s64)) s64
+  (let (cs (global.get $cursors))
+    (let (at (cursor-index cs 0 name))
+      (let (kept (if (i32.ge_s at 0) (without-cursor cs 0 at (list-new event-cursor))
+                   (if (i32.ge_s (list-len cs) 16) (without-cursor cs 0 (oldest-cursor cs 1 0) (list-new event-cursor)) cs)))
+        (begin
+          (global.set $cursors (list-push kept (event-cursor name seq (tick-cursor-clock))))
+          seq)))))
+
+; NAME's seq, creating it at 0 (everything still buffered) if it is new.
+(fn get-cursor ((name string)) s64
+  (let (at (cursor-index (global.get $cursors) 0 name))
+    (put-cursor name (if (i32.ge_s at 0) (event-cursor.seq (list-get (global.get $cursors) at)) 0s64))))
+
+(fn cursor-name-arg ((args (list value)) (verb string)) string
+  (if (i32.lt_s (list-len args) 1) ""
+    (if (string-arg? (list-get args 0)) (as-string (list-get args 0)) "")))
+
+(fn apply-event-cursor ((args (list value))) value
+  (if (i32.or (i32.ne (list-len args) 1) (i32.eq (string-len (cursor-name-arg args "")) 0))
+    (failure "event-cursor expects (event-cursor NAME)")
+    (seq-value (get-cursor (cursor-name-arg args "")))))
+
+; (event-ack NAME SEQ): NAME has handled everything up to SEQ. Never moves back.
+(fn apply-event-ack ((args (list value))) value
+  (if (i32.or (i32.ne (list-len args) 2) (i32.eq (string-len (cursor-name-arg args "")) 0))
+    (failure "event-ack expects (event-ack NAME SEQ)")
+    (let (seq (seq-arg (list-get args 1)))
+      (if (i64.lt_s seq 0s64) (failure "event-ack expects a seq: an integer 0 or more")
+        (if (i64.gt_s seq (global.get $event-seq))
+          (failure (string-append "seq " (string-append (show-seq seq)
+            (string-append " is after head " (show-seq (global.get $event-seq))))))
+          (let (old (get-cursor (cursor-name-arg args "")))
+            (seq-value (put-cursor (cursor-name-arg args "") (if (i64.gt_s seq old) seq old)))))))))
+
+; (event-read NAME [max] ["text"|"wire"]): the firings after NAME's cursor.
+; Does not move the cursor; acknowledge with event-ack after handling them.
+(fn apply-event-read ((args (list value))) value
+  (if (i32.or (i32.or (i32.lt_s (list-len args) 1) (i32.gt_s (list-len args) 3))
+        (i32.eq (string-len (cursor-name-arg args "")) 0))
+    (failure "event-read expects (event-read NAME [max] [\"text\"|\"wire\"])")
+    (read-events (get-cursor (cursor-name-arg args "")) args 1 -1 "")))
+
+(fn show-cursors ((cs (list event-cursor)) (i s32) (out (list value))) value
+  (if (i32.ge_s i (list-len cs)) (sequence out)
+    (show-cursors cs (i32.add i 1)
+      (list-push out (sequence (list-push (list-push (list-new value)
+        (text (event-cursor.name (list-get cs i)))) (seq-value (event-cursor.seq (list-get cs i)))))))))
+
+(fn apply-event-cursors ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "event-cursors expects no arguments")
+    (show-cursors (global.get $cursors) 0 (list-new value))))
+
+(fn apply-event-cursor-drop ((args (list value))) value
+  (if (i32.or (i32.ne (list-len args) 1) (i32.eq (string-len (cursor-name-arg args "")) 0))
+    (failure "event-cursor-drop expects (event-cursor-drop NAME)")
+    (let (at (cursor-index (global.get $cursors) 0 (cursor-name-arg args "")))
+      (begin
+        (if (i32.ge_s at 0)
+          (begin (global.set $cursors (without-cursor (global.get $cursors) 0 at (list-new event-cursor))) 0)
+          0)
+        (nil)))))
+
+; (poll-events) / (poll-events "text"): the firings since the last poll, in the
+; shapes they have always had: (firing...), with the count of dropped firings
+; first after drops, or "handler: result" lines. It reads through its own cursor,
+; "poll", so it no longer takes firings from theater-repl read/follow/wait.
 (fn apply-poll-events ((args (list value))) value
   (let (n (list-len args))
     (if (i32.gt_s n 1) (failure "poll-events expects no argument or \"text\"")
@@ -1288,13 +1515,16 @@
         (failure "poll-events expects no argument or \"text\"")
         (begin
           (trim-events)
-          (let (evs (global.get $events))
-            (let (dropped (global.get $events-dropped))
-              (begin
-                (global.set $events (list-new value))
-                (global.set $events-dropped 0)
-                (if (i32.eq n 1) (text (show-firings evs 0 (dropped-line dropped)))
-                  (sequence (if (i32.gt_s dropped 0) (copy-list evs 0 (list-push (list-new value) (integer dropped))) evs)))))))))))
+          (let (after (get-cursor "poll"))
+            (let (start (window-start after))
+              (let (end (i32.add start (window-count start -1)))
+                (let (lost (i32.wrap_i64 (lost-after after)))
+                  (begin
+                    (put-cursor "poll" (window-next start (i32.sub end start)))
+                    (if (i32.eq n 1)
+                      (text (show-firings-range (global.get $events) start end (dropped-line lost)))
+                      (sequence (copy-range (global.get $events) start end
+                        (if (i32.gt_s lost 0) (list-push (list-new value) (integer lost)) (list-new value)))))))))))))))
 
 (fn dropped-line ((dropped s32)) string
   (if (i32.gt_s dropped 0)
@@ -1324,7 +1554,7 @@
   (if (i32.ne (list-len args) 0) (failure "memory-stats expects no arguments")
     (begin
       (trim-events)
-      (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+      (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
         (stat "heap-bytes" (heap-alloc 0)))
         (stat "bindings" (list-len (global.get $bindings))))
         (stat "modules" (list-len (global.get $modules))))
@@ -1332,15 +1562,17 @@
         (stat "macros" (list-len (global.get $session-macros))))
         (stat "events" (list-len (global.get $events))))
         (stat "events-dropped" (global.get $events-dropped)))
-        (stat "handles" (list-len (global.get $handles))))))))
+        (stat "handles" (list-len (global.get $handles))))
+        (stat "event-seq" (i32.wrap_i64 (global.get $event-seq))))
+        (stat "cursors" (list-len (global.get $cursors))))))))
 
 (fn text-mode? ((v value)) s32
   (if (string-arg? v) (string=? (as-string v) "text") 0))
 
-; One "handler: result" line per firing, after OUT (the drop line, or "").
-(fn show-firings ((evs (list value)) (index s32) (out string)) string
-  (if (i32.ge_s index (list-len evs)) out
-    (show-firings evs (i32.add index 1)
+; One "handler: result" line per firing INDEX..END-1, after OUT (the drop line, or "").
+(fn show-firings-range ((evs (list value)) (index s32) (end s32) (out string)) string
+  (if (i32.ge_s index end) out
+    (show-firings-range evs (i32.add index 1) end
       (string-append (if (string-len out) (string-append out "\n") out)
         (show-firing (list-get evs index))))))
 
@@ -1364,7 +1596,7 @@
     ((string=? topic "tcp")
       "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (conn-id bytes): (car e), (car (cdr e))\n    (define on-close      (lambda (e) e))       ; e = (conn-id reason): (car e), (car (cdr e))\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
     ((string=? topic "triggers")
-      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name handler-result), or (handler-name event\nhandler-result) when the event was not handled (no handler, or it failed);\n(poll-events) returns those lists. (poll-events \"text\") returns one\n\"handler: result\" line per firing instead (event left out, a string result raw);\ntheater-repl read/follow print that, and read --full / follow --full print the\nlists. Scripts should parse --full: a raw result can span lines.\n\nThe buffer keeps the newest 256 firings and drops older ones. After drops,\n(poll-events) puts the count first, (N firing ...), and the text form starts with\n\"(N earlier firings dropped)\". (event-buffer N) sets the limit (0 = keep none;\nhandlers still run) and returns the old one. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
+      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\nread with theater-repl read / follow / wait <id> (or (events-after N) here).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name handler-result), or (handler-name event\nhandler-result) when the event was not handled (no handler, or it failed);\n(poll-events) returns those lists. (poll-events \"text\") returns one\n\"handler: result\" line per firing instead (event left out, a string result raw);\ntheater-repl read/follow print that, and read --full / follow --full print the\nlists. Scripts should parse --full: a raw result can span lines.\n\nThe buffer keeps the newest 256 firings and drops older ones. After drops,\n(poll-events) puts the count first, (N firing ...), and the text form starts with\n\"(N earlier firings dropped)\". (event-buffer N) sets the limit (0 = keep none;\nhandlers still run) and returns the old one.\n\nReading never removes firings. Each has a seq (1, 2, 3, ...):\n  (events-after N [max] [\"text\"])  firings after seq N: (next lost (seq handler result) ...)\n  (event-read NAME [max] [\"text\"])  the same, after cursor NAME (new cursors start at 0)\n  (event-ack NAME SEQ)    NAME has handled up to SEQ (never moves back)\n  (event-cursors) (event-cursor NAME) (event-cursor-drop NAME) (event-head)\nlost counts firings after N that the limit dropped. Acknowledge NEXT once handled.\ntheater-repl read, follow and wait use cursors \"read\", \"follow\" and \"wait\";\n(poll-events) uses \"poll\", so none of them takes firings from another. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
     ((string=? topic "modules")
       "Modules — load a library with (require NAME \"path\") at top level.\n\n  (require greet \"lib/greet.wisp\")   ; read the file, bind greet's provides\n  (hi \"bob\")                          ; provided names come in UNQUALIFIED (not greet.hi)\n  (require greet)                     ; reuse an already-loaded greet\n  (reload greet)                      ; re-read lib/greet.wisp after editing it\n\nrequire loads a module once per session: requiring an already-loaded NAME does\nnot re-read the file. To pick up an edit, (reload NAME) re-reads the source NAME\nwas loaded from into a fresh module env and rebinds the copies in EVERY module of\nthis session that imported it. It returns the names the new version no longer\nprovides (now unbound; () if none); newly provided names need (require NAME)\nagain. Shallow: NAME's own requires are not reloaded. If the new source fails,\nnothing changes and reload returns the error. A value copied by hand, like\n(define f hi), is not an import and keeps the old code.")
     (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\"), (help \"modules\")")))))
@@ -1384,7 +1616,7 @@
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n"
-                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events [\"text\"]) to drain   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
+                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (events-after N) (event-read cursor) (event-ack cursor seq) (poll-events)   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
                         (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes\n"
                         (string-append "modules:   (require NAME \"path\") load once, bind provides unqualified   (reload NAME) re-read an edited module   see (help \"modules\")\n"
                           "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")")))))))))))))))))
@@ -1457,6 +1689,13 @@
     ((string=? name "http-get") (apply-http-get args))
     ((string=? name "http-req") (apply-http-req args))
     ((string=? name "poll-events") (apply-poll-events args))
+    ((string=? name "events-after") (apply-events-after args))
+    ((string=? name "event-head") (apply-event-head args))
+    ((string=? name "event-cursor") (apply-event-cursor args))
+    ((string=? name "event-ack") (apply-event-ack args))
+    ((string=? name "event-read") (apply-event-read args))
+    ((string=? name "event-cursors") (apply-event-cursors args))
+    ((string=? name "event-cursor-drop") (apply-event-cursor-drop args))
     ((string=? name "event-buffer") (apply-event-buffer args))
     ((string=? name "handles") (apply-handles args))
     ((string=? name "memory-stats") (apply-memory-stats args))

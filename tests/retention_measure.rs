@@ -368,6 +368,11 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
         "list-sessions",
         host_fn(|_input| async move { Ok(Value::String("sessions not exercised".into())) }),
     );
+    imports.define(
+        "wisp-events",
+        "event-recorded",
+        host_fn(|_input| async move { Ok(Value::Tuple(vec![])) }),
+    );
     imports
 }
 async fn evaluate(instance: &mut WasmtimeInstance, source: &str) -> String {

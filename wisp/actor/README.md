@@ -55,8 +55,10 @@ LISP
 | `set-default <M>` / `set-default --reset` | change the actor later `new` sessions start from (checked first; running sessions keep theirs) |
 | `list` | list every interpreter actor in the runtime, however it was spawned |
 | `eval [-l] <s> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result. A string result prints raw (its text); `--literal`/`-l` prints it as a Wisp literal |
-| `read [--full] <s>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …), one `handler: result` per firing; `--full` prints the `(handler result)` lists (`(handler event result)` when unhandled) |
-| `follow [--full] <s>` | stream a session's events live until Ctrl-C (same format as `read`) |
+| `read [--full] <s>` | print the session's trigger firings (on-tick, on-message, …) since the `read` cursor, one `handler: result` per firing, then move the cursor; `--full` prints `(next lost (seq handler result) …)` (`(seq handler event result)` when unhandled) |
+| `follow [--full] [--from-now] <s>` | stream firings until Ctrl-C (same format as `read`), resuming from the `follow` cursor |
+| `wait [--timeout S] <s>` | block until there is a firing after the `wait` cursor, print all there are, move the cursor, exit (exit 2 on timeout). The wake-on-message monitor |
+| `cursors <s>` | the session's event cursors: name, acknowledged seq, how far behind |
 | `status [s]` | show a session (with one) or the daemon (without) |
 | `stop <s>` | stop the session's actor and reclaim its heap |
 | `repl` | interactive stdin/stdout prompt against a private session (for a human) |
@@ -83,9 +85,18 @@ stock `manifest.toml` is called `wisp-interpreter`. To reach a spawned interpret
 by name, give its manifest its own `name`; otherwise use its id. `list` shows AGE
 and SOURCE only for the sessions this daemon made; the runtime does not record them.
 
-`read` evaluates `(poll-events)` in the actor, and `follow` repeats that `read`
-once a second. The events are buffered by the actor itself, not by the daemon, so
-both work the same for any session, including ones the daemon did not spawn.
+**Reading never removes firings.** `read`, `follow` and `wait` each read after
+their own cursor in the session (`read`, `follow`, `wait`; `--cursor NAME` picks
+another, `--after N` reads after seq N with no cursor, `--peek` doesn't move
+the cursor), so a monitor, a person and a leftover `follow` never take firings
+from one another. The client moves a cursor only after it has printed, so a
+reader that dies or whose output is closed (`| head`) sees the same firings
+again next time: duplicates are possible, loss is not. `wait` and `follow` cost
+no evaluation while idle: the session tells the daemon each new seq through the
+`wisp-events` interface (`events.pact`). The firings are buffered by the actor
+itself, so this works for any session, including ones the daemon did not spawn.
+A session whose actor predates cursors falls back to the old draining read. See
+`docs/proposals/SESSION-INBOX.md`.
 
 Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
 `$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated
@@ -166,7 +177,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | tcp⁴ | `(tcp-connect addr)` · `(tcp-send conn data)` → bytes · `(tcp-receive conn max)`⁵ · `(tcp-close conn)` · `(tcp-peer conn)` · `(tcp-is-tls conn)` · `(tcp-listen addr)`⁶ · `(tcp-accept lst)`⁶ · `(tcp-activate conn)` · `(tcp-set-active conn mode)` · `(tcp-transfer conn actor)` · `(tcp-transfer-async conn actor)` · `(tcp-tls-client conn name)` · `(tcp-tls-server conn)` · `(tcp-close-listener lst)` |
 | podman | `(podman-run image name)` · `(podman-stop name)` · `(podman-rm name force)` · `(podman-list)` |
 | lifecycle⁷ | `(monitor id)` · `(unmonitor id)` · `(link id)` · `(unlink id)` |
-| meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(poll-events)` · `(event-buffer N)` · `(handles)` · `(memory-stats)` |
+| meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(events-after N)` · `(event-read c)` · `(event-ack c seq)` · `(event-cursors)` · `(poll-events)` · `(event-buffer N)` · `(handles)` · `(memory-stats)` |
 
 ¹ Self-targeted blocking calls — `(exports (self))`, `(implements (self) …)`,
 `(call (self) …)`, `(actor-state (self))` — would deadlock (the actor can't
@@ -224,26 +235,41 @@ literally a `(define …)`:
 
 Each firing is buffered as `(handler-name result)`, or `(handler-name event result)`
 when the event was not handled (no handler defined, or the handler failed): a
-handled event was delivered already, so it is not kept. `(poll-events)` drains
-the buffer as those lists; `(poll-events "text")` drains it as one `handler: result`
-line per firing (event left out, a string result raw).
+handled event was delivered already, so it is not kept. Each firing also has a
+sequence number, 1, 2, 3, … for the life of the session, and reading removes
+nothing:
 
-The buffer keeps the newest 256 firings. When it is full the oldest is dropped
-and counted: the next `(poll-events)` puts the count first, `(N firing …)`, and
-the text form starts with a `(N earlier firings dropped)` line. `(event-buffer N)`
-sets the limit (0 = keep nothing; handlers still run) and returns the old one.
-`follow` drains once a second, so a burst of more than 256 firings in a second
-loses the oldest records (not their handling).
+```lisp
+(events-after 41)              ; => (44 0 (42 "on-tick" "tick: beat") …): next, lost, firings
+(events-after 41 10 "text")    ; at most 10, as "handler: result" lines
+(event-read "mine")            ; the same, after cursor "mine" (a new cursor starts at 0)
+(event-ack "mine" 44)          ; "mine" has handled up to 44 (never moves back)
+(event-cursors) (event-cursor "mine") (event-cursor-drop "mine") (event-head)
+```
+
+`next` is the seq to acknowledge once the firings are handled; `lost` counts
+firings after the seq that the limit already dropped. At most 16 cursors: a new
+one past that replaces the least recently used. `(poll-events)` and
+`(poll-events "text")` keep their old shapes (`(firing …)`, or `handler: result`
+lines) but read through their own cursor, `poll`, so they no longer take firings
+from the CLI's readers.
+
+The buffer keeps the newest 256 firings. When it is full the oldest is dropped,
+and every reader whose cursor is before it is told: `(poll-events)` puts the
+count first, `(N firing …)`, and the text forms start with a `(N earlier firings
+dropped)` line. `(event-buffer N)` sets the limit (0 = keep nothing; handlers
+still run, and readers see each firing as dropped) and returns the old one.
 
 `(handles)` lists the timers, listeners, connections, processes and channels the
 session holds open, as `(kind id)`; the open and close verbs and the
 `on-close`/`on-exit`/`on-channel-close` events keep it current. `(memory-stats)`
 returns `(("heap-bytes" n) ("bindings" n) ("modules" n) ("types" n) ("macros" n)
-("events" n) ("events-dropped" n) ("handles" n))`; `heap-bytes` is the bump
-pointer, so for now it counts garbage too. The latter is what
-**`theater-repl read <id>`** calls (the former with `--full`), with
-**`theater-repl follow <id>`** polling it in a loop to stream firings live. So from
-the shell:
+("events" n) ("events-dropped" n) ("handles" n) ("event-seq" n) ("cursors" n))`;
+`heap-bytes` is the bump pointer, so for now it counts garbage too, and
+`events-dropped` counts every firing the limit has dropped.
+
+From the shell, **`theater-repl read <id>`** reads the firings (`--full` for the
+lists), **`follow <id>`** streams them, and **`wait <id>`** blocks for the next:
 
 ```sh
 theater-repl eval $id '(define on-tick (lambda (n) (string-append "fired: " n)))'
