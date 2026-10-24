@@ -208,7 +208,7 @@ fn test_small_types_preserve_types_and_recover() {
         ),
         ("(fn byte () u8 255) (byte)", "#<u8 255>"),
         (
-            "(define bytes (list-new u8)) (define stored 42) (list-push bytes stored) (id (list-get bytes 0))",
+            "(define stored 42) (define bytes (list-push (list-new u8) stored)) (id (list-get bytes 0))",
             "#<u8 42>",
         ),
         ("(i32.add (byte) 1)", "256"),
@@ -1336,8 +1336,7 @@ fn test_parity_compound_operations_across_both_compilers() {
         "tests/fixtures/interpreter_collections.wisp",
         &[
             ("list-sum", &[], 42),
-            ("list-alias", &[], 42),
-            ("nested-push", &[], 12),
+            ("list-push-result", &[], 42),
             ("option-present", &[], 42),
             ("option-absent", &[], 7),
             ("result-ok", &[], 42),
@@ -1518,18 +1517,26 @@ fn test_compound_types_validate_nested_and_absent_payloads() {
     }
 }
 
+/// Whether this run compiles with value-semantics list-push
+/// (`GRANITE_VALUE_LISTS`, MEMORY.md §7 stage 3).
+fn value_lists() -> bool {
+    std::env::var_os("GRANITE_VALUE_LISTS").is_some_and(|v| v != "0" && !v.is_empty())
+}
+
 #[test]
-fn test_typed_list_aliases_and_failed_mutation_recover() {
+fn test_typed_list_pushes_and_failed_mutation_recover() {
     let mut s = session();
     assert_eq!(
-        s.evaluate("(define xs (list-new s32)) (define alias xs) (list-push xs 42)")
+        s.evaluate("(define xs (list-push (list-new s32) 42))")
             .unwrap(),
         "#<list s32 (42)>"
     );
-    assert_eq!(s.evaluate("(list-get alias 0)").unwrap(), "42");
+    assert_eq!(s.evaluate("(list-get xs 0)").unwrap(), "42");
     assert_eq!(
-        s.evaluate("(define push-one (lambda () (list-push xs 1))) (push-one) (list-len alias)")
-            .unwrap(),
+        s.evaluate(
+            "(define push-one (lambda () (list-push xs 1))) (define xs (push-one)) (list-len xs)"
+        )
+        .unwrap(),
         "2"
     );
     for source in [
@@ -1543,9 +1550,9 @@ fn test_typed_list_aliases_and_failed_mutation_recover() {
     ] {
         let output = s.evaluate(source).unwrap();
         assert!(output.starts_with("error:"), "{source}: {output}");
-        assert_eq!(s.evaluate("alias").unwrap(), "#<list s32 (42 1)>");
+        assert_eq!(s.evaluate("xs").unwrap(), "#<list s32 (42 1)>");
     }
-    // Nominal identity remains enforced inside mutable containers.
+    // Nominal identity remains enforced inside containers.
     s.evaluate("(record point (x s32)) (record other (x s32)) (define points (list-new point))")
         .unwrap();
     assert!(
@@ -1554,27 +1561,52 @@ fn test_typed_list_aliases_and_failed_mutation_recover() {
             .starts_with("error:")
     );
     assert_eq!(
-        s.evaluate("(list-push points (point 42)) (point.x (list-get points 0))")
+        s.evaluate("(define points (list-push points (point 42))) (point.x (list-get points 0))")
             .unwrap(),
         "42"
     );
-    // A recursive record can introduce a cycle through its mutable children.
+}
+
+/// What another name for a list sees after a push into it: the push, while
+/// list-push writes in place (the default), or nothing with value lists, which
+/// also rules out a cycle through a record's children (MEMORY.md §2.2).
+#[test]
+fn test_typed_list_aliases_follow_the_push_semantics() {
+    let value = value_lists();
+    let mut s = session();
+    assert_eq!(
+        s.evaluate("(define xs (list-new s32)) (define alias xs) (list-push xs 42)")
+            .unwrap(),
+        "#<list s32 (42)>"
+    );
+    assert_eq!(
+        s.evaluate("(list-len alias)").unwrap(),
+        if value { "0" } else { "1" }
+    );
     s.evaluate("(record node (children (list node))) (define children (list-new node)) (define root (node children))").unwrap();
     let output = s.evaluate("(list-push children root)").unwrap();
-    assert!(output.contains("#<depth-limit>"), "{output}");
+    assert_eq!(output.contains("#<depth-limit>"), !value, "{output}");
     assert_eq!(
-        s.evaluate("(list-len (node.children (list-get children 0)))")
-            .unwrap(),
-        "1"
+        s.evaluate("(list-len (node.children root))").unwrap(),
+        if value { "0" } else { "1" }
     );
-    assert_eq!(s.evaluate("(list-get xs 0)").unwrap(), "42");
-    // Errors do not roll back an earlier, successful mutation in a payload.
+    // A push inside the pushed value: the outer push fails, the inner one stays
+    // only while pushes write in place.
+    s.evaluate("(define ys (list-push (list-new s32) 1)) (define ys-alias ys)")
+        .unwrap();
     assert!(
-        s.evaluate("(list-push xs (begin (list-push xs 7) \"bad\"))")
+        s.evaluate("(list-push ys (begin (list-push ys 7) \"bad\"))")
             .unwrap()
             .starts_with("error:")
     );
-    assert_eq!(s.evaluate("alias").unwrap(), "#<list s32 (42 1 7)>");
+    assert_eq!(
+        s.evaluate("ys-alias").unwrap(),
+        if value {
+            "#<list s32 (1)>"
+        } else {
+            "#<list s32 (1 7)>"
+        }
+    );
 }
 
 #[test]
