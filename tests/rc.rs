@@ -161,6 +161,7 @@ const SHARED: &str = r#"
     0)))
 (export (fn s-addr ((n s32)) s32 (string-addr (global.get $s))))
 (export (fn s-len ((n s32)) s32 (string-len (global.get $s))))
+(export (fn s-hold ((n s32)) s32 (list-len (list-push (list-new string) (global.get $s)))))
 (export (fn reset-s ((n s32)) s32 (begin (global.set $s "x") 0)))
 (export (fn reset-xs ((n s32)) s32 (begin (global.set $xs (list-new string)) 0)))
 "#;
@@ -242,9 +243,11 @@ fn every_export_call_is_verified_in_debug_builds() {
 #[test]
 fn a_freed_object_traps_when_used() {
     let (mut g, p) = shared();
-    // global.get dups the freed string. (Free it after the call's buffers are
-    // allocated, or one of them would reuse its block.)
-    let r = g.try_call_after("s-len", 0, |g| {
+    // Storing $s in a list takes a reference: a dup of the freed string. (A read
+    // like string-len takes none; the verifier at the end of the call finds the
+    // dangling global instead.) Free it after the call's buffers are allocated,
+    // or one of them would reuse its block.
+    let r = g.try_call_after("s-hold", 0, |g| {
         let free: TypedFunc<(i32, i32), ()> = g.func("__pack_free");
         free.call(&mut g.store, (p as i32, 4)).unwrap();
     });
@@ -263,7 +266,7 @@ fn a_drop_below_zero_traps() {
 fn a_counted_operation_on_a_raw_block_traps() {
     let (mut g, p) = shared();
     g.set_rc(p, RAW_RC);
-    assert_trap(g.try_call("s-len", 0), "__granite_rc_on_raw_block");
+    assert_trap(g.try_call("s-hold", 0), "__granite_rc_on_raw_block");
 }
 
 /// Release build: objects are freed when their last reference goes, so an export
@@ -290,4 +293,148 @@ fn garbage_is_freed_in_release_builds() {
         }
         assert_eq!(g.live_blocks(), blocks, "debug={debug}");
     }
+}
+
+impl Guest {
+    fn total_bytes(&mut self) -> u64 {
+        let stats: TypedFunc<(), i32> = self.func("__granite_heap_stats");
+        let s = stats.call(&mut self.store, ()).unwrap() as u32;
+        self.u32_at(s + 16) as u64 | (self.u32_at(s + 20) as u64) << 32
+    }
+}
+
+/// Bytes `export` allocates when called once with `n`.
+fn bytes_for(source: &str, export: &str, n: i32, expect: i32) -> u64 {
+    let mut g = Guest::new(&compile(source, false));
+    let before = g.total_bytes();
+    assert_eq!(g.call(export, n), expect);
+    g.total_bytes() - before
+}
+
+/// MEMORY.md §7 stage 5: a list-push accumulator threaded through a loop has a
+/// count of 1 at every push, so 100,000 pushes never copy the list: the bytes
+/// allocated are the doubling buffers (under twice the final buffer) plus the
+/// call's own small blocks, not the quadratic total a copy per push would cost.
+#[test]
+fn a_threaded_accumulator_never_copies() {
+    let source = r#"
+(fn fill ((xs (list s32)) (i s32) (n s32)) (list s32)
+  (if (i32.lt_s i n) (fill (list-push xs i) (i32.add i 1) n) xs))
+(export (fn push-n ((n s32)) s32 (list-len (fill (list-new s32) 0 n))))
+"#;
+    let bytes = bytes_for(source, "push-n", 100_000, 100_000);
+    assert!(
+        bytes < 2 * 4 * 131_072 + 4096,
+        "{bytes} bytes for 100,000 pushes"
+    );
+}
+
+/// MEMORY.md §3.5, the take rule: `(global.set $g (list-push (global.get $g) x))`
+/// moves the list out of the global instead of taking a second reference, so the
+/// push writes in place. The same holds when the global goes to an owned
+/// parameter of a function that does not touch the global itself.
+#[test]
+fn pushes_onto_a_global_do_not_copy() {
+    let direct = r#"
+(global $xs (list s32) mut 0)
+(fn fill ((i s32) (n s32)) s32
+  (if (i32.lt_s i n)
+    (begin (global.set $xs (list-push (global.get $xs) i)) (fill (i32.add i 1) n))
+    (list-len (global.get $xs))))
+(export (fn push-n ((n s32)) s32 (begin (global.set $xs (list-new s32)) (fill 0 n))))
+"#;
+    let through_call = r#"
+(global $xs (list s32) mut 0)
+(fn add ((xs (list s32)) (x s32)) (list s32) (list-push xs x))
+(fn fill ((i s32) (n s32)) s32
+  (if (i32.lt_s i n)
+    (begin (global.set $xs (add (global.get $xs) i)) (fill (i32.add i 1) n))
+    (list-len (global.get $xs))))
+(export (fn push-n ((n s32)) s32 (begin (global.set $xs (list-new s32)) (fill 0 n))))
+"#;
+    for source in [direct, through_call] {
+        let bytes = bytes_for(source, "push-n", 20_000, 20_000);
+        assert!(
+            bytes < 2 * 4 * 32_768 + 4096,
+            "{bytes} bytes for 20,000 pushes"
+        );
+    }
+    // A global the pushed value reads cannot be moved out: still correct.
+    let reads = r#"
+(global $xs (list s32) mut 0)
+(export (fn push-len ((n s32)) s32
+  (begin
+    (global.set $xs (list-push (list-new s32) 7))
+    (global.set $xs (list-push (global.get $xs) (list-len (global.get $xs))))
+    (i32.add (i32.mul (list-len (global.get $xs)) 10) (list-get (global.get $xs) 1)))))
+"#;
+    bytes_for(reads, "push-len", 0, 21);
+}
+
+/// MEMORY.md §3.4: `string-append` writes a left string held only by the
+/// append into spare room in its block, and a new string gets half again the
+/// room it needs, so left-fold string building is O(n): 10,000 one-byte appends
+/// allocate a few times the final length, not the ~50 MB copying would.
+#[test]
+fn left_fold_string_building_is_linear() {
+    let source = r#"
+(fn build ((s string) (i s32) (n s32)) string
+  (if (i32.lt_s i n) (build (string-append s "x") (i32.add i 1) n) s))
+(export (fn build-n ((n s32)) s32 (string-len (build "" 0 n))))
+"#;
+    let bytes = bytes_for(source, "build-n", 10_000, 10_000);
+    assert!(bytes < 200_000, "{bytes} bytes for 10,000 appends");
+    for debug in [false, true] {
+        let mut g = Guest::new(&compile(source, debug));
+        assert_eq!(g.call("build-n", 3000), 3000);
+        assert_eq!(g.verify_if(debug), 0);
+    }
+}
+
+impl Guest {
+    fn verify_if(&mut self, debug: bool) -> i32 {
+        if debug { self.verify().unwrap() } else { 0 }
+    }
+}
+
+/// MEMORY.md §3.4, drop-guided reuse: a match on a uniquely held variant whose
+/// arm rebuilds the same variant writes the new case into the old block, so
+/// mapping over a 1,000-link chain allocates nothing new. A shared chain is
+/// copied instead, and both versions stay intact.
+#[test]
+fn a_unique_match_reuses_its_block() {
+    let source = r#"
+(variant chain (end) (link s32 chain))
+(fn make ((n s32) (acc chain)) chain (if (i32.eq n 0) acc (make (i32.sub n 1) (link n acc))))
+(fn incr ((c chain)) chain (match c ((end) (end)) ((link v rest) (link (i32.add v 1) (incr rest)))))
+(fn total ((c chain) (acc s32)) s32 (match c ((end) acc) ((link v rest) (total rest (i32.add acc v)))))
+(global $keep chain mut 0)
+(export (fn map-unique ((n s32)) s32 (total (incr (make n (end))) 0)))
+(export (fn map-shared ((n s32)) s32
+  (begin
+    (global.set $keep (make n (end)))
+    (i32.sub (total (incr (global.get $keep)) 0) (total (global.get $keep) 0)))))
+"#;
+    for debug in [false, true] {
+        let mut g = Guest::new(&compile(source, debug));
+        // sum of 2..=1001
+        assert_eq!(g.call("map-unique", 1000), 501_500);
+        assert_eq!(g.call("map-shared", 1000), 1000);
+        assert_eq!(g.verify_if(debug), 0);
+    }
+    // make allocates 1,001 blocks; incr reuses every one of them.
+    let make_only = bytes_for(
+        &source.replace(
+            "(total (incr (make n (end))) 0)",
+            "(total (make n (end)) 0)",
+        ),
+        "map-unique",
+        1000,
+        500_500,
+    );
+    let mapped = bytes_for(source, "map-unique", 1000, 501_500);
+    assert!(
+        mapped < make_only + 2048,
+        "make {make_only} bytes, make+incr {mapped}"
+    );
 }
