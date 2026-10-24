@@ -38,9 +38,9 @@
               (let (checked (check-params params 0))
                 (if (failed? checked) checked
                   (begin
-                    (global.set $pending-macros (list-push (global.get $pending-macros)
-                      (binding name (sequence (list-push (list-push (list-new value)
-                        (sequence params)) (list-get parts 3))))))
+                    (global.set $pending-macros (upsert-binding (global.get $pending-macros) name
+                      (sequence (list-push (list-push (list-new value)
+                        (sequence params)) (list-get parts 3)))))
                     (nil)))))
             (else (failure "defmacro expects a parameter list"))))))))
 

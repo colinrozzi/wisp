@@ -55,7 +55,7 @@ LISP
 | `set-default <M>` / `set-default --reset` | change the actor later `new` sessions start from (checked first; running sessions keep theirs) |
 | `list` | list every interpreter actor in the runtime, however it was spawned |
 | `eval [-l] <s> [form]` | evaluate a form (omit `form` or pass `-` to read stdin); exits non-zero on an `error:` result. A string result prints raw (its text); `--literal`/`-l` prints it as a Wisp literal |
-| `read [--full] <s>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …), one `handler: result` per firing; `--full` prints the `(handler event result)` lists |
+| `read [--full] <s>` | drain the session's buffered events (inbound triggers: on-tick, on-message, …), one `handler: result` per firing; `--full` prints the `(handler result)` lists (`(handler event result)` when unhandled) |
 | `follow [--full] <s>` | stream a session's events live until Ctrl-C (same format as `read`) |
 | `status [s]` | show a session (with one) or the daemon (without) |
 | `stop <s>` | stop the session's actor and reclaim its heap |
@@ -166,7 +166,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | tcp⁴ | `(tcp-connect addr)` · `(tcp-send conn data)` → bytes · `(tcp-receive conn max)`⁵ · `(tcp-close conn)` · `(tcp-peer conn)` · `(tcp-is-tls conn)` · `(tcp-listen addr)`⁶ · `(tcp-accept lst)`⁶ · `(tcp-activate conn)` · `(tcp-set-active conn mode)` · `(tcp-transfer conn actor)` · `(tcp-transfer-async conn actor)` · `(tcp-tls-client conn name)` · `(tcp-tls-server conn)` · `(tcp-close-listener lst)` |
 | podman | `(podman-run image name)` · `(podman-stop name)` · `(podman-rm name force)` · `(podman-list)` |
 | lifecycle⁷ | `(monitor id)` · `(unmonitor id)` · `(link id)` · `(unlink id)` |
-| meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(poll-events)` |
+| meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(poll-events)` · `(event-buffer N)` · `(handles)` · `(memory-stats)` |
 
 ¹ Self-targeted blocking calls — `(exports (self))`, `(implements (self) …)`,
 `(call (self) …)`, `(actor-state (self))` — would deadlock (the actor can't
@@ -219,12 +219,28 @@ literally a `(define …)`:
 
 (set-interval "beat" 1000)     ; Theater now calls handle-tick → your on-tick
 ;; …later…
-(poll-events)                  ; => (("on-tick" "beat" "tick: beat") …) — what fired + each result
+(poll-events)                  ; => (("on-tick" "tick: beat") …) — what fired + each result
 ```
 
-Each firing is buffered as `(handler-name event result)`. `(poll-events)` drains
+Each firing is buffered as `(handler-name result)`, or `(handler-name event result)`
+when the event was not handled (no handler defined, or the handler failed): a
+handled event was delivered already, so it is not kept. `(poll-events)` drains
 the buffer as those lists; `(poll-events "text")` drains it as one `handler: result`
-line per firing (event dropped, a string result raw). The latter is what
+line per firing (event left out, a string result raw).
+
+The buffer keeps the newest 256 firings. When it is full the oldest is dropped
+and counted: the next `(poll-events)` puts the count first, `(N firing …)`, and
+the text form starts with a `(N earlier firings dropped)` line. `(event-buffer N)`
+sets the limit (0 = keep nothing; handlers still run) and returns the old one.
+`follow` drains once a second, so a burst of more than 256 firings in a second
+loses the oldest records (not their handling).
+
+`(handles)` lists the timers, listeners, connections, processes and channels the
+session holds open, as `(kind id)`; the open and close verbs and the
+`on-close`/`on-exit`/`on-channel-close` events keep it current. `(memory-stats)`
+returns `(("heap-bytes" n) ("bindings" n) ("modules" n) ("types" n) ("macros" n)
+("events" n) ("events-dropped" n) ("handles" n))`; `heap-bytes` is the bump
+pointer, so for now it counts garbage too. The latter is what
 **`theater-repl read <id>`** calls (the former with `--full`), with
 **`theater-repl follow <id>`** polling it in a loop to stream firings live. So from
 the shell:

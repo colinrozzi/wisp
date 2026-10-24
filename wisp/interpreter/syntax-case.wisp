@@ -69,9 +69,9 @@
   (let (checked (sc-check-clauses clauses 0 literals name (list-new value)))
     (if (failed? checked) checked
       (begin
-        (global.set $pending-macros (list-push (global.get $pending-macros)
-          (binding name (sequence (list-push (list-push (list-push (list-push (list-new value)
-            (symbol "syntax-case")) (symbol param)) (sequence literals)) checked)))))
+        (global.set $pending-macros (upsert-binding (global.get $pending-macros) name
+          (sequence (list-push (list-push (list-push (list-push (list-new value)
+            (symbol "syntax-case")) (symbol param)) (sequence literals)) checked))))
         (nil)))))
 (fn sc-check-clauses ((clauses (list value)) (index s32) (literals (list value)) (name string) (out (list value))) value
   (if (i32.ge_s index (list-len clauses)) (sequence out)

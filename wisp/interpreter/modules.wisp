@@ -95,7 +95,10 @@
   (if (i32.ge_s index (list-len items)) (nil)
     (if (symbol? (list-get items index))
       (begin
-        (global.set $current-exports (list-push (global.get $current-exports) (symbol-name (list-get items index))))
+        (let (name (symbol-name (list-get items index)))
+          (global.set $current-exports
+            (if (name-member? (global.get $current-exports) 0 name) (global.get $current-exports)
+              (list-push (global.get $current-exports) name))))
         (add-exports items (i32.add index 1)))
       (failure "provide expects symbols"))))
 

@@ -69,8 +69,9 @@
         (if (field-present? out (declaration-key field keyed) 0 keyed) (failure "duplicate field or parameter")
           (normalize-fields fields (i32.add index 1) (list-push out field) self keyed))))))
 
+; Redefinition replaces the old binding, so $bindings is bounded by distinct names.
 (fn publish ((name string) (v value)) value
-  (begin (global.set $bindings (list-push (global.get $bindings) (binding name v))) v))
+  (begin (global.set $bindings (upsert-binding (global.get $bindings) name v)) v))
 
 (fn eval-fn ((items (list value)) (top s32)) value
   (declare-function items top))

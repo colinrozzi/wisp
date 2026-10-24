@@ -94,14 +94,16 @@ enum Command {
     /// parse --full output.
     Read {
         id: String,
-        /// Print the firings as a Wisp list of (handler event result).
+        /// Print the firings as a Wisp list of (handler result), or (handler event
+        /// result) when unhandled; a drop count comes first after drops.
         #[arg(long)]
         full: bool,
     },
     /// Stream a session's events live until Ctrl-C (same format as read).
     Follow {
         id: String,
-        /// Print the firings as a Wisp list of (handler event result).
+        /// Print the firings as a Wisp list of (handler result), or (handler event
+        /// result) when unhandled; a drop count comes first after drops.
         #[arg(long)]
         full: bool,
     },
@@ -452,7 +454,7 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
             (true, format!("new sessions now start from {origin}"))
         }
         "eval" => run(daemon, field(request, "id"), field(request, "form")).await,
-        // Clients that predate "text" get the full (handler event result) list.
+        // Clients that predate "text" get the full list of firings.
         "read" => {
             let form = if request.get("text").and_then(Value::as_bool) == Some(true) {
                 "(poll-events \"text\")"
