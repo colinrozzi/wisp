@@ -1269,7 +1269,8 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
             Type::List(Box::new(elem_type.clone()))
         }
-        // List: push - simplified version that reallocates every time
+        // List: push - in place, amortized: when len == cap, grow the data
+        // buffer by doubling; then store into spare capacity.
         Expr::ListPush { list, value } => {
             let list_ty = gen_expr(
                 list, out, indent, env, signatures, globals, records, variants, false,
@@ -1296,48 +1297,57 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}i32.load\n", pad));
             out.push_str(&format!("{}local.set {}\n", pad, len_local));
 
-            // Allocate new data array (simple approach: always reallocate)
+            // Grow when len >= cap (unsigned). A header's cap never exceeds the
+            // slots its data buffer holds: list-new writes 0, decoders write len.
+            let new_cap_local = env.declare_local(Type::S32);
             let new_data_local = env.declare_local(Type::S32);
-            let new_size = env.declare_local(Type::S32);
-
-            // new_size = (len + 1) * elem_size
             out.push_str(&format!("{}local.get {}\n", pad, len_local));
-            out.push_str(&format!("{}i32.const 1\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
-            out.push_str(&format!("{}i32.mul\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, new_size));
-
-            // new_data = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, new_data_local));
-
-            // heap_ptr += new_size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}local.get {}\n", pad, new_size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
-
-            // Copy old data if len > 0
-            // Get old data pointer from list+8
-            let old_data_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.get {}\n", pad, list_local));
-            out.push_str(&format!("{}i32.const 8\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}i32.load\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, old_data_local));
+            out.push_str(&format!("{}i32.load offset=4\n", pad));
+            out.push_str(&format!("{}i32.ge_u\n", pad));
+            out.push_str(&format!("{}if\n", pad));
 
-            // Copy len * elem_size bytes from old_data to new_data
-            // memory.copy(dst, src, len)
-            out.push_str(&format!("{}local.get {}\n", pad, new_data_local)); // dst
-            out.push_str(&format!("{}local.get {}\n", pad, old_data_local)); // src
-            out.push_str(&format!("{}local.get {}\n", pad, len_local)); // len (in elements)
-            out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
-            out.push_str(&format!("{}i32.mul\n", pad)); // len * elem_size
-            out.push_str(&format!("{}memory.copy\n", pad));
+            // new_cap = len == 0 ? 1 : len * 2
+            out.push_str(&format!("{}  i32.const 1\n", pad));
+            out.push_str(&format!("{}  local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}  i32.const 1\n", pad));
+            out.push_str(&format!("{}  i32.shl\n", pad));
+            out.push_str(&format!("{}  local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}  i32.eqz\n", pad));
+            out.push_str(&format!("{}  select\n", pad));
+            out.push_str(&format!("{}  local.set {}\n", pad, new_cap_local));
 
-            // Store new value at new_data + len * elem_size
-            out.push_str(&format!("{}local.get {}\n", pad, new_data_local));
+            // new_data = heap_ptr; heap_ptr += new_cap * elem_size
+            out.push_str(&format!("{}  global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}  local.set {}\n", pad, new_data_local));
+            out.push_str(&format!("{}  global.get $__heap_ptr\n", pad));
+            out.push_str(&format!("{}  local.get {}\n", pad, new_cap_local));
+            out.push_str(&format!("{}  i32.const {}\n", pad, elem_size));
+            out.push_str(&format!("{}  i32.mul\n", pad));
+            out.push_str(&format!("{}  i32.add\n", pad));
+            out.push_str(&format!("{}  global.set $__heap_ptr\n", pad));
+
+            // memory.copy(new_data, old_data, len * elem_size)
+            out.push_str(&format!("{}  local.get {}\n", pad, new_data_local));
+            out.push_str(&format!("{}  local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}  i32.load offset=8\n", pad));
+            out.push_str(&format!("{}  local.get {}\n", pad, len_local));
+            out.push_str(&format!("{}  i32.const {}\n", pad, elem_size));
+            out.push_str(&format!("{}  i32.mul\n", pad));
+            out.push_str(&format!("{}  memory.copy\n", pad));
+
+            // Update list header: cap = new_cap, data = new_data
+            out.push_str(&format!("{}  local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}  local.get {}\n", pad, new_cap_local));
+            out.push_str(&format!("{}  i32.store offset=4\n", pad));
+            out.push_str(&format!("{}  local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}  local.get {}\n", pad, new_data_local));
+            out.push_str(&format!("{}  i32.store offset=8\n", pad));
+            out.push_str(&format!("{}end\n", pad));
+
+            // Store new value at data + len * elem_size
+            out.push_str(&format!("{}local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}i32.load offset=8\n", pad));
             out.push_str(&format!("{}local.get {}\n", pad, len_local));
             out.push_str(&format!("{}i32.const {}\n", pad, elem_size));
             out.push_str(&format!("{}i32.mul\n", pad));
@@ -1357,13 +1367,6 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}local.get {}\n", pad, len_local));
             out.push_str(&format!("{}i32.const 1\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}i32.store\n", pad));
-
-            // Update list header: data = new_data
-            out.push_str(&format!("{}local.get {}\n", pad, list_local));
-            out.push_str(&format!("{}i32.const 8\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}local.get {}\n", pad, new_data_local));
             out.push_str(&format!("{}i32.store\n", pad));
 
             // Return the list pointer
