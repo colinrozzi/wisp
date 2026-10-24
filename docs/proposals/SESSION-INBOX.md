@@ -494,25 +494,26 @@ theater_host`, on its own port):
 - No evaluation happens while a `wait` is idle (count `evaluate` calls on the
   session over 3 idle seconds: zero after the first read).
 
-## 9. Open questions for review
+## 9. Decisions from review
 
-1. **Default for a new cursor: 0 (the whole ring) or the head (new firings
-   only)?** This proposal says 0, so a first `wait` reports messages that
-   arrived before the monitor started (the "registered but not yet
-   watching" window). The cost is that a first `read` on a busy session
-   prints up to 256 old firings, as `read` does today.
-2. **Should `read` (no flags) acknowledge?** This proposal says yes, so that a
-   person who runs `read` twice sees each firing once, as today. `--peek`
-   reads without acknowledging.
-3. **Sender in `on-message`.** Not part of this ticket, but an inbox entry
-   would be more useful with the sender's actor id. Theater's `send` does
-   not pass it to `handle-send` today.
+Settled with claude (coordinator) in review:
+
+1. **A new cursor starts at 0** (the whole ring), not at the head. The
+   window between `(msg-register)` and the first `wait` matters more than a
+   long first `read` on a busy session (up to 256 old firings, as `read`
+   prints today).
+2. **Plain `read` acknowledges**, so a person who runs `read` twice sees
+   each firing once, as today. `--peek` reads without acknowledging.
+3. **No sender in `on-message`.** colin decided messages carry no sender;
+   an actor that wants a reply puts its own id in the message, as the
+   current convention does. Out of scope here.
 
 ## 10. Problems noticed outside this ticket
 
 - Theater: `respond-to-request` / `cancel-request` read an
   `outstanding_requests` map that `process_actor_message` never fills
   (ms:540, ms:1013-1060), so a deferred reply appears not to work.
-- Theater: one full mailbox (100 messages) stalls the single router task
-  for every actor (ms:278), and channel open waits for the target's
-  `handle-channel-open` inside the router (ms:325).
+- Theater (**known, deliberately deferred**): one full mailbox (100
+  messages) stalls the single router task for every actor (ms:278), and
+  channel open waits for the target's `handle-channel-open` inside the
+  router (ms:325).
