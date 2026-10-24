@@ -5,7 +5,7 @@
 // Every heap block starts with a header; the program only sees the payload after it,
 // so payload layouts (and field offsets) are unchanged:
 //
-//   block + 0: rc   i32  reference count, 1 at birth (unused until RC lands)
+//   block + 0: rc   i32  reference count, 1 at birth (counted with RC on, rc.rs)
 //   block + 4: size u32  block size in bytes, header included (the block's class)
 //   block + 8: payload   <- the pointer `$__alloc` returns
 //
@@ -19,6 +19,8 @@
 //   CLASS_SIZE  block size of each class, one i32 per class
 //   CLASS_OF    small class index by (block size - 1) / 8, one byte per entry
 //   heap start  the first block; the frontier starts here
+
+use super::rc::RAW_RC;
 
 /// Block sizes of the small classes, header included (§5.2): at most 25% waste.
 const SMALL_CLASSES: [u32; 23] = [
@@ -117,7 +119,21 @@ pub(crate) fn debug_heap_from_env() -> bool {
 /// With `debug`, `$__free` fills the payload with 0xDD and poisons `rc`; freeing a
 /// poisoned block, freeing something that is not a block, a `__pack_free` length
 /// larger than the block, and reusing a free block whose header was written all trap.
-pub(crate) fn emit_heap_runtime(out: &mut String, heap_base: u32, data_end: u64, debug: bool) {
+/// The lowest payload address of a heap block for a module whose static data ends
+/// at `heap_base`: anything below it is static data, a table, or null.
+pub(crate) fn heap_payload_start(heap_base: u32) -> u32 {
+    HeapLayout::new(heap_base).heap_start + BLOCK_HEADER
+}
+
+/// With `rc` as well, `__pack_alloc` marks the blocks it hands the host as raw, so
+/// the verifier's census can tell them from counted objects (rc.rs).
+pub(crate) fn emit_heap_runtime(
+    out: &mut String,
+    heap_base: u32,
+    data_end: u64,
+    debug: bool,
+    rc: bool,
+) {
     let l = HeapLayout::new(heap_base);
     let first_chunk_end = (l.heap_start as u64 + INITIAL_HEAP as u64).max(data_end);
     let initial_pages = first_chunk_end.div_ceil(65536);
@@ -494,11 +510,18 @@ pub(crate) fn emit_heap_runtime(out: &mut String, heap_base: u32, data_end: u64,
     } else {
         String::new()
     };
+    let mark_raw = if debug && rc {
+        format!(
+            "    local.tee $size\n    i32.const {BLOCK_HEADER}\n    i32.sub\n    i32.const {RAW_RC}\n    i32.store\n    local.get $size\n"
+        )
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
         r#"  (func (export "__pack_alloc") (param $size i32) (result i32)
     local.get $size
     call $__alloc
-  )
+{mark_raw}  )
   (func (export "__pack_free") (param $ptr i32) (param $len i32)
 {check_len}    local.get $ptr
     call $__free

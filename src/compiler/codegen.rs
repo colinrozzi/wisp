@@ -265,6 +265,9 @@ pub(crate) fn gen_expr(
         Expr::Var(name) => {
             let (idx, ty) = env.lookup(name);
             out.push_str(&format!("{}local.get {}\n", pad, idx));
+            if rc_on() && is_counted(&ty) && !rc_is_last(expr) {
+                emit_dup(out, &pad);
+            }
             ty
         }
         Expr::Call { name, args } => {
@@ -296,8 +299,10 @@ pub(crate) fn gen_expr(
                 panic!("if condition must be s32");
             }
             let result_ty = expr_type(then_branch, env, signatures, globals, records, variants);
+            let branch_drops = rc_branch_drops(&[then_branch, else_branch], &[&[], &[]]);
             out.push_str(&format!("{}(if (result {})\n", pad, wat_type(&result_ty)));
             out.push_str(&format!("{}  (then\n", pad));
+            emit_drop_names(out, &format!("{pad}    "), env, &branch_drops[0]);
             gen_expr(
                 then_branch,
                 out,
@@ -311,6 +316,7 @@ pub(crate) fn gen_expr(
             );
             out.push_str(&format!("{}  )\n", pad));
             out.push_str(&format!("{}  (else\n", pad));
+            emit_drop_names(out, &format!("{pad}    "), env, &branch_drops[1]);
             let else_ty = gen_expr(
                 else_branch,
                 out,
@@ -335,21 +341,41 @@ pub(crate) fn gen_expr(
         Expr::Let {
             name, value, body, ..
         } => {
+            // RC: a string-addr/any-addr here keeps its object alive to the end of
+            // the body (§3.6), so the body cannot end in a tail call.
+            let keeps_alive = rc_on() && (has_direct_addr(value) || has_direct_addr(body));
+            if keeps_alive {
+                rc_push_addr_frame();
+            }
             let value_ty = gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
             // Only save to local if value type is not unit (unit leaves nothing on stack)
             let has_binding = !is_unit_type(&value_ty);
             if has_binding {
-                let idx = env.declare_local(value_ty);
+                let idx = env.declare_local(value_ty.clone());
                 out.push_str(&format!("{}local.set {}\n", pad, idx));
                 env.push_binding(name.clone(), idx);
+                if rc_on() && is_counted(&value_ty) && !rc_live_in(body).contains(name) {
+                    emit_drop_local(out, &pad, idx, &value_ty);
+                }
             }
             let body_ty = gen_expr(
-                body, out, indent, env, signatures, globals, records, variants, is_tail,
+                body,
+                out,
+                indent,
+                env,
+                signatures,
+                globals,
+                records,
+                variants,
+                is_tail && !keeps_alive,
             );
             if has_binding {
                 env.pop_binding();
+            }
+            if keeps_alive {
+                rc_pop_addr_frame(out, &pad);
             }
             body_ty
         }
@@ -370,7 +396,11 @@ pub(crate) fn gen_expr(
                 );
                 if !is_last && !is_unit_type(&last_ty) {
                     // Drop the value of non-final expressions (only if they return a value)
-                    out.push_str(&format!("{}drop\n", pad));
+                    if rc_on() && is_counted(&last_ty) {
+                        emit_drop(out, &pad, &last_ty);
+                    } else {
+                        out.push_str(&format!("{}drop\n", pad));
+                    }
                 }
             }
             last_ty
@@ -441,6 +471,9 @@ pub(crate) fn gen_expr(
         Expr::GlobalGet { name } => {
             out.push_str(&format!("{}global.get {}\n", pad, name));
             let (ty, _) = globals.get(name).expect("global should exist");
+            if rc_on() && is_counted(ty) {
+                emit_dup(out, &pad);
+            }
             ty.clone()
         }
         Expr::GlobalSet { name, value } => {
@@ -451,9 +484,21 @@ pub(crate) fn gen_expr(
             );
             let value_local = env.declare_local(value_ty.clone());
             out.push_str(&format!("{}local.set {}\n", pad, value_local));
+            // RC: the global owns its value; drop the old one after the store (the
+            // new value may be built from it), and return a second reference.
+            let counted = rc_on() && is_counted(&value_ty);
+            if counted {
+                out.push_str(&format!("{}global.get {}\n", pad, name));
+            }
             out.push_str(&format!("{}local.get {}\n", pad, value_local));
             out.push_str(&format!("{}global.set {}\n", pad, name));
+            if counted {
+                emit_drop(out, &pad, &value_ty);
+            }
             out.push_str(&format!("{}local.get {}\n", pad, value_local));
+            if counted {
+                emit_dup(out, &pad);
+            }
             value_ty
         }
         Expr::RecordConstruct {
@@ -538,6 +583,11 @@ pub(crate) fn gen_expr(
             gen_expr(
                 expr, out, indent, env, signatures, globals, records, variants, false,
             );
+            let rec_local = rc_on().then(|| {
+                let l = env.declare_local(Type::S32);
+                out.push_str(&format!("{}local.tee {}\n", pad, l));
+                l
+            });
 
             // Add offset if non-zero
             if offset > 0 {
@@ -568,6 +618,12 @@ pub(crate) fn gen_expr(
                 | Type::Any => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
+            if let Some(l) = rec_local {
+                if is_counted(&field_def.ty) {
+                    emit_dup(out, &pad);
+                }
+                emit_drop_local(out, &pad, l, &Type::Record(record_name.clone()));
+            }
             field_def.ty.clone()
         }
         Expr::VariantConstruct {
@@ -656,12 +712,36 @@ pub(crate) fn gen_expr(
             let value_ptr = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.set {}\n", pad, value_ptr));
 
-            // Desugar a `_` wildcard the same way the checker did.
+            // Desugar a `_` wildcard the same way the checker did. Arms written in
+            // the source are used as they are (RC's analysis knows those nodes);
+            // the arms a wildcard expands to are clones, analysed here.
             let effective = expand_match_wildcard(cases, &expr_ty, variants);
-            let cases = &effective;
+            let arm_refs: Vec<&MatchArm> = effective
+                .iter()
+                .map(|a| {
+                    cases
+                        .iter()
+                        .find(|o| o.case_name == a.case_name)
+                        .unwrap_or(a)
+                })
+                .collect();
+            let synthesized: Vec<&MatchArm> = arm_refs
+                .iter()
+                .copied()
+                .filter(|a| !cases.iter().any(|o| std::ptr::eq(o, *a)))
+                .collect();
+            let overlay = rc_on() && !synthesized.is_empty();
+            if overlay {
+                rc_push_overlay(expr, &synthesized);
+            }
+            let cases = &arm_refs;
+            // RC: per arm, the outer bindings that die at its start.
+            let arm_bodies: Vec<&Expr> = cases.iter().map(|a| &a.body).collect();
+            let arm_names: Vec<&[String]> = cases.iter().map(|a| a.bindings.as_slice()).collect();
+            let arm_drops = rc_branch_drops(&arm_bodies, &arm_names);
 
             // Handle Option, Result, and Variant types
-            match &expr_ty {
+            let match_result = match &expr_ty {
                 Type::Option(inner_ty) => {
                     // Option: discriminant 0 = none, 1 = some
                     // Load discriminant
@@ -695,6 +775,7 @@ pub(crate) fn gen_expr(
                         }
 
                         // Load payload for 'some' case
+                        emit_drop_names(out, &format!("{pad}    "), env, &arm_drops[i]);
                         let saved_binding_count = env.bindings.len();
                         if arm.case_name == "some" && !arm.bindings.is_empty() {
                             out.push_str(&format!("{}    local.get {}\n", pad, value_ptr));
@@ -723,11 +804,15 @@ pub(crate) fn gen_expr(
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
+                            rc_dup_binding(out, &pad, inner_ty, &arm.body, &arm.bindings[0]);
                             let idx = env.declare_local((**inner_ty).clone());
                             out.push_str(&format!("{}    local.set {}\n", pad, idx));
                             env.push_binding(arm.bindings[0].clone(), idx);
                         }
 
+                        if rc_on() {
+                            emit_drop_local(out, &format!("{pad}    "), value_ptr, &expr_ty);
+                        }
                         // Generate arm body - inherits tail position
                         gen_expr(
                             &arm.body,
@@ -799,6 +884,7 @@ pub(crate) fn gen_expr(
                         }
 
                         // Load payload
+                        emit_drop_names(out, &format!("{pad}    "), env, &arm_drops[i]);
                         let saved_binding_count = env.bindings.len();
                         if !arm.bindings.is_empty() {
                             out.push_str(&format!("{}    local.get {}\n", pad, value_ptr));
@@ -827,11 +913,15 @@ pub(crate) fn gen_expr(
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
+                            rc_dup_binding(out, &pad, &payload_ty, &arm.body, &arm.bindings[0]);
                             let idx = env.declare_local(payload_ty.clone());
                             out.push_str(&format!("{}    local.set {}\n", pad, idx));
                             env.push_binding(arm.bindings[0].clone(), idx);
                         }
 
+                        if rc_on() {
+                            emit_drop_local(out, &format!("{pad}    "), value_ptr, &expr_ty);
+                        }
                         // Generate arm body - inherits tail position
                         gen_expr(
                             &arm.body,
@@ -907,6 +997,7 @@ pub(crate) fn gen_expr(
                         }
 
                         // Load payload values into locals and bind them
+                        emit_drop_names(out, &format!("{pad}    "), env, &arm_drops[i]);
                         let saved_binding_count = env.bindings.len();
                         let mut payload_offset = 4;
                         for (binding, payload_ty) in arm.bindings.iter().zip(case.payload.iter()) {
@@ -937,6 +1028,7 @@ pub(crate) fn gen_expr(
                             };
                             out.push_str(&format!("{}    {}\n", pad, load_instr));
 
+                            rc_dup_binding(out, &pad, payload_ty, &arm.body, binding);
                             // Save to local
                             let idx = env.declare_local(payload_ty.clone());
                             out.push_str(&format!("{}    local.set {}\n", pad, idx));
@@ -945,6 +1037,9 @@ pub(crate) fn gen_expr(
                             payload_offset += type_size(payload_ty);
                         }
 
+                        if rc_on() {
+                            emit_drop_local(out, &format!("{pad}    "), value_ptr, &expr_ty);
+                        }
                         // Generate arm body - inherits tail position
                         gen_expr(
                             &arm.body,
@@ -984,7 +1079,11 @@ pub(crate) fn gen_expr(
                     result_ty
                 }
                 _ => panic!("match expression must be variant, option, or result"),
+            };
+            if overlay {
+                rc_pop_overlay();
             }
+            match_result
         }
         // Option: some - allocate, store discriminant 1, store value
         Expr::Some { inner_type, value } => {
@@ -1244,56 +1343,15 @@ pub(crate) fn gen_expr(
             let value_local = env.declare_local(elem_type.clone());
             out.push_str(&format!("{}local.set {}\n", pad, value_local));
 
-            // Value semantics: unless nothing can see the old list again, push
-            // into a copy with room for one more element (see last_use.rs).
-            if !push_in_place(list) {
-                let copy_local = env.declare_local(Type::S32);
-                let copy_data = env.declare_local(Type::S32);
-                emit_alloc_const(out, &pad, 12);
-                out.push_str(&format!("{}local.set {}\n", pad, copy_local));
-                // data = alloc((len + 1) * elem_size); copy len elements into it
-                out.push_str(&format!("{}local.get {}\n", pad, list_local));
-                out.push_str(&format!("{}i32.load\n", pad));
-                out.push_str(&format!("{}i32.const 1\n{}i32.add\n", pad, pad));
-                out.push_str(&format!("{}i32.const {}\n{}i32.mul\n", pad, elem_size, pad));
-                out.push_str(&format!("{}call $__alloc\n", pad));
-                out.push_str(&format!("{}local.set {}\n", pad, copy_data));
-                out.push_str(&format!("{}local.get {}\n", pad, copy_data));
-                out.push_str(&format!("{}local.get {}\n", pad, list_local));
-                out.push_str(&format!("{}i32.load offset=8\n", pad));
-                out.push_str(&format!("{}local.get {}\n", pad, list_local));
-                out.push_str(&format!("{}i32.load\n", pad));
-                out.push_str(&format!("{}i32.const {}\n{}i32.mul\n", pad, elem_size, pad));
-                out.push_str(&format!("{}memory.copy\n", pad));
-                // header: len, cap = (block size - header) / elem_size, data
-                out.push_str(&format!("{}local.get {}\n", pad, copy_local));
-                out.push_str(&format!("{}local.get {}\n", pad, list_local));
-                out.push_str(&format!("{}i32.load\n", pad));
-                out.push_str(&format!("{}i32.store\n", pad));
-                out.push_str(&format!("{}local.get {}\n", pad, copy_local));
-                out.push_str(&format!("{}local.get {}\n", pad, copy_data));
+            // RC (§3.4): write in place only when this is the list's only
+            // reference; otherwise push into a copy (see emit_list_copy).
+            if rc_on() {
                 out.push_str(&format!(
-                    "{}i32.const {}\n{}i32.sub\n",
-                    pad,
-                    BLOCK_HEADER - 4,
-                    pad
+                    "{pad}local.get {list_local}\n{pad}i32.const 8\n{pad}i32.sub\n{pad}i32.load\n{pad}i32.const 1\n{pad}i32.ne\n{pad}if\n"
                 ));
-                out.push_str(&format!("{}i32.load\n", pad));
+                let copy = emit_list_copy(out, &format!("{pad}  "), env, list_local, &elem_type);
                 out.push_str(&format!(
-                    "{}i32.const {}\n{}i32.sub\n",
-                    pad, BLOCK_HEADER, pad
-                ));
-                out.push_str(&format!(
-                    "{}i32.const {}\n{}i32.div_u\n",
-                    pad, elem_size, pad
-                ));
-                out.push_str(&format!("{}i32.store offset=4\n", pad));
-                out.push_str(&format!("{}local.get {}\n", pad, copy_local));
-                out.push_str(&format!("{}local.get {}\n", pad, copy_data));
-                out.push_str(&format!("{}i32.store offset=8\n", pad));
-                out.push_str(&format!(
-                    "{}local.get {}\n{}local.set {}\n",
-                    pad, copy_local, pad, list_local
+                    "{pad}  local.get {copy}\n{pad}  local.set {list_local}\n{pad}end\n"
                 ));
             }
 
@@ -1438,15 +1496,29 @@ pub(crate) fn gen_expr(
                 _ => "i32.load",
             };
             out.push_str(&format!("{}{}\n", pad, load_instr));
+            if rc_on() {
+                if is_counted(&elem_type) {
+                    emit_dup(out, &pad);
+                }
+                emit_drop_local(out, &pad, list_local, &list_ty);
+            }
             elem_type
         }
         // List: len - return length
         Expr::ListLen { list } => {
-            gen_expr(
+            let operand_ty = gen_expr(
                 list, out, indent, env, signatures, globals, records, variants, false,
             );
+            let operand = rc_on().then(|| {
+                let l = env.declare_local(Type::S32);
+                out.push_str(&format!("{}local.tee {}\n", pad, l));
+                l
+            });
             // Load len field at offset 0
             out.push_str(&format!("{}i32.load\n", pad));
+            if let Some(l) = operand {
+                emit_drop_local(out, &pad, l, &operand_ty.clone());
+            }
             Type::S32
         }
         // String: len - return length
@@ -1454,8 +1526,16 @@ pub(crate) fn gen_expr(
             gen_expr(
                 string, out, indent, env, signatures, globals, records, variants, false,
             );
+            let operand = rc_on().then(|| {
+                let l = env.declare_local(Type::S32);
+                out.push_str(&format!("{}local.tee {}\n", pad, l));
+                l
+            });
             // Load len field at offset 0 (string layout: 4 bytes len + data)
             out.push_str(&format!("{}i32.load\n", pad));
+            if let Some(l) = operand {
+                emit_drop_local(out, &pad, l, &Type::Str);
+            }
             Type::S32
         }
         // String: ref - get byte at index
@@ -1465,6 +1545,11 @@ pub(crate) fn gen_expr(
             gen_expr(
                 string, out, indent, env, signatures, globals, records, variants, false,
             );
+            let operand = rc_on().then(|| {
+                let l = env.declare_local(Type::S32);
+                out.push_str(&format!("{}local.tee {}\n", pad, l));
+                l
+            });
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
             gen_expr(
@@ -1472,6 +1557,9 @@ pub(crate) fn gen_expr(
             );
             out.push_str(&format!("{}i32.add\n", pad));
             out.push_str(&format!("{}i32.load8_u\n", pad));
+            if let Some(l) = operand {
+                emit_drop_local(out, &pad, l, &Type::Str);
+            }
             Type::S32
         }
         // String: substring - extract portion of string
@@ -1534,6 +1622,9 @@ pub(crate) fn gen_expr(
 
             // Return new string pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            if rc_on() {
+                emit_drop_local(out, &pad, str_local, &Type::Str);
+            }
             Type::Str
         }
         // String: append - concatenate two strings
@@ -1577,7 +1668,15 @@ pub(crate) fn gen_expr(
             gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
+            let operand = rc_on().then(|| {
+                let l = env.declare_local(Type::S32);
+                out.push_str(&format!("{}local.tee {}\n", pad, l));
+                l
+            });
             out.push_str(&format!("{}i32.load offset=28\n", pad));
+            if let Some(l) = operand {
+                emit_drop_local(out, &pad, l, &Type::Any);
+            }
             Type::S32
         }
         Expr::AnyFromString { value } => {
@@ -1643,16 +1742,25 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}memory.copy\n", pad));
             // Result: the `any` pointer.
             out.push_str(&format!("{}local.get {}\n", pad, ptr));
+            if rc_on() {
+                emit_drop_local(out, &pad, s_local, &Type::Str);
+            }
             Type::Any
         }
         Expr::AnyToString { value } => {
-            // Zero-copy: a CGRF string payload [len:u32][bytes] sits at blob+28,
-            // which is exactly a Wisp string, so return a pointer to it.
+            // A CGRF string payload [len:u32][bytes] sits at blob+28, the shape of a
+            // Wisp string: copy it out (§3.6), then drop the blob.
             gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
+            let blob = env.declare_local(Type::S32);
+            out.push_str(&format!("{}local.tee {}\n", pad, blob));
             out.push_str(&format!("{}i32.const 28\n", pad));
             out.push_str(&format!("{}i32.add\n", pad));
+            emit_copy_len_prefixed(out, &pad, env);
+            if rc_on() {
+                emit_drop_local(out, &pad, blob, &Type::Any);
+            }
             Type::Str
         }
         Expr::HeapAlloc { size } => {
@@ -1662,6 +1770,9 @@ pub(crate) fn gen_expr(
                 size, out, indent, env, signatures, globals, records, variants, false,
             );
             out.push_str(&format!("{}call $__alloc\n", pad));
+            if rc_debug() {
+                emit_mark_raw(out, &pad, env);
+            }
             Type::S32
         }
         Expr::HeapFree { ptr } => {
@@ -1675,33 +1786,34 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}call $__heap_stats\n", pad));
             Type::S32
         }
-        Expr::AnyAddr { value } => {
-            // Pure reinterpret: an `any` is already the i32 address of its blob.
-            gen_expr(
+        Expr::AnyAddr { value } | Expr::StringAddr { value } => {
+            // An `any` or a string is already the i32 address of its blob or of
+            // [len][bytes]. RC: the address is a borrow, valid while the object is
+            // alive, so the object is kept alive to the end of the enclosing `let`
+            // body or function (§3.6).
+            let ty = gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
+            if rc_on() {
+                let l = env.declare_local(Type::S32);
+                out.push_str(&format!("{}local.tee {}\n", pad, l));
+                rc_keep_alive(l, ty);
+            }
             Type::S32
         }
-        Expr::AnyFromAddr { value } => {
-            // Pure reinterpret: a blob address is an `any`.
+        Expr::AnyFromAddr { value } | Expr::StringFromAddr { value } => {
+            // Copy [len:u32][len bytes] at the address into a new object: an `any`
+            // blob and a string have that shape. A copy, so the object never points
+            // into memory it does not own (§3.6).
             gen_expr(
                 value, out, indent, env, signatures, globals, records, variants, false,
             );
-            Type::Any
-        }
-        Expr::StringAddr { value } => {
-            // Pure reinterpret: a string is already the i32 address of [len][bytes].
-            gen_expr(
-                value, out, indent, env, signatures, globals, records, variants, false,
-            );
-            Type::S32
-        }
-        Expr::StringFromAddr { value } => {
-            // Pure reinterpret: an address of [len][bytes] is a string.
-            gen_expr(
-                value, out, indent, env, signatures, globals, records, variants, false,
-            );
-            Type::Str
+            emit_copy_len_prefixed(out, &pad, env);
+            if matches!(expr, Expr::AnyFromAddr { .. }) {
+                Type::Any
+            } else {
+                Type::Str
+            }
         }
         Expr::RawInvoke {
             module,
@@ -1767,7 +1879,11 @@ pub(crate) fn gen_expr(
                 pad, any_len, pad
             ));
             // Same ownership rule as the import wrapper: status 1 means the
-            // result buffer came from our `__pack_alloc`. The blob is the caller's.
+            // result buffer came from our `__pack_alloc`. RC: the argument blob is
+            // consumed.
+            if rc_on() {
+                emit_drop_local(out, &pad, blob, &Type::Any);
+            }
             out.push_str(&format!(
                 "{pad}local.get {status}\n{pad}i32.const 1\n{pad}i32.eq\n{pad}if\n\
                  {pad}  local.get {slots}\n{pad}  i32.load\n{pad}  call $__free\n{pad}end\n\
@@ -1853,6 +1969,10 @@ pub(crate) fn gen_expr(
 
             // Return new string pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            if rc_on() {
+                emit_drop_local(out, &pad, left_local, &Type::Str);
+                emit_drop_local(out, &pad, right_local, &Type::Str);
+            }
             Type::Str
         }
         // String: equality - compare two strings
@@ -1942,6 +2062,10 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}    end ;; comparison result block\n", pad));
             out.push_str(&format!("{}  end ;; if\n", pad));
             out.push_str(&format!("{}end ;; string-eq outer\n", pad));
+            if rc_on() {
+                emit_drop_local(out, &pad, left_local, &Type::Str);
+                emit_drop_local(out, &pad, right_local, &Type::Str);
+            }
             Type::S32
         }
         // String: from-bytes - create string from list<u8>
@@ -1989,6 +2113,9 @@ pub(crate) fn gen_expr(
 
             // Return new string pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            if rc_on() {
+                emit_drop_local(out, &pad, bytes_local, &Type::List(Box::new(Type::U8)));
+            }
             Type::Str
         }
         // String: to-bytes - convert string to list<u8>
@@ -2036,6 +2163,9 @@ pub(crate) fn gen_expr(
 
             // Return new list pointer
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
+            if rc_on() {
+                emit_drop_local(out, &pad, str_local, &Type::Str);
+            }
             Type::List(Box::new(Type::U8))
         }
     }
@@ -2076,6 +2206,15 @@ impl CodegenEnv {
         self.bindings.pop();
     }
 
+    /// The binding of `name`, if there is one.
+    fn try_lookup(&self, name: &str) -> Option<(u32, Type)> {
+        self.bindings
+            .iter()
+            .rev()
+            .any(|(n, _)| n == name)
+            .then(|| self.lookup(name))
+    }
+
     fn lookup(&self, name: &str) -> (u32, Type) {
         let (_name, idx) = self
             .bindings
@@ -2090,6 +2229,138 @@ impl CodegenEnv {
             self.locals[local_idx].clone()
         };
         (*idx, ty)
+    }
+}
+
+/// RC: for each of the alternative bodies of an `if` or a `match` (with the names
+/// each one binds), the bindings live before the branch point that die at the
+/// start of that body, sorted.
+fn rc_branch_drops(bodies: &[&Expr], binds: &[&[String]]) -> Vec<Vec<String>> {
+    if !rc_on() {
+        return vec![Vec::new(); bodies.len()];
+    }
+    let outer: Vec<HashSet<String>> = bodies
+        .iter()
+        .zip(binds)
+        .map(|(b, names)| {
+            let mut live = rc_live_in(b);
+            for n in *names {
+                live.remove(n);
+            }
+            live
+        })
+        .collect();
+    let all: HashSet<String> = outer.iter().flatten().cloned().collect();
+    outer
+        .iter()
+        .map(|live| {
+            let mut dead: Vec<String> = all.difference(live).cloned().collect();
+            dead.sort();
+            dead
+        })
+        .collect()
+}
+
+/// RC: drop the counted bindings named `names`.
+fn emit_drop_names(out: &mut String, pad: &str, env: &CodegenEnv, names: &[String]) {
+    for n in names {
+        if let Some((idx, ty)) = env.try_lookup(n)
+            && is_counted(&ty)
+        {
+            emit_drop_local(out, pad, idx, &ty);
+        }
+    }
+}
+
+/// RC: a match binding of a counted type that its arm uses takes its own
+/// reference (the scrutinee is dropped after the bindings). The loaded value is on
+/// the stack.
+fn rc_dup_binding(out: &mut String, pad: &str, ty: &Type, body: &Expr, name: &str) {
+    if rc_on() && is_counted(ty) && rc_live_in(body).contains(name) {
+        emit_dup(out, &format!("{pad}    "));
+    }
+}
+
+/// Copy the [len:u32][len bytes] object whose address is on the stack into a new
+/// block; leaves the new address.
+fn emit_copy_len_prefixed(out: &mut String, pad: &str, env: &mut CodegenEnv) {
+    let src = env.declare_local(Type::S32);
+    let dst = env.declare_local(Type::S32);
+    out.push_str(&format!(
+        "{pad}local.tee {src}\n{pad}i32.load\n{pad}i32.const 4\n{pad}i32.add\n{pad}call $__alloc\n{pad}local.tee {dst}\n\
+         {pad}local.get {src}\n{pad}local.get {src}\n{pad}i32.load\n{pad}i32.const 4\n{pad}i32.add\n{pad}memory.copy\n{pad}local.get {dst}\n"
+    ));
+}
+
+/// Mark the block whose payload address is on the stack as raw (debug RC builds:
+/// the verifier skips raw blocks). The address stays on the stack.
+fn emit_mark_raw(out: &mut String, pad: &str, env: &mut CodegenEnv) {
+    let p = env.declare_local(Type::S32);
+    out.push_str(&format!(
+        "{pad}local.tee {p}\n{pad}i32.const 8\n{pad}i32.sub\n{pad}i32.const {RAW_RC}\n{pad}i32.store\n{pad}local.get {p}\n"
+    ));
+}
+
+/// RC: a copy of the list in `list_local` with room for one more element, its
+/// elements dupped; the original loses this reference (it has others, or this
+/// would not be a copy). Returns the local holding the copy.
+fn emit_list_copy(
+    out: &mut String,
+    pad: &str,
+    env: &mut CodegenEnv,
+    list_local: u32,
+    elem_type: &Type,
+) -> u32 {
+    let elem_size = type_size(elem_type);
+    let copy = env.declare_local(Type::S32);
+    let data = env.declare_local(Type::S32);
+    let i = env.declare_local(Type::S32);
+    emit_alloc_const(out, pad, 12);
+    out.push_str(&format!("{pad}local.set {copy}\n"));
+    // data = alloc((len + 1) * elem_size); copy len elements into it
+    out.push_str(&format!(
+        "{pad}local.get {list_local}\n{pad}i32.load\n{pad}i32.const 1\n{pad}i32.add\n{pad}i32.const {elem_size}\n{pad}i32.mul\n{pad}call $__alloc\n{pad}local.set {data}\n"
+    ));
+    out.push_str(&format!(
+        "{pad}local.get {data}\n{pad}local.get {list_local}\n{pad}i32.load offset=8\n{pad}local.get {list_local}\n{pad}i32.load\n{pad}i32.const {elem_size}\n{pad}i32.mul\n{pad}memory.copy\n"
+    ));
+    // header: len, cap = (block size - header) / elem_size, data
+    out.push_str(&format!(
+        "{pad}local.get {copy}\n{pad}local.get {list_local}\n{pad}i32.load\n{pad}i32.store\n\
+         {pad}local.get {copy}\n{pad}local.get {data}\n{pad}i32.const {sz_off}\n{pad}i32.sub\n{pad}i32.load\n{pad}i32.const {BLOCK_HEADER}\n{pad}i32.sub\n{pad}i32.const {elem_size}\n{pad}i32.div_u\n{pad}i32.store offset=4\n\
+         {pad}local.get {copy}\n{pad}local.get {data}\n{pad}i32.store offset=8\n",
+        sz_off = BLOCK_HEADER - 4,
+    ));
+    // the copy holds a second reference to every element
+    if is_counted(elem_type) {
+        out.push_str(&format!(
+            "{pad}i32.const 0\n{pad}local.set {i}\n{pad}block\n{pad}  loop\n\
+             {pad}    local.get {i}\n{pad}    local.get {list_local}\n{pad}    i32.load\n{pad}    i32.ge_u\n{pad}    br_if 1\n\
+             {pad}    local.get {data}\n{pad}    local.get {i}\n{pad}    i32.const {elem_size}\n{pad}    i32.mul\n{pad}    i32.add\n{pad}    i32.load\n{pad}    call $__dup\n{pad}    drop\n\
+             {pad}    local.get {i}\n{pad}    i32.const 1\n{pad}    i32.add\n{pad}    local.set {i}\n{pad}    br 0\n{pad}  end\n{pad}end\n"
+        ));
+    }
+    // the original keeps its other references
+    out.push_str(&format!(
+        "{pad}local.get {list_local}\n{pad}i32.const 8\n{pad}i32.sub\n{pad}local.get {list_local}\n{pad}i32.const 8\n{pad}i32.sub\n{pad}i32.load\n{pad}i32.const 1\n{pad}i32.sub\n{pad}i32.store\n"
+    ));
+    copy
+}
+
+/// RC, end of an export wrapper: the result is encoded, so drop it; in debug
+/// builds mark the output buffer raw and verify the heap (§5.5).
+fn rc_export_finish(out: &mut String, return_type: &Type) {
+    if !rc_on() {
+        return;
+    }
+    if is_counted(return_type) {
+        out.push_str("    local.get $value\n");
+        emit_drop(out, "    ", return_type);
+    }
+    if rc_debug() {
+        out.push_str(&format!(
+            "    local.get $out_ptr\n    i32.const 8\n    i32.sub\n    i32.const {RAW_RC}\n    i32.store\n    call $__heap_verify\n    drop\n"
+        ));
     }
 }
 
@@ -3388,15 +3659,16 @@ pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 /// - Memory layout with input buffer at 0x0, output at 0x4000
 ///
 /// `emit.debug_heap` (or `GRANITE_DEBUG_HEAP=1`) builds the debug heap: see
-/// `emit_heap_runtime`. `emit.value_lists` (or `GRANITE_VALUE_LISTS=1`) gives
-/// `list-push` value semantics: see `last_use.rs`.
+/// `emit_heap_runtime`. `emit.rc` (or `GRANITE_RC=1`) counts references: see
+/// `rc.rs`.
 pub(crate) fn generate_wat_pack(
     prog: &Program,
     signatures: &HashMap<String, Signature>,
     emit: &EmitOptions,
 ) -> String {
     let debug_heap = emit.debug_heap || debug_heap_from_env();
-    let value_lists = emit.value_lists || value_lists_from_env();
+    let rc = emit.rc || rc_from_env();
+    let _rc = rc.then(|| RcModuleScope::enter(debug_heap));
     let _static_strings = StaticStringsScope::enter();
     let mut out = String::new();
     out.push_str("(module\n");
@@ -3510,7 +3782,19 @@ pub(crate) fn generate_wat_pack(
     for func in &prog.functions {
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
-        let _last_uses = value_lists.then(|| LastUseScope::enter(&func.body));
+        // RC: parameters are owned; drop the ones the body never uses. A
+        // string-addr/any-addr outside any `let` keeps its object alive to the end
+        // of the body, which then cannot end in a tail call.
+        let keeps_alive = rc && has_direct_addr(&func.body);
+        if rc {
+            rc_enter_function(&func.body);
+            let live = rc_live_in(&func.body);
+            for (i, param) in func.params.iter().enumerate() {
+                if is_counted(&param.ty) && !live.contains(&param.name) {
+                    emit_drop_local(&mut body, "    ", i as u32, &param.ty);
+                }
+            }
+        }
         gen_expr(
             &func.body,
             &mut body,
@@ -3520,8 +3804,11 @@ pub(crate) fn generate_wat_pack(
             &globals_map,
             &records_map,
             &variants_map,
-            true, // Function body is in tail position
+            !keeps_alive, // Function body is in tail position
         );
+        if rc {
+            rc_pop_addr_frame(&mut body, "    ");
+        }
 
         out.push_str(&format!("  (func ${} ", func.name));
         for param in &func.params {
@@ -3571,7 +3858,14 @@ pub(crate) fn generate_wat_pack(
         .map(|seg| seg.offset as u32 as u64 + seg.bytes.len() as u64)
         .max()
         .unwrap_or(0);
-    emit_heap_runtime(&mut out, heap_base, data_end, debug_heap);
+    emit_heap_runtime(&mut out, heap_base, data_end, debug_heap, rc);
+    emit_rc_runtime(
+        &mut out,
+        heap_payload_start(heap_base),
+        &prog.globals,
+        &records_map,
+        &variants_map,
+    );
 
     out.push_str(")\n");
     out
@@ -3874,6 +4168,7 @@ pub(crate) fn generate_pack_wrapper(
         out.push_str("    local.get $out_len_ptr\n");
         out.push_str("    local.get $any_len\n");
         out.push_str("    i32.store\n");
+        rc_export_finish(out, &func.return_type);
         out.push_str("    i32.const 0\n");
         out.push_str("  )\n");
         return;
@@ -3979,6 +4274,7 @@ pub(crate) fn generate_pack_wrapper(
     out.push_str("    local.get $out_len_ptr\n");
     out.push_str("    local.get $bytes_written\n");
     out.push_str("    i32.store\n");
+    rc_export_finish(out, &func.return_type);
     out.push_str("    ;; Return 0 for success\n");
     out.push_str("    i32.const 0\n");
 
@@ -4581,6 +4877,16 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
         // Set in_len from buf_cursor
         out.push_str("    local.get $buf_cursor\n");
         out.push_str("    local.set $in_len\n");
+    }
+
+    // RC: the arguments are owned; they are encoded now, so drop them.
+    if rc_on() {
+        for param in &import.params {
+            if is_counted(&param.ty) {
+                out.push_str(&format!("    local.get ${}\n", param.name));
+                emit_drop(out, "    ", &param.ty);
+            }
+        }
     }
 
     // Call the raw import (guest-allocates ABI)

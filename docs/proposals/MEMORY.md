@@ -606,6 +606,33 @@ Wisp loop, repeated `define`, repeated `require`, 10,000 trigger firings; a
 use-after-free test suite (debug poisoning traps); the cycle program from §2.2 now
 returns 1 (no cycle).
 
+*As built (ticket 0026, `src/compiler/rc.rs`):*
+- Ownership is decided in codegen, not in a separate pass over the AST: `gen_expr`
+  already knows every expression's type. An expression of a counted type leaves an
+  owned reference; a variable's last use on its path moves it (a backward liveness
+  pass), earlier uses dup it; a binding that dies on a path unused is dropped at
+  the start of that path (after its `let` or parameter, or at the start of the
+  `if` branch or `match` arm), so no drop follows a tail call. Every primitive that
+  reads a counted operand drops it after reading, and dups any child it hands out.
+- `expand_match_wildcard` clones every arm. The pass is keyed by node, so codegen
+  uses the source arms as they are and analyses only the arms a `_` expands to,
+  from the live-after set of the `match`.
+- `string-addr`/`any-addr` keep their object alive to the end of the innermost
+  enclosing `let` (or the function body); only that scope loses its tail call.
+  `string-from-addr`, `any-from-addr` and `any-as-string` copy with RC on or off,
+  since the interpreter now frees its raw buffers after the copy.
+- The verifier walks from the globals, taking one off each object's count per
+  reference and marking it; then every block from the heap start to the frontier
+  must be free (poisoned), raw (marked at `heap-alloc`, `__pack_alloc` and the export
+  output buffer), or reached with a count of exactly 0; a second walk restores the
+  counts. Debug builds run it at the end of every export call.
+- Measured (release, `tests/memory_baseline.rs`): every Wisp evaluation retains 0
+  bytes; the evaluator ends at 19 pages instead of 1165, the self-compile peaks at
+  120 pages instead of 1378 at the same time. The interpreter is 2-3.7 times slower:
+  `(count 1000)` does about 764 dups and 1290 drops per loop iteration, only 24 of
+  which free anything, and no list copies. That is counting on borrowed reads, what
+  borrow inference removes in stage 5.
+
 **Stage 5: make it cheap.** Borrowed-parameter inference, drop-guided reuse,
 `string-append` in place, the global take rule, early drops before tail calls. Remove
 `copy-env`/`copy-list` from the interpreter. Tests: the performance gate in §6.2; the
