@@ -165,6 +165,10 @@ pub(crate) fn generate_wat(prog: &Program, signatures: &HashMap<String, Signatur
         ));
     }
 
+    if needs_heap {
+        emit_legacy_bump_alloc(&mut out);
+    }
+
     // Export memory for component model
     out.push_str("  (export \"memory\" (memory 0))\n");
 
@@ -223,12 +227,8 @@ pub(crate) fn gen_expr(
 
             // Allocate space for the string
             let ptr_local = env.declare_local(Type::S32);
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            emit_alloc_const(out, &pad, total_size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, total_size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store length at ptr
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
@@ -463,19 +463,13 @@ pub(crate) fn gen_expr(
             let record_def = records.get(record_name).expect("record should exist");
             let size = record_def.size();
 
-            // Bump allocate: get current heap_ptr, advance it by record size
+            // Allocate the record
             // Save the base pointer to a local
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // ptr = alloc(size)
+            emit_alloc_const(out, &pad, size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            // heap_ptr += size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store each field at the appropriate offset
             for (i, (field_expr, field_def)) in
@@ -585,18 +579,12 @@ pub(crate) fn gen_expr(
             let (case_idx, case) = variant_def.find_case(case_name).expect("case should exist");
             let size = variant_def.size();
 
-            // Bump allocate: get current heap_ptr, advance it by variant size
+            // Allocate the variant
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // ptr = alloc(size)
+            emit_alloc_const(out, &pad, size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            // heap_ptr += size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store discriminant (case index) at offset 0
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
@@ -1003,15 +991,9 @@ pub(crate) fn gen_expr(
             let size = 4 + type_size(inner_type); // discriminant + payload
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // ptr = alloc(size)
+            emit_alloc_const(out, &pad, size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            // heap_ptr += size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store discriminant = 1 (some)
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
@@ -1043,15 +1025,9 @@ pub(crate) fn gen_expr(
             let size = 4 + type_size(inner_type); // discriminant + payload space
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // ptr = alloc(size)
+            emit_alloc_const(out, &pad, size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            // heap_ptr += size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store discriminant = 0 (none)
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
@@ -1072,15 +1048,9 @@ pub(crate) fn gen_expr(
             let size = 4 + max_payload; // discriminant + max payload
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // ptr = alloc(size)
+            emit_alloc_const(out, &pad, size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            // heap_ptr += size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store discriminant = 0 (ok)
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
@@ -1117,15 +1087,9 @@ pub(crate) fn gen_expr(
             let size = 4 + max_payload; // discriminant + max payload
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // ptr = alloc(size)
+            emit_alloc_const(out, &pad, size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            // heap_ptr += size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store discriminant = 1 (err)
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
@@ -1171,13 +1135,8 @@ pub(crate) fn gen_expr(
             let total_size: usize = value_types.iter().map(type_size).sum();
             let ptr_local = env.declare_local(Type::S32);
 
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            emit_alloc_const(out, &pad, total_size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, total_size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store each field from temp locals
             let mut field_offset = 0;
@@ -1236,15 +1195,9 @@ pub(crate) fn gen_expr(
             let header_size = 12; // 4 bytes len + 4 bytes cap + 4 bytes data ptr
             let ptr_local = env.declare_local(Type::S32);
 
-            // ptr = heap_ptr
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // ptr = alloc(header_size)
+            emit_alloc_const(out, &pad, header_size);
             out.push_str(&format!("{}local.set {}\n", pad, ptr_local));
-
-            // heap_ptr += header_size
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const {}\n", pad, header_size));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
             // Store len = 0
             out.push_str(&format!("{}local.get {}\n", pad, ptr_local));
@@ -1317,15 +1270,26 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}  select\n", pad));
             out.push_str(&format!("{}  local.set {}\n", pad, new_cap_local));
 
-            // new_data = heap_ptr; heap_ptr += new_cap * elem_size
-            out.push_str(&format!("{}  global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}  local.set {}\n", pad, new_data_local));
-            out.push_str(&format!("{}  global.get $__heap_ptr\n", pad));
+            // new_data = alloc(new_cap * elem_size)
             out.push_str(&format!("{}  local.get {}\n", pad, new_cap_local));
             out.push_str(&format!("{}  i32.const {}\n", pad, elem_size));
             out.push_str(&format!("{}  i32.mul\n", pad));
-            out.push_str(&format!("{}  i32.add\n", pad));
-            out.push_str(&format!("{}  global.set $__heap_ptr\n", pad));
+            out.push_str(&format!("{}  call $__alloc\n", pad));
+            out.push_str(&format!("{}  local.set {}\n", pad, new_data_local));
+
+            // The block may hold more than asked (its size class): use it all.
+            // new_cap = (block size - header) / elem_size. With power-of-two
+            // blocks this keeps doubling inside one bucket instead of overflowing
+            // into the next because of the header.
+            out.push_str(&format!("{}  local.get {}\n", pad, new_data_local));
+            out.push_str(&format!("{}  i32.const {}\n", pad, BLOCK_HEADER - 4));
+            out.push_str(&format!("{}  i32.sub\n", pad));
+            out.push_str(&format!("{}  i32.load\n", pad));
+            out.push_str(&format!("{}  i32.const {}\n", pad, BLOCK_HEADER));
+            out.push_str(&format!("{}  i32.sub\n", pad));
+            out.push_str(&format!("{}  i32.const {}\n", pad, elem_size));
+            out.push_str(&format!("{}  i32.div_u\n", pad));
+            out.push_str(&format!("{}  local.set {}\n", pad, new_cap_local));
 
             // memory.copy(new_data, old_data, len * elem_size)
             out.push_str(&format!("{}  local.get {}\n", pad, new_data_local));
@@ -1482,14 +1446,11 @@ pub(crate) fn gen_expr(
 
             // Allocate space for new string: 4 bytes len + new_len bytes
             let new_ptr_local = env.declare_local(Type::S32);
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}local.get {}\n", pad, new_len_local));
             out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            out.push_str(&format!("{}call $__alloc\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
 
             // Store new length at new_ptr
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
@@ -1525,13 +1486,9 @@ pub(crate) fn gen_expr(
             );
             out.push_str(&format!("{}local.set {}\n", pad, n_local));
             let ptr = env.declare_local(Type::S32);
-            // Bump the shared heap by 32 bytes (4 len prefix + 28 CGRF scalar value).
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // Allocate 32 bytes (4 len prefix + 28 CGRF scalar value).
+            emit_alloc_const(out, &pad, 32);
             out.push_str(&format!("{}local.set {}\n", pad, ptr));
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}i32.const 32\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
             // A little helper writes `local.get ptr; i32.const v; <instr> offset=o`.
             {
                 let mut w = |v: String, instr: &str, o: u32| {
@@ -1578,15 +1535,12 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}i32.load\n", pad)); // string byte length
             out.push_str(&format!("{}local.set {}\n", pad, slen));
             let ptr = env.declare_local(Type::S32);
-            // Bump the heap by 32 + slen (4 len prefix + 28 CGRF fixed + bytes).
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, ptr));
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // Allocate 32 + slen bytes (4 len prefix + 28 CGRF fixed + bytes).
             out.push_str(&format!("{}i32.const 32\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
             out.push_str(&format!("{}local.get {}\n", pad, slen));
             out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            out.push_str(&format!("{}call $__alloc\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, ptr));
             // Fixed header fields.
             {
                 let mut w = |v: String, instr: &str, o: u32| {
@@ -1773,14 +1727,11 @@ pub(crate) fn gen_expr(
 
             // Allocate space for new string: 4 bytes len + total_len bytes
             let new_ptr_local = env.declare_local(Type::S32);
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}local.get {}\n", pad, total_len_local));
             out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            out.push_str(&format!("{}call $__alloc\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
 
             // Store total length at new_ptr
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
@@ -1925,16 +1876,13 @@ pub(crate) fn gen_expr(
 
             // Allocate new string: 4 bytes for length + len bytes for data
             let new_ptr_local = env.declare_local(Type::S32);
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
 
-            // Bump heap pointer
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // size = 4 + len
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}local.get {}\n", pad, len_local));
             out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            out.push_str(&format!("{}call $__alloc\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
 
             // Store length in new string
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
@@ -1975,16 +1923,13 @@ pub(crate) fn gen_expr(
 
             // Allocate new list: 4 bytes for length + len bytes for data
             let new_ptr_local = env.declare_local(Type::S32);
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
 
-            // Bump heap pointer
-            out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+            // size = 4 + len
             out.push_str(&format!("{}i32.const 4\n", pad));
             out.push_str(&format!("{}local.get {}\n", pad, len_local));
             out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}i32.add\n", pad));
-            out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
+            out.push_str(&format!("{}call $__alloc\n", pad));
+            out.push_str(&format!("{}local.set {}\n", pad, new_ptr_local));
 
             // Store length in new list
             out.push_str(&format!("{}local.get {}\n", pad, new_ptr_local));
@@ -2424,12 +2369,8 @@ pub(crate) fn generate_abi_wrapper(
                 let size = type_size(&param.ty);
 
                 // Allocate space for the record
-                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+                emit_alloc_const(out, pad, size);
                 out.push_str(&format!("{}local.set {}\n", pad, complex_local_idx));
-                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-                out.push_str(&format!("{}i32.const {}\n", pad, size));
-                out.push_str(&format!("{}i32.add\n", pad));
-                out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
                 // Store each field
                 let mut offset = 0;
@@ -2456,12 +2397,8 @@ pub(crate) fn generate_abi_wrapper(
                 let size = type_size(&param.ty);
 
                 // Allocate space for the variant
-                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
+                emit_alloc_const(out, pad, size);
                 out.push_str(&format!("{}local.set {}\n", pad, complex_local_idx));
-                out.push_str(&format!("{}global.get $__heap_ptr\n", pad));
-                out.push_str(&format!("{}i32.const {}\n", pad, size));
-                out.push_str(&format!("{}i32.add\n", pad));
-                out.push_str(&format!("{}global.set $__heap_ptr\n", pad));
 
                 // Store discriminant (first flat param)
                 out.push_str(&format!("{}local.get {}\n", pad, complex_local_idx));
@@ -3037,16 +2974,16 @@ const CGRF_U64: u8 = 0x0F;
 const CGRF_RESULT: u8 = 0x14;
 const CGRF_ARRAY: u8 = 0x15;
 
-/// Memory layout for Pack packages
-const METADATA_OFFSET: i32 = 0xA000; // Pack metadata segment (8KB reserved)
-/// Static data (string literals) starts here: past the encoder stack (0xB000-0xBFFF)
-/// and past the end of the host's scratch buffer (0x4008 + 32 KiB = 0xC008). The heap
-/// (`$__heap_base`) starts after the static data.
+/// Static data (the Pack metadata, then string literals) starts here: past the
+/// encoder stack (0xB000-0xBFFF) and past the end of the host's scratch buffer
+/// (0x4008 + 32 KiB = 0xC008). The heap (`$__heap_base`) starts after the static
+/// data. (The metadata used to sit at a fixed 0xA000 with 8 KiB reserved; a large
+/// interface ran over the encoder stack, the literals, and the heap.)
 const STATIC_DATA_OFFSET: u32 = 0xC010;
 
-/// String literals placed in static data, one `[len:u32][utf-8 bytes]` object per
-/// distinct literal (the same layout as a heap string). Nothing writes into a string,
-/// so every evaluation of a literal shares the one copy.
+/// Static data: the Pack metadata, and string literals, one `[len:u32][utf-8 bytes]`
+/// object per distinct literal (the same layout as a heap string). Nothing writes into
+/// a string, so every evaluation of a literal shares the one copy.
 #[derive(Default)]
 struct StaticStrings {
     bytes: Vec<u8>,
@@ -3054,6 +2991,16 @@ struct StaticStrings {
 }
 
 impl StaticStrings {
+    /// Place raw bytes (4-aligned) in static data; returns their address.
+    fn place(&mut self, bytes: &[u8]) -> u32 {
+        while !self.bytes.len().is_multiple_of(4) {
+            self.bytes.push(0);
+        }
+        let addr = STATIC_DATA_OFFSET + self.bytes.len() as u32;
+        self.bytes.extend_from_slice(bytes);
+        addr
+    }
+
     fn intern(&mut self, s: &str) -> u32 {
         if let Some(&addr) = self.addrs.get(s) {
             return addr;
@@ -3354,7 +3301,15 @@ pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 /// - Export functions using Pack/Graph ABI calling convention: (i32, i32, i32, i32) -> i32
 /// - CGRF encoding for input/output values
 /// - Memory layout with input buffer at 0x0, output at 0x4000
-pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) -> String {
+///
+/// `debug_heap` (or `GRANITE_DEBUG_HEAP=1`) builds the debug heap: see
+/// `emit_heap_runtime`.
+pub(crate) fn generate_wat_pack(
+    prog: &Program,
+    signatures: &HashMap<String, Signature>,
+    debug_heap: bool,
+) -> String {
+    let debug_heap = debug_heap || debug_heap_from_env();
     let _static_strings = StaticStringsScope::enter();
     let mut out = String::new();
     out.push_str("(module\n");
@@ -3372,11 +3327,6 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
         ));
     }
 
-    // Large fixed memory: the self-hosted compiler never frees its bump heap, so
-    // self-compiling the (now ~130KB) compiler source accumulates well over 1GB of
-    // intermediate strings. 32000 pages = 2GB.
-    out.push_str("  (memory (export \"memory\") 32000 32000)\n");
-
     // Emit data segments
     for seg in &prog.data_segments {
         out.push_str(&format!("  (data (i32.const {}) \"", seg.offset));
@@ -3386,14 +3336,15 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
         out.push_str("\")\n");
     }
 
-    // Emit Pack metadata data segment
+    // Pack metadata, in static data
     let metadata_bytes = encode_pack_metadata(prog);
     let metadata_len = metadata_bytes.len();
-    out.push_str(&format!("  (data (i32.const {}) \"", METADATA_OFFSET));
-    for byte in &metadata_bytes {
-        out.push_str(&format!("\\{:02x}", byte));
-    }
-    out.push_str("\")\n");
+    let metadata_addr = STATIC_STRINGS.with(|t| {
+        t.borrow_mut()
+            .as_mut()
+            .expect("static string table")
+            .place(&metadata_bytes)
+    });
 
     // __pack_types function - returns pointer and length of CGRF-encoded metadata
     // This enables the REPL import system to auto-detect function signatures
@@ -3410,7 +3361,7 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
     ;; Return 0 for success
     i32.const 0)
 "#,
-        METADATA_OFFSET, metadata_len
+        metadata_addr, metadata_len
     ));
 
     // `$__heap_base`/`$__heap_ptr` are declared at the end of the module, once the
@@ -3453,78 +3404,6 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
         .iter()
         .map(|v| (v.name.clone(), v.clone()))
         .collect();
-
-    // Allocator helper that grows memory when needed
-    // Takes size in bytes, returns pointer to allocated block
-    out.push_str(
-        r#"  (func $__alloc (param $size i32) (result i32)
-    (local $ptr i32)
-    (local $end i32)
-    (local $pages_needed i32)
-    ;; Get current heap pointer
-    global.get $__heap_ptr
-    local.set $ptr
-    ;; Calculate end of allocation
-    local.get $ptr
-    local.get $size
-    i32.add
-    local.set $end
-    ;; Check if we need to grow memory
-    ;; memory.size returns pages, multiply by 64KB to get bytes
-    memory.size
-    i32.const 65536
-    i32.mul
-    local.get $end
-    i32.lt_u
-    (if
-      (then
-        ;; Calculate pages needed: (end - current_size + 65535) / 65536
-        local.get $end
-        memory.size
-        i32.const 65536
-        i32.mul
-        i32.sub
-        i32.const 65535
-        i32.add
-        i32.const 65536
-        i32.div_u
-        local.set $pages_needed
-        ;; Grow memory
-        local.get $pages_needed
-        memory.grow
-        ;; Check if grow failed (returns -1)
-        i32.const -1
-        i32.eq
-        (if
-          (then
-            ;; Out of memory - trap
-            unreachable
-          )
-        )
-      )
-    )
-    ;; Bump heap pointer
-    local.get $end
-    global.set $__heap_ptr
-    ;; Return old pointer
-    local.get $ptr
-  )
-"#,
-    );
-
-    // Pack ABI: __pack_alloc and __pack_free exports for the host
-    out.push_str(
-        r#"  (func (export "__pack_alloc") (param $size i32) (result i32)
-    local.get $size
-    call $__alloc
-  )
-  (func (export "__pack_free") (param $ptr i32) (param $len i32)
-    ;; Simple bump allocator doesn't actually free, but we need the export
-    ;; for Pack's ABI. A future optimization could track free lists.
-    nop
-  )
-"#,
-    );
 
     // Generate import wrapper functions. These have the original wisp signature
     // and are called by bare name (describe/self/...); raw-invoked imports call the
@@ -3585,7 +3464,7 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
         );
     }
 
-    // Static string literals (every one is interned by now), then the heap.
+    // Static data (every literal is interned by now), then the heap.
     let heap_base = STATIC_STRINGS.with(|t| {
         let t = t.borrow();
         let t = t.as_ref().expect("static string table");
@@ -3598,14 +3477,13 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
         }
         t.heap_base()
     });
-    out.push_str(&format!(
-        "  (global $__heap_base i32 (i32.const {}))\n",
-        heap_base
-    ));
-    out.push_str(&format!(
-        "  (global $__heap_ptr (mut i32) (i32.const {}))\n",
-        heap_base
-    ));
+    let data_end = prog
+        .data_segments
+        .iter()
+        .map(|seg| seg.offset as u32 as u64 + seg.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    emit_heap_runtime(&mut out, heap_base, data_end, debug_heap);
 
     out.push_str(")\n");
     out
@@ -5827,14 +5705,11 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             out.push_str("    local.set $dec_tmp\n"); // string length
 
             // Allocate wisp string: 4 + length
-            out.push_str("    global.get $__heap_ptr\n");
-            out.push_str("    local.set $dec_result\n");
-            out.push_str("    global.get $__heap_ptr\n");
             out.push_str("    i32.const 4\n");
-            out.push_str("    i32.add\n");
             out.push_str("    local.get $dec_tmp\n");
             out.push_str("    i32.add\n");
-            out.push_str("    global.set $__heap_ptr\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $dec_result\n");
 
             // Store length
             out.push_str("    local.get $dec_result\n");
@@ -5862,12 +5737,8 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             let inner_size = type_size(inner_ty);
             let opt_size = 4 + inner_size;
             out.push_str("    ;; decode option\n");
-            out.push_str("    global.get $__heap_ptr\n");
+            emit_alloc_const(out, "    ", opt_size);
             out.push_str("    local.set $dec_opt_ptr\n");
-            out.push_str("    global.get $__heap_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", opt_size));
-            out.push_str("    i32.add\n");
-            out.push_str("    global.set $__heap_ptr\n");
 
             // Save option node offset for reading child_index
             out.push_str("    local.get $dec_node_offset\n");
@@ -5945,12 +5816,8 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             out.push_str("    local.set $dec_list_len\n");
 
             // Allocate list struct (12 bytes: len, cap, data_ptr)
-            out.push_str("    global.get $__heap_ptr\n");
+            emit_alloc_const(out, "    ", 12);
             out.push_str("    local.set $dec_list_ptr\n");
-            out.push_str("    global.get $__heap_ptr\n");
-            out.push_str("    i32.const 12\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    global.set $__heap_ptr\n");
 
             // Set len
             out.push_str("    local.get $dec_list_ptr\n");
@@ -5965,14 +5832,11 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             out.push_str("    i32.store\n");
 
             // Allocate data array: elem_size * len
-            out.push_str("    global.get $__heap_ptr\n");
-            out.push_str("    local.set $dec_list_data\n");
-            out.push_str("    global.get $__heap_ptr\n");
             out.push_str(&format!("    i32.const {}\n", elem_size));
             out.push_str("    local.get $dec_list_len\n");
             out.push_str("    i32.mul\n");
-            out.push_str("    i32.add\n");
-            out.push_str("    global.set $__heap_ptr\n");
+            out.push_str("    call $__alloc\n");
+            out.push_str("    local.set $dec_list_data\n");
 
             // Set data_ptr
             out.push_str("    local.get $dec_list_ptr\n");
@@ -6046,12 +5910,8 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
 
             // Allocate tuple: sum of type_size for each field
             let tuple_size: usize = elem_types.iter().map(type_size).sum();
-            out.push_str("    global.get $__heap_ptr\n");
+            emit_alloc_const(out, "    ", tuple_size);
             out.push_str("    local.set $dec_tuple_ptr\n");
-            out.push_str("    global.get $__heap_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", tuple_size));
-            out.push_str("    i32.add\n");
-            out.push_str("    global.set $__heap_ptr\n");
 
             // Decode each field
             let mut field_offset = 0;
@@ -6103,12 +5963,8 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             let result_size = 4 + payload_size;
 
             out.push_str("    ;; decode result\n");
-            out.push_str("    global.get $__heap_ptr\n");
+            emit_alloc_const(out, "    ", result_size);
             out.push_str("    local.set $dec_result\n");
-            out.push_str("    global.get $__heap_ptr\n");
-            out.push_str(&format!("    i32.const {}\n", result_size));
-            out.push_str("    i32.add\n");
-            out.push_str("    global.set $__heap_ptr\n");
 
             // Save result pointer (will be overwritten by child decode)
             out.push_str("    local.get $dec_result\n");
@@ -6257,16 +6113,13 @@ pub(crate) fn generate_cgrf_decode_string(out: &mut String) {
     out.push_str("    local.set $str_len\n");
 
     // Allocate space for wisp string: 4 bytes for length + string data
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str("    local.set $str_ptr\n");
 
-    // Update heap pointer: heap_ptr += 4 + str_len
-    out.push_str("    global.get $__heap_ptr\n");
+    // size = 4 + str_len
     out.push_str("    i32.const 4\n");
-    out.push_str("    i32.add\n");
     out.push_str("    local.get $str_len\n");
     out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
+    out.push_str("    call $__alloc\n");
+    out.push_str("    local.set $str_ptr\n");
 
     // Copy string data from CGRF to wisp string FIRST, then write the length
     // header. Order matters: the caller may place the input just below the heap
@@ -6332,12 +6185,8 @@ pub(crate) fn generate_cgrf_decode_record(
     let record_size: usize = record_def.fields.iter().map(|f| type_size(&f.ty)).sum();
 
     // Allocate heap space
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", record_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", record_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // In CGRF, children are encoded BEFORE their parent.
     // For a record with N scalar fields, the layout is:
@@ -6455,12 +6304,8 @@ pub(crate) fn generate_cgrf_decode_option(out: &mut String, inner_ty: &Type, par
     let option_size = 4 + inner_size; // tag + optional payload
 
     // Allocate heap space
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", option_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", option_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // For a single option param:
     // - If Some: node 0 is the inner value, node 1 is the option (root)
@@ -6609,12 +6454,8 @@ pub(crate) fn generate_cgrf_decode_variant(
     let variant_size = variant_def.size();
 
     // Allocate wisp variant on heap
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", variant_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", variant_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // Use node_count to determine if there's a payload
     // node_count == 1: no payload (just variant node at offset 16)
@@ -6761,12 +6602,8 @@ pub(crate) fn generate_cgrf_decode_result(
     let err_tag_size = type_tag_size(err_ty);
 
     // Allocate wisp result on heap
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", result_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", result_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // Use node_count to determine if there's a payload
     // node_count == 1: just result node (at offset 16)
@@ -6881,12 +6718,8 @@ pub(crate) fn generate_cgrf_decode_list(out: &mut String, elem_ty: &Type, param_
     out.push_str("    local.set $list_len\n");
 
     // Allocate wisp list struct (12 bytes: len, cap, data_ptr)
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", 12);
     out.push_str("    local.set $list_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str("    i32.const 12\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // Store len
     out.push_str("    local.get $list_ptr\n");
@@ -6907,14 +6740,11 @@ pub(crate) fn generate_cgrf_decode_list(out: &mut String, elem_ty: &Type, param_
     };
 
     // Allocate element data: elem_size * len bytes
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str("    local.set $list_data\n");
-    out.push_str("    global.get $__heap_ptr\n");
     out.push_str(&format!("    i32.const {}\n", elem_size));
     out.push_str("    local.get $list_len\n");
     out.push_str("    i32.mul\n");
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
+    out.push_str("    call $__alloc\n");
+    out.push_str("    local.set $list_data\n");
 
     // Store data_ptr
     out.push_str("    local.get $list_ptr\n");
@@ -7202,12 +7032,8 @@ pub(crate) fn generate_decode_record_at_offset(
 
     // Allocate wisp record on heap
     let rec_size = rec_def.size();
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", rec_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", rec_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // v2 record payload: [type_name_len:u32, type_name:utf8, field_count:u32,
     //                     field_names:(len:u32, name:utf8)*, child_indices:u32*]
@@ -7345,12 +7171,8 @@ pub(crate) fn generate_decode_option_at_offset(
     let child_index_offset = presence_offset + 1;
 
     // Allocate wisp option on heap
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", option_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", option_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // Read presence byte from option node
     out.push_str("    local.get $in_ptr\n");
@@ -7439,12 +7261,8 @@ pub(crate) fn generate_decode_variant_at_offset(
     ));
 
     let var_size = var_def.size();
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", var_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", var_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // Variant node payload: [tag: u32, has_payload: u8, child_index?: u32]
     // Read tag from variant node (at child_offset + 8)
@@ -7521,12 +7339,8 @@ pub(crate) fn generate_decode_result_at_offset(
     };
     let result_size = 4 + payload_size;
 
-    out.push_str("    global.get $__heap_ptr\n");
+    emit_alloc_const(out, "    ", result_size);
     out.push_str("    local.set $rec_ptr\n");
-    out.push_str("    global.get $__heap_ptr\n");
-    out.push_str(&format!("    i32.const {}\n", result_size));
-    out.push_str("    i32.add\n");
-    out.push_str("    global.set $__heap_ptr\n");
 
     // Result v2 format: [ok_type:type_tag*, err_type:type_tag*, tag:u32, has_payload:u8, child_index:u32]
     // Calculate offsets based on type tag sizes
@@ -7692,14 +7506,11 @@ pub(crate) fn generate_cgrf_decode_tuple_param(
                 out.push_str("    local.set $str_len\n");
 
                 // Allocate wisp string: 4 bytes for length + string data
-                out.push_str("    global.get $__heap_ptr\n");
-                out.push_str("    local.set $str_ptr\n");
-                out.push_str("    global.get $__heap_ptr\n");
                 out.push_str("    i32.const 4\n");
-                out.push_str("    i32.add\n");
                 out.push_str("    local.get $str_len\n");
                 out.push_str("    i32.add\n");
-                out.push_str("    global.set $__heap_ptr\n");
+                out.push_str("    call $__alloc\n");
+                out.push_str("    local.set $str_ptr\n");
 
                 // Write length to wisp string
                 out.push_str("    local.get $str_ptr\n");
@@ -7943,7 +7754,7 @@ pub fn compile_repl_expr_pack(
     type_check(&prog, &full_signatures, &ctx)?;
 
     // Generate Pack/Graph ABI WAT
-    let wat = generate_wat_pack(&prog, &full_signatures);
+    let wat = generate_wat_pack(&prog, &full_signatures, false);
 
     // Convert WAT to WASM bytes (raw module, not component)
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
@@ -8023,5 +7834,5 @@ pub fn compile_repl_expr_pack_wat(
     let full_signatures = collect_signatures(&prog)?;
     type_check(&prog, &full_signatures, &ctx)?;
 
-    Ok(generate_wat_pack(&prog, &full_signatures))
+    Ok(generate_wat_pack(&prog, &full_signatures, false))
 }

@@ -308,7 +308,7 @@ fn test_self_hosted_compiles() {
             &out_base,
             compiler::EmitOptions {
                 wat: true,
-                pact: false,
+                ..Default::default()
             },
         )
         .expect("self-hosted compiler failed to compile");

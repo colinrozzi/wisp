@@ -10,7 +10,9 @@ mod tokenizer;
 pub(crate) use tokenizer::*;
 mod codegen;
 use codegen::*;
+mod heap;
 pub use codegen::{compile_repl_expr, compile_repl_expr_pack, compile_repl_expr_pack_wat};
+use heap::*;
 mod eval;
 pub use eval::{
     Host, NullHost, Value, eval_repl_expr, eval_repl_expr_with_host, eval_source,
@@ -321,11 +323,16 @@ pub struct CompileArtifacts {
     pub pact: Option<PathBuf>,
 }
 
-/// Which optional, human-readable views to write alongside the `.wasm`.
+/// Which optional, human-readable views to write alongside the `.wasm`, and how to
+/// build it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EmitOptions {
     pub wat: bool,
     pub pact: bool,
+    /// Build the debug heap (docs/proposals/MEMORY.md §5.5): freed blocks are
+    /// poisoned, and a double free or a write to a free block's header traps.
+    /// `GRANITE_DEBUG_HEAP=1` turns it on for every compile.
+    pub debug_heap: bool,
 }
 
 /// Splice `(include "path")` top-level forms in place, reading each referenced
@@ -448,7 +455,7 @@ pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result
     // Generate Pack-compatible WAT (raw module with Pack/Graph ABI). This text is
     // always produced because the wasm is built from it, but it is only *written*
     // when requested — it is a readable disassembly the wasm can regenerate.
-    let wat = generate_wat_pack(&prog, &signatures);
+    let wat = generate_wat_pack(&prog, &signatures, emit.debug_heap);
 
     // Ensure the output directory (e.g. `compiled/`) exists.
     if let Some(dir) = out_base.parent().filter(|d| !d.as_os_str().is_empty()) {

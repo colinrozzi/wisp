@@ -299,8 +299,9 @@ fn test_string_escape_esc_nul_hex() {
 
 // === Static string literals ===
 
-/// Run `test-func` and return its s32 result with the bytes it allocated (the
-/// heap frontier, `__pack_alloc(0)`, before and after the call).
+/// Run `test-func` and return its s32 result with the bytes it allocated (live
+/// heap bytes from `__granite_heap_stats` before and after the call; compiled code
+/// does not free yet).
 fn run_counting_alloc(source: &str) -> (i32, i32) {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
@@ -327,10 +328,20 @@ fn run_counting_alloc(source: &str) -> (i32, i32) {
         .get_memory(&mut store, "memory")
         .expect("memory not found");
 
+    let stats = instance
+        .get_typed_func::<(), i32>(&mut store, "__granite_heap_stats")
+        .expect("__granite_heap_stats not found");
+    let live_bytes = |store: &mut Store<()>| {
+        let s = stats.call(&mut *store, ()).unwrap() as usize;
+        let mut b = [0u8; 4];
+        memory.read(&*store, s, &mut b).unwrap();
+        i32::from_le_bytes(b)
+    };
+
     let slots = alloc.call(&mut store, 8).unwrap();
-    let before = alloc.call(&mut store, 0).unwrap();
+    let before = live_bytes(&mut store);
     let status = func.call(&mut store, (0, 0, slots, slots + 4)).unwrap();
-    let after = alloc.call(&mut store, 0).unwrap();
+    let after = live_bytes(&mut store);
     assert_eq!(status, 0);
 
     let mut buf = [0u8; 4];
