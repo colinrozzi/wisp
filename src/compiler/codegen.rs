@@ -1300,6 +1300,13 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}  i32.mul\n", pad));
             out.push_str(&format!("{}  memory.copy\n", pad));
 
+            // Free the old buffer. Only this header points at it: headers are
+            // never copied, and every data buffer is its own block (or 0, which
+            // $__free ignores).
+            out.push_str(&format!("{}  local.get {}\n", pad, list_local));
+            out.push_str(&format!("{}  i32.load offset=8\n", pad));
+            out.push_str(&format!("{}  call $__free\n", pad));
+
             // Update list header: cap = new_cap, data = new_data
             out.push_str(&format!("{}  local.get {}\n", pad, list_local));
             out.push_str(&format!("{}  local.get {}\n", pad, new_cap_local));
@@ -1604,6 +1611,17 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}call $__alloc\n", pad));
             Type::S32
         }
+        Expr::HeapFree { ptr } => {
+            gen_expr(
+                ptr, out, indent, env, signatures, globals, records, variants, false,
+            );
+            out.push_str(&format!("{}call $__free\n{}i32.const 0\n", pad, pad));
+            Type::S32
+        }
+        Expr::HeapStats => {
+            out.push_str(&format!("{}call $__heap_stats\n", pad));
+            Type::S32
+        }
         Expr::AnyAddr { value } => {
             // Pure reinterpret: an `any` is already the i32 address of its blob.
             gen_expr(
@@ -1652,6 +1670,9 @@ pub(crate) fn gen_expr(
                 "{}i32.const 8\n{}call $__alloc\n{}local.set {}\n",
                 pad, pad, pad, slots
             ));
+            out.push_str(&format!(
+                "{pad}local.get {slots}\n{pad}i64.const 0\n{pad}i64.store\n"
+            ));
             // $__raw_<import>(blob+4, load(blob), slots, slots+4)
             out.push_str(&format!(
                 "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
@@ -1663,7 +1684,11 @@ pub(crate) fn gen_expr(
                 "{}local.get {}\n{}i32.const 4\n{}i32.add\n",
                 pad, slots, pad, pad
             ));
-            out.push_str(&format!("{}call ${}\n{}drop\n", pad, raw_sym, pad)); // ignore status
+            let status = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{}call ${}\n{}local.set {}\n",
+                pad, raw_sym, pad, status
+            ));
             let any_len = env.declare_local(Type::S32);
             out.push_str(&format!(
                 "{}local.get {}\n{}i32.const 4\n{}i32.add\n{}i32.load\n{}local.set {}\n",
@@ -1687,6 +1712,13 @@ pub(crate) fn gen_expr(
             out.push_str(&format!(
                 "{}local.get {}\n{}memory.copy\n",
                 pad, any_len, pad
+            ));
+            // Same ownership rule as the import wrapper: status 1 means the
+            // result buffer came from our `__pack_alloc`. The blob is the caller's.
+            out.push_str(&format!(
+                "{pad}local.get {status}\n{pad}i32.const 1\n{pad}i32.eq\n{pad}if\n\
+                 {pad}  local.get {slots}\n{pad}  i32.load\n{pad}  call $__free\n{pad}end\n\
+                 {pad}local.get {slots}\n{pad}call $__free\n"
             ));
             out.push_str(&format!("{}local.get {}\n", pad, res));
             Type::Any
@@ -4020,6 +4052,10 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
     out.push_str("    i32.const 8\n");
     out.push_str("    call $__alloc\n");
     out.push_str("    local.set $result_slots\n");
+    // A reused block holds stale bytes; a failed call (status -1) writes nothing.
+    out.push_str("    local.get $result_slots\n");
+    out.push_str("    i64.const 0\n");
+    out.push_str("    i64.store\n");
 
     // Input buffer: allocate enough space for CGRF-encoded arguments
     // Use larger buffer for complex types (tuples with options, nested lists, etc.)
@@ -4512,6 +4548,12 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
     out.push_str("    i32.load\n");
     out.push_str("    local.set $out_len\n");
 
+    // The host has read the arguments: free them and the slots (§4).
+    out.push_str("    local.get $in_buf\n");
+    out.push_str("    call $__free\n");
+    out.push_str("    local.get $result_slots\n");
+    out.push_str("    call $__free\n");
+
     // Decode result from CGRF output buffer
     // The result is a single CGRF node: header(16) + node_header(8) + payload
     // The scalar value is at $out_ptr + 24
@@ -4602,6 +4644,17 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
             _ => out.push_str("    i32.const 0\n"),
         }
     }
+
+    // Status 1: the host put the result in a buffer from our `__pack_alloc`, so
+    // it is ours to free now that it is decoded (decoders copy). Status 0: it is
+    // the host's fixed scratch area. The decoded value stays on the stack.
+    out.push_str("    local.get $status\n");
+    out.push_str("    i32.const 1\n");
+    out.push_str("    i32.eq\n");
+    out.push_str("    if\n");
+    out.push_str("      local.get $out_ptr\n");
+    out.push_str("      call $__free\n");
+    out.push_str("    end\n");
 
     out.push_str("  )\n");
 }

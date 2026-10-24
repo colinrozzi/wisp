@@ -470,6 +470,8 @@ fn eval_inner(ctx: &EvalCtx, expr: &Expr, env: &Env) -> Result<Value> {
             .ok_or_else(|| anyhow!("eval: borrow of unbound capability '{}'", name)),
         // Raw-memory / `any` / host operations are codegen-only.
         Expr::HeapAlloc { .. }
+        | Expr::HeapFree { .. }
+        | Expr::HeapStats
         | Expr::AnyFromS32 { .. }
         | Expr::AnyToS32 { .. }
         | Expr::AnyFromString { .. }

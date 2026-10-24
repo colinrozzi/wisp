@@ -1511,7 +1511,7 @@
 (fn apply-poll-events ((args (list value))) value
   (let (n (list-len args))
     (if (i32.gt_s n 1) (failure "poll-events expects no argument or \"text\"")
-      (if (i32.and (i32.eq n 1) (i32.eq (text-mode? (list-get args 0)) 0))
+      (if (if (i32.eq n 1) (i32.eq (text-mode? (list-get args 0)) 0) 0)
         (failure "poll-events expects no argument or \"text\"")
         (begin
           (trim-events)
@@ -1546,8 +1546,9 @@
       (else (failure "event-buffer expects an integer limit")))))
 
 ; (memory-stats): heap bytes in use, and the sizes of the session's long-lived
-; tables, as (name count) pairs. heap-bytes is the bump pointer for now: it counts
-; every byte ever allocated, garbage included.
+; tables, as (name count) pairs. heap-bytes is the allocator's live bytes (block
+; headers included): what is allocated and not yet freed, which still includes
+; garbage nothing frees yet.
 (fn stat ((name string) (n s32)) value
   (sequence (list-push (list-push (list-new value) (text name)) (integer n))))
 (fn apply-memory-stats ((args (list value))) value
@@ -1555,7 +1556,7 @@
     (begin
       (trim-events)
       (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
-        (stat "heap-bytes" (heap-alloc 0)))
+        (stat "heap-bytes" (i32.load (heap-stats))))
         (stat "bindings" (list-len (global.get $bindings))))
         (stat "modules" (list-len (global.get $modules))))
         (stat "types" (list-len (global.get $types))))

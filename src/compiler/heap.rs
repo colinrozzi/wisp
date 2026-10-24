@@ -508,7 +508,7 @@ pub(crate) fn emit_heap_runtime(out: &mut String, heap_base: u32, data_end: u64,
 
     // __granite_heap_stats(): fill in the STATS record and return its address.
     out.push_str(&format!(
-        r#"  (func (export "__granite_heap_stats") (result i32)
+        r#"  (func $__heap_stats (export "__granite_heap_stats") (result i32)
     i32.const {stats}
     global.get $__live_bytes
     i32.store
@@ -566,6 +566,9 @@ pub(crate) fn emit_legacy_bump_alloc(out: &mut String) {
   )
 "#
     ));
+    // A bump heap cannot free, and keeps no stats (heap-stats is null here).
+    out.push_str("  (func $__free (param $p i32))\n");
+    out.push_str("  (func $__heap_stats (result i32)\n    i32.const 0\n  )\n");
     // $__alloc_class(k) allocates class k's payload size.
     out.push_str("  (func $__alloc_class (param $k i32) (result i32)\n");
     for _ in SMALL_CLASSES {
