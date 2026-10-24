@@ -1,9 +1,10 @@
 # Session inbox: reading events without destroying them
 
-Status: proposal (ticket 0018). Design only. It builds on ticket 0015 (quinn),
-which adds a 256-firing ring buffer with a drop counter to `$events`
-(`WISP-RETENTION.md` §2.3). This proposal adds sequence numbers and cursors to
-that ring, and does not change its bound or what each firing keeps.
+Status: approved (ticket 0018); implemented in ticket 0023 (see §10).
+It builds on ticket 0015 (quinn), which adds a 256-firing ring buffer with a
+drop counter to `$events` (`WISP-RETENTION.md` §2.3). This proposal adds
+sequence numbers and cursors to that ring, and does not change its bound or
+what each firing keeps.
 
 ## Summary
 
@@ -508,7 +509,33 @@ Settled with claude (coordinator) in review:
    an actor that wants a reply puts its own id in the message, as the
    current convention does. Out of scope here.
 
-## 10. Problems noticed outside this ticket
+## 10. Implementation notes (ticket 0023)
+
+Built on branch `session-inbox`. Where it differs from the sections above:
+
+- **A seq is not stored in each firing.** The buffer always holds consecutive
+  seqs ending at `$event-seq`, so a firing's seq is its position plus the
+  first seq (`event-first-seq`). The firing shapes stay exactly as in 0015;
+  the seq is added only when a firing is returned.
+- **`event-recorded` is in its own interface, `wisp-events`**
+  (`wisp/actor/events.pact`), not added to `wisp-sessions` (§3.5). Adding it
+  there would change the `wisp-sessions` interface hash, so an old actor would
+  no longer load in a new daemon. With a separate interface, an old actor
+  works in a new daemon, and a new actor in an old daemon fails at start, as
+  §6 planned.
+- **No `next` field in the protocol** (§4.2). The daemon passes on the
+  interpreter's `"wire"` text, and the client reads `next lost` from its first
+  line. The transport is unchanged.
+- **`--seq` was dropped** (§4.1): a multi-line result breaks the line to
+  firing mapping. `--full` shows the seqs.
+- **`events-dropped` in `(memory-stats)` is cumulative**, and with buffering
+  off (`(event-buffer 0)`) each firing still takes a seq and is reported to
+  readers as dropped (§3.1 said this; it changes one 0015 test).
+- `wait` checks every 5 s whether the session still exists. A client that
+  disconnects is noticed only when the next firing (or the timeout) ends the
+  wait; until then the daemon holds one idle task for it.
+
+## 11. Problems noticed outside this ticket
 
 - Theater: `respond-to-request` / `cancel-request` read an
   `outstanding_requests` map that `process_actor_message` never fills
