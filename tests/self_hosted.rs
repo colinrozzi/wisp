@@ -154,16 +154,15 @@ fn compile_and_call_with_string_arg_inner(source: &str, func_name: &str, input: 
             .expect("failed to grow memory");
     }
 
-    // Layout:
-    // - 0x0000-0x0FFF: reserved
-    // - 0x1000-0xBFFF: input buffer (~44KB available, enough for 42KB input)
-    // - 0xC000+: heap region (compiler allocates here)
-    // - High address: output buffer (after growing memory)
-    //
-    // The heap needs room to grow. Place output at a high address.
-    // With 4MB of memory (64 pages), we have addresses 0x0-0x3FFFFF
-    // Put output near the top: 0x200000 (2MB offset), leaving 2MB for output
-    let in_ptr: i32 = 0x1000;
+    // The input (the whole compiler source when self-compiling, ~150 KB) goes in a
+    // buffer from `__pack_alloc`, as the host does: a fixed low address would run
+    // over the metadata, the encoder stack and the static string literals.
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut store, "__pack_alloc")
+        .expect("__pack_alloc not found");
+    let in_ptr = alloc
+        .call(&mut store, 16 + 8 + 4 + input.len() as i32) // CGRF header + node + string
+        .expect("__pack_alloc failed");
     // Scratch slots for the returned pointer/length, in the reserved low region.
     let out_ptr_ptr: i32 = 0x800;
     let out_len_ptr: i32 = 0x804;
