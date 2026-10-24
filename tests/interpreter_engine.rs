@@ -492,6 +492,15 @@ async fn engine_session() {
     );
     assert_eq!(evaluate(&mut first, "(increment 41)").await, "42");
     reload_session(&mut first, &files, &calls).await;
+    // A required file that does not read names its path and the error's place.
+    files.lock().unwrap().insert(
+        "lib/broken.wisp".to_string(),
+        "(module broken (provide x)\n  (define x (+ 1 2)\n  (define y 3))".to_string(),
+    );
+    assert_eq!(
+        evaluate(&mut first, "(require broken \"lib/broken.wisp\")").await,
+        "error: lib/broken.wisp: line 1, column 1: unclosed parenthesis: the one that opens here is never closed"
+    );
 }
 
 // (reload NAME) re-reads a loaded module from its original source and refreshes

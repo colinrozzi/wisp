@@ -198,6 +198,156 @@ fn test_interpreter_length_null_and_error() {
 }
 
 #[test]
+fn test_interpreter_and_or_cond_not() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(and)", "true"),
+        ("(or)", "false"),
+        // and/or return the value that decided, not a boolean.
+        ("(and 1 2 3)", "3"),
+        ("(and 1 0 3)", "0"),
+        ("(or 0 false 5)", "5"),
+        ("(or 0 false)", "false"),
+        ("(or '() 7)", "7"),
+        // Short-circuit: the rest is never evaluated.
+        ("(and 0 (error \"evaluated\"))", "0"),
+        ("(or 1 (error \"evaluated\"))", "1"),
+        ("(and 1 (error \"reached\"))", "error: reached"),
+        ("(not 0)", "true"),
+        ("(not 5)", "false"),
+        ("(not '())", "true"),
+        ("(not false)", "true"),
+        ("(not)", "error: not expects one argument"),
+        // cond: first true test wins; else is the fallback; no match gives ().
+        ("(cond (0 1) (2 3))", "3"),
+        ("(cond (0 1) (else 4))", "4"),
+        ("(cond (0 1))", "()"),
+        ("(cond)", "()"),
+        ("(cond ((+ 1 1)))", "2"),
+        ("(cond (1 (+ 1 1) (+ 2 2)))", "4"),
+        ("(cond (0 (error \"evaluated\")) (else 9))", "9"),
+        (
+            "(cond (else 1) (1 2))",
+            "error: cond else must be the last clause",
+        ),
+        (
+            "(cond 5)",
+            "error: cond expects clauses like (test body ...)",
+        ),
+        (
+            "(cond ())",
+            "error: cond expects clauses like (test body ...)",
+        ),
+    ] {
+        eval(&mut s, source, expected);
+    }
+    eval(
+        &mut s,
+        "(define sign (lambda (n) (cond ((< n 0) -1) ((= n 0) 0) (else 1))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(list (sign -5) (sign 0) (sign 8))", "(-1 0 1)");
+    // The last and/or operand and the chosen cond body are tail positions, so a
+    // loop through them runs far past the 128-deep non-tail nesting guard.
+    eval(
+        &mut s,
+        "(define down (lambda (n) (cond ((= n 0) 0) (else (down (- n 1))))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(down 5000)", "0");
+    eval(
+        &mut s,
+        "(define all (lambda (n) (or (= n 0) (and (< 0 n) (all (- n 1))))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(all 5000)", "1");
+    // A session's own not (as lib code defines) still wins over the builtin.
+    eval(&mut s, "(define not (lambda (b) (if b 0 1)))", "#<closure>");
+    eval(&mut s, "(not 0)", "1");
+    // and/or/cond are keywords a binding shadows, local or top-level, so code that
+    // already defines a function by one of these names keeps calling it.
+    eval(
+        &mut s,
+        "((lambda (cond) (cond 4)) (lambda (x) (+ x 1)))",
+        "5",
+    );
+    eval(&mut s, "(cond (0 1) (else 2))", "2");
+    eval(&mut s, "(define or (lambda (a b) 99))", "#<closure>");
+    eval(&mut s, "(or 1 2)", "99");
+    let help = s.evaluate("(help)").unwrap();
+    assert!(
+        help.contains("(cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)"),
+        "{help}"
+    );
+}
+
+#[test]
+fn test_interpreter_parse_errors_have_locations() {
+    let mut s = session();
+    for (source, expected) in [
+        (
+            "(define x\n  (+ 1 2)",
+            "error: line 1, column 1: unclosed parenthesis: the one that opens here is never closed",
+        ),
+        // The innermost list that runs to the end is reported, with its top-level form.
+        (
+            "(define a 1)\n(define f (lambda (x)\n  (+ x 1)",
+            "error: line 2, column 11: unclosed parenthesis: the one that opens here is never closed (in the form at line 2, column 1)",
+        ),
+        (
+            "1 2\n  )",
+            "error: line 2, column 3: unexpected closing parenthesis",
+        ),
+        (
+            "(define s\n \"abc)",
+            "error: line 2, column 2: unterminated string: the one that opens here is never closed (in the form at line 1, column 1)",
+        ),
+        (
+            "(list \"a\\qb\")",
+            "error: line 1, column 9: unknown string escape (in the form at line 1, column 1)",
+        ),
+    ] {
+        eval(&mut s, source, expected);
+    }
+}
+
+#[test]
+fn test_interpreter_list_functions_take_untyped_lists() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(list-len (list 1 2 3))", "3"),
+        ("(list-len '(a b))", "2"),
+        ("(list-len nil)", "0"),
+        ("(list-get (list 10 20) 1)", "20"),
+        ("(list-get '(x y) 0)", "x"),
+        ("(list-get (list 1) 5)", "error: list index out of bounds"),
+        ("(list-get (list 1) \"0\")", "error: list index must be s32"),
+        ("(list-push (list 1 2) 3)", "(1 2 3)"),
+        // No element type: any value may join an untyped list.
+        ("(list-push (list 1) \"two\")", "(1 \"two\")"),
+        ("(list-len 5)", "error: expected a list"),
+        // Typed lists keep their element check.
+        ("(list-push (list-new s32) \"x\")", "error: expected s32"),
+    ] {
+        eval(&mut s, source, expected);
+    }
+    // list-push on an untyped list returns a new list; the old one, which may be
+    // a quoted literal in some function's body, is unchanged.
+    eval(&mut s, "(define xs '(1 2))", "(1 2)");
+    eval(&mut s, "(list-push xs 3)", "(1 2 3)");
+    eval(&mut s, "xs", "(1 2)");
+    eval(
+        &mut s,
+        "(define build (lambda (n) (list-push '(0) n)))",
+        "#<closure>",
+    );
+    eval(&mut s, "(build 1)", "(0 1)");
+    eval(&mut s, "(build 2)", "(0 2)");
+    let help = s.evaluate("(help)").unwrap();
+    assert!(help.contains("list-push returns the new list"), "{help}");
+}
+
+#[test]
 fn test_interpreter_errors_preserve_existing_definitions() {
     let mut s = session();
     eval(&mut s, "(define x 42)", "42");
@@ -249,7 +399,11 @@ fn test_interpreter_errors_preserve_existing_definitions() {
     );
     eval(&mut s, "y", "7");
     let deep = format!("{}0{}", "(".repeat(66), ")".repeat(66));
-    eval(&mut s, &deep, "error: reader nesting limit");
+    eval(
+        &mut s,
+        &deep,
+        "error: line 1, column 66: reader nesting limit (in the form at line 1, column 1)",
+    );
     eval(&mut s, &" ".repeat(4097), "error: input exceeds 4096 bytes");
     eval(&mut s, "x", "42");
 }
@@ -297,10 +451,22 @@ fn test_interpreter_control_character_escapes() {
         (r#""\e[1m\0\x01\x7f""#, r#""\e[1m\0\x01\x7f""#),
         (r#"(bytes->string (string->bytes "\x1B"))"#, r#""\e""#),
         // A malformed escape is a reader error.
-        (r#""\x4""#, "error: \\x escape needs two hex digits"),
-        (r#""\xg1""#, "error: \\x escape needs two hex digits"),
-        (r#""\x"#, "error: \\x escape needs two hex digits"),
-        (r#""\q""#, "error: unknown string escape"),
+        (
+            r#""\x4""#,
+            "error: line 1, column 2: \\x escape needs two hex digits (in the form at line 1, column 1)",
+        ),
+        (
+            r#""\xg1""#,
+            "error: line 1, column 2: \\x escape needs two hex digits (in the form at line 1, column 1)",
+        ),
+        (
+            r#""\x"#,
+            "error: line 1, column 2: \\x escape needs two hex digits (in the form at line 1, column 1)",
+        ),
+        (
+            r#""\q""#,
+            "error: line 1, column 2: unknown string escape (in the form at line 1, column 1)",
+        ),
     ] {
         eval(&mut s, source, expected);
     }
