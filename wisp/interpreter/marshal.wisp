@@ -301,12 +301,14 @@
 (global $marshal-cap s32 mut 0)
 
 ; The shared buffer, grown first if NEED bytes (len prefix + header + nodes) do not
-; fit. Growing replaces it; the old buffer is garbage.
+; fit. Growing replaces it and frees the old one (no blob outlives the next
+; marshal, see above; the first time the old buffer is 0, which heap-free ignores).
 (fn marshal-buffer ((need s32)) s32
   (begin
     (if (i32.gt_s need (global.get $marshal-cap))
       (let (cap (if (i32.gt_s need 16388) need 16388))
         (begin
+          (heap-free (global.get $marshal-buf))
           (global.set $marshal-buf (heap-alloc cap))
           (global.set $marshal-cap cap)
           0))

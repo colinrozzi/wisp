@@ -70,7 +70,7 @@
       (if (i32.and (i32.eq (list-len items) 2) (string=? name "list-new")) (unary-type "list" (list-get items 1))
         (if (numeric-type? name) (symbol name)
           (if (numeric-primitive? name) (primitive-result-type name)
-            (if (i32.and (i32.eq (list-len items) 3) (string=? (symbol-name (list-get items 1)) ":")) (list-get items 2)
+            (if (if (i32.eq (list-len items) 3) (string=? (symbol-name (list-get items 1)) ":") 0) (list-get items 2)
               (let (callee (peek-value (list-get items 0) env))
                 (let (actual (callable-type callee))
                   (if (function-type? actual) (function-result actual)

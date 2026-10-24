@@ -265,7 +265,8 @@ session holds open, as `(kind id)`; the open and close verbs and the
 `on-close`/`on-exit`/`on-channel-close` events keep it current. `(memory-stats)`
 returns `(("heap-bytes" n) ("bindings" n) ("modules" n) ("types" n) ("macros" n)
 ("events" n) ("events-dropped" n) ("handles" n) ("event-seq" n) ("cursors" n))`;
-`heap-bytes` is the bump pointer, so for now it counts garbage too, and
+`heap-bytes` is the allocator's live bytes (allocated and not yet freed; garbage
+nothing frees yet still counts), and
 `events-dropped` counts every firing the limit has dropped.
 
 From the shell, **`theater-repl read <id>`** reads the firings (`--full` for the
