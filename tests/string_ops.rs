@@ -296,3 +296,86 @@ fn test_string_escape_esc_nul_hex() {
         assert_eq!(compile_and_run(&source), len, "{lit}");
     }
 }
+
+// === Static string literals ===
+
+/// Run `test-func` and return its s32 result with the bytes it allocated (the
+/// heap frontier, `__pack_alloc(0)`, before and after the call).
+fn run_counting_alloc(source: &str) -> (i32, i32) {
+    let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let temp_dir = std::env::temp_dir();
+    let source_path = temp_dir.join(format!("test_string_ops_{}.wisp", test_id));
+    let out_base = temp_dir.join(format!("test_string_ops_{}", test_id));
+    std::fs::write(&source_path, source).expect("failed to write temp source");
+    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
+        .expect("failed to compile");
+    let wasm_bytes = std::fs::read(out_base.with_extension("wasm")).expect("failed to read wasm");
+
+    let mut config = Config::new();
+    config.wasm_tail_call(true);
+    let engine = Engine::new(&config).expect("failed to create engine");
+    let module = Module::new(&engine, &wasm_bytes).expect("failed to create module");
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).expect("failed to instantiate");
+    let func = instance
+        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "test-func")
+        .expect("function 'test-func' not found");
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut store, "__pack_alloc")
+        .expect("__pack_alloc not found");
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .expect("memory not found");
+
+    let slots = alloc.call(&mut store, 8).unwrap();
+    let before = alloc.call(&mut store, 0).unwrap();
+    let status = func.call(&mut store, (0, 0, slots, slots + 4)).unwrap();
+    let after = alloc.call(&mut store, 0).unwrap();
+    assert_eq!(status, 0);
+
+    let mut buf = [0u8; 4];
+    memory.read(&store, slots as usize, &mut buf).unwrap();
+    let out_ptr = i32::from_le_bytes(buf);
+    memory
+        .read(&store, (out_ptr + 24) as usize, &mut buf)
+        .unwrap();
+    (i32::from_le_bytes(buf), after - before)
+}
+
+fn literal_loop(n: i32) -> String {
+    format!(
+        r#"
+(fn go ((i s32) (acc s32)) s32
+  (if (i32.eq i (i32.const 0))
+    acc
+    (go (i32.sub i (i32.const 1))
+        (i32.add acc (i32.add (string-len "hello")
+                              (string=? "f32" "f32"))))))
+(export (fn test-func () s32 (go (i32.const {n}) (i32.const 0))))
+"#
+    )
+}
+
+#[test]
+fn test_string_literal_in_loop_allocates_nothing() {
+    let (one, bytes_one) = run_counting_alloc(&literal_loop(1));
+    let (many, bytes_many) = run_counting_alloc(&literal_loop(1000));
+    assert_eq!(one, 6);
+    assert_eq!(many, 6000);
+    // Only the export's output buffer is allocated, however many times the
+    // literals are evaluated.
+    assert_eq!(bytes_one, bytes_many);
+}
+
+#[test]
+fn test_string_literal_is_shared() {
+    // Every evaluation of equal literals yields the same static object.
+    let source = r#"
+(fn lit () string "shared")
+(export (fn test-func () s32
+  (i32.add
+    (i32.eq (string-addr (lit)) (string-addr (lit)))
+    (i32.eq (string-addr "shared") (string-addr (lit))))))
+"#;
+    assert_eq!(compile_and_run(source), 2);
+}

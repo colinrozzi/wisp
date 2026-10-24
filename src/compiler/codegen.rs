@@ -211,6 +211,11 @@ pub(crate) fn gen_expr(
             ty.clone()
         }
         Expr::StringLiteral(s) => {
+            // Pack path: the literal lives once in static data; evaluate to its address.
+            if let Some(addr) = intern_static_string(s) {
+                out.push_str(&format!("{}i32.const {}\n", pad, addr));
+                return Type::Str;
+            }
             // String layout in memory: 4 bytes length + UTF-8 bytes
             let bytes = s.as_bytes();
             let len = bytes.len();
@@ -3031,7 +3036,70 @@ const CGRF_ARRAY: u8 = 0x15;
 
 /// Memory layout for Pack packages
 const METADATA_OFFSET: i32 = 0xA000; // Pack metadata segment (8KB reserved)
-const HEAP_START_OFFSET: i32 = 0xC000;
+/// Static data (string literals) starts here: past the encoder stack (0xB000-0xBFFF)
+/// and past the end of the host's scratch buffer (0x4008 + 32 KiB = 0xC008). The heap
+/// (`$__heap_base`) starts after the static data.
+const STATIC_DATA_OFFSET: u32 = 0xC010;
+
+/// String literals placed in static data, one `[len:u32][utf-8 bytes]` object per
+/// distinct literal (the same layout as a heap string). Nothing writes into a string,
+/// so every evaluation of a literal shares the one copy.
+#[derive(Default)]
+struct StaticStrings {
+    bytes: Vec<u8>,
+    addrs: HashMap<String, u32>,
+}
+
+impl StaticStrings {
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&addr) = self.addrs.get(s) {
+            return addr;
+        }
+        while !self.bytes.len().is_multiple_of(4) {
+            self.bytes.push(0);
+        }
+        let addr = STATIC_DATA_OFFSET + self.bytes.len() as u32;
+        self.bytes
+            .extend_from_slice(&(s.len() as u32).to_le_bytes());
+        self.bytes.extend_from_slice(s.as_bytes());
+        self.addrs.insert(s.to_string(), addr);
+        addr
+    }
+
+    /// First heap address: the end of static data, 16-byte aligned.
+    fn heap_base(&self) -> u32 {
+        (STATIC_DATA_OFFSET + self.bytes.len() as u32 + 15) & !15
+    }
+}
+
+thread_local! {
+    /// Set only while `generate_wat_pack` runs; legacy `generate_wat` builds
+    /// literals on its heap instead.
+    static STATIC_STRINGS: std::cell::RefCell<Option<StaticStrings>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The static address of literal `s`, or `None` outside the Pack code generator.
+fn intern_static_string(s: &str) -> Option<u32> {
+    STATIC_STRINGS.with(|t| t.borrow_mut().as_mut().map(|t| t.intern(s)))
+}
+
+/// Installs an empty literal table for `generate_wat_pack`, and clears it when that
+/// returns (or unwinds).
+struct StaticStringsScope;
+
+impl StaticStringsScope {
+    fn enter() -> Self {
+        STATIC_STRINGS.with(|t| *t.borrow_mut() = Some(StaticStrings::default()));
+        StaticStringsScope
+    }
+}
+
+impl Drop for StaticStringsScope {
+    fn drop(&mut self) {
+        STATIC_STRINGS.with(|t| *t.borrow_mut() = None);
+    }
+}
 
 /// Get the type tag byte for a type (for CGRF v2 encoding)
 pub(crate) fn type_to_tag(ty: &Type) -> u8 {
@@ -3284,6 +3352,7 @@ pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 /// - CGRF encoding for input/output values
 /// - Memory layout with input buffer at 0x0, output at 0x4000
 pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Signature>) -> String {
+    let _static_strings = StaticStringsScope::enter();
     let mut out = String::new();
     out.push_str("(module\n");
 
@@ -3341,11 +3410,8 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
         METADATA_OFFSET, metadata_len
     ));
 
-    // Heap pointer for allocations, starts after output buffer
-    out.push_str(&format!(
-        "  (global $__heap_ptr (mut i32) (i32.const {}))\n",
-        HEAP_START_OFFSET
-    ));
+    // `$__heap_base`/`$__heap_ptr` are declared at the end of the module, once the
+    // static data is known.
 
     // Encoder stack pointer for nested Tuple/List encoding (0xB000-0xBFFF = 4KB)
     // Each frame saves 12 bytes: (enc_tuple_header, enc_tuple_ci_pos, enc_save_root)
@@ -3515,6 +3581,28 @@ pub(crate) fn generate_wat_pack(prog: &Program, signatures: &HashMap<String, Sig
             &variants_map,
         );
     }
+
+    // Static string literals (every one is interned by now), then the heap.
+    let heap_base = STATIC_STRINGS.with(|t| {
+        let t = t.borrow();
+        let t = t.as_ref().expect("static string table");
+        if !t.bytes.is_empty() {
+            out.push_str(&format!("  (data (i32.const {}) \"", STATIC_DATA_OFFSET));
+            for byte in &t.bytes {
+                out.push_str(&format!("\\{:02x}", byte));
+            }
+            out.push_str("\")\n");
+        }
+        t.heap_base()
+    });
+    out.push_str(&format!(
+        "  (global $__heap_base i32 (i32.const {}))\n",
+        heap_base
+    ));
+    out.push_str(&format!(
+        "  (global $__heap_ptr (mut i32) (i32.const {}))\n",
+        heap_base
+    ));
 
     out.push_str(")\n");
     out
