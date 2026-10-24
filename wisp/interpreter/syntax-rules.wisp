@@ -96,9 +96,9 @@
                         (let (rules (sr-check-rules (copy-list body 2 (list-new value)) 0 literals name (list-new value)))
                           (if (failed? rules) rules
                             (begin
-                              (global.set $pending-macros (list-push (global.get $pending-macros)
-                                (binding name (sequence (list-push (list-push (list-push (list-new value)
-                                  (symbol "syntax-rules")) (sequence literals)) rules)))))
+                              (global.set $pending-macros (upsert-binding (global.get $pending-macros) name
+                                (sequence (list-push (list-push (list-push (list-new value)
+                                  (symbol "syntax-rules")) (sequence literals)) rules))))
                               (nil))))))))))))))))
 
 ; Pattern validation makes names unique, so merging captures needs no overwrite.

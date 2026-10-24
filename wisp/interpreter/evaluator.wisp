@@ -60,6 +60,24 @@
   (if (i32.ge_s index (list-len env)) out
     (copy-env env (i32.add index 1) (list-push out (list-get env index)))))
 
+; The index of the newest binding of NAME at or below INDEX, or -1.
+(fn binding-index ((env (list binding)) (index s32) (name string)) s32
+  (if (i32.lt_s index 0) -1
+    (if (string=? name (binding.name (list-get env index))) index
+      (binding-index env (i32.sub index 1) name))))
+
+(fn replace-binding ((env (list binding)) (index s32) (at s32) (entry binding) (out (list binding))) (list binding)
+  (if (i32.ge_s index (list-len env)) out
+    (replace-binding env (i32.add index 1) at entry
+      (list-push out (if (i32.eq index at) entry (list-get env index))))))
+
+; Bind NAME to V: replace its newest binding, or append when NAME is new. Callers
+; store the returned list; replacing copies, so no other holder's list changes.
+(fn upsert-binding ((env (list binding)) (name string) (v value)) (list binding)
+  (let (at (binding-index env (i32.sub (list-len env) 1) name))
+    (if (i32.lt_s at 0) (list-push env (binding name v))
+      (replace-binding env 0 at (binding name v) (list-new binding)))))
+
 (fn extend-env ((env (list binding)) (entry binding)) (list binding)
   (list-push (copy-env env 0 (list-new binding)) entry))
 
@@ -354,26 +372,33 @@
 (export (fn evaluate ((source string)) string
   (evaluate-from source "")))
 
+; Set up the session tables on first use: the first evaluation, or an inbound
+; event that arrives before any evaluation.
+(fn ensure-started () s32
+  (if (global.get $started) 0
+    (begin
+      (global.set $bindings (list-new binding))
+      (global.set $modules (list-new module))
+      (global.set $current-module "main")
+      (global.set $current-exports (list-new string))
+      (global.set $current-imports (list-new binding))
+      (global.set $current-source "")
+      (global.set $types (list-new named-type))
+      (register-mount-spec)
+      (global.set $session-globals (list-new global-binding))
+      (global.set $session-macros (list-new binding))
+      (global.set $traits (list-new trait-definition))
+      (global.set $instances (list-new trait-implementation))
+      (global.set $events (list-new value))
+      (global.set $event-limit 256)
+      (global.set $handles (list-new host-handle))
+      (global.set $started 1) 0)))
+
 ; base is the canonical source file, or empty for interactive input. Each input
 ; gets its own include-once set, matching one compiler expansion graph.
 (export (fn evaluate-from ((source string) (base string)) string
   (begin
-    (if (global.get $started) 0
-      (begin
-        (global.set $bindings (list-new binding))
-        (global.set $modules (list-new module))
-        (global.set $current-module "main")
-        (global.set $current-exports (list-new string))
-        (global.set $current-imports (list-new binding))
-        (global.set $current-source "")
-        (global.set $types (list-new named-type))
-        (register-mount-spec)
-        (global.set $session-globals (list-new global-binding))
-        (global.set $session-macros (list-new binding))
-        (global.set $traits (list-new trait-definition))
-        (global.set $instances (list-new trait-implementation))
-        (global.set $events (list-new value))
-        (global.set $started 1) 0))
+    (ensure-started)
     (global.set $steps 0)
     (global.set $include-seen (list-new string))
     (global.set $loading (list-new string))

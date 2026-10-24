@@ -21,28 +21,140 @@
 ; the whole session is one live image — evaluate and the callbacks share $bindings
 ; — a trigger just dispatches to a user-defined handler (on-tick, on-spawn, ...)
 ; looked up in that env. So "add a handler" is literally "(define (on-tick d) ...)".
-; Each firing is buffered in $events (handler name, the event value, the handler's
-; result) so the REPL can see what fired via (poll-events).
+; Each firing is buffered in $events so the REPL can see what fired via
+; (poll-events): (handler-name result) when the handler ran and succeeded, or
+; (handler-name event result) when the event was not handled (no handler, or the
+; handler failed). A handled event was delivered already, so it is not kept.
+; The buffer keeps the newest $event-limit firings (256; (event-buffer N) changes
+; it, 0 turns buffering off) and counts the older ones it drops.
 (global $events (list value) mut 0)
+(global $event-limit s32 mut 0)
+(global $events-dropped s32 mut 0)
 
-(fn record-event ((handler string) (event value) (result value)) s32
-  (begin
-    (global.set $events (list-push (global.get $events)
-      (sequence (list-push (list-push (list-push (list-new value) (text handler)) event) result))))
-    0))
+(fn firing ((handler string) (event value) (result value) (handled s32)) value
+  (sequence
+    (if handled (list-push (list-push (list-new value) (text handler)) result)
+      (list-push (list-push (list-push (list-new value) (text handler)) event) result))))
+
+; Drop all but the newest $event-limit firings, counting the dropped ones.
+(fn trim-events () s32
+  (let (excess (i32.sub (list-len (global.get $events)) (global.get $event-limit)))
+    (if (i32.gt_s excess 0)
+      (begin
+        (global.set $events (copy-list (global.get $events) excess (list-new value)))
+        (global.set $events-dropped (i32.add (global.get $events-dropped) excess))
+        0)
+      0)))
+
+; Trimming copies the list, so it runs once the buffer holds twice the limit, not
+; on every firing; poll-events and memory-stats trim before they report.
+(fn record-event ((handler string) (event value) (result value) (handled s32)) s32
+  (if (i32.le_s (global.get $event-limit) 0) 0
+    (begin
+      (global.set $events (list-push (global.get $events) (firing handler event result handled)))
+      (if (i32.gt_s (i32.sub (list-len (global.get $events)) (global.get $event-limit)) (global.get $event-limit))
+        (trim-events) 0))))
 
 ; Dispatch an inbound event to a user handler named `handler` (a 1-arg function
 ; defined in the session). Resets the step budget (the handler runs fresh), applies
-; the handler to the event, records (handler, event, result). If no such handler is
-; defined, records the event with a "no handler" note so it is still visible.
+; the handler to the event, records the firing. If no such handler is defined,
+; records the event with a "no handler" note so it is still visible. Open and
+; close events also update the (handles) table.
 (fn dispatch-event ((handler string) (event value)) value
   (begin
     (global.set $steps (i32.const 0))
+    (ensure-started)
+    (track-event handler event)
     (let (h (lookup handler (list-new binding)))
       (if (failed? h)
-        (begin (record-event handler event (text "no handler defined")) h)
+        (begin (record-event handler event (text "no handler defined") 0) h)
         (let (result (apply-value h (list-push (list-new value) event) (i32.const 0) ""))
-          (begin (record-event handler event result) result))))))
+          (begin (record-event handler event result (i32.eq (failed? result) 0)) result))))))
+
+; --- handles ---------------------------------------------------------------
+; Host resources this session holds open, by kind ("timer", "listener",
+; "connection", "process", "channel") and id. The open verbs add an entry on
+; success; the close verbs and the close/exit events remove it. Bounded by the
+; number of open handles. (handles) lists them.
+(record host-handle (kind string) (id string))
+(global $handles (list host-handle) mut 0)
+
+(fn handle-index ((hs (list host-handle)) (index s32) (kind string) (id string)) s32
+  (if (i32.ge_s index (list-len hs)) -1
+    (if (i32.and (string=? kind (host-handle.kind (list-get hs index))) (string=? id (host-handle.id (list-get hs index)))) index
+      (handle-index hs (i32.add index 1) kind id))))
+
+(fn drop-handle ((hs (list host-handle)) (index s32) (kind string) (id string) (out (list host-handle))) (list host-handle)
+  (if (i32.ge_s index (list-len hs)) out
+    (drop-handle hs (i32.add index 1) kind id
+      (if (i32.and (string=? kind (host-handle.kind (list-get hs index))) (string=? id (host-handle.id (list-get hs index)))) out
+        (list-push out (list-get hs index))))))
+
+(fn open-handle ((kind string) (id string)) s32
+  (if (i32.or (i32.eq (string-len id) 0) (i32.ge_s (handle-index (global.get $handles) 0 kind id) 0)) 0
+    (begin (global.set $handles (list-push (global.get $handles) (host-handle kind id))) 0)))
+
+(fn close-handle ((kind string) (id string)) s32
+  (if (i32.lt_s (handle-index (global.get $handles) 0 kind id) 0) 0
+    (begin (global.set $handles (drop-handle (global.get $handles) 0 kind id (list-new host-handle))) 0)))
+
+; The string payload of an (ok id) host result, or "".
+(fn ok-id ((result value)) string
+  (value-case result
+    ((compound ty case-name fields)
+      (if (i32.and (string=? case-name "ok") (i32.ge_s (list-len fields) 1)) (as-string (list-get fields 0)) ""))
+    (else "")))
+
+; The id an event is about: the event itself, or its first element.
+(fn event-id ((event value)) string
+  (value-case event
+    ((text s) s)
+    ((sequence items) (if (list-len items) (as-string (list-get items 0)) ""))
+    (else "")))
+
+(fn first-arg ((args (list value))) string
+  (if (list-len args) (as-string (list-get args 0)) ""))
+
+; After a host verb ran: record the handle it opened, or forget the one it closed.
+; A close forgets the handle whatever the host answered: the caller is done with it.
+(fn track-verb ((verb string) (args (list value)) (result value)) s32
+  (cond
+    ((string=? verb "set-interval") (open-handle "timer" (ok-id result)))
+    ((string=? verb "clear-interval") (close-handle "timer" (first-arg args)))
+    ((string=? verb "tcp-listen") (open-handle "listener" (ok-id result)))
+    ((string=? verb "tcp-close-listener") (close-handle "listener" (first-arg args)))
+    ((string=? verb "tcp-connect") (open-handle "connection" (ok-id result)))
+    ((string=? verb "tcp-close") (close-handle "connection" (first-arg args)))
+    ((string=? verb "tcp-transfer") (close-handle "connection" (first-arg args)))
+    ((string=? verb "tcp-transfer-async") (close-handle "connection" (first-arg args)))
+    ((string=? verb "process-spawn") (open-handle "process" (ok-id result)))
+    ((string=? verb "process-spawn-pty") (open-handle "process" (ok-id result)))
+    ((string=? verb "process-close") (close-handle "process" (first-arg args)))
+    ((string=? verb "process-transfer") (close-handle "process" (first-arg args)))
+    ((string=? verb "msg-open") (open-handle "channel" (ok-id result)))
+    ((string=? verb "msg-close-channel") (close-handle "channel" (first-arg args)))
+    (else 0)))
+
+; Before an inbound event is dispatched: the same, for handles the peer opened or closed.
+(fn track-event ((handler string) (event value)) s32
+  (cond
+    ((string=? handler "on-connection") (open-handle "connection" (event-id event)))
+    ((string=? handler "on-close") (close-handle "connection" (event-id event)))
+    ((string=? handler "on-exit") (close-handle "process" (event-id event)))
+    ((string=? handler "on-process-transfer") (open-handle "process" (event-id event)))
+    ((string=? handler "on-channel-open") (open-handle "channel" (event-id event)))
+    ((string=? handler "on-channel-close") (close-handle "channel" (event-id event)))
+    (else 0)))
+
+(fn show-handles ((hs (list host-handle)) (index s32) (out (list value))) value
+  (if (i32.ge_s index (list-len hs)) (sequence out)
+    (show-handles hs (i32.add index 1)
+      (list-push out (sequence (list-push (list-push (list-new value)
+        (text (host-handle.kind (list-get hs index)))) (text (host-handle.id (list-get hs index)))))))))
+
+(fn apply-handles ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "handles expects no arguments")
+    (show-handles (global.get $handles) 0 (list-new value))))
 
 (import theater:simple/rpc describe ((actor-id string)) any)
 (import theater:simple/rpc exports ((actor-id string)) any)
@@ -317,6 +429,9 @@
     ((string=? name "http-get") 1)
     ((string=? name "http-req") 1)
     ((string=? name "poll-events") 1)
+    ((string=? name "event-buffer") 1)
+    ((string=? name "handles") 1)
+    ((string=? name "memory-stats") 1)
     ((string=? name "help") 1)
     ((string=? name "marshal") 1)
     ((string=? name "unmarshal") 1)
@@ -1160,35 +1275,81 @@
   (if (two-str? args) (unmarshal (raw-invoke "theater:simple/process" "transfer" (arg-tuple args))) (failure "process-transfer expects a process id and target actor")))
 
 ; --- inbound events --------------------------------------------------------
-; Drain the buffered triggers: each is (handler-name event result). Clears the
-; buffer so you see only what fired since the last poll. (poll-events "text")
-; drains the same buffer into readable text instead: one "handler: result" per
-; firing, the event dropped, a string result shown raw (for theater-repl read).
+; Drain the buffered triggers (see $events). Clears the buffer so you see only
+; what fired since the last poll. When firings were dropped since then, the count
+; comes first: (N firing...) instead of (firing...). (poll-events "text") drains
+; the same buffer into readable text instead: a "(N earlier firings dropped)" line
+; when there were drops, then one "handler: result" per firing, the event left
+; out, a string result shown raw (for theater-repl read).
 (fn apply-poll-events ((args (list value))) value
   (let (n (list-len args))
     (if (i32.gt_s n 1) (failure "poll-events expects no argument or \"text\"")
       (if (i32.and (i32.eq n 1) (i32.eq (text-mode? (list-get args 0)) 0))
         (failure "poll-events expects no argument or \"text\"")
-        (let (evs (global.get $events))
-          (begin (global.set $events (list-new value))
-            (if (i32.eq n 1) (text (show-firings evs 0 "")) (sequence evs))))))))
+        (begin
+          (trim-events)
+          (let (evs (global.get $events))
+            (let (dropped (global.get $events-dropped))
+              (begin
+                (global.set $events (list-new value))
+                (global.set $events-dropped 0)
+                (if (i32.eq n 1) (text (show-firings evs 0 (dropped-line dropped)))
+                  (sequence (if (i32.gt_s dropped 0) (copy-list evs 0 (list-push (list-new value) (integer dropped))) evs)))))))))))
+
+(fn dropped-line ((dropped s32)) string
+  (if (i32.gt_s dropped 0)
+    (string-append "(" (string-append (show-integer dropped) " earlier firings dropped)"))
+    ""))
+
+; (event-buffer N) keeps the newest N firings (0 turns buffering off) and returns
+; the old limit.
+(fn apply-event-buffer ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "event-buffer expects (event-buffer N)")
+    (value-case (list-get args 0)
+      ((integer limit)
+        (if (i32.lt_s limit 0) (failure "event-buffer expects a limit of 0 or more")
+          (let (old (global.get $event-limit))
+            (begin
+              (global.set $event-limit limit)
+              (trim-events)
+              (integer old)))))
+      (else (failure "event-buffer expects an integer limit")))))
+
+; (memory-stats): heap bytes in use, and the sizes of the session's long-lived
+; tables, as (name count) pairs. heap-bytes is the bump pointer for now: it counts
+; every byte ever allocated, garbage included.
+(fn stat ((name string) (n s32)) value
+  (sequence (list-push (list-push (list-new value) (text name)) (integer n))))
+(fn apply-memory-stats ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "memory-stats expects no arguments")
+    (begin
+      (trim-events)
+      (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+        (stat "heap-bytes" (heap-alloc 0)))
+        (stat "bindings" (list-len (global.get $bindings))))
+        (stat "modules" (list-len (global.get $modules))))
+        (stat "types" (list-len (global.get $types))))
+        (stat "macros" (list-len (global.get $session-macros))))
+        (stat "events" (list-len (global.get $events))))
+        (stat "events-dropped" (global.get $events-dropped)))
+        (stat "handles" (list-len (global.get $handles))))))))
 
 (fn text-mode? ((v value)) s32
   (if (string-arg? v) (string=? (as-string v) "text") 0))
 
-; One "handler: result" line per (handler event result) firing.
+; One "handler: result" line per firing, after OUT (the drop line, or "").
 (fn show-firings ((evs (list value)) (index s32) (out string)) string
   (if (i32.ge_s index (list-len evs)) out
     (show-firings evs (i32.add index 1)
-      (string-append (if (i32.eq index 0) out (string-append out "\n"))
+      (string-append (if (string-len out) (string-append out "\n") out)
         (show-firing (list-get evs index))))))
 
 (fn show-firing ((firing value)) string
   (value-case firing
     ((sequence items)
-      (if (i32.ne (list-len items) 3) (show firing)
+      (if (i32.or (i32.lt_s (list-len items) 2) (i32.gt_s (list-len items) 3)) (show firing)
         (string-append (show-raw (list-get items 0))
-          (string-append ": " (show-raw (list-get items 2))))))
+          (string-append ": " (show-raw (list-get items (i32.sub (list-len items) 1)))))))
     (else (show firing))))
 
 ; A string as its bare contents; any other value as show prints it.
@@ -1203,7 +1364,7 @@
     ((string=? topic "tcp")
       "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (conn-id bytes): (car e), (car (cdr e))\n    (define on-close      (lambda (e) e))       ; e = (conn-id reason): (car e), (car (cdr e))\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
     ((string=? topic "triggers")
-      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name event handler-result); (poll-events) returns\nthose lists. (poll-events \"text\") returns one \"handler: result\" line per firing\ninstead (event dropped, a string result raw); theater-repl read/follow print that,\nand read --full / follow --full print the lists. Scripts should parse --full: a raw\nresult can span lines. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
+      "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\ndrained by (poll-events) (CLI: theater-repl read <id> / follow <id>).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name handler-result), or (handler-name event\nhandler-result) when the event was not handled (no handler, or it failed);\n(poll-events) returns those lists. (poll-events \"text\") returns one\n\"handler: result\" line per firing instead (event left out, a string result raw);\ntheater-repl read/follow print that, and read --full / follow --full print the\nlists. Scripts should parse --full: a raw result can span lines.\n\nThe buffer keeps the newest 256 firings and drops older ones. After drops,\n(poll-events) puts the count first, (N firing ...), and the text form starts with\n\"(N earlier firings dropped)\". (event-buffer N) sets the limit (0 = keep none;\nhandlers still run) and returns the old one. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
     ((string=? topic "modules")
       "Modules — load a library with (require NAME \"path\") at top level.\n\n  (require greet \"lib/greet.wisp\")   ; read the file, bind greet's provides\n  (hi \"bob\")                          ; provided names come in UNQUALIFIED (not greet.hi)\n  (require greet)                     ; reuse an already-loaded greet\n  (reload greet)                      ; re-read lib/greet.wisp after editing it\n\nrequire loads a module once per session: requiring an already-loaded NAME does\nnot re-read the file. To pick up an edit, (reload NAME) re-reads the source NAME\nwas loaded from into a fresh module env and rebinds the copies in EVERY module of\nthis session that imported it. It returns the names the new version no longer\nprovides (now unbound; () if none); newly provided names need (require NAME)\nagain. Shallow: NAME's own requires are not reloaded. If the new source fails,\nnothing changes and reload returns the error. A value copied by hand, like\n(define f hi), is not an import and keeps the old code.")
     (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\"), (help \"modules\")")))))
@@ -1223,14 +1384,20 @@
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
                         (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n"
-                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events [\"text\"]) to drain   see (help \"triggers\")\n"
+                        (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (poll-events [\"text\"]) to drain   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
+                        (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes\n"
                         (string-append "modules:   (require NAME \"path\") load once, bind provides unqualified   (reload NAME) re-read an edited module   see (help \"modules\")\n"
-                          "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")"))))))))))))))))
+                          "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")")))))))))))))))))
     (if (string-arg? (list-get args 0))
       (text (help-topic (as-string (list-get args 0))))
       (failure "help expects an optional topic string"))))
 
+; Run a host verb, then keep the (handles) table in step with what it opened or closed.
 (fn apply-host-builtin ((name string) (args (list value))) value
+  (let (result (apply-host-verb name args))
+    (begin (track-verb name args result) result)))
+
+(fn apply-host-verb ((name string) (args (list value))) value
   (cond
     ((string=? name "self") (apply-self args))
     ((string=? name "log") (apply-log args))
@@ -1290,6 +1457,9 @@
     ((string=? name "http-get") (apply-http-get args))
     ((string=? name "http-req") (apply-http-req args))
     ((string=? name "poll-events") (apply-poll-events args))
+    ((string=? name "event-buffer") (apply-event-buffer args))
+    ((string=? name "handles") (apply-handles args))
+    ((string=? name "memory-stats") (apply-memory-stats args))
     ((string=? name "help") (apply-help args))
     ((string=? name "tcp-connect") (apply-tcp-connect args))
     ((string=? name "udp-bind") (apply-udp-bind args))

@@ -582,3 +582,122 @@ fn test_interpreter_help_documents_reload() {
     let out = s.evaluate("(help \"modules\")").unwrap();
     assert!(out.contains("(reload greet)"), "{out}");
 }
+
+/// One count from `(memory-stats)`, which prints as `(("name" n) ...)`.
+fn stat(session: &mut Interpreter, name: &str) -> i64 {
+    let out = session.evaluate("(memory-stats)").unwrap();
+    let key = format!("(\"{name}\" ");
+    let start = out
+        .find(&key)
+        .unwrap_or_else(|| panic!("no {name} in {out}"))
+        + key.len();
+    let digits: String = out[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().unwrap_or_else(|_| panic!("{name} in {out}"))
+}
+
+#[test]
+fn test_interpreter_redefinition_replaces_bindings() {
+    let mut s = session();
+    eval(&mut s, "(define x 0)", "0");
+    eval(&mut s, "(define f (lambda (y) y))", "#<closure>");
+    let bindings = stat(&mut s, "bindings");
+    // 1,000 redefinitions, 250 to an input (the input limit is 4 KB).
+    for chunk in 0..4 {
+        let source: Vec<String> = (0..250)
+            .map(|i| format!("(define x {})", chunk * 250 + i))
+            .collect();
+        s.evaluate(&source.join(" ")).unwrap();
+    }
+    for _ in 0..10 {
+        eval(&mut s, "(define f (lambda (y) (+ y x)))", "#<closure>");
+    }
+    assert_eq!(stat(&mut s, "bindings"), bindings);
+    eval(&mut s, "x", "999");
+    eval(&mut s, "(f 1)", "1000");
+    // A new name still adds a binding.
+    eval(&mut s, "(define z 1)", "1");
+    assert_eq!(stat(&mut s, "bindings"), bindings + 1);
+}
+
+#[test]
+fn test_interpreter_macro_redefinition_replaces_macro() {
+    let mut s = session();
+    eval(&mut s, "(defmacro twice (e) `(+ ,e ,e))", "()");
+    let macros = stat(&mut s, "macros");
+    for _ in 0..20 {
+        eval(&mut s, "(defmacro twice (e) `(* 2 ,e))", "()");
+    }
+    eval(
+        &mut s,
+        "(define-syntax twice (syntax-rules () ((_ e) (* 3 e))))",
+        "()",
+    );
+    assert_eq!(stat(&mut s, "macros"), macros);
+    eval(&mut s, "(twice 5)", "15");
+}
+
+#[test]
+fn test_interpreter_repeated_provide_still_binds_once() {
+    let mut s = session();
+    eval(
+        &mut s,
+        "(module m (provide a) (provide a b) (define a 1) (define b 2))",
+        "()",
+    );
+    eval(&mut s, "(require m)", "()");
+    eval(&mut s, "(+ a b)", "3");
+}
+
+#[test]
+fn test_interpreter_memory_stats() {
+    let mut s = session();
+    let out = s.evaluate("(memory-stats)").unwrap();
+    for name in [
+        "heap-bytes",
+        "bindings",
+        "modules",
+        "types",
+        "macros",
+        "events",
+        "events-dropped",
+        "handles",
+    ] {
+        assert!(out.contains(&format!("(\"{name}\" ")), "{name} in {out}");
+    }
+    assert_eq!(stat(&mut s, "events"), 0);
+    assert_eq!(stat(&mut s, "events-dropped"), 0);
+    assert_eq!(stat(&mut s, "handles"), 0);
+    let heap = stat(&mut s, "heap-bytes");
+    let types = stat(&mut s, "types");
+    eval(&mut s, "(record point (x s32) (y s32))", "()");
+    assert_eq!(stat(&mut s, "types"), types + 1);
+    assert!(stat(&mut s, "heap-bytes") > heap);
+    eval(
+        &mut s,
+        "(memory-stats 1)",
+        "error: memory-stats expects no arguments",
+    );
+    let out = s.evaluate("(help)").unwrap();
+    assert!(
+        out.contains("(memory-stats)") && out.contains("(handles)"),
+        "{out}"
+    );
+    assert!(out.contains("(event-buffer N)"), "{out}");
+}
+
+#[test]
+fn test_interpreter_event_buffer_returns_old_limit() {
+    let mut s = session();
+    eval(&mut s, "(event-buffer 10)", "256");
+    eval(&mut s, "(event-buffer 0)", "10");
+    eval(&mut s, "(event-buffer 256)", "0");
+    eval(
+        &mut s,
+        "(event-buffer -1)",
+        "error: event-buffer expects a limit of 0 or more",
+    );
+    eval(&mut s, "(handles)", "()");
+}

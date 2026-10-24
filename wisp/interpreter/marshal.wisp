@@ -294,21 +294,46 @@
   (if (i32.ge_s i (list-len items)) acc
     (enc-children items (i32.add i (i32.const 1)) (list-push acc (enc-value (list-get items i))))))
 
-(fn marshal ((v value)) any
-  ; TODO: size pass instead of a fixed over-allocation (bump heap never frees).
-  (let (buf (heap-alloc (i32.const 16388)))
+; One encode buffer, reused by every marshal. A blob is valid only until the next
+; marshal: every caller hands it straight to raw-invoke / call-raw / an export
+; return, or copies it out (apply-marshal), before marshalling again.
+(global $marshal-buf s32 mut 0)
+(global $marshal-cap s32 mut 0)
+
+; The shared buffer, grown first if NEED bytes (len prefix + header + nodes) do not
+; fit. Growing replaces it; the old buffer is garbage.
+(fn marshal-buffer ((need s32)) s32
+  (begin
+    (if (i32.gt_s need (global.get $marshal-cap))
+      (let (cap (if (i32.gt_s need 16388) need 16388))
+        (begin
+          (global.set $marshal-buf (heap-alloc cap))
+          (global.set $marshal-cap cap)
+          0))
+      0)
+    (global.get $marshal-buf)))
+
+; Write the header and len prefix once the nodes are in buf; return the blob.
+(fn finish-blob ((buf s32) (root s32)) any
+  (let (cgrf-len (i32.sub (global.get $enc-cur) (i32.add buf (i32.const 4))))
+    (begin
+      (i32.store (i32.add buf (i32.const 4)) (i32.const 1179797315)) ; magic "CGRF"
+      (i32.store (i32.add buf (i32.const 8)) (i32.const 3))          ; version=3, flags=0
+      (i32.store (i32.add buf (i32.const 12)) (global.get $enc-idx)) ; node_count
+      (i32.store (i32.add buf (i32.const 16)) root)                  ; root_index
+      (i32.store buf cgrf-len)                                       ; len prefix
+      (any-from-addr buf))))
+
+(fn start-blob ((need s32)) s32
+  (let (buf (marshal-buffer (i32.add (i32.const 20) need)))
     (begin
       (global.set $enc-cur (i32.add buf (i32.const 20)))   ; past len prefix(4) + header(16)
       (global.set $enc-idx (i32.const 0))
-      (let (root (enc-value v))
-        (let (cgrf-len (i32.sub (global.get $enc-cur) (i32.add buf (i32.const 4))))
-          (begin
-            (i32.store (i32.add buf (i32.const 4)) (i32.const 1179797315)) ; magic "CGRF"
-            (i32.store (i32.add buf (i32.const 8)) (i32.const 3))          ; version=3, flags=0
-            (i32.store (i32.add buf (i32.const 12)) (global.get $enc-idx)) ; node_count
-            (i32.store (i32.add buf (i32.const 16)) root)                  ; root_index
-            (i32.store buf cgrf-len)                                       ; len prefix
-            (any-from-addr buf)))))))
+      buf)))
+
+(fn marshal ((v value)) any
+  (let (buf (start-blob (enc-bound v)))
+    (finish-blob buf (enc-value v))))
 
 ; Marshal a record directly from (type-name, field-name symbols, field values)
 ; without needing the type registered in $types — the way to send a foreign
@@ -316,19 +341,52 @@
 ; interp values (strings, lists, options, ...); nested records would recurse via
 ; their own aggregate/marshal-record, but typical args (empty lists, none) don't.
 (fn marshal-record ((name string) (fnames (list value)) (fields (list value))) any
-  (let (buf (heap-alloc (i32.const 16388)))
-    (begin
-      (global.set $enc-cur (i32.add buf (i32.const 20)))
-      (global.set $enc-idx (i32.const 0))
-      (let (root (enc-record name fnames fields))
-        (let (cgrf-len (i32.sub (global.get $enc-cur) (i32.add buf (i32.const 4))))
-          (begin
-            (i32.store (i32.add buf (i32.const 4)) (i32.const 1179797315))
-            (i32.store (i32.add buf (i32.const 8)) (i32.const 3))
-            (i32.store (i32.add buf (i32.const 12)) (global.get $enc-idx))
-            (i32.store (i32.add buf (i32.const 16)) root)
-            (i32.store buf cgrf-len)
-            (any-from-addr buf)))))))
+  (let (buf (start-blob (record-bound name (names-bound fnames 0 0) fields)))
+    (finish-blob buf (enc-record name fnames fields))))
+
+; --- size bound -------------------------------------------------------------
+; An upper bound on the bytes enc-value writes for a value, mirroring it node by
+; node, so the shared buffer is grown before encoding instead of overrun.
+(fn pstring-len ((s string)) s32 (i32.load (string-addr s)))
+(fn sum-bounds ((items (list value)) (i s32) (acc s32)) s32
+  (if (i32.ge_s i (list-len items)) acc
+    (sum-bounds items (i32.add i (i32.const 1)) (i32.add acc (enc-bound (list-get items i))))))
+; Children plus a container of HEAD bytes and one index for each child.
+(fn children-bound ((head s32) (items (list value))) s32
+  (i32.add head (i32.add (i32.mul (i32.const 4) (list-len items)) (sum-bounds items 0 0))))
+(fn tags-bound ((parts (list value)) (i s32) (acc s32)) s32
+  (if (i32.ge_s i (list-len parts)) acc
+    (tags-bound parts (i32.add i (i32.const 1)) (i32.add acc (tag-bound (list-get parts i))))))
+(fn tag-bound ((ty value)) s32
+  (if (symbol? ty) (i32.add (i32.const 5) (pstring-len (symbol-name ty)))
+    (i32.add (i32.const 5) (tags-bound (items-of ty) 1 0))))
+(fn names-bound ((names (list value)) (i s32) (acc s32)) s32
+  (if (i32.ge_s i (list-len names)) acc
+    (names-bound names (i32.add i (i32.const 1))
+      (i32.add acc (i32.add (i32.const 4) (pstring-len (symbol-name (list-get names i))))))))
+(fn schema-names-bound ((schema (list value)) (i s32) (acc s32)) s32
+  (if (i32.ge_s i (list-len schema)) acc
+    (schema-names-bound schema (i32.add i (i32.const 1))
+      (i32.add acc (i32.add (i32.const 4) (pstring-len (symbol-name (list-get (items-of (list-get schema i)) 0))))))))
+(fn record-bound ((name string) (names s32) (fields (list value))) s32
+  (children-bound (i32.add (i32.const 16) (i32.add (pstring-len name) names)) fields))
+(fn variant-bound ((tn string) (cn string) (fields (list value))) s32
+  (children-bound (i32.add (i32.const 24) (i32.add (pstring-len tn) (pstring-len cn))) fields))
+(fn enc-bound ((v value)) s32
+  (value-case v
+    ((text s) (i32.add (i32.const 12) (pstring-len s)))
+    ((sequence items) (children-bound (i32.const 12) items))
+    ((typed-list element items)
+      (if (i32.eq (tag-of-type element) (i32.const 12)) (i32.add (i32.const 13) (list-len items))
+        (children-bound (i32.add (i32.const 12) (tag-bound element)) items)))
+    ((compound ty case fields)
+      (children-bound (i32.add (i32.const 24) (tag-bound ty)) fields))
+    ((aggregate name id case-name fields)
+      (let (nt (list-get (global.get $types) id))
+        (if (named-type.variant? nt) (variant-bound name case-name fields)
+          (record-bound name (schema-names-bound (named-type.schema nt) 0 0) fields))))
+    ((open-variant tn cn tag fields) (variant-bound tn cn fields))
+    (else (i32.const 16))))                 ; a scalar or the empty-tuple placeholder
 
 ; ---------------------------------------------------------------------------
 ; unmarshal — Pack dynamic `any` (CGRF) back into an interpreter `value`.
