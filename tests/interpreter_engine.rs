@@ -661,6 +661,10 @@ fn test_rc_session_memory_is_flat() {
 }
 
 async fn rc_session_memory() {
+    // GRANITE_RC=0 turns counting off for every compile: nothing would be freed.
+    if std::env::var_os("GRANITE_RC").is_some_and(|v| v == "0") {
+        return;
+    }
     for debug_heap in [true, false] {
         let wasm = compile_rc_probe(debug_heap);
         let engine = WasmtimeEngine::new();

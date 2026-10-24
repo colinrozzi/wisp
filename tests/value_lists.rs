@@ -55,6 +55,14 @@ fn run_compiled(source: &str, rc: bool) -> (i32, u64) {
     (i32::from_le_bytes(b), after - before)
 }
 
+/// `GRANITE_RC` forces reference counting on (`1`) or off (`0`) for every
+/// compile; unset, each compile's own option decides (on by default).
+fn rc_forced() -> Option<bool> {
+    std::env::var_os("GRANITE_RC")
+        .filter(|v| !v.is_empty())
+        .map(|v| v != "0")
+}
+
 fn run_eval(source: &str) -> i32 {
     match compiler::eval_source(source).expect("eval failed") {
         Value::Int(n) => n as i32,
@@ -66,13 +74,16 @@ fn run_eval(source: &str) -> i32 {
 /// still writes in place (`in_place` is that answer).
 fn check(source: &str, value_semantics: i32, in_place: i32) {
     assert_eq!(run_eval(source), value_semantics, "granite eval\n{source}");
-    assert_eq!(
-        run_compiled(source, true).0,
-        value_semantics,
-        "rc\n{source}"
-    );
-    // GRANITE_RC=1 turns reference counting on for every compile.
-    if std::env::var_os("GRANITE_RC").is_none_or(|v| v == "0" || v.is_empty()) {
+    // GRANITE_RC forces one mode for every compile: check only that side.
+    let forced = rc_forced();
+    if forced != Some(false) {
+        assert_eq!(
+            run_compiled(source, true).0,
+            value_semantics,
+            "rc\n{source}"
+        );
+    }
+    if forced != Some(true) {
         assert_eq!(
             run_compiled(source, false).0,
             in_place,
@@ -191,6 +202,9 @@ fn pushes_through_aliases_copy() {
 /// is still written in place: 100,000 pushes allocate O(n) bytes, not O(n^2).
 #[test]
 fn accumulators_still_push_in_place() {
+    if rc_forced() == Some(false) {
+        return;
+    }
     let source = "(fn fill ((xs (list s32)) (i s32) (n s32)) (list s32)
   (if (i32.lt_s i n) (fill (list-push xs i) (i32.add i 1) n) xs))
 (export (fn test-func () s32 (list-len (fill (list-new s32) 0 100000))))";

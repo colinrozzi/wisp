@@ -1,6 +1,7 @@
 // Reference counting (docs/proposals/MEMORY.md §3, §7 stage 4: correct before fast).
 //
-// With `EmitOptions::rc` (or GRANITE_RC=1), heap objects are counted. The `rc` word
+// Heap objects are counted (`EmitOptions::rc`, on by default; `--no-rc` or
+// GRANITE_RC=0 turns it off, GRANITE_RC=1 forces it on). The `rc` word
 // of the block header (heap.rs) is the count; `$__dup` adds one and `$__drop_T`
 // takes one away, freeing the object and dropping its children at zero.
 //
@@ -33,8 +34,12 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 
-pub(crate) fn rc_from_env() -> bool {
-    std::env::var_os("GRANITE_RC").is_some_and(|v| v != "0" && !v.is_empty())
+/// `GRANITE_RC` overrides `EmitOptions::rc` for every compile: `0` turns
+/// reference counting off, anything else on; unset leaves the option alone.
+pub(crate) fn rc_from_env() -> Option<bool> {
+    std::env::var_os("GRANITE_RC")
+        .filter(|v| !v.is_empty())
+        .map(|v| v != "0")
 }
 
 /// `rc` of a raw block (`heap-alloc`, `__pack_alloc`) in debug builds with RC, so

@@ -13,14 +13,22 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Compile `source`, call its exported `test-func`, and return the s32 result
 /// and the bytes the call allocated.
 fn run_measured(source: &str) -> (i32, i64) {
+    run_measured_rc(source, true)
+}
+
+/// `run_measured` with reference counting on or off.
+fn run_measured_rc(source: &str, rc: bool) -> (i32, i64) {
     let test_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let temp_dir = std::env::temp_dir();
     let source_path = temp_dir.join(format!("test_list_push_{}.wisp", test_id));
     let out_base = temp_dir.join(format!("test_list_push_{}", test_id));
 
     std::fs::write(&source_path, source).expect("failed to write temp source");
-    compiler::compile(&source_path, &out_base, compiler::EmitOptions::default())
-        .expect("failed to compile");
+    let emit = compiler::EmitOptions {
+        rc,
+        ..Default::default()
+    };
+    compiler::compile(&source_path, &out_base, emit).expect("failed to compile");
     let wasm_bytes = std::fs::read(out_base.with_extension("wasm")).expect("failed to read wasm");
 
     let mut config = Config::new();
@@ -65,9 +73,9 @@ fn run_measured(source: &str) -> (i32, i64) {
     (i32::from_le_bytes(buf), after - before)
 }
 
-/// GRANITE_RC=1 gives every compile reference counting, whose list-push has
-/// value semantics, which the in-place tests below do not describe.
-fn rc() -> bool {
+/// The in-place tests below compile without reference counting (`--no-rc`),
+/// whose list-push writes in place; GRANITE_RC=1 forces RC on for every compile.
+fn rc_forced_on() -> bool {
     std::env::var_os("GRANITE_RC").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
@@ -118,35 +126,37 @@ fn push_100k_f64_allocates_linear() {
 
 #[test]
 fn push_is_still_in_place() {
-    if rc() {
-        return; // GRANITE_RC: pushes copy (tests/value_lists.rs)
+    if rc_forced_on() {
+        return; // GRANITE_RC=1: pushes copy (tests/value_lists.rs)
     }
     // Today's semantics: push mutates the header, so every alias sees it.
-    let (result, _) = run_measured(
+    let (result, _) = run_measured_rc(
         "(fn test-func () s32
   (let (a (list-new s32))
     (let (b (list-push a (i32.const 7)))
       (let (c (list-push b (i32.const 8)))
         (i32.add (i32.mul (list-len a) (i32.const 100)) (list-get a 1))))))
 (export test-func)",
+        false,
     );
     assert_eq!(result, 208);
 }
 
 #[test]
 fn push_value_that_pushes_same_list() {
-    if rc() {
-        return; // GRANITE_RC: pushes copy (tests/value_lists.rs)
+    if rc_forced_on() {
+        return; // GRANITE_RC=1: pushes copy (tests/value_lists.rs)
     }
     // The value expression pushes into the same list first; the outer push
     // must read the header after that, landing at index 1.
-    let (result, _) = run_measured(
+    let (result, _) = run_measured_rc(
         "(fn test-func () s32
   (let (a (list-new s32))
     (let (b (list-push a (list-len (list-push a (i32.const 5)))))
       (i32.add (i32.mul (list-len a) (i32.const 100))
         (i32.add (i32.mul (list-get a 0) (i32.const 10)) (list-get a 1))))))
 (export test-func)",
+        false,
     );
     assert_eq!(result, 251);
 }

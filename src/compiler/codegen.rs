@@ -3130,15 +3130,15 @@ pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 /// - Memory layout with input buffer at 0x0, output at 0x4000
 ///
 /// `emit.debug_heap` (or `GRANITE_DEBUG_HEAP=1`) builds the debug heap: see
-/// `emit_heap_runtime`. `emit.rc` (or `GRANITE_RC=1`) counts references: see
-/// `rc.rs`.
+/// `emit_heap_runtime`. `emit.rc` (overridden by `GRANITE_RC`) counts
+/// references: see `rc.rs`.
 pub(crate) fn generate_wat_pack(
     prog: &Program,
     signatures: &HashMap<String, Signature>,
     emit: &EmitOptions,
 ) -> String {
     let debug_heap = emit.debug_heap || debug_heap_from_env();
-    let rc = emit.rc || rc_from_env();
+    let rc = rc_from_env().unwrap_or(emit.rc);
     let _rc = rc.then(|| RcModuleScope::enter(debug_heap));
     rc_infer_borrowed(&prog.functions);
     let _static_strings = StaticStringsScope::enter();

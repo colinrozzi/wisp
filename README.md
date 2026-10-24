@@ -79,8 +79,8 @@ self-hosted compilers are tested separately; support is not identical.
 
 Compiled code (`granite compile`) manages its heap itself: each object carries a
 small header with a reference count, and an object is freed when its last
-reference goes (`--rc`, or `GRANITE_RC=1`; see
-[docs/proposals/MEMORY.md](docs/proposals/MEMORY.md)). The memory starts small
+reference goes (on by default; `--no-rc` or `GRANITE_RC=0` builds the old heap,
+which never frees; see [docs/proposals/MEMORY.md](docs/proposals/MEMORY.md)). The memory starts small
 and grows as the heap needs it. For a program this means:
 
 - **Values are immutable.** `(list-push xs v)` returns a list with `v` added and
@@ -101,8 +101,8 @@ and grows as the heap needs it. For a program this means:
   address of a counted object, valid until the end of the enclosing `let` (or the
   function); `string-from-addr`/`any-from-addr` copy bytes into a new object.
 - **Debugging:** `--debug-heap` (or `GRANITE_DEBUG_HEAP=1`) poisons freed blocks,
-  traps on a use after free or a double free, and with `--rc` checks every count
-  against the heap after each export call (`__granite_heap_verify`).
+  traps on a use after free or a double free, and with reference counting checks
+  every count against the heap after each export call (`__granite_heap_verify`).
   `__granite_heap_stats` reports live bytes and blocks.
 
 ## Wisp — the interpreted Lisp
