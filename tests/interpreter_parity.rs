@@ -1517,10 +1517,10 @@ fn test_compound_types_validate_nested_and_absent_payloads() {
     }
 }
 
-/// Whether this run compiles with value-semantics list-push
-/// (`GRANITE_VALUE_LISTS`, MEMORY.md §7 stage 3).
+/// Whether this run compiles with reference counting, whose list-push has value
+/// semantics (`GRANITE_RC`, MEMORY.md §7 stage 4).
 fn value_lists() -> bool {
-    std::env::var_os("GRANITE_VALUE_LISTS").is_some_and(|v| v != "0" && !v.is_empty())
+    std::env::var_os("GRANITE_RC").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
 #[test]

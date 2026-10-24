@@ -13,8 +13,8 @@ use codegen::*;
 mod heap;
 pub use codegen::{compile_repl_expr, compile_repl_expr_pack, compile_repl_expr_pack_wat};
 use heap::*;
-mod last_use;
-use last_use::*;
+mod rc;
+use rc::*;
 mod eval;
 pub use eval::{
     Host, NullHost, Value, eval_repl_expr, eval_repl_expr_with_host, eval_source,
@@ -335,10 +335,10 @@ pub struct EmitOptions {
     /// poisoned, and a double free or a write to a free block's header traps.
     /// `GRANITE_DEBUG_HEAP=1` turns it on for every compile.
     pub debug_heap: bool,
-    /// Value-semantics `list-push` (docs/proposals/MEMORY.md §7 stage 3): the
-    /// argument list is left unchanged unless it is a local's last use.
-    /// `GRANITE_VALUE_LISTS=1` turns it on for every compile.
-    pub value_lists: bool,
+    /// Reference counting (docs/proposals/MEMORY.md §3, stage 4): objects are
+    /// freed when their last reference goes, and `list-push` has value semantics.
+    /// `GRANITE_RC=1` turns it on for every compile.
+    pub rc: bool,
 }
 
 /// Splice `(include "path")` top-level forms in place, reading each referenced

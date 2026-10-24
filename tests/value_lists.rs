@@ -1,6 +1,6 @@
-// Value-semantics `list-push` behind `EmitOptions::value_lists` (MEMORY.md §7
-// stage 3): `(list-push xs v)` leaves `xs` unchanged, as `granite eval` always
-// has, and still writes in place when nothing can see the old list.
+// Value-semantics `list-push` under reference counting (`EmitOptions::rc`,
+// MEMORY.md §3.4, §7 stage 4): `(list-push xs v)` leaves `xs` unchanged, as
+// `granite eval` always has, and still writes in place when the list's count is 1.
 
 use granite::compiler::{self, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,14 +10,14 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Compile `source` and call its nullary s32 export `test-func`; also return the bytes
 /// the call allocated (`total_bytes` of `__granite_heap_stats`).
-fn run_compiled(source: &str, value_lists: bool) -> (i32, u64) {
+fn run_compiled(source: &str, rc: bool) -> (i32, u64) {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir();
     let source_path = dir.join(format!("test_value_lists_{}_{id}.wisp", std::process::id()));
     let out_base = dir.join(format!("test_value_lists_{}_{id}", std::process::id()));
     std::fs::write(&source_path, source).unwrap();
     let emit = compiler::EmitOptions {
-        value_lists,
+        rc,
         ..Default::default()
     };
     let wasm = compiler::compile(&source_path, &out_base, emit)
@@ -69,10 +69,10 @@ fn check(source: &str, value_semantics: i32, in_place: i32) {
     assert_eq!(
         run_compiled(source, true).0,
         value_semantics,
-        "value lists\n{source}"
+        "rc\n{source}"
     );
-    // GRANITE_VALUE_LISTS=1 turns value lists on for every compile.
-    if std::env::var_os("GRANITE_VALUE_LISTS").is_none_or(|v| v == "0" || v.is_empty()) {
+    // GRANITE_RC=1 turns reference counting on for every compile.
+    if std::env::var_os("GRANITE_RC").is_none_or(|v| v == "0" || v.is_empty()) {
         assert_eq!(
             run_compiled(source, false).0,
             in_place,
@@ -126,6 +126,27 @@ fn pushing_a_holder_into_its_list_makes_no_cycle() {
     );
 }
 
+/// MEMORY.md §7 stage 4: the §2.2 program, using the list the push returns, gives
+/// 1 (b's own list stays empty) instead of following the cycle to the fuel limit.
+#[test]
+fn the_cycle_program_returns_one() {
+    check(
+        "(variant node (leaf s32) (branch (list node)))
+(fn depth ((n node) (fuel s32)) s32
+  (if (i32.eq fuel 0) 0
+    (match n
+      ((leaf v) 0)
+      ((branch kids)
+        (if (list-len kids) (i32.add 1 (depth (list-get kids 0) (i32.sub fuel 1))) 0)))))
+(export (fn test-func () s32
+  (let (xs (list-new node))
+    (let (b (branch xs))
+      (depth (branch (list-push xs b)) 1000)))))",
+        1,
+        1000,
+    );
+}
+
 /// The outer push already holds `xs` while its value runs, so the inner push (the
 /// last use of `xs`) must not write into it.
 #[test]
@@ -143,7 +164,7 @@ fn a_push_inside_the_pushed_value_copies() {
 }
 
 /// A `let` alias and a `match` binding both share their list with something
-/// still live, so a push through them copies even at their last use.
+/// still live (count 2), so a push through them copies.
 #[test]
 fn pushes_through_aliases_copy() {
     check(
@@ -166,8 +187,8 @@ fn pushes_through_aliases_copy() {
     );
 }
 
-/// An accumulator threaded through a loop is pushed at its last use, so it is
-/// still written in place: 100,000 pushes allocate O(n) bytes, not O(n^2).
+/// An accumulator threaded through a loop has a count of 1 at every push, so it
+/// is still written in place: 100,000 pushes allocate O(n) bytes, not O(n^2).
 #[test]
 fn accumulators_still_push_in_place() {
     let source = "(fn fill ((xs (list s32)) (i s32) (n s32)) (list s32)

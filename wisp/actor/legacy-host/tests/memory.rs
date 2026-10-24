@@ -51,14 +51,15 @@ async fn test_host_calls_in_a_loop_keep_memory_flat() -> anyhow::Result<()> {
     let wasm = std::fs::read(actor_path())?;
     let runtime = Runtime::new(SourceBundle::default(), Default::default()).await?;
     let session = runtime.spawn(wasm).await?;
-    // Each loop iteration retains the interpreter's own garbage (environments,
-    // values), which nothing frees until reference counting (stage 4), so compare
-    // with a builtin that makes no host call. A host call then adds only its
-    // decoded result: the marshal buffer is reused, and raw-invoke frees its
-    // slots and the host's result buffer (before stage 2, 56 B more per (now)
-    // and 304 B more per (sessions)). tests/heap.rs checks the boundary exactly.
+    // Without reference counting each loop iteration retains the interpreter's
+    // own garbage (environments, values), so compare with a builtin that makes no
+    // host call. A host call then adds only its decoded result and its marshalled
+    // argument (a copy out of the shared buffer since stage 4, §3.6): raw-invoke
+    // frees its slots and the host's result buffer (before stage 2, 56 B more per
+    // (now) and 304 B more per (sessions)). With RC (GRANITE_RC) both are 0.
+    // tests/heap.rs checks the boundary exactly.
     let baseline = per_call(&session, "list").await?;
-    for (verb, result_bytes) in [("now", 128), ("sessions", 1024)] {
+    for (verb, result_bytes) in [("now", 256), ("sessions", 1280)] {
         let extra = per_call(&session, verb).await? - baseline;
         println!("({verb}): {extra} B/call more than (list)");
         assert!(

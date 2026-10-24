@@ -288,7 +288,7 @@ fn every_small_class() {
         let b = expected_block(n);
         assert_eq!(p % 8, 0, "payload of {n} bytes is not 8-aligned");
         assert_eq!(h.block_size(p), b, "block size for {n} bytes");
-        assert_eq!(h.rc(p), 1, "rc at birth");
+        assert_eq!(h.rc(p), raw_rc(false), "rc at birth");
     }
     // Every class got blocks: count each payload size's class.
     for (k, &c) in SMALL_CLASSES.iter().enumerate() {
@@ -497,7 +497,8 @@ fn compiled_allocations_have_headers() {
         panic!()
     };
     assert_eq!(h.block_size(p as u32), 112);
-    assert_eq!(h.rc(p as u32), 1);
+    // A raw block is never counted; debug RC builds mark it for the verifier.
+    assert_eq!(h.rc(p as u32), raw_rc(true));
 }
 
 /// The host frees every input and output buffer, so an export that allocates
@@ -552,6 +553,36 @@ fn actor_memory_is_growable() {
 
 // ---- Stage 2: frees at obvious owners ----
 
+/// GRANITE_RC=1: every compile counts references (rc.rs).
+fn rc() -> bool {
+    std::env::var_os("GRANITE_RC").is_some_and(|v| v != "0" && !v.is_empty())
+}
+
+/// `rc` of a raw block (`__pack_alloc`, `heap-alloc`) at birth: 1, except in
+/// debug RC builds, which mark raw blocks for the verifier (rc.rs).
+fn raw_rc(debug_compile: bool) -> u32 {
+    let debug = debug_compile
+        || std::env::var_os("GRANITE_DEBUG_HEAP").is_some_and(|v| v != "0" && !v.is_empty());
+    if rc() && debug { 0xABAB_ABAB } else { 1 }
+}
+
+/// The stage 2 program. Without RC the exports free what the imports return by
+/// hand; with RC those objects are counted and freed when dropped, so freeing
+/// them by hand would free them twice (MEMORY.md §3.6).
+fn imports() -> String {
+    let free = |e: &str| {
+        if rc() {
+            "0".to_string()
+        } else {
+            format!("(heap-free {e})")
+        }
+    };
+    IMPORTS
+        .replace("(heap-free (string-addr r))", &free("(string-addr r)"))
+        .replace("(heap-free (any-addr arg))", &free("(any-addr arg)"))
+        .replace("(heap-free (any-addr r))", &free("(any-addr r)"))
+}
+
 const IMPORTS: &str = r#"
 (import host bump ((x s32)) s32)
 (import host bump-scratch ((x s32)) s32)
@@ -584,7 +615,7 @@ const IMPORTS: &str = r#"
 #[test]
 fn import_called_10000_times_keeps_memory_flat() {
     for debug in [false, true] {
-        let mut h = Heap::new(&compile(IMPORTS, debug));
+        let mut h = Heap::new(&compile(&imports(), debug));
         for name in ["call-bump", "call-scratch", "call-echo", "call-raw"] {
             let expect = |i: i32| match name {
                 "call-echo" => "hello from the guest".len() as i32,
@@ -607,18 +638,22 @@ fn import_called_10000_times_keeps_memory_flat() {
 }
 
 /// list-push frees the old data buffer when it grows: after n pushes only the
-/// header and the last buffer are live, not every buffer on the way.
+/// header and the last buffer are live, not every buffer on the way. With RC the
+/// list itself is dropped when the export returns, so nothing stays live.
 #[test]
 fn list_push_frees_the_old_buffer() {
     for debug in [false, true] {
-        let mut h = Heap::new(&compile(IMPORTS, debug));
+        let mut h = Heap::new(&compile(&imports(), debug));
         let before = h.stats();
         assert_eq!(h.call("push-n", Value::S32(10_000)), Value::S32(10_000));
         let after = h.stats();
-        let header = expected_block(12);
-        let data = expected_block(4 * 10_000);
-        assert_eq!(after.live_bytes - before.live_bytes, header + data);
-        assert_eq!(after.live_blocks - before.live_blocks, 2);
+        let (bytes, blocks) = if rc() {
+            (0, 0)
+        } else {
+            (expected_block(12) + expected_block(4 * 10_000), 2)
+        };
+        assert_eq!(after.live_bytes - before.live_bytes, bytes);
+        assert_eq!(after.live_blocks - before.live_blocks, blocks);
     }
 }
 
@@ -626,7 +661,7 @@ fn list_push_frees_the_old_buffer() {
 /// returns a block to its class.
 #[test]
 fn heap_stats_and_heap_free_from_granite() {
-    let mut h = Heap::new(&compile(IMPORTS, true));
+    let mut h = Heap::new(&compile(&imports(), true));
     // The export's own buffers are live while it runs: the input (16 bytes,
     // a 24-byte block) and the slots; the output comes after the read.
     let Value::S32(live) = h.call("live-bytes", Value::S32(0)) else {
