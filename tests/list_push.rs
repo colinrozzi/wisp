@@ -65,6 +65,12 @@ fn run_measured(source: &str) -> (i32, i64) {
     (i32::from_le_bytes(buf), after - before)
 }
 
+/// GRANITE_VALUE_LISTS=1 gives every compile value-semantics list-push, which
+/// the in-place tests below do not describe.
+fn value_lists() -> bool {
+    std::env::var_os("GRANITE_VALUE_LISTS").is_some_and(|v| v != "0" && !v.is_empty())
+}
+
 const N: i64 = 100_000;
 
 /// Push 0..N into a list of `ty`, then return 1 if every element reads back.
@@ -112,6 +118,9 @@ fn push_100k_f64_allocates_linear() {
 
 #[test]
 fn push_is_still_in_place() {
+    if value_lists() {
+        return; // GRANITE_VALUE_LISTS: pushes copy (tests/value_lists.rs)
+    }
     // Today's semantics: push mutates the header, so every alias sees it.
     let (result, _) = run_measured(
         "(fn test-func () s32
@@ -126,6 +135,9 @@ fn push_is_still_in_place() {
 
 #[test]
 fn push_value_that_pushes_same_list() {
+    if value_lists() {
+        return; // GRANITE_VALUE_LISTS: pushes copy (tests/value_lists.rs)
+    }
     // The value expression pushes into the same list first; the outer push
     // must read the header after that, landing at index 1.
     let (result, _) = run_measured(

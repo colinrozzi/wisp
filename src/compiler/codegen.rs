@@ -1244,6 +1244,59 @@ pub(crate) fn gen_expr(
             let value_local = env.declare_local(elem_type.clone());
             out.push_str(&format!("{}local.set {}\n", pad, value_local));
 
+            // Value semantics: unless nothing can see the old list again, push
+            // into a copy with room for one more element (see last_use.rs).
+            if !push_in_place(list) {
+                let copy_local = env.declare_local(Type::S32);
+                let copy_data = env.declare_local(Type::S32);
+                emit_alloc_const(out, &pad, 12);
+                out.push_str(&format!("{}local.set {}\n", pad, copy_local));
+                // data = alloc((len + 1) * elem_size); copy len elements into it
+                out.push_str(&format!("{}local.get {}\n", pad, list_local));
+                out.push_str(&format!("{}i32.load\n", pad));
+                out.push_str(&format!("{}i32.const 1\n{}i32.add\n", pad, pad));
+                out.push_str(&format!("{}i32.const {}\n{}i32.mul\n", pad, elem_size, pad));
+                out.push_str(&format!("{}call $__alloc\n", pad));
+                out.push_str(&format!("{}local.set {}\n", pad, copy_data));
+                out.push_str(&format!("{}local.get {}\n", pad, copy_data));
+                out.push_str(&format!("{}local.get {}\n", pad, list_local));
+                out.push_str(&format!("{}i32.load offset=8\n", pad));
+                out.push_str(&format!("{}local.get {}\n", pad, list_local));
+                out.push_str(&format!("{}i32.load\n", pad));
+                out.push_str(&format!("{}i32.const {}\n{}i32.mul\n", pad, elem_size, pad));
+                out.push_str(&format!("{}memory.copy\n", pad));
+                // header: len, cap = (block size - header) / elem_size, data
+                out.push_str(&format!("{}local.get {}\n", pad, copy_local));
+                out.push_str(&format!("{}local.get {}\n", pad, list_local));
+                out.push_str(&format!("{}i32.load\n", pad));
+                out.push_str(&format!("{}i32.store\n", pad));
+                out.push_str(&format!("{}local.get {}\n", pad, copy_local));
+                out.push_str(&format!("{}local.get {}\n", pad, copy_data));
+                out.push_str(&format!(
+                    "{}i32.const {}\n{}i32.sub\n",
+                    pad,
+                    BLOCK_HEADER - 4,
+                    pad
+                ));
+                out.push_str(&format!("{}i32.load\n", pad));
+                out.push_str(&format!(
+                    "{}i32.const {}\n{}i32.sub\n",
+                    pad, BLOCK_HEADER, pad
+                ));
+                out.push_str(&format!(
+                    "{}i32.const {}\n{}i32.div_u\n",
+                    pad, elem_size, pad
+                ));
+                out.push_str(&format!("{}i32.store offset=4\n", pad));
+                out.push_str(&format!("{}local.get {}\n", pad, copy_local));
+                out.push_str(&format!("{}local.get {}\n", pad, copy_data));
+                out.push_str(&format!("{}i32.store offset=8\n", pad));
+                out.push_str(&format!(
+                    "{}local.get {}\n{}local.set {}\n",
+                    pad, copy_local, pad, list_local
+                ));
+            }
+
             // Get current len
             let len_local = env.declare_local(Type::S32);
             out.push_str(&format!("{}local.get {}\n", pad, list_local));
@@ -3334,14 +3387,16 @@ pub(crate) fn encode_pack_metadata(prog: &Program) -> Vec<u8> {
 /// - CGRF encoding for input/output values
 /// - Memory layout with input buffer at 0x0, output at 0x4000
 ///
-/// `debug_heap` (or `GRANITE_DEBUG_HEAP=1`) builds the debug heap: see
-/// `emit_heap_runtime`.
+/// `emit.debug_heap` (or `GRANITE_DEBUG_HEAP=1`) builds the debug heap: see
+/// `emit_heap_runtime`. `emit.value_lists` (or `GRANITE_VALUE_LISTS=1`) gives
+/// `list-push` value semantics: see `last_use.rs`.
 pub(crate) fn generate_wat_pack(
     prog: &Program,
     signatures: &HashMap<String, Signature>,
-    debug_heap: bool,
+    emit: &EmitOptions,
 ) -> String {
-    let debug_heap = debug_heap || debug_heap_from_env();
+    let debug_heap = emit.debug_heap || debug_heap_from_env();
+    let value_lists = emit.value_lists || value_lists_from_env();
     let _static_strings = StaticStringsScope::enter();
     let mut out = String::new();
     out.push_str("(module\n");
@@ -3455,6 +3510,7 @@ pub(crate) fn generate_wat_pack(
     for func in &prog.functions {
         let mut body = String::new();
         let mut env = CodegenEnv::new(&func.params);
+        let _last_uses = value_lists.then(|| LastUseScope::enter(&func.body));
         gen_expr(
             &func.body,
             &mut body,
@@ -7807,7 +7863,7 @@ pub fn compile_repl_expr_pack(
     type_check(&prog, &full_signatures, &ctx)?;
 
     // Generate Pack/Graph ABI WAT
-    let wat = generate_wat_pack(&prog, &full_signatures, false);
+    let wat = generate_wat_pack(&prog, &full_signatures, &EmitOptions::default());
 
     // Convert WAT to WASM bytes (raw module, not component)
     let wasm_bytes = parse_str(&wat).context("failed to convert generated WAT to wasm")?;
@@ -7887,5 +7943,9 @@ pub fn compile_repl_expr_pack_wat(
     let full_signatures = collect_signatures(&prog)?;
     type_check(&prog, &full_signatures, &ctx)?;
 
-    Ok(generate_wat_pack(&prog, &full_signatures, false))
+    Ok(generate_wat_pack(
+        &prog,
+        &full_signatures,
+        &EmitOptions::default(),
+    ))
 }

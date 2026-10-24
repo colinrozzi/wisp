@@ -38,6 +38,10 @@ enum Command {
         /// write to a free block's header.
         #[arg(long = "debug-heap")]
         debug_heap: bool,
+        /// Value-semantics list-push: leave the argument list unchanged unless
+        /// it is a local's last use (memory stage 3; slow, for testing).
+        #[arg(long = "value-lists")]
+        value_lists: bool,
     },
     /// Evaluate a source file directly with the tree-walking interpreter — no
     /// compile-to-wasm step. Runs the shared front/middle (so the full type system
@@ -96,6 +100,7 @@ fn main() -> Result<()> {
             emit_wat,
             emit_pact,
             debug_heap,
+            value_lists,
         } => run_compile(
             &source,
             out.as_deref(),
@@ -103,6 +108,7 @@ fn main() -> Result<()> {
                 wat: emit_wat,
                 pact: emit_pact,
                 debug_heap,
+                value_lists,
             },
         )?,
         Command::Eval { source, entry } => run_eval(&source, &entry)?,
