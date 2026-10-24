@@ -592,3 +592,144 @@ async fn reload_session(
     assert_eq!(evaluate(first, "(reload counter)").await, "()");
     assert_eq!(evaluate(first, "value").await, "40");
 }
+
+/// Compile the retention probe (the evaluator plus `heap-mark`, its live bytes,
+/// and `fire-message`, a trigger firing) with reference counting.
+fn compile_rc_probe(debug_heap: bool) -> Vec<u8> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let package = std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn_scoped(s, || {
+                granite::compiler::compile(
+                    &root.join("tests/fixtures/retention/probe.wisp"),
+                    &root.join(format!(
+                        "target/interpreter-engine/{}/rc-probe-{debug_heap}",
+                        std::process::id()
+                    )),
+                    granite::compiler::EmitOptions {
+                        rc: true,
+                        debug_heap,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .expect("spawn big-stack compile thread")
+            .join()
+            .expect("big-stack compile thread panicked")
+    });
+    std::fs::read(package.wasm).unwrap()
+}
+
+async fn live_bytes(instance: &mut WasmtimeInstance) -> i64 {
+    match call_with_value(instance, "heap-mark", &Value::Tuple(vec![]))
+        .await
+        .unwrap()
+    {
+        Value::S32(n) => n as i64,
+        other => panic!("heap-mark: {other:?}"),
+    }
+}
+
+/// Run `step` `warm` times, then `n` more, and return the live-byte change over
+/// the `n` (the warm-up covers first-use tables and grown buffers).
+async fn growth<F>(instance: &mut WasmtimeInstance, warm: usize, n: usize, mut step: F) -> i64
+where
+    F: AsyncFnMut(&mut WasmtimeInstance),
+{
+    for _ in 0..warm {
+        step(instance).await;
+    }
+    let before = live_bytes(instance).await;
+    for _ in 0..n {
+        step(instance).await;
+    }
+    live_bytes(instance).await - before
+}
+
+/// MEMORY.md §7 stage 4: with reference counting a session's live heap is flat
+/// under a Wisp loop, repeated `define`, repeated `require` and `reload`, and
+/// trigger firings. In the debug build the verifier also checks every count after
+/// every export call (exact counts, no extra live objects).
+#[test]
+fn test_rc_session_memory_is_flat() {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(rc_session_memory());
+}
+
+async fn rc_session_memory() {
+    for debug_heap in [true, false] {
+        let wasm = compile_rc_probe(debug_heap);
+        let engine = WasmtimeEngine::new();
+        let module = engine.compile(&wasm).await.unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let files = Files::default();
+        let mut s = engine
+            .instantiate(&module, imports(calls, files))
+            .await
+            .unwrap();
+        // The debug build verifies the whole heap after each call: fewer rounds.
+        let n = if debug_heap { 50 } else { 1000 };
+        // The event buffer grows to twice its limit (256) and is then trimmed back:
+        // a 257-firing cycle. Whole cycles start and end at the same size.
+        let firings = if debug_heap { 257 } else { 39 * 257 };
+
+        assert_eq!(
+            evaluate(
+                &mut s,
+                "(define count (lambda (n) (if (= n 0) 0 (count (- n 1)))))"
+            )
+            .await,
+            "#<closure>"
+        );
+        let loops = growth(&mut s, 10, n, async |s| {
+            assert_eq!(evaluate(s, "(count 100)").await, "0");
+        })
+        .await;
+        assert_eq!(loops, 0, "a Wisp loop: {loops} bytes over {n} evaluations");
+
+        let defines = growth(&mut s, 10, n, async |s| {
+            assert_eq!(evaluate(s, "(define x (list 1 2 3))").await, "(1 2 3)");
+        })
+        .await;
+        assert_eq!(defines, 0, "repeated define: {defines} bytes over {n}");
+
+        let requires = growth(&mut s, 10, n, async |s| {
+            assert_eq!(
+                evaluate(s, "(require greet \"lib/greet.wisp\") greeting").await,
+                "7"
+            );
+        })
+        .await;
+        assert_eq!(requires, 0, "repeated require: {requires} bytes over {n}");
+
+        let reloads = growth(&mut s, 10, n, async |s| {
+            assert_eq!(evaluate(s, "(reload greet) greeting").await, "7");
+        })
+        .await;
+        assert_eq!(reloads, 0, "repeated reload: {reloads} bytes over {n}");
+
+        assert_eq!(
+            evaluate(
+                &mut s,
+                "(define on-message (lambda (e) (bytes->string (car e))))"
+            )
+            .await,
+            "#<closure>"
+        );
+        let fired = growth(&mut s, 600, firings, async |s| {
+            call_with_value(
+                s,
+                "fire-message",
+                &Value::Tuple(vec![Value::String("ping".into())]),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        assert_eq!(fired, 0, "{firings} trigger firings: {fired} bytes");
+    }
+}
