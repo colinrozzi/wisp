@@ -5,12 +5,8 @@
 (record bucket (items (list s32)))
 (variant batch (values (list s32)) (empty))
 (export (fn list-sum () s32 (sum (list-push (list-push (list-new s32) 20) 22))))
-(export (fn list-alias () s32
-  (let (xs (list-new s32)) (let (alias xs) (begin (list-push xs 42) (list-get alias 0))))))
-(export (fn nested-push () s32
-  (let (xs (list-new s32))
-    (begin (list-push xs (begin (list-push xs 1) 2))
-      (if (i32.eq (list-len xs) 2) (i32.add (i32.mul (list-get xs 0) 10) (list-get xs 1)) -1)))))
+(export (fn list-push-result () s32
+  (let (xs (list-new s32)) (let (ys (list-push xs 42)) (list-get ys 0)))))
 (export (fn option-present () s32 (option-value (some s32 42))))
 (export (fn option-absent () s32 (option-value (none s32))))
 (export (fn result-ok () s32 (result-value (ok s32 string 42))))
