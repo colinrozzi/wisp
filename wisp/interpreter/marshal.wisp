@@ -294,15 +294,14 @@
   (if (i32.ge_s i (list-len items)) acc
     (enc-children items (i32.add i (i32.const 1)) (list-push acc (enc-value (list-get items i))))))
 
-; One encode buffer, reused by every marshal. A blob is valid only until the next
-; marshal: every caller hands it straight to raw-invoke / call-raw / an export
-; return, or copies it out (apply-marshal), before marshalling again.
+; One encode buffer, reused by every marshal; finish-blob copies the encoded blob
+; out of it (any-from-addr copies), so each marshal returns its own `any`.
 (global $marshal-buf s32 mut 0)
 (global $marshal-cap s32 mut 0)
 
 ; The shared buffer, grown first if NEED bytes (len prefix + header + nodes) do not
-; fit. Growing replaces it and frees the old one (no blob outlives the next
-; marshal, see above; the first time the old buffer is 0, which heap-free ignores).
+; fit. Growing replaces it and frees the old one (the first time the old buffer
+; is 0, which heap-free ignores).
 (fn marshal-buffer ((need s32)) s32
   (begin
     (if (i32.gt_s need (global.get $marshal-cap))

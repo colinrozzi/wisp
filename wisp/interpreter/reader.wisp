@@ -68,13 +68,15 @@
         (if (numeric-token? s) (read-number s) (symbol s))))))
 
 ; A one-byte string holding `code` (0-255). A string is a [len:u32][bytes]
-; buffer, so build that buffer and reinterpret it via string-from-addr.
+; buffer, so build that buffer in a raw block, copy it into a string with
+; string-from-addr, and free the raw block.
 (fn byte->string ((code s32)) string
   (let (buf (heap-alloc 5))
     (begin
       (i32.store buf 1)
       (i32.store8 (i32.add buf 4) code)
-      (string-from-addr buf))))
+      (let (s (string-from-addr buf))
+        (begin (heap-free buf) s)))))
 
 ; The value of hex digit `c` (0-9, a-f, A-F), or -1.
 (fn hex-digit ((c s32)) s32

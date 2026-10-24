@@ -809,7 +809,10 @@
         (read-bytes addr (i32.add (i32.const 4) (i32.load addr)) (i32.const 0) (list-new value))))))
 (fn unmarshal-bytevals ((items (list value))) value
   (let (buf (heap-alloc (i32.add (list-len items) (i32.const 16))))
-    (begin (write-bytes buf items (i32.const 0)) (unmarshal (any-from-addr buf)))))
+    (begin
+      (write-bytes buf items (i32.const 0))
+      (let (blob (any-from-addr buf))
+        (begin (heap-free buf) (unmarshal blob))))))
 (fn apply-unmarshal ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "unmarshal expects (unmarshal bytes)")
     (value-case (list-get args 0)

@@ -123,9 +123,9 @@
     ((integer n) n)
     (else 0)))
 
-; A string is a [len:u32][bytes] buffer, so decoding bytes is: allocate that
-; buffer, write each code as one byte (the (u8 ...) cast masks to a byte), then
-; reinterpret the buffer as a string via string-from-addr.
+; A string is a [len:u32][bytes] buffer, so decoding bytes is: build that buffer
+; in a raw block, writing each code as one byte (the (u8 ...) cast masks to a
+; byte), copy it into a string with string-from-addr, and free the raw block.
 (fn pack-bytes ((items (list value)) (i s32) (n s32) (buf s32)) s32
   (if (i32.ge_s i n) buf
     (begin
@@ -139,7 +139,8 @@
       (begin
         (i32.store buf n)
         (pack-bytes items (i32.const 0) n buf)
-        (text (string-from-addr buf))))))
+        (let (s (string-from-addr buf))
+          (begin (heap-free buf) (text s)))))))
 
 ; bytes->string: decode a byte list (typed-list or sequence of byte-values) to a
 ; string. The inverse of string->bytes; together they bridge the host byte boundary.
