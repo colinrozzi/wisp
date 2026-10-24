@@ -1615,11 +1615,12 @@
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
-                        (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n"
+                        (string-append "control:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
+                        (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n           (list-len xs) (list-get xs i) (list-push xs x) take (list ...) and (list-new T) lists alike;\n           list-push returns the new list (use the result; do not count on xs changing)\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (events-after N) (event-read cursor) (event-ack cursor seq) (poll-events)   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
                         (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes\n"
                         (string-append "modules:   (require NAME \"path\") load once, bind provides unqualified   (reload NAME) re-read an edited module   see (help \"modules\")\n"
-                          "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")")))))))))))))))))
+                          "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")"))))))))))))))))))
     (if (string-arg? (list-get args 0))
       (text (help-topic (as-string (list-get args 0))))
       (failure "help expects an optional topic string"))))

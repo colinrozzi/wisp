@@ -1539,8 +1539,6 @@ fn test_typed_list_aliases_and_failed_mutation_recover() {
         "(list-get xs 2)",
         "(list-get xs 0s64)",
         "(list-get (list-new s32) 0)",
-        "(list-len '(1 2))",
-        "(list-push '(1) 2)",
         "(cdr (list-new s32))",
     ] {
         let output = s.evaluate(source).unwrap();
@@ -1818,7 +1816,26 @@ fn test_include_failures_preflight_and_recovery() {
     );
     assert_eq!(s.evaluate("marker").unwrap(), "42");
     std::fs::write(&child, "(define child-value 7) (").unwrap();
-    assert!(s.load_file(&main).unwrap().contains("unclosed parenthesis"));
+    // A read error names the file, then the line and column where the unclosed
+    // list opened.
+    let out = s.load_file(&main).unwrap();
+    assert!(
+        out.starts_with("error: ")
+            && out.ends_with(
+                "child.wisp: line 1, column 24: unclosed parenthesis: the one that opens here is never closed"
+            ),
+        "{out}"
+    );
+    // The top file of a load is named too, not only included ones.
+    std::fs::write(&main, "(define marker 0)\n(define m\n  (+ 1").unwrap();
+    let out = s.load_file(&main).unwrap();
+    assert!(
+        out.ends_with(
+            "main.wisp: line 3, column 3: unclosed parenthesis: the one that opens here is never closed (in the form at line 2, column 1)"
+        ),
+        "{out}"
+    );
+    std::fs::write(&main, "(define marker 0) (include \"child.wisp\")").unwrap();
     assert_eq!(s.evaluate("marker").unwrap(), "42");
     assert!(s.evaluate("child-value").unwrap().starts_with("error:"));
     std::fs::write(&child, "(define child-value 7)").unwrap();

@@ -146,9 +146,9 @@
         (read-result (failure "expected expression") start)
         (if (syntax-reader-prefix? src start) (read-syntax-prefix src start depth)
           (let (c (string-ref src start))
-            (if (i32.eq c 40) (read-list src (i32.add start 1) (list-new value) (i32.add depth 1))
+            (if (i32.eq c 40) (at-opener src start "unclosed parenthesis" (read-list src (i32.add start 1) (list-new value) (i32.add depth 1)))
               (if (i32.eq c 41) (read-result (failure "unexpected closing parenthesis") start)
-                (if (i32.eq c 34) (read-string src (i32.add start 1) "")
+                (if (i32.eq c 34) (at-opener src start "unterminated string" (read-string src (i32.add start 1) ""))
                   (if (i32.eq c 39) (read-prefix src (i32.add start 1) depth "quote")
                     (if (i32.eq c 96) (read-prefix src (i32.add start 1) depth "quasiquote")
                       (if (i32.eq c 44)
@@ -162,8 +162,40 @@
   (let (start (skip-space src pos))
     (if (i32.ge_s start (string-len src)) (sequence items)
       (let (one (read-one src start 0))
-        (if (failed? (read-result.item one)) (read-result.item one)
+        (if (failed? (read-result.item one)) (located-failure src start one)
           (read-forms src (read-result.next one) (list-push items (read-result.item one))))))))
+
+; A failure's position is where reading stopped. For a list or string that runs
+; to the end of input, point instead at the ( or " that opened it: the innermost
+; one, since each enclosing reader sees the position already moved.
+(fn at-opener ((src string) (open s32) (message string) (r read-result)) read-result
+  (value-case (read-result.item r)
+    ((failure m)
+      (if (i32.and (string=? m message) (i32.ge_s (read-result.next r) (string-len src)))
+        (read-result (failure (string-append m ": the one that opens here is never closed")) open)
+        r))
+    (else r)))
+
+; "line L, column C: message", plus the enclosing top-level form when the error
+; is inside one. Lines and columns count from 1; columns count bytes.
+(fn located-failure ((src string) (form-start s32) (r read-result)) value
+  (let (at (read-result.next r))
+    (value-case (read-result.item r)
+      ((failure m)
+        (failure (string-append (source-location src at) (string-append ": " (string-append m
+          (if (i32.eq at form-start) ""
+            (string-append " (in the form at " (string-append (source-location src form-start) ")"))))))))
+      (else (read-result.item r)))))
+
+(fn source-location ((src string) (pos s32)) string
+  (location-from src pos 0 1 0))
+(fn location-from ((src string) (pos s32) (index s32) (line s32) (line-start s32)) string
+  (if (i32.ge_s index pos)
+    (string-append "line " (string-append (show-integer line)
+      (string-append ", column " (show-integer (i32.add (i32.sub pos line-start) 1)))))
+    (if (i32.eq (string-ref src index) 10)
+      (location-from src pos (i32.add index 1) (i32.add line 1) (i32.add index 1))
+      (location-from src pos (i32.add index 1) line line-start))))
 
 (fn syntax-reader-prefix? ((src string) (pos s32)) s32
   (if (i32.ge_s (i32.add pos 1) (string-len src)) 0

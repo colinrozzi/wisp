@@ -41,7 +41,7 @@
     (i32.or (i32.or (string=? name "=") (string=? name "<"))
       (i32.or (string=? name "list")
         (i32.or (i32.or (string=? name "car") (i32.or (string=? name "cdr") (string=? name "cons")))
-          (i32.or (list-query? name) (string=? name "error")))))))
+          (i32.or (list-query? name) (i32.or (string=? name "error") (string=? name "not"))))))))
 
 (fn lookup ((name string) (env (list binding))) value
   (let (local (lookup-local name env (i32.sub (list-len env) 1)))
@@ -129,7 +129,8 @@
             (if (string=? name "lambda") (eval-lambda items env)
               (if (string=? name "let") (eval-let items env depth expected)
                 (if (string=? name "begin") (eval-body-expected items 1 env depth top (nil) expected)
-                  (eval-declaration-or-call name items env depth top expected))))))))
+                  (if (logic-form? name env) (eval-logic-form name items env depth expected)
+                    (eval-declaration-or-call name items env depth top expected)))))))))
     (eval-call items env depth expected)))
 
 (fn truthy? ((v value)) s32
@@ -174,6 +175,49 @@
     (let (condition (eval (list-get items 1) env (i32.add depth 1) 0))
       (if (failed? condition) condition
         (eval-expected (list-get items (if (truthy? condition) 2 3)) env depth 0 expected)))))
+
+; and / or / cond are core special forms, like if: they must not evaluate every
+; operand, and their last operand (or the chosen cond body) is a tail position,
+; so it carries depth unchanged. and/or return the deciding value itself.
+; As in Scheme they are keywords a binding can shadow: code that defines its own
+; and (say an (fn and ...) over i64.and) keeps calling it.
+(fn logic-form? ((name string) (env (list binding))) s32
+  (if (i32.or (string=? name "and") (i32.or (string=? name "or") (string=? name "cond")))
+    (i32.and (failed? (lookup-local name env (i32.sub (list-len env) 1)))
+      (failed? (lookup-local name (global.get $bindings) (i32.sub (list-len (global.get $bindings)) 1))))
+    0))
+
+(fn eval-logic-form ((name string) (items (list value)) (env (list binding)) (depth s32) (expected string)) value
+  (if (string=? name "cond") (eval-cond items 1 env depth expected)
+    (if (i32.eq (list-len items) 1) (boolean (string=? name "and"))
+      (eval-and-or (string=? name "and") items 1 env depth expected))))
+
+; (and a b c) stops at the first false value; (or a b c) at the first true one.
+(fn eval-and-or ((conjunction s32) (items (list value)) (index s32) (env (list binding)) (depth s32) (expected string)) value
+  (if (i32.eq index (i32.sub (list-len items) 1))
+    (eval-expected (list-get items index) env depth 0 expected)
+    (let (v (eval (list-get items index) env (i32.add depth 1) 0))
+      (if (failed? v) v
+        (if (i32.eq (truthy? v) conjunction)
+          (eval-and-or conjunction items (i32.add index 1) env depth expected)
+          v)))))
+
+; (cond (test body ...) ... (else body ...)). A clause with no body gives the
+; test's value; when no clause matches the result is nil.
+(fn eval-cond ((items (list value)) (index s32) (env (list binding)) (depth s32) (expected string)) value
+  (if (i32.ge_s index (list-len items)) (nil)
+    (let (clause (list-get items index))
+      (let (parts (items-of clause))
+        (if (i32.or (i32.eq (sequence? clause) 0) (i32.eq (list-len parts) 0))
+          (failure "cond expects clauses like (test body ...)")
+          (if (string=? (symbol-name (list-get parts 0)) "else")
+            (if (i32.ne index (i32.sub (list-len items) 1)) (failure "cond else must be the last clause")
+              (eval-body-expected parts 1 env depth 0 (nil) expected))
+            (let (test (eval (list-get parts 0) env (i32.add depth 1) 0))
+              (if (failed? test) test
+                (if (truthy? test)
+                  (if (i32.eq (list-len parts) 1) test (eval-body-expected parts 1 env depth 0 (nil) expected))
+                  (eval-cond items (i32.add index 1) env depth expected))))))))))
 
 (fn eval-define ((items (list value)) (env (list binding)) (depth s32) (top s32)) value
   (if (i32.eq top 0) (failure "define is only supported at top level")
@@ -228,13 +272,14 @@
 
 (fn eval-body-expected ((items (list value)) (index s32) (env (list binding)) (depth s32) (top s32) (last value) (expected string)) value
   (if (i32.ge_s index (list-len items)) last
-    ; The last form is in tail position (its value is the body's value); earlier
-    ; forms are non-tail (sequenced for effect), so only those grow the stack.
-    (let (v (eval-expected (list-get items index) env
-                (if (i32.eq index (i32.sub (list-len items) 1)) depth (i32.add depth 1)) top
-                (if (i32.eq index (i32.sub (list-len items) 1)) expected "")))
-      (if (failed? v) v
-        (eval-body-expected items (i32.add index 1) env depth top v expected)))))
+    ; The last form is in tail position (its value is the body's value), so it is
+    ; returned directly; earlier forms are non-tail (sequenced for effect), so
+    ; only those grow the stack.
+    (if (i32.eq index (i32.sub (list-len items) 1))
+      (eval-expected (list-get items index) env depth top expected)
+      (let (v (eval-expected (list-get items index) env (i32.add depth 1) top ""))
+        (if (failed? v) v
+          (eval-body-expected items (i32.add index 1) env depth top v expected))))))
 
 (fn eval-args ((items (list value)) (index s32) (env (list binding)) (depth s32) (args (list value)) (callee value)) value
   (if (i32.ge_s index (list-len items)) (sequence args)
@@ -345,6 +390,9 @@
   (if (string=? name "list") (sequence args)
     (if (list-query? name) (apply-list-query name args)
     (if (string=? name "error") (apply-error args)
+    (if (string=? name "not")
+      (if (i32.ne (list-len args) 1) (failure "not expects one argument")
+        (boolean (i32.eq (truthy? (list-get args 0)) 0)))
     (if (i32.or (string=? name "car") (string=? name "cdr"))
       (if (i32.ne (list-len args) 1) (failure "car/cdr expects one argument")
         (value-case (list-get args 0)
@@ -364,7 +412,7 @@
           (value-case (list-get args 1)
             ((sequence items) (sequence (copy-list items 0 (list-push (list-new value) (list-get args 0)))))
             (else (failure "cons expects a list as its second argument")))
-          (apply-numeric-builtin name (list-get args 0) (list-get args 1)))))))))
+          (apply-numeric-builtin name (list-get args 0) (list-get args 1))))))))))
 
 ; A minimal local REPL boundary: source in, printed value (or diagnostic) out.
 ; Actual values and closures stay in the session heap. A Theater adapter can

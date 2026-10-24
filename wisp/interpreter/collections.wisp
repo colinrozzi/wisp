@@ -98,12 +98,22 @@
             (if (string=? name "list-push")
               (let (checked (list-element (list-get args 1) element))
                 (if (failed? checked) checked (typed-list element (list-push items checked))))
-              (value-case (list-get args 1)
-                ((integer index)
-                  (if (i32.and (i32.ge_s index 0) (i32.lt_s index (list-len items)))
-                    (list-get items index) (failure "list index out of bounds")))
-                (else (failure "list index must be s32"))))))
-        (else (failure "expected typed list"))))))
+              (list-index items (list-get args 1)))))
+        ; An untyped list from (list ...) or a quote has no element type to check.
+        ; list-push copies it: the sequence may be a quoted literal in some code.
+        ((sequence items)
+          (if (string=? name "list-len") (integer (list-len items))
+            (if (string=? name "list-push")
+              (sequence (list-push (copy-list items 0 (list-new value)) (list-get args 1)))
+              (list-index items (list-get args 1)))))
+        (else (failure "expected a list"))))))
+
+(fn list-index ((items (list value)) (at value)) value
+  (value-case at
+    ((integer index)
+      (if (i32.and (i32.ge_s index 0) (i32.lt_s index (list-len items)))
+        (list-get items index) (failure "list index out of bounds")))
+    (else (failure "list index must be s32"))))
 
 ; The compiler permits s32 elements in byte lists; retain the u8 type on reads.
 (fn list-element ((v value) (ty value)) value

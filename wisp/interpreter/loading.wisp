@@ -40,4 +40,7 @@
           (expand-forms forms (i32.add index 1) base depth (list-push out form)))))))
 (fn expand-source ((source string) (base string) (depth s32)) value
   (let (forms (read-forms source 0 (list-new value)))
-    (if (failed? forms) forms (expand-forms (items-of forms) 0 base depth (list-new value)))))
+    ; An included file's failures get its path from expand-file; name the top
+    ; file (a require or a loaded file) here. Interactive input has no base.
+    (if (failed? forms) (if (i32.and (i32.eq depth 0) (i32.ne (string-len base) 0)) (source-failure forms base) forms)
+      (expand-forms (items-of forms) 0 base depth (list-new value)))))
