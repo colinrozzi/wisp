@@ -373,6 +373,13 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
         "event-recorded",
         host_fn(|_input| async move { Ok(Value::Tuple(vec![])) }),
     );
+    for name in ["watch", "unwatch", "head", "tail", "verify"] {
+        imports.define(
+            "wisp-chain",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("chain not exercised".into())) }),
+        );
+    }
     imports
 }
 async fn evaluate(instance: &mut WasmtimeInstance, source: &str) -> String {
