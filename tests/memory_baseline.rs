@@ -239,10 +239,11 @@ fn gen2_self_compile() {
             .get_typed_func::<i32, i32>(&mut store, "compile-source")
             .unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
-        let have = (memory.data_size(&store) / 65536) as u64;
-        memory.grow(&mut store, 32768 - have).unwrap();
-        let in_ptr: i32 = 0x6000_0000;
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "__alloc")
+            .unwrap();
         let b = source.as_bytes();
+        let in_ptr = alloc.call(&mut store, 4 + b.len() as i32).unwrap();
         memory
             .write(&mut store, in_ptr as usize, &(b.len() as u32).to_le_bytes())
             .unwrap();
@@ -254,8 +255,9 @@ fn gen2_self_compile() {
         memory.read(&store, out as usize, &mut l).unwrap();
         let len = u32::from_le_bytes(l) as i64;
         let end = out as i64 + 4 + len;
+        let pages = memory.data_size(&store) / 65536;
         println!(
-            "gen-2 self-compile: output {len} B, heap 0xC000 -> {end} ({:.1} MiB allocated), {:.2} s",
+            "gen-2 self-compile: output {len} B, heap 0xC000 -> {end} ({:.1} MiB allocated), {pages} pages, {:.2} s",
             (end - 0xC000) as f64 / 1048576.0,
             dt.as_secs_f64()
         );

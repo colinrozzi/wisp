@@ -139,20 +139,7 @@ fn compile_and_call_with_string_arg_inner(source: &str, func_name: &str, input: 
         mem_size / 65536
     );
 
-    // Memory layout to avoid heap conflicts:
-    // - Heap starts at 0xC000 and grows upward
-    // - We need space for: input (at low address) + heap growth + output (at higher address)
-
-    // First, grow memory modestly - the module may have a memory limit
-    // Grow to allow heap + reasonable output buffer
-    let target_pages: u64 = 64; // 64 pages = 4MB
-    let current_pages = (memory.data_size(&store) / 65536) as u64;
-    if target_pages > current_pages {
-        let pages_needed = target_pages - current_pages;
-        memory
-            .grow(&mut store, pages_needed)
-            .expect("failed to grow memory");
-    }
+    // The module's memory grows as its heap needs (MEMORY.md §5.4).
 
     // The input (the whole compiler source when self-compiling, ~150 KB) goes in a
     // buffer from `__pack_alloc`, as the host does: a fixed low address would run
@@ -716,15 +703,17 @@ fn test_bootstrap_v2_compiles_factorial() {
             .get_memory(&mut store, "memory")
             .expect("memory not found");
 
-        // Give gen-2's bump heap (base 0xC000) room to grow.
-        memory.grow(&mut store, 64).expect("failed to grow memory");
-
         let test_program = "(fn factorial ((n s32)) s32 (if (i32.le_s n (i32.const 1)) (i32.const 1) (i32.mul n (factorial (i32.sub n (i32.const 1))))))";
 
-        // Write the input as a wisp string [len][bytes] at a low address, below the
-        // heap base. The program is tiny, so heap growth won't reach it.
-        let in_ptr: i32 = 0x1000;
+        // Write the input as a wisp string [len][bytes] in a block from gen-2's own
+        // allocator, which grows the memory as its heap needs.
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "__alloc")
+            .expect("__alloc not found in v2 compiler");
         let bytes = test_program.as_bytes();
+        let in_ptr = alloc
+            .call(&mut store, 4 + bytes.len() as i32)
+            .expect("__alloc failed");
         memory
             .write(
                 &mut store,
@@ -794,24 +783,16 @@ fn run_plain_abi_compile_source(wat: &str, input: &str) -> String {
         .get_memory(&mut store, "memory")
         .expect("memory not found");
 
-    // Grow generously: the divide-and-conquer string-append never frees, so peak
-    // heap is many times the ~1MB output. gen-1's Rust-emitted module gets 2 GB, so
-    // match that for gen-2 to remove memory size as a variable.
-    let target_pages: u64 = 32768; // 2 GB
-    let current_pages = (memory.data_size(&store) / 65536) as u64;
-    if target_pages > current_pages {
-        memory
-            .grow(&mut store, target_pages - current_pages)
-            .expect("failed to grow memory");
-    }
-
-    // Input as [len][bytes], placed HIGH -- above the heap's working region. gen-2's
-    // bump heap grows from 0xC000 upward (peak < 256 MB for the full source), so an
-    // input at 0x1000 would be clobbered mid-compile. Put it at 512 MB, well above the
-    // heap peak and below the 1 GB memory top. (gen-1 avoids this because its CGRF
-    // wrapper copies the input onto the heap before compiling.)
-    let in_ptr: i32 = 0x2000_0000; // 512 MB
+    // Input as [len][bytes] in a block from gen-2's own allocator, which grows the
+    // memory as its heap needs (it never frees, so the heap is many times the
+    // ~1MB output).
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut store, "__alloc")
+        .expect("__alloc not found in gen-2");
     let bytes = input.as_bytes();
+    let in_ptr = alloc
+        .call(&mut store, 4 + bytes.len() as i32)
+        .expect("__alloc failed");
     memory
         .write(
             &mut store,
@@ -932,14 +913,8 @@ fn selfhost_run_i32(program: &str, func_name: &str) -> i32 {
             panic!("self-hosted output is not valid WAT: {e}\n--- WAT ---\n{wat}")
         });
         let mut store = Store::new(&engine, ());
+        // The self-hosted runtime's allocator grows the memory as the heap needs.
         let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
-        // Variant construction allocates on the heap (base 0xC000); give it room.
-        if let Some(memory) = instance.get_memory(&mut store, "memory") {
-            let have = (memory.data_size(&store) / 65536) as u64;
-            if have < 64 {
-                memory.grow(&mut store, 64 - have).expect("grow");
-            }
-        }
         let func = instance
             .get_typed_func::<(), i32>(&mut store, func_name)
             .unwrap_or_else(|e| panic!("export {func_name} not found: {e}\n--- WAT ---\n{wat}"));
@@ -1332,4 +1307,41 @@ fn test_selfhosted_macros() {
         ),
         42
     );
+}
+
+/// The self-hosted runtime allocates like the Rust one (MEMORY.md §7 stage 6):
+/// every block has the 8-byte header (rc, size) before its payload, and the memory
+/// starts at one page and grows as the heap needs, instead of the host growing it.
+#[test]
+fn test_selfhosted_runtime_headers_and_growth() {
+    let program = "(fn fill ((xs (list s32)) (i s32) (n s32)) (list s32) \
+         (if (i32.lt_s i n) (fill (list-push xs i) (i32.add i (i32.const 1)) n) xs)) \
+         (export (fn big () s32 (list-len (fill (list-new) (i32.const 0) (i32.const 100000)))))";
+    let wat = compile_and_call_with_string_arg(&get_compiler_source(), "compile-source", program);
+    run_big_stack(move || {
+        let mut config = Config::new();
+        config.wasm_tail_call(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::new(&engine, &wat).expect("self-hosted output is valid WAT");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+        let memory = instance.get_memory(&mut store, "memory").expect("memory");
+        assert_eq!(memory.data_size(&store), 65536, "starts at one page");
+
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "__alloc")
+            .expect("__alloc exported");
+        let p = alloc.call(&mut store, 13).expect("alloc") as usize;
+        let mut h = [0u8; 8];
+        memory.read(&store, p - 8, &mut h).unwrap();
+        assert_eq!(u32::from_le_bytes(h[..4].try_into().unwrap()), 1, "rc at birth");
+        assert_eq!(u32::from_le_bytes(h[4..].try_into().unwrap()), 24, "13 + 8, 8-aligned");
+        assert_eq!(p % 8, 0);
+
+        let big = instance
+            .get_typed_func::<(), i32>(&mut store, "big")
+            .expect("big");
+        assert_eq!(big.call(&mut store, ()).expect("call"), 100_000);
+        assert!(memory.data_size(&store) > 400_000, "the memory grew for the list");
+    })
 }
