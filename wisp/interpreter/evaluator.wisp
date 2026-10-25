@@ -38,7 +38,7 @@
   (i32.or
     (i32.or (i32.or (string=? name "+") (string=? name "-"))
       (i32.or (string=? name "*") (string=? name "/")))
-    (i32.or (i32.or (string=? name "=") (string=? name "<"))
+    (i32.or (i32.or (string=? name "=") (comparison? name))
       (i32.or (string=? name "list")
         (i32.or (i32.or (string=? name "car") (i32.or (string=? name "cdr") (string=? name "cons")))
           (i32.or (list-query? name) (i32.or (string=? name "error") (string=? name "not"))))))))
@@ -240,22 +240,29 @@
         (check-params params (i32.add index 1)))
       (failure "lambda parameters must be symbols"))))
 
+; A body of several forms runs them in order, as if wrapped in begin. Only a
+; multi-form body builds that begin, once, when the closure is made.
+(fn body-form ((items (list value)) (start s32)) value
+  (if (i32.eq (list-len items) (i32.add start 1)) (list-get items start)
+    (sequence (copy-list items start (list-push (list-new value) (symbol "begin"))))))
+
 (fn eval-lambda ((items (list value)) (env (list binding))) value
-  (if (i32.ne (list-len items) 3) (failure "lambda expects parameters and body")
+  (if (i32.lt_s (list-len items) 3) (failure "lambda expects parameters and a body")
     (value-case (list-get items 1)
       ((sequence params)
         (let (checked (check-params params 0))
-          (if (failed? checked) checked (closure params (list-get items 2) env (global.get $current-module)))))
+          (if (failed? checked) checked (closure params (body-form items 2) env (global.get $current-module)))))
       (else (failure "lambda expects a parameter list")))))
 
-; Support both (let (name value) body) and (let (name : type value) body).
+; Support both (let (name value) body ...) and (let (name : type value) body ...).
+; The body forms run in order (an implicit begin); the last one is in tail position.
 (fn eval-let ((items (list value)) (env (list binding)) (depth s32) (expected string)) value
-  (if (i32.ne (list-len items) 3) (failure "let expects a binding and body")
+  (if (i32.lt_s (list-len items) 3) (failure "let expects a binding and a body")
     (value-case (list-get items 1)
-      ((sequence pair) (eval-let-binding pair (list-get items 2) env depth expected))
+      ((sequence pair) (eval-let-binding pair items env depth expected))
       (else (failure "let expects (name value)")))))
 
-(fn eval-let-binding ((pair (list value)) (body value) (env (list binding)) (depth s32) (expected string)) value
+(fn eval-let-binding ((pair (list value)) (items (list value)) (env (list binding)) (depth s32) (expected string)) value
   (if (i32.or (i32.eq (list-len pair) 2)
         (if (i32.eq (list-len pair) 4)
           (i32.and (string=? (symbol-name (list-get pair 1)) ":") (known-type? (list-get pair 2) "")) 0))
@@ -264,7 +271,7 @@
         (let (raw (eval-expected (list-get pair (i32.sub (list-len pair) 1)) env (i32.add depth 1) 0
                     (if (i32.eq (list-len pair) 4) (symbol-name (list-get pair 2)) "")))
           (let (v (if (i32.eq (list-len pair) 4) (require-type raw (list-get pair 2)) raw))
-            (if (failed? v) v (eval-expected body (extend-env env (binding name v)) depth 0 expected)))))
+            (if (failed? v) v (eval-body-expected items 2 (extend-env env (binding name v)) depth 0 (nil) expected)))))
       (failure "let expects a symbol"))
     (failure "invalid let binding or unsupported type")))
 
@@ -353,7 +360,7 @@
     (if (string=? name "-") (integer (i32.sub a b))
       (if (string=? name "*") (integer (i32.mul a b))
         (if (string=? name "=") (integer (i32.eq a b))
-          (if (string=? name "<") (integer (i32.lt_s a b))
+          (if (comparison? name) (apply-i32-pair (integer-comparison-name name "i32") a b)
             (if (i32.eq b 0) (failure "division by zero")
               (if (i32.and (i32.eq a -2147483648) (i32.eq b -1))
                 (failure "division overflow")

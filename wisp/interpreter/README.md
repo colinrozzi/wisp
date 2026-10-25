@@ -25,8 +25,9 @@ cargo run --example interpreter -- examples/factorial-test.wisp
 (add-two 40)                          ; 42: session still works
 ```
 
-Enter one input per line; an input can contain several expressions. Use `begin`
-for a sequence inside a function body. `:quit`, `:q`, or EOF exits. Piped input
+Enter one input per line; an input can contain several expressions. A `lambda`
+or `let` body may hold several forms: they run in order and the last gives the
+value (an implicit `begin`). `:quit`, `:q`, or EOF exits. Piped input
 works too. The reader itself accepts multiline source through `evaluate`.
 
 The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lists, closures,
@@ -37,15 +38,18 @@ Forms include `define`, `lambda`,
 `global`, `global.get`, `global.set`, `include`, `trait`, `instance`, `derive`, `defmacro`, `define-syntax`, `quasiquote`, and
 `export`. Both `(x s32)` and
 `(x : s32)` parameter/field declarations work.
-`let` supports `(let (name expression) body)` and `(let (name : type expression) body)`.
-Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<` take two numbers of the same type; `list`
+`let` supports `(let (name expression) body ...)` and `(let (name : type expression) body ...)`.
+Arithmetic/comparisons `+`, `-`, `*`, `/`, `=`, `<`, `>`, `<=`, `>=` take two numbers of the same
+type (s32, s64, f32, f64, or the unsigned u64, u32 and u16 that host calls return,
+which compare unsigned and wrap at their width); `list`
 takes any number of values, with `cons`, `car`, and `cdr` for list operations.
 Zero and the empty Lisp list (`nil` or `'()`) are false; other values are true,
 including typed lists and option/result values.
 Integer arithmetic wraps at the operand width except division errors, which produce diagnostics.
 The compiler's `i32` and `i64` constants, arithmetic, bitwise, shift/rotate, and comparison
 operations are available. Comparisons return s32. String operations are `string-len`, `string-ref`,
-`string-append`, `string=?`, and `substring`; positions and lengths count bytes.
+`string-append` (any number of strings; none gives `""`), `string=?`, and `substring`;
+positions and lengths count bytes.
 
 A string literal is written in double quotes and accepts these escapes:
 

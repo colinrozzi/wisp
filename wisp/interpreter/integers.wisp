@@ -21,8 +21,14 @@
 
 (fn resolve-integer-width ((n s64) (expected string)) value
   (if (string=? expected "s64") (wide-integer n)
+   (if (string=? expected "u64")
+    (if (i64.lt_s n 0) (failure "integer out of u64 range") (u64-value n))
+   (if (string=? expected "u32")
+    (if (i32.or (i64.lt_s n 0) (i64.gt_s n 4294967295)) (failure "integer out of u32 range") (u32-value (i32.wrap_i64 n)))
+   (if (string=? expected "u16")
+    (if (i32.or (i64.lt_s n 0) (i64.gt_s n 65535)) (failure "integer out of u16 range") (u16-value (i32.wrap_i64 n)))
     (if (i32.or (i64.lt_s n -2147483648) (i64.gt_s n 2147483647))
-      (failure "integer out of s32 range") (integer (i32.wrap_i64 n)))))
+      (failure "integer out of s32 range") (integer (i32.wrap_i64 n))))))))
 
 ; Quoted data is materialized with default types, never adopted at a later call.
 (fn quote-value ((v value)) value
@@ -92,19 +98,69 @@
     (if (string=? name "-") "i64.sub"
       (if (string=? name "*") "i64.mul"
         (if (string=? name "=") "i64.eq"
-          (if (string=? name "<") "i64.lt_s" "i64.div_s"))))))
+          (if (comparison? name) (integer-comparison-name name "i64") "i64.div_s"))))))
+
+; The ordering builtins < > <= >= work on every numeric type; integers compare signed.
+(fn comparison? ((name string)) s32
+  (i32.or (i32.or (string=? name "<") (string=? name ">"))
+    (i32.or (string=? name "<=") (string=? name ">="))))
+(fn comparison-suffix ((name string)) string
+  (if (string=? name "<") ".lt"
+    (if (string=? name ">") ".gt"
+      (if (string=? name "<=") ".le" ".ge"))))
+(fn integer-comparison-name ((name string) (prefix string)) string
+  (string-append prefix (string-append (comparison-suffix name) "_s")))
 
 (fn apply-integer-builtin ((name string) (left value) (right value)) value
   (value-case left
     ((integer a)
       (value-case right
         ((integer b) (numeric-op name a b))
-        (else (failure "expected matching integer types"))))
+        (else (mismatched-integers left right))))
     ((wide-integer a)
       (value-case right
         ((wide-integer b) (apply-i64-pair (wide-builtin-name name) a b))
-        (else (failure "expected matching integer types"))))
+        (else (mismatched-integers left right))))
+    ((u64-value a)
+      (value-case right
+        ((u64-value b) (unsigned-op name a b 0 (i64.const -1)))
+        (else (mismatched-integers left right))))
+    ((u32-value a)
+      (value-case right
+        ((u32-value b) (unsigned-op name (i64.extend_i32_u a) (i64.extend_i32_u b) 1 (i64.const 4294967295)))
+        (else (mismatched-integers left right))))
+    ((u16-value a)
+      (value-case right
+        ((u16-value b) (unsigned-op name (i64.extend_i32_u a) (i64.extend_i32_u b) 2 (i64.const 65535)))
+        (else (mismatched-integers left right))))
     (else (failure "expected integer arguments"))))
+
+(fn mismatched-integers ((left value) (right value)) value
+  (failure (string-append "expected matching integer types, got "
+    (string-append (operand-type-name left) (string-append " and " (string-append (operand-type-name right)
+      "; give a literal the type, like 1000u64, or cast with (s64 x)"))))))
+(fn operand-type-name ((v value)) string
+  (value-case v
+    ((u16-value n) "u16")
+    (else (let (ty (value-type v)) (if (failed? ty) "a non-number" (show ty))))))
+
+; Unsigned arithmetic, done in 64 bits on zero-extended operands. A result wraps
+; to its width (MASK); KIND 0 is u64, 1 u32, 2 u16. Comparisons give s32 0/1.
+(fn unsigned-op ((name string) (a s64) (b s64) (kind s32) (mask s64)) value
+  (if (string=? name "=") (integer (i64.eq a b))
+    (if (string=? name "<") (integer (i64.lt_u a b))
+      (if (string=? name ">") (integer (i64.gt_u a b))
+        (if (string=? name "<=") (integer (i64.le_u a b))
+          (if (string=? name ">=") (integer (i64.ge_u a b))
+            (if (i32.and (string=? name "/") (i64.eq b 0)) (failure "division by zero")
+              (unsigned-value kind (i64.and mask
+                (if (string=? name "+") (i64.add a b)
+                  (if (string=? name "-") (i64.sub a b)
+                    (if (string=? name "*") (i64.mul a b) (i64.div_u a b)))))))))))))
+
+(fn unsigned-value ((kind s32) (n s64)) value
+  (if (i32.eq kind 0) (u64-value n)
+    (if (i32.eq kind 1) (u32-value (i32.wrap_i64 n)) (u16-value (i32.wrap_i64 n)))))
 
 (fn i64-primitive? ((name string)) s32
   (i32.or (string=? name "i64.const")

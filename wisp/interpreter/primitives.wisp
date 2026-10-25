@@ -159,17 +159,25 @@
       ((text s) (str-to-bytes (list-get args 0)))
       (else (failure "string->bytes expects a string")))))
 
+; string-append joins any number of strings; with none it gives "".
+(fn append-strings ((args (list value)) (index s32) (out string)) value
+  (if (i32.ge_s index (list-len args)) (text out)
+    (value-case (list-get args index)
+      ((text s) (append-strings args (i32.add index 1) (string-append out s)))
+      (else (failure "string-append expects string arguments")))))
+
 (fn apply-string ((name string) (args (list value))) value
   (if (string=? name "bytes->string") (apply-bytes-to-string args)
     (if (string=? name "string->bytes") (apply-string-to-bytes args)
+    (if (string=? name "string-append") (append-strings args 0 "")
   (let (arity (if (string=? name "string-len") 1 (if (string=? name "substring") 3 2)))
     (if (i32.ne (list-len args) arity) (failure "wrong number of arguments")
       (value-case (list-get args 0)
         ((text s)
           (if (string=? name "string-len") (integer (string-len s))
-            (if (i32.or (string=? name "string-append") (string=? name "string=?"))
+            (if (string=? name "string=?")
               (value-case (list-get args 1)
-                ((text t) (if (string=? name "string-append") (text (string-append s t)) (integer (string=? s t))))
+                ((text t) (integer (string=? s t)))
                 (else (failure "expected string arguments")))
               (value-case (list-get args 1)
                 ((integer start)
@@ -183,4 +191,4 @@
                           (text (substring s start end)) (failure "substring bounds out of range")))
                       (else (failure "expected s32 bounds")))))
                 (else (failure "expected s32 index"))))))
-        (else (failure "expected string argument"))))))))
+        (else (failure "expected string argument")))))))))

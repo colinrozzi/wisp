@@ -530,7 +530,7 @@ fn test_interpreter_modules_isolate_from_main() {
     eval(
         &mut s,
         "(module m (define probe shared))",
-        "error: unbound symbol: shared",
+        "error: in (define probe shared): unbound symbol: shared",
     );
     eval(&mut s, "shared", "7");
 }
@@ -541,7 +541,7 @@ fn test_interpreter_provide_requires_symbols() {
     eval(
         &mut s,
         "(module m (provide 5))",
-        "error: provide expects symbols",
+        "error: in (provide 5): provide expects symbols",
     );
     // provide is top-level only: inside a called lambda body (top = 0) it errors.
     eval(
@@ -866,4 +866,134 @@ fn test_interpreter_event_buffer_returns_old_limit() {
         "error: event-buffer expects a limit of 0 or more",
     );
     eval(&mut s, "(handles)", "()");
+}
+
+#[test]
+fn test_interpreter_ordering_comparisons() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(< 1 2)", "1"),
+        ("(> 1 2)", "0"),
+        ("(> 2 1)", "1"),
+        ("(<= 2 2)", "1"),
+        ("(<= 3 2)", "0"),
+        ("(>= 2 2)", "1"),
+        ("(>= 1 2)", "0"),
+        ("(> -1 -2)", "1"),
+        ("(> 5s64 4s64)", "1"),
+        ("(<= 5s64 4s64)", "0"),
+        ("(>= -5s64 -5s64)", "1"),
+        ("(> 2.5 1.5)", "1"),
+        ("(<= 1.5 1.5)", "1"),
+        ("(>= 1.0 2.0)", "0"),
+        ("(> 2.5f32 1.5f32)", "1"),
+        ("(<= 2.5f32 1.5f32)", "0"),
+        ("(>= 1.5f32 1.5f32)", "1"),
+        (
+            "(> 1 2.0)",
+            "error: expected matching integer types, got s32 and f64; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
+        ("(>= 1)", "error: expected two arguments"),
+        ("(define gt >)", "#<builtin >>"),
+        ("(gt 3 2)", "1"),
+    ] {
+        eval(&mut s, source, expected);
+    }
+}
+
+#[test]
+fn test_interpreter_string_append_is_variadic() {
+    let mut s = session();
+    eval(&mut s, "(string-append)", "\"\"");
+    eval(&mut s, "(string-append \"a\")", "\"a\"");
+    eval(&mut s, "(string-append \"a\" \"b\")", "\"ab\"");
+    eval(
+        &mut s,
+        "(string-append \"a\" \"b\" \"c\" \"d\")",
+        "\"abcd\"",
+    );
+    eval(
+        &mut s,
+        "(string-append \"a\" 1 \"c\")",
+        "error: string-append expects string arguments",
+    );
+    eval(&mut s, "(string=? \"a\" \"a\")", "1");
+}
+
+#[test]
+fn test_interpreter_lambda_and_let_bodies_are_implicit_begin() {
+    let mut s = session();
+    eval(
+        &mut s,
+        "(define f (lambda (x) (+ x 1) (+ x 2)))",
+        "#<closure>",
+    );
+    eval(&mut s, "(f 40)", "42");
+    // Earlier forms run, and a failure in one stops the body.
+    eval(
+        &mut s,
+        "(define g (lambda (x) (error \"stop\") x))",
+        "#<closure>",
+    );
+    eval(&mut s, "(g 1)", "error: stop");
+    eval(&mut s, "(let (x 1) (+ x 1) (+ x 41))", "42");
+    eval(&mut s, "(let (x : s64 1) x (i64.add x 41s64))", "42s64");
+    // The last form stays in tail position: a long loop in a multi-form body.
+    eval(
+        &mut s,
+        "(define loop (lambda (n) n (if (= n 0) 0 (loop (- n 1)))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(loop 10000)", "0");
+    eval(
+        &mut s,
+        "(define count (lambda (n) (let (m (- n 1)) m (if (< m 0) 0 (count m)))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(count 10000)", "0");
+    eval(
+        &mut s,
+        "(lambda (x))",
+        "error: lambda expects parameters and a body",
+    );
+    eval(
+        &mut s,
+        "(let (x 1))",
+        "error: let expects a binding and a body",
+    );
+}
+
+#[test]
+fn test_interpreter_unsigned_arithmetic_and_casts() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(- 10u64 3u64)", "7u64"),
+        ("(+ 10u64 3u64)", "13u64"),
+        ("(/ 5000u64 1000u64)", "5u64"),
+        ("(* 3u64 4u64)", "12u64"),
+        ("(- 0u64 1u64)", "18446744073709551615u64"),
+        ("(> (- 0u64 1u64) 1u64)", "1"),
+        ("(< 2u64 3u64)", "1"),
+        ("(= 2u64 2u64)", "1"),
+        ("(/ 1u64 0u64)", "error: division by zero"),
+        (
+            "(/ 5000u64 1000)",
+            "error: expected matching integer types, got u64 and s32; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
+        ("(s64 7u64)", "7s64"),
+        ("(s32 7u64)", "7"),
+        ("(f64 (- 0u64 1u64))", "1.8446744073709552e19f64"),
+        ("(s64 (- 0u64 1u64))", "-1s64"),
+        (
+            "(+ 1u64 2s64)",
+            "error: expected matching integer types, got u64 and s64; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
+        (
+            "(- 1 2u64)",
+            "error: expected matching integer types, got s32 and u64; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
+        ("(let (x : u64 5) x)", "5u64"),
+    ] {
+        eval(&mut s, source, expected);
+    }
 }
