@@ -4,14 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use wat::parse_str;
-use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 
 mod tokenizer;
 pub(crate) use tokenizer::*;
 mod codegen;
 use codegen::*;
 mod heap;
-pub use codegen::{compile_repl_expr, compile_repl_expr_pack, compile_repl_expr_pack_wat};
+pub use codegen::{compile_repl_expr_pack, compile_repl_expr_pack_wat};
 use heap::*;
 mod rc;
 use rc::*;
@@ -30,7 +29,6 @@ mod lower;
 pub(crate) use lower::*;
 mod parser;
 pub(crate) use parser::*;
-use wit_parser::Resolve;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
@@ -507,65 +505,6 @@ pub fn compile(source_path: &Path, out_base: &Path, emit: EmitOptions) -> Result
         wat: wat_path,
         pact: pact_path,
     })
-}
-
-fn encode_component(
-    module: &[u8],
-    wit_source: &str,
-    world_config: Option<&WorldConfig>,
-    source_path: &Path,
-) -> Result<Vec<u8>> {
-    let mut resolve = Resolve::new();
-
-    // If we have external WIT dependencies, load them first
-    if let Some(config) = world_config
-        && let Some(wit_deps) = &config.wit_deps
-    {
-        // Resolve wit_deps path relative to the source file
-        let deps_path = if wit_deps.is_absolute() {
-            wit_deps.clone()
-        } else {
-            source_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(wit_deps)
-        };
-
-        if deps_path.exists() {
-            // Load all WIT packages from the deps directory
-            resolve
-                .push_path(&deps_path)
-                .with_context(|| format!("failed to load WIT deps from {}", deps_path.display()))?;
-        } else {
-            bail!("WIT deps path not found: {}", deps_path.display());
-        }
-    }
-
-    // Parse our generated WIT (which may reference the loaded external packages)
-    let pkg_id = resolve
-        .push_str(Path::new("generated.wit"), wit_source)
-        .context("failed to parse generated WIT")?;
-    let world_id = resolve.packages[pkg_id]
-        .worlds
-        .values()
-        .next()
-        .cloned()
-        .context("generated WIT is missing a world declaration")?;
-    let mut module_with_metadata = module.to_vec();
-    embed_component_metadata(
-        &mut module_with_metadata,
-        &resolve,
-        world_id,
-        StringEncoding::UTF8,
-    )
-    .context("failed to embed component metadata")?;
-    let bytes = ComponentEncoder::default()
-        .module(&module_with_metadata)
-        .context("failed to prepare module for component encoding")?
-        .validate(true)
-        .encode()
-        .context("failed to encode component")?;
-    Ok(bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -1131,31 +1070,6 @@ fn type_size(ty: &Type) -> usize {
     }
 }
 
-/// Check if a type requires heap allocation
-fn type_needs_heap(ty: &Type) -> bool {
-    match ty {
-        Type::S32
-        | Type::S64
-        | Type::F32
-        | Type::F64
-        | Type::U8
-        | Type::Bool
-        | Type::U16
-        | Type::U32
-        | Type::U64 => false,
-        Type::Record(_)
-        | Type::Variant(_)
-        | Type::Option(_)
-        | Type::Result(_, _)
-        | Type::List(_)
-        | Type::Str
-        | Type::Tuple(_)
-        | Type::Any => true,
-        // Resources don't need heap - they're opaque handles managed externally
-        Type::Resource(_) | Type::Borrow(_) => false,
-    }
-}
-
 /// Estimate the CGRF node size for an element type (used for list buffer allocation).
 /// Returns the approximate size in bytes of a single CGRF node for this type.
 fn cgrf_element_node_size(ty: &Type) -> usize {
@@ -1179,57 +1093,6 @@ fn cgrf_element_node_size(ty: &Type) -> usize {
         Type::Any => 64,
         // Resources/borrows: just a handle
         Type::Resource(_) | Type::Borrow(_) => 12,
-    }
-}
-
-/// Check if an expression uses heap allocation
-fn expr_uses_heap(expr: &Expr) -> bool {
-    match expr {
-        Expr::Int { .. } | Expr::Float { .. } | Expr::Var(_) | Expr::GlobalGet { .. } => false,
-        Expr::StringLiteral(_) => true,
-        Expr::Ascribe { expr, .. } => expr_uses_heap(expr),
-        Expr::Call { args, .. } => args.iter().any(expr_uses_heap),
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => expr_uses_heap(cond) || expr_uses_heap(then_branch) || expr_uses_heap(else_branch),
-        Expr::Let { value, body, .. } => expr_uses_heap(value) || expr_uses_heap(body),
-        Expr::Begin { exprs } => exprs.iter().any(expr_uses_heap),
-        Expr::WasmInstr { args, .. } => args.iter().any(expr_uses_heap),
-        Expr::GlobalSet { value, .. } => expr_uses_heap(value),
-        Expr::RecordConstruct { .. } => true, // records need heap
-        Expr::RecordAccess { expr, .. } => expr_uses_heap(expr),
-        Expr::VariantConstruct { .. } => true, // variants need heap
-        Expr::Match { expr, cases } => {
-            expr_uses_heap(expr) || cases.iter().any(|c| expr_uses_heap(&c.body))
-        }
-        Expr::Some { .. } | Expr::None { .. } => true,
-        Expr::Ok { .. } | Expr::Err { .. } => true,
-        Expr::ListNew { .. } | Expr::ListPush { .. } => true,
-        Expr::ListGet { list, index } => expr_uses_heap(list) || expr_uses_heap(index),
-        Expr::ListLen { list } => expr_uses_heap(list),
-        Expr::StringLen { string } => expr_uses_heap(string),
-        Expr::StringRef { string, index } => expr_uses_heap(string) || expr_uses_heap(index),
-        Expr::AnyFromS32 { .. } | Expr::AnyFromString { .. } => true, // allocate a CGRF blob
-        Expr::AnyToS32 { value } | Expr::AnyToString { value } => expr_uses_heap(value),
-        Expr::HeapAlloc { .. } | Expr::HeapFree { .. } | Expr::HeapStats => true,
-        Expr::AnyAddr { value }
-        | Expr::AnyFromAddr { value }
-        | Expr::StringAddr { value }
-        | Expr::StringFromAddr { value } => expr_uses_heap(value),
-        Expr::RawInvoke { .. } => true, // allocates the result blob
-        Expr::Substring { .. }
-        | Expr::StringAppend { .. }
-        | Expr::StringFromBytes { .. }
-        | Expr::StringToBytes { .. } => true, // allocate new strings/lists
-        Expr::StringEq { left, right } => expr_uses_heap(left) || expr_uses_heap(right),
-        Expr::TupleConstruct { .. } => true,
-        // A capability witness is an i32 constant; with-cap/release-cap only touch
-        // the heap if their body/value does; a borrow is a bare local.get.
-        Expr::WithCap { body, .. } => expr_uses_heap(body),
-        Expr::ReleaseCap { value } => expr_uses_heap(value),
-        Expr::BorrowCap { .. } => false,
     }
 }
 

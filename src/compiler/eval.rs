@@ -163,7 +163,7 @@ pub fn eval_source_entry_with_host(
 }
 
 /// Evaluate a single REPL expression against accumulated value bindings and
-/// function definitions — the eval dual of `compile_repl_expr`. Bindings are
+/// function definitions — the eval dual of `compile_repl_expr_pack`. Bindings are
 /// inlined as literals; functions are in scope; the expression is type-checked and
 /// then evaluated. Returns the resulting `Value` and its inferred `Type` (the REPL
 /// needs the type to render/store the result). This is the typed evaluation
