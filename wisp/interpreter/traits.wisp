@@ -32,15 +32,15 @@
             (let (vars (copy-list header 1 (list-new value)))
               (let (checked (check-params vars 0))
                 (if (failed? checked) checked
-                  (if (i32.or (string=? name "") (i32.ge_s (trait-index name) 0)) (failure "invalid or already declared trait")
+                  (if (i32.or (string=? name "") (trait-name-taken? name)) (failure "invalid or already declared trait")
                     (let (valid (where-bare-vars header 1 (list-new value)))
                       (if (failed? valid) valid
-                        (let (methods (trait-signatures items 2 vars (list-new value)))
+                        (let (methods (trait-signatures items 2 vars (replaced-trait name) (list-new value)))
                           (if (failed? methods) methods
-                            (begin
-                              (global.set $traits (list-push (global.get $traits) (trait-definition name vars (items-of methods))))
-                              (publish-trait-methods name (items-of methods) 0))))))))))))))))
-(fn trait-signatures ((items (list value)) (index s32) (vars (list value)) (out (list value))) value
+                            (let (declared (declare-session-trait (trait-definition name vars (items-of methods))))
+                              (if (failed? declared) declared
+                                (publish-trait-methods name (items-of methods) 0)))))))))))))))))
+(fn trait-signatures ((items (list value)) (index s32) (vars (list value)) (replacing s32) (out (list value))) value
   (if (i32.ge_s index (list-len items)) (sequence out)
     (let (item (list-get items index))
       (if (i32.eq (string=? (form-head item) "fn") 0) (failure "trait expects function signatures")
@@ -48,12 +48,12 @@
           (if (failed? shape) shape
             (let (parts (items-of shape))
               (let (name (symbol-name (list-get parts 0)))
-                (if (i32.or (i32.ge_s (method-owner name 0) 0) (i32.eq (failed? (trait-method-schema out name 0)) 0))
+                (if (i32.or (let (owner (method-owner name 0)) (i32.and (i32.ge_s owner 0) (i32.ne owner replacing))) (i32.eq (failed? (trait-method-schema out name 0)) 0))
                   (failure "trait method name is already declared")
                   (let (params (normalize-generic-fields (items-of (list-get parts 1)) 0 vars (list-new value)))
                     (if (failed? params) params
                       (if (i32.eq (generic-type? (list-get parts 2) vars) 0) (failure "invalid trait return type")
-                        (trait-signatures items (i32.add index 1) vars
+                        (trait-signatures items (i32.add index 1) vars replacing
                           (list-push out (sequence (list-push (list-push (list-push (list-new value)
                             (list-get parts 0)) params) (list-get parts 2)))))))))))))))))
 (fn publish-trait-methods ((name string) (methods (list value)) (index s32)) value
@@ -77,10 +77,8 @@
                           (if (string-len (type-solution.error methods)) (failure (type-solution.error methods))
                             (if (i32.ne (list-len (type-solution.bindings methods)) (list-len (trait-definition.methods trait)))
                               (failure "instance is missing trait methods")
-                              (begin
-                                (global.set $instances (list-push (global.get $instances)
-                                  (trait-implementation (trait-definition.name trait) types (type-solution.bindings methods))))
-                                (nil)))))))))))))))))
+                              (declare-session-instance
+                                (trait-implementation (trait-definition.name trait) types (type-solution.bindings methods))))))))))))))))))
 (fn bind-type-vars ((vars (list value)) (types (list value)) (index s32) (out (list binding))) (list binding)
   (if (i32.ge_s index (list-len vars)) out
     (bind-type-vars vars types (i32.add index 1)

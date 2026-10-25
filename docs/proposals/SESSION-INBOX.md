@@ -275,7 +275,7 @@ call is simpler and says exactly what happened.
 | `theater-repl read <id>` | `read` | Prints the firings after the cursor, then acks. Returns at once |
 | `theater-repl follow <id>` | `follow` | Prints firings as they are recorded, acking after each batch, until Ctrl-C. Resumes from where the last `follow` with this cursor stopped |
 | `theater-repl wait <id>` | `wait` | Blocks until at least one firing exists after the cursor, prints them all, acks, exits 0 |
-| `theater-repl cursors <id>` | — | Lists cursors and the head: `NAME SEQ BEHIND` |
+| `theater-repl cursors <id>` | — | Lists cursors and the head: `NAME SEQ BEHIND WAITING`. WAITING is how many `wait`s (or `follow`s) are parked on the cursor now, so a running monitor shows as 1 on `wait` |
 
 Options for all three readers:
 
@@ -298,6 +298,13 @@ agents' monitors would still have seen the replies.
 
 A human who wants to see what the monitor saw uses `read --after 0` or
 `read --cursor wait --peek`.
+
+**Parked waits read after a seq** (ticket 0037, 2026-10-25). The first read of
+a `wait` is after its cursor. If nothing is there, the wait parks and from then
+on reads after the seq the cursor had (`wait` in legacy-host `src/main.rs`), not
+after the cursor again. Two monitors on one cursor can then both get a
+message: before this, the first one to print acked it, and the second one
+re-read after the moved cursor and missed it (the `tests/inbox.rs` flake).
 
 ### 4.2 Protocol
 

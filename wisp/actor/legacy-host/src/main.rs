@@ -121,8 +121,9 @@ enum Command {
         #[arg(long)]
         timeout: Option<u64>,
     },
-    /// List a session's event cursors: NAME, the seq it has acknowledged, and how
-    /// many firings it is behind.
+    /// List a session's event cursors: NAME, the seq it has acknowledged, how
+    /// many firings it is behind, and how many `wait`s (or follows) are parked on
+    /// it now. A running wake-on-message monitor shows as WAITING 1 on `wait`.
     Cursors { id: String },
     /// Show a session (with id) or the daemon (without).
     Status { id: Option<String> },
@@ -734,9 +735,11 @@ fn reader_head(printed: &str, text: bool) -> Option<(u64, u64, bool)> {
 /// session reports each new seq through `wisp-events.event-recorded`.
 async fn wait(daemon: &Daemon, request: &Value) -> (bool, String) {
     let target = field(request, "id");
-    let Some(form) = reader_form(request) else {
+    let Some(mut form) = reader_form(request) else {
         return (false, "error: wait needs a cursor or a seq".into());
     };
+    let cursor = request.get("cursor").and_then(Value::as_str);
+    let mut parked = None;
     let text = request.get("text").and_then(Value::as_bool) == Some(true);
     let session = match daemon.runtime.find(target).await {
         Ok(session) => session,
@@ -770,6 +773,18 @@ async fn wait(daemon: &Daemon, request: &Value) -> (bool, String) {
         }
         match reader_head(&output, text) {
             Some((_, _, true)) => return (true, output),
+            // Nothing yet. Read after the seq the cursor was at from now on, not
+            // after the cursor: another reader of the same cursor (a second
+            // monitor) may acknowledge the next firing before this one re-reads.
+            Some((next, _, false)) if parked.is_none() => {
+                if let Some(cursor) = cursor {
+                    parked = Some(daemon.runtime.events.park(session.id, cursor));
+                    let mut after = request.clone();
+                    after.as_object_mut().map(|fields| fields.remove("cursor"));
+                    after["after"] = json!(next);
+                    form = reader_form(&after).expect("a seq names a read");
+                }
+            }
             Some(_) => {}
             None => return (false, format!("error: unexpected reader output: {output}")),
         }
@@ -803,7 +818,7 @@ async fn wait(daemon: &Daemon, request: &Value) -> (bool, String) {
     }
 }
 
-/// `NAME SEQ BEHIND` for each of a session's cursors.
+/// `NAME SEQ BEHIND WAITING` for each of a session's cursors.
 async fn cursors(daemon: &Daemon, target: &str) -> (bool, String) {
     let (ok, head) = run(daemon, target, "(event-head)").await;
     if !ok {
@@ -814,18 +829,33 @@ async fn cursors(daemon: &Daemon, target: &str) -> (bool, String) {
         return (false, list);
     }
     let head = parse_seq(&head).unwrap_or(0);
-    let mut out = format!("{:<16} {:>8} {:>8}", "NAME", "SEQ", "BEHIND");
+    let parked = match daemon.runtime.find(target).await {
+        Ok(session) => daemon.runtime.events.parked(session.id),
+        Err(_) => Vec::new(),
+    };
+    let waiting = |name: &str| {
+        parked
+            .iter()
+            .find(|(cursor, _)| cursor == name)
+            .map_or(0, |(_, count)| *count)
+    };
+    let mut out = format!(
+        "{:<16} {:>8} {:>8} {:>8}",
+        "NAME", "SEQ", "BEHIND", "WAITING"
+    );
     // (("name" seq) ...): names are written as Wisp strings.
     for entry in list.split("(\"").skip(1) {
         let Some((name, rest)) = entry.split_once("\" ") else {
             continue;
         };
         let seq = parse_seq(rest.split(')').next().unwrap_or("")).unwrap_or(0);
+        let name = name.replace("\\\"", "\"").replace("\\\\", "\\");
         out.push_str(&format!(
-            "\n{:<16} {:>8} {:>8}",
-            name.replace("\\\"", "\"").replace("\\\\", "\\"),
+            "\n{:<16} {:>8} {:>8} {:>8}",
+            name,
             seq,
-            head.saturating_sub(seq)
+            head.saturating_sub(seq),
+            waiting(&name)
         ));
     }
     if out.lines().count() == 1 {

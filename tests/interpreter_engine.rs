@@ -499,6 +499,7 @@ async fn engine_session() {
     );
     assert_eq!(evaluate(&mut first, "(increment 41)").await, "42");
     reload_session(&mut first, &files, &calls).await;
+    reload_declarations_session(&mut first, &files).await;
     // A required file that does not read names its path and the error's place.
     files.lock().unwrap().insert(
         "lib/broken.wisp".to_string(),
@@ -704,7 +705,10 @@ async fn reload_session(
     ] {
         set(text);
         let result = evaluate(first, "(reload counter)").await;
-        assert!(result.starts_with(error), "{text}: {result}");
+        assert!(
+            result.starts_with("error:") && result.contains(error),
+            "{text}: {result}"
+        );
         assert_eq!(evaluate(first, "value").await, "20", "{text}");
     }
     files.lock().unwrap().remove(path);
@@ -746,6 +750,128 @@ fn compile_rc_probe(debug_heap: bool) -> Vec<u8> {
             .expect("big-stack compile thread panicked")
     });
     std::fs::read(package.wasm).unwrap()
+}
+
+// (reload NAME) of a module that declares a record, variant, global, trait and
+// instance (docs/proposals/RELOAD-DECLARATIONS.md): its own declarations are
+// declared again, an unchanged type keeps its identity, a mut global keeps its
+// value, and a failed reload restores every table.
+async fn reload_declarations_session(first: &mut WasmtimeInstance, files: &Files) {
+    let path = "lib/shapes.wisp";
+    let set = |body: &str| {
+        files.lock().unwrap().insert(
+            path.to_string(),
+            format!("(module shapes (provide make x-of bump hits limit size)\n{body})"),
+        );
+    };
+    let rest = "  (define x-of (lambda (p) (pt.x p)))
+  (define bump (lambda () (global.set $shape-hits (i32.add (global.get $shape-hits) 1))))
+  (define hits (lambda () (global.get $shape-hits)))
+  (define limit (lambda () (global.get $limit)))";
+    let trait_decl = "  (trait (Sized T) (fn size ((x T)) : s32))
+  (instance (Sized s32) (fn size ((x s32)) s32 x))";
+    let v1 = format!(
+        "  (record pt (x s32) (y s32))
+  (variant shape (circle s32) (square s32))
+  (global $shape-hits s32 mut 0)
+  (global $limit s32 const 5)
+{trait_decl}
+  (define make (lambda (n) (pt n n)))
+{rest}"
+    );
+    set(&v1);
+    assert_eq!(
+        evaluate(first, "(require shapes \"lib/shapes.wisp\")").await,
+        "()"
+    );
+    evaluate(first, "(define p (make 2))").await;
+    evaluate(first, "(bump)").await;
+    assert_eq!(evaluate(first, "(bump)").await, "2");
+    assert_eq!(evaluate(first, "(size 7)").await, "7");
+
+    // Only a function changed: the record keeps its id, so p is still a pt; the
+    // mut global keeps its value; the const takes its new initializer.
+    set(&v1
+        .replace("(pt n n)", "(pt (i32.add n 1) n)")
+        .replace("const 5", "const 9"));
+    assert_eq!(evaluate(first, "(reload shapes)").await, "()");
+    assert_eq!(evaluate(first, "(hits)").await, "2");
+    assert_eq!(evaluate(first, "(x-of p)").await, "2");
+    assert_eq!(evaluate(first, "(x-of (make 2))").await, "3");
+    assert_eq!(evaluate(first, "(limit)").await, "9");
+    assert_eq!(evaluate(first, "(size 7)").await, "7");
+
+    // The record changed: a new type. p still matches its old shape, but fails
+    // the new type's accessor.
+    let v3 = v1
+        .replace(
+            "(record pt (x s32) (y s32))",
+            "(record pt (x s32) (y s32) (z s32))",
+        )
+        .replace("(pt n n)", "(pt n n n)");
+    set(&v3);
+    assert_eq!(evaluate(first, "(reload shapes)").await, "()");
+    assert_eq!(evaluate(first, "(x-of (make 1))").await, "1");
+    assert_eq!(
+        evaluate(first, "(x-of p)").await,
+        "error: expected record pt"
+    );
+    assert_eq!(evaluate(first, "(match p ((pt a b) (+ a b)))").await, "4");
+    assert_eq!(evaluate(first, "(hits)").await, "2");
+
+    // Failed reloads restore everything: a duplicate in one file, a name another
+    // module declared, and a changed trait that another module has an instance of.
+    evaluate(first, "(module mine (record thing (n s32)))").await;
+    evaluate(
+        first,
+        "(module inst (instance (Sized string) (fn size ((x string)) s32 1)))",
+    )
+    .await;
+    for (text, error) in [
+        (
+            format!("{v3}\n  (record pt (x s32))"),
+            "invalid or already defined type name",
+        ),
+        (
+            format!("{v3}\n  (record thing (n s32))"),
+            "invalid or already defined type name",
+        ),
+        (
+            v3.replace("(fn size ((x T)) : s32)", "(fn size ((x T)) : s64)")
+                .replace(
+                    "(fn size ((x s32)) s32 x)",
+                    "(fn size ((x s32)) s64 (i64.extend_i32_s x))",
+                ),
+            "trait Sized changed, but module inst has an instance of it",
+        ),
+        (
+            v3.replace(trait_decl, "  (define size (lambda (x) x))"),
+            "trait Sized was removed, but module inst has an instance of it",
+        ),
+    ] {
+        set(&text);
+        let result = evaluate(first, "(reload shapes)").await;
+        assert!(
+            result.starts_with("error:") && result.contains(error),
+            "{text}: {result}"
+        );
+        assert_eq!(evaluate(first, "(hits)").await, "2", "{text}");
+        assert_eq!(evaluate(first, "(x-of (make 1))").await, "1", "{text}");
+        assert_eq!(evaluate(first, "(size 7)").await, "7", "{text}");
+    }
+
+    // Declarations the new source leaves out are retired: their names are free.
+    set(&v3
+        .replace("  (variant shape (circle s32) (square s32))\n", "")
+        .replace("  (global $limit s32 const 5)\n", "")
+        .replace(
+            "(define limit (lambda () (global.get $limit)))",
+            "(define limit 0)",
+        ));
+    assert_eq!(evaluate(first, "(reload shapes)").await, "()");
+    assert_eq!(evaluate(first, "(variant shape (blob s32))").await, "()");
+    assert_eq!(evaluate(first, "(global $limit s32 const 1)").await, "()");
+    assert_eq!(evaluate(first, "(hits)").await, "2");
 }
 
 async fn live_bytes(instance: &mut WasmtimeInstance) -> i64 {

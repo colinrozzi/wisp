@@ -72,6 +72,29 @@ impl Daemon {
             .to_string()
     }
 
+    /// Cursor `cursor` of session `id` as `cursors` shows it: (seq, behind,
+    /// waiting), or None while the cursor does not exist.
+    fn cursor(&self, id: &str, cursor: &str) -> Option<(u64, u64, usize)> {
+        let listing = self.ok(&["cursors", id]);
+        let line = listing
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(cursor))?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        Some((
+            fields[1].parse().ok()?,
+            fields[2].parse().ok()?,
+            fields[3].parse().ok()?,
+        ))
+    }
+
+    /// Wait until `n` readers are parked on cursor `cursor` of session `id`.
+    fn parked(&self, id: &str, cursor: &str, n: usize) {
+        until(&format!("{n} parked on {cursor}"), || {
+            self.cursor(id, cursor)
+                .is_some_and(|(_, _, waiting)| waiting == n)
+        });
+    }
+
     /// Send `body` to session `to` from session `from`.
     fn message(&self, from: &str, to: &str, body: &str) {
         let form = format!("(msg-send \"{}\" \"{body}\")", self.actor(to));
@@ -85,6 +108,16 @@ impl Drop for Daemon {
         let _ = self.cli(&["down"]);
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Poll `done` until it holds; fail after 30s. Waits on a condition the
+/// daemon reports, never on a guess at how long a reader takes to start.
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -133,7 +166,7 @@ fn readers_keep_their_own_place_and_lose_nothing() {
 
     // With nothing new, wait blocks until a message arrives.
     let mut waiter = daemon.spawn(&["wait", "alice"]);
-    std::thread::sleep(Duration::from_secs(1));
+    daemon.parked("alice", "wait", 1);
     assert!(
         still_running(&mut waiter),
         "wait returned with nothing to read"
@@ -148,12 +181,15 @@ fn readers_keep_their_own_place_and_lose_nothing() {
 
     // The incident: a stray follow is running when a message arrives. The
     // monitor's wait still gets it, and so does the follow.
-    let follower = daemon.spawn(&["follow", "alice", "--from-now"]);
-    std::thread::sleep(Duration::from_secs(1));
+    // Parked means --from-now has moved its cursor to the head.
+    let mut follower = daemon.spawn(&["follow", "alice", "--from-now"]);
+    daemon.parked("alice", "follow", 1);
     daemon.message("bob", "alice", "three");
     assert_eq!(daemon.ok(&["wait", "alice"]), "on-message: three");
-    std::thread::sleep(Duration::from_millis(500));
-    let mut follower = follower;
+    // A follow acknowledges a batch with its next round, after printing it.
+    until("follow to acknowledge three", || {
+        matches!(daemon.cursor("alice", "follow"), Some((_, 0, 1)))
+    });
     let _ = follower.kill();
     let (_, followed) = finish(follower, 5);
     assert!(
@@ -164,7 +200,7 @@ fn readers_keep_their_own_place_and_lose_nothing() {
     // Two monitors on one session both get the message.
     let first = daemon.spawn(&["wait", "alice"]);
     let second = daemon.spawn(&["wait", "alice"]);
-    std::thread::sleep(Duration::from_secs(1));
+    daemon.parked("alice", "wait", 2);
     daemon.message("bob", "alice", "four");
     assert_eq!(finish(first, 15).1, "on-message: four");
     assert_eq!(finish(second, 15).1, "on-message: four");
@@ -173,7 +209,7 @@ fn readers_keep_their_own_place_and_lose_nothing() {
     // acknowledge: the next wait gets the message again.
     let mut blind = daemon.spawn(&["wait", "alice"]);
     drop(blind.stdout.take());
-    std::thread::sleep(Duration::from_secs(1));
+    daemon.parked("alice", "wait", 1);
     daemon.message("bob", "alice", "five");
     let (code, _) = finish(blind, 15);
     assert_ne!(code, Some(0), "a wait that could not print must fail");
@@ -199,7 +235,7 @@ fn readers_keep_their_own_place_and_lose_nothing() {
 
     // A wait on a session that stops returns an error.
     let waiter = daemon.spawn(&["wait", "alice"]);
-    std::thread::sleep(Duration::from_secs(1));
+    daemon.parked("alice", "wait", 1);
     daemon.ok(&["stop", "alice"]);
     let (code, _) = finish(waiter, 20);
     assert_eq!(code, Some(1));

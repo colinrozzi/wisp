@@ -46,3 +46,26 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: Run tests
         run: nix develop -c cargo test --locked --workspace -- --test-threads=2
+
+  # The theater-repl daemon (wisp/actor/legacy-host) is its own Cargo workspace,
+  # so the jobs above never build or test it. It builds Theater from git; the
+  # cache keeps the second run fast.
+  legacy-host:
+    name: Daemon tests (legacy-host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            wisp/actor/legacy-host -> target
+      # The tests load the checked-in actor.wasm; fail if it is stale.
+      - name: actor.wasm matches its source
+        run: nix develop -c bash wisp/actor/build.sh && git diff --exit-code --stat wisp/actor/actor.wasm
+      - name: Clippy
+        run: nix develop -c cargo clippy --locked --manifest-path wisp/actor/legacy-host/Cargo.toml --all-targets -- -D warnings
+      - name: Run tests
+        run: nix develop -c cargo test --locked --manifest-path wisp/actor/legacy-host/Cargo.toml -- --test-threads=2

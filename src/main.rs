@@ -92,7 +92,17 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The front end recurses per nesting level (and the Wisp interpreter's source
+    // nests deeply), so compiling it overflows the default 8 MiB main stack. Run on
+    // a 1 GiB thread, as the tests do; the stack is reserved, not committed.
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || run(cli))?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
 
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Compile {
             source,

@@ -116,14 +116,13 @@
   (if (i32.eq top 0) (failure "record is only supported at top level")
     (if (i32.lt_s (list-len items) 2) (failure "record expects a name")
       (let (name (symbol-name (list-get items 1)))
-        (if (i32.or (string=? name "") (known-type? (symbol name) ""))
+        (if (i32.or (string=? name "") (type-name-taken? name))
           (failure "invalid or already defined type name")
           (let (checked (normalize-fields (declaration-tail items) 0 (list-new value) name 0))
             (if (failed? checked) checked
               (let (fields (items-of checked))
-                (let (id (list-len (global.get $types)))
+                (let (id (declare-type name 0 fields))
                   (begin
-                    (global.set $types (list-push (global.get $types) (named-type name id 0 fields)))
                     (publish name (constructor name id name (schema-types fields 0 (list-new value))))
                     (add-accessors name id fields 0)))))))))))
 
@@ -159,14 +158,13 @@
   (if (i32.eq top 0) (failure "variant is only supported at top level")
     (if (i32.lt_s (list-len items) 3) (failure "variant expects a name and cases")
       (let (name (symbol-name (list-get items 1)))
-        (if (i32.or (string=? name "") (known-type? (symbol name) ""))
+        (if (i32.or (string=? name "") (type-name-taken? name))
           (failure "invalid or already defined type name")
           (let (cases (declaration-tail items))
             (let (checked (validate-cases cases 0 name))
               (if (failed? checked) checked
-                (let (id (list-len (global.get $types)))
+                (let (id (declare-type name 1 cases))
                   (begin
-                    (global.set $types (list-push (global.get $types) (named-type name id 1 cases)))
                     (add-constructors name id cases 0)))))))))))
 
 (fn apply-constructor ((name string) (id s32) (case-name string) (types (list value)) (args (list value))) value

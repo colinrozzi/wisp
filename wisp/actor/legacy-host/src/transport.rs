@@ -68,3 +68,16 @@ pub async fn request(port: u16, req: Value) -> Result<(bool, String)> {
         .to_string();
     Ok((ok, text))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frame_size_is_bounded() {
+        let bytes = vec![b'x'; MAX_FRAME + 1];
+        let mut reader = BufReader::new(bytes.as_slice());
+        let error = read_line(&mut reader).await.unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+    }
+}
