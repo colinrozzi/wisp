@@ -553,9 +553,17 @@ fn actor_memory_is_growable() {
 
 // ---- Stage 2: frees at obvious owners ----
 
-/// GRANITE_RC=1: every compile counts references (rc.rs).
+/// `GRANITE_RC` forces reference counting on (`1`) or off (`0`) for every
+/// compile; unset, each compile's own option decides (on by default).
+fn rc_forced() -> Option<bool> {
+    std::env::var_os("GRANITE_RC")
+        .filter(|v| !v.is_empty())
+        .map(|v| v != "0")
+}
+
+/// Whether this file's compiles (default options) count references.
 fn rc() -> bool {
-    std::env::var_os("GRANITE_RC").is_some_and(|v| v != "0" && !v.is_empty())
+    rc_forced().unwrap_or(true)
 }
 
 /// `rc` of a raw block (`__pack_alloc`, `heap-alloc`) at birth: 1, except in

@@ -1518,9 +1518,9 @@ fn test_compound_types_validate_nested_and_absent_payloads() {
 }
 
 /// Whether this run compiles with reference counting, whose list-push has value
-/// semantics (`GRANITE_RC`, MEMORY.md §7 stage 4).
+/// semantics (MEMORY.md §7 stage 4): on unless `GRANITE_RC=0`.
 fn value_lists() -> bool {
-    std::env::var_os("GRANITE_RC").is_some_and(|v| v != "0" && !v.is_empty())
+    std::env::var_os("GRANITE_RC").is_none_or(|v| v != "0")
 }
 
 #[test]

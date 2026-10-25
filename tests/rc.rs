@@ -14,6 +14,14 @@ static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 const RAW_RC: u32 = 0xABAB_ABAB;
 const POISON: u32 = 0xDDDD_DDDD;
 
+/// `GRANITE_RC` forces reference counting on (`1`) or off (`0`) for every
+/// compile; unset, each compile's own option decides (on by default).
+fn rc_forced() -> Option<bool> {
+    std::env::var_os("GRANITE_RC")
+        .filter(|v| !v.is_empty())
+        .map(|v| v != "0")
+}
+
 fn compile(source: &str, debug_heap: bool) -> Vec<u8> {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir();
@@ -175,6 +183,9 @@ fn shared() -> (Guest, u32) {
 
 #[test]
 fn counts_are_exact() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     assert_eq!(g.rc(p), 2, "the global and the list element");
     assert_eq!(g.call("s-len", 0), 4);
@@ -190,6 +201,9 @@ fn counts_are_exact() {
 
 #[test]
 fn the_verifier_accepts_a_consistent_heap() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, _) = shared();
     assert_eq!(g.verify().unwrap(), 0);
     // It puts every count back: verifying twice works, and counts are unchanged.
@@ -200,6 +214,9 @@ fn the_verifier_accepts_a_consistent_heap() {
 
 #[test]
 fn the_verifier_finds_a_count_too_high() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     g.set_rc(p, 3);
     assert_trap(g.verify(), "__granite_verify_count_high");
@@ -207,6 +224,9 @@ fn the_verifier_finds_a_count_too_high() {
 
 #[test]
 fn the_verifier_finds_a_count_too_low() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     g.set_rc(p, 1);
     assert_trap(g.verify(), "__granite_verify_count_low");
@@ -214,6 +234,9 @@ fn the_verifier_finds_a_count_too_low() {
 
 #[test]
 fn the_verifier_finds_a_leak() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, _) = shared();
     // A block that looks counted (rc 1) but nothing reaches.
     let alloc: TypedFunc<i32, i32> = g.func("__pack_alloc");
@@ -225,6 +248,9 @@ fn the_verifier_finds_a_leak() {
 
 #[test]
 fn the_verifier_finds_a_dangling_reference() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     // Free the string behind the program's back: both references now dangle.
     let free: TypedFunc<(i32, i32), ()> = g.func("__pack_free");
@@ -234,6 +260,9 @@ fn the_verifier_finds_a_dangling_reference() {
 
 #[test]
 fn every_export_call_is_verified_in_debug_builds() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     g.set_rc(p, 3);
     // Any export call ends with the verifier: this one finds the bad count.
@@ -242,6 +271,9 @@ fn every_export_call_is_verified_in_debug_builds() {
 
 #[test]
 fn a_freed_object_traps_when_used() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     // Storing $s in a list takes a reference: a dup of the freed string. (A read
     // like string-len takes none; the verifier at the end of the call finds the
@@ -256,6 +288,9 @@ fn a_freed_object_traps_when_used() {
 
 #[test]
 fn a_drop_below_zero_traps() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     g.set_rc(p, 0);
     // global.set drops the old value of $s.
@@ -264,6 +299,9 @@ fn a_drop_below_zero_traps() {
 
 #[test]
 fn a_counted_operation_on_a_raw_block_traps() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let (mut g, p) = shared();
     g.set_rc(p, RAW_RC);
     assert_trap(g.try_call("s-hold", 0), "__granite_rc_on_raw_block");
@@ -273,6 +311,9 @@ fn a_counted_operation_on_a_raw_block_traps() {
 /// that builds and drops structure keeps memory flat however often it runs.
 #[test]
 fn garbage_is_freed_in_release_builds() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let source = r#"
 (record point (x s32) (name string))
 (variant tree (leaf s32) (node tree tree))
@@ -317,6 +358,9 @@ fn bytes_for(source: &str, export: &str, n: i32, expect: i32) -> u64 {
 /// call's own small blocks, not the quadratic total a copy per push would cost.
 #[test]
 fn a_threaded_accumulator_never_copies() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let source = r#"
 (fn fill ((xs (list s32)) (i s32) (n s32)) (list s32)
   (if (i32.lt_s i n) (fill (list-push xs i) (i32.add i 1) n) xs))
@@ -335,6 +379,9 @@ fn a_threaded_accumulator_never_copies() {
 /// parameter of a function that does not touch the global itself.
 #[test]
 fn pushes_onto_a_global_do_not_copy() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let direct = r#"
 (global $xs (list s32) mut 0)
 (fn fill ((i s32) (n s32)) s32
@@ -377,6 +424,9 @@ fn pushes_onto_a_global_do_not_copy() {
 /// allocate a few times the final length, not the ~50 MB copying would.
 #[test]
 fn left_fold_string_building_is_linear() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let source = r#"
 (fn build ((s string) (i s32) (n s32)) string
   (if (i32.lt_s i n) (build (string-append s "x") (i32.add i 1) n) s))
@@ -403,6 +453,9 @@ impl Guest {
 /// copied instead, and both versions stay intact.
 #[test]
 fn a_unique_match_reuses_its_block() {
+    if rc_forced() == Some(false) {
+        return; // GRANITE_RC=0: nothing is counted
+    }
     let source = r#"
 (variant chain (end) (link s32 chain))
 (fn make ((n s32) (acc chain)) chain (if (i32.eq n 0) acc (make (i32.sub n 1) (link n acc))))

@@ -38,10 +38,10 @@ enum Command {
         /// write to a free block's header.
         #[arg(long = "debug-heap")]
         debug_heap: bool,
-        /// Count references: free objects when their last reference goes, and
-        /// give list-push value semantics (memory stage 4).
-        #[arg(long = "rc")]
-        rc: bool,
+        /// Do not count references: objects are never freed and list-push
+        /// writes in place (the pre-stage-4 heap).
+        #[arg(long = "no-rc")]
+        no_rc: bool,
     },
     /// Evaluate a source file directly with the tree-walking interpreter — no
     /// compile-to-wasm step. Runs the shared front/middle (so the full type system
@@ -100,7 +100,7 @@ fn main() -> Result<()> {
             emit_wat,
             emit_pact,
             debug_heap,
-            rc,
+            no_rc,
         } => run_compile(
             &source,
             out.as_deref(),
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
                 wat: emit_wat,
                 pact: emit_pact,
                 debug_heap,
-                rc,
+                rc: !no_rc,
             },
         )?,
         Command::Eval { source, entry } => run_eval(&source, &entry)?,

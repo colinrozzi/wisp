@@ -325,7 +325,7 @@ pub struct CompileArtifacts {
 
 /// Which optional, human-readable views to write alongside the `.wasm`, and how to
 /// build it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EmitOptions {
     pub wat: bool,
     pub pact: bool,
@@ -333,10 +333,21 @@ pub struct EmitOptions {
     /// poisoned, and a double free or a write to a free block's header traps.
     /// `GRANITE_DEBUG_HEAP=1` turns it on for every compile.
     pub debug_heap: bool,
-    /// Reference counting (docs/proposals/MEMORY.md §3, stage 4): objects are
-    /// freed when their last reference goes, and `list-push` has value semantics.
-    /// `GRANITE_RC=1` turns it on for every compile.
+    /// Reference counting (docs/proposals/MEMORY.md §3, stage 4), on by default:
+    /// objects are freed when their last reference goes, and `list-push` has value
+    /// semantics. `GRANITE_RC=0` turns it off for every compile, `=1` on.
     pub rc: bool,
+}
+
+impl Default for EmitOptions {
+    fn default() -> Self {
+        EmitOptions {
+            wat: false,
+            pact: false,
+            debug_heap: false,
+            rc: true,
+        }
+    }
 }
 
 /// Splice `(include "path")` top-level forms in place, reading each referenced
