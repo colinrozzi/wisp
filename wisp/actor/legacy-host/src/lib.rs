@@ -1,3 +1,4 @@
+pub mod chain;
 pub mod eval_session;
 pub mod events;
 pub mod sessions;
@@ -64,6 +65,7 @@ impl Runtime {
         handlers.register(sessions.clone());
         let events = events::EventWatch::default();
         handlers.register(events.clone());
+        handlers.register(chain::ChainRecorder::new(commands.clone()));
         handlers.register(theater_handler_rpc::RpcHandler::new(commands.clone()));
         // Per-interface handlers the local runtime provides. Each is one line;
         // real Theater deployments enable handlers via the actor manifest.
