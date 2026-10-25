@@ -75,6 +75,36 @@ See [examples/](examples/), [test fixtures](tests/fixtures/), and the
 [standard library](std/) for executable examples. Features in the Rust and
 self-hosted compilers are tested separately; support is not identical.
 
+## Memory
+
+Compiled code (`granite compile`) manages its heap itself: each object carries a
+small header with a reference count, and an object is freed when its last
+reference goes (`--rc`, or `GRANITE_RC=1`; see
+[docs/proposals/MEMORY.md](docs/proposals/MEMORY.md)). The memory starts small
+and grows as the heap needs it. For a program this means:
+
+- **Values are immutable.** `(list-push xs v)` returns a list with `v` added and
+  leaves `xs` unchanged; it writes in place only when nothing else can see `xs`
+  (its count is 1), so threading an accumulator through a loop costs O(1) per
+  push. `string-append` works the same way.
+- **The heap has no cycles,** and that is what lets reference counting reclaim
+  everything: an object only ever points at objects that existed when it was
+  built.
+- **No mutable cells without a cycle plan.** A feature that lets a value be
+  changed after it is built (a `set!`, a mutable box or list, `letrec`) could
+  make a cycle (closure → environment → box → closure), and reference counting
+  never frees a cycle. Such a feature must refer back *by name* through a table a
+  global owns (as top-level recursion does today), or bring its own cycle
+  collector.
+- **Raw memory is manual.** `heap-alloc` returns a block the program frees with
+  `heap-free`; raw blocks are never counted. `string-addr`/`any-addr` give the
+  address of a counted object, valid until the end of the enclosing `let` (or the
+  function); `string-from-addr`/`any-from-addr` copy bytes into a new object.
+- **Debugging:** `--debug-heap` (or `GRANITE_DEBUG_HEAP=1`) poisons freed blocks,
+  traps on a use after free or a double free, and with `--rc` checks every count
+  against the heap after each export call (`__granite_heap_verify`).
+  `__granite_heap_stats` reports live bytes and blocks.
+
 ## Wisp — the interpreted Lisp
 
 **Wisp** is a small dynamic Lisp written in Granite (`wisp/interpreter/`), running inside
@@ -99,6 +129,9 @@ Persistent `defmacro` templates support quasiquotation and splicing; hygienic
 `syntax-case-lambda` adds guards and computation during expansion.
 Source files can be loaded as command-line arguments, with relative `include`
 directives resolved from each file's directory.
+
+Wisp values are immutable like Granite's: `(list-push xs v)` returns the longer
+list and leaves `xs` as it was, so use the result.
 
 Wisp is deliberately *not* a full Scheme: no `set!`, `call/cc`, `letrec`/named-let,
 varargs/`apply`, or numeric tower (fixed-width numerics only). It is closures + macros

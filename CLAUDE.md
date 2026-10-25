@@ -110,7 +110,9 @@ wasmtime runtime for `run`.
   `derive`, resolve generic ADTs by name.
 - `typecheck.rs` — `check_expr()` (inference with numeric widening) and
   `check_fn_linearity()`/`linear_uses()` (the substructural checker).
-- `codegen.rs` — `generate_wat()`, `generate_wit()`, CGRF/Pack encode+decode glue.
+- `codegen.rs` — `generate_wat_pack()` (the one code generator), `generate_pact()`, CGRF/Pack encode+decode glue.
+- `heap.rs` — the heap runtime it emits: block headers, size-class allocator, growth, debug heap.
+- `rc.rs` — reference counting: ownership, borrowing, drop functions, the heap verifier.
 - `eval.rs` — the tree-walking **back-end**: the dual of codegen. `analyze()` + eval.
   `Value`, `Host` (imported calls dispatch here), `eval_source*`, `eval_repl_expr*`.
 - `repl.rs` — `ReplSession`: the shared REPL abstraction (accumulate `(fn)`/`(define)`,

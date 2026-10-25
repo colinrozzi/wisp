@@ -1,4 +1,4 @@
-use granite::compiler::{Function, InlineValue, Type, compile_repl_expr, compile_repl_expr_pack};
+use granite::compiler::{Function, InlineValue, Type, compile_repl_expr_pack};
 use std::collections::HashMap;
 
 /// A runtime value that can be inlined during REPL compilation
@@ -129,23 +129,6 @@ impl Default for ReplState {
     }
 }
 
-/// Compile an expression with REPL context
-/// Returns WASM package bytes (standard component model)
-pub fn compile_repl(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
-    // Convert bindings to InlineValue
-    let bindings: HashMap<String, InlineValue> = state
-        .bindings
-        .iter()
-        .map(|(k, v)| (k.clone(), v.to_inline()))
-        .collect();
-
-    // Collect functions as a Vec
-    let functions: Vec<Function> = state.functions.values().cloned().collect();
-
-    // Compile the expression
-    compile_repl_expr(expr, &bindings, &functions)
-}
-
 /// Compile an expression with REPL context for Pack runtime
 /// Returns raw WASM bytes (Pack package with Graph ABI encoding)
 pub fn compile_repl_pack(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8>> {
@@ -167,86 +150,45 @@ pub fn compile_repl_pack(expr: &str, state: &ReplState) -> anyhow::Result<Vec<u8
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_compile_simple_literal() {
-        let state = ReplState::new();
-        let result = compile_repl("42", &state);
-        assert!(
-            result.is_ok(),
-            "Failed to compile literal: {:?}",
-            result.err()
-        );
-        let bytes = result.unwrap();
-        assert!(!bytes.is_empty(), "Package bytes should not be empty");
-    }
-
-    #[test]
-    fn test_compile_with_binding() {
-        let mut state = ReplState::new();
-        state.bindings.insert("x".to_string(), Value::S32(10));
-
-        let result = compile_repl("x", &state);
-        assert!(
-            result.is_ok(),
-            "Failed to compile with binding: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn test_compile_arithmetic_with_bindings() {
-        let mut state = ReplState::new();
-        state.bindings.insert("x".to_string(), Value::S32(10));
-        state.bindings.insert("y".to_string(), Value::S32(20));
-
-        let result = compile_repl("(i32.add x y)", &state);
-        assert!(
-            result.is_ok(),
-            "Failed to compile arithmetic: {:?}",
-            result.err()
-        );
-    }
-
-    /// Helper to run a compiled package and get the i32 result
+    /// Run a compiled Pack package's nullary `eval` export through the Pack ABI
+    /// and read its s32 result (16-byte CGRF header + 8-byte node header).
     fn run_eval_i32(wasm_bytes: &[u8]) -> anyhow::Result<i32> {
-        use wasmtime::{Engine, Store, component::Component, component::Linker, component::Val};
+        use wasmtime::{Config, Engine, Instance, Module, Store, TypedFunc};
 
-        let engine = Engine::default();
-        let component = Component::new(&engine, wasm_bytes)?;
+        let mut config = Config::new();
+        config.wasm_tail_call(true);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(&engine, wasm_bytes)?;
         let mut store = Store::new(&engine, ());
-        let linker = Linker::new(&engine);
-        let instance = linker.instantiate(&mut store, &component)?;
-
-        let eval_func = instance
-            .get_func(&mut store, "eval")
-            .ok_or_else(|| anyhow::anyhow!("eval function not found"))?;
-
-        let mut results = vec![Val::S32(0)];
-        eval_func.call(&mut store, &[], &mut results)?;
-        eval_func.post_return(&mut store)?;
-
-        match results.into_iter().next() {
-            Some(Val::S32(n)) => Ok(n),
-            other => anyhow::bail!("unexpected result: {:?}", other),
-        }
+        let instance = Instance::new(&mut store, &module, &[])?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("no memory"))?;
+        let alloc: TypedFunc<i32, i32> = instance.get_typed_func(&mut store, "__pack_alloc")?;
+        let eval: TypedFunc<(i32, i32, i32, i32), i32> =
+            instance.get_typed_func(&mut store, "eval")?;
+        let slots = alloc.call(&mut store, 8)?;
+        eval.call(&mut store, (0, 0, slots, slots + 4))?;
+        let mut b = [0u8; 4];
+        memory.read(&store, slots as usize, &mut b)?;
+        let out = u32::from_le_bytes(b) as usize;
+        memory.read(&store, out + 24, &mut b)?;
+        Ok(i32::from_le_bytes(b))
     }
 
     #[test]
     fn test_run_literal() {
         let state = ReplState::new();
-        let wasm = compile_repl("42", &state).expect("compile failed");
-        let result = run_eval_i32(&wasm).expect("run failed");
-        assert_eq!(result, 42);
+        let wasm = compile_repl_pack("42", &state).expect("compile failed");
+        assert_eq!(run_eval_i32(&wasm).expect("run failed"), 42);
     }
 
     #[test]
     fn test_run_with_binding() {
         let mut state = ReplState::new();
         state.bindings.insert("x".to_string(), Value::S32(100));
-
-        let wasm = compile_repl("x", &state).expect("compile failed");
-        let result = run_eval_i32(&wasm).expect("run failed");
-        assert_eq!(result, 100);
+        let wasm = compile_repl_pack("x", &state).expect("compile failed");
+        assert_eq!(run_eval_i32(&wasm).expect("run failed"), 100);
     }
 
     #[test]
@@ -254,10 +196,8 @@ mod tests {
         let mut state = ReplState::new();
         state.bindings.insert("x".to_string(), Value::S32(10));
         state.bindings.insert("y".to_string(), Value::S32(32));
-
-        let wasm = compile_repl("(i32.add x y)", &state).expect("compile failed");
-        let result = run_eval_i32(&wasm).expect("run failed");
-        assert_eq!(result, 42);
+        let wasm = compile_repl_pack("(i32.add x y)", &state).expect("compile failed");
+        assert_eq!(run_eval_i32(&wasm).expect("run failed"), 42);
     }
 
     #[test]
@@ -266,11 +206,9 @@ mod tests {
         state.bindings.insert("a".to_string(), Value::S32(2));
         state.bindings.insert("b".to_string(), Value::S32(3));
         state.bindings.insert("c".to_string(), Value::S32(4));
-
         // (a + b) * c = (2 + 3) * 4 = 20
-        let wasm = compile_repl("(i32.mul (i32.add a b) c)", &state).expect("compile failed");
-        let result = run_eval_i32(&wasm).expect("run failed");
-        assert_eq!(result, 20);
+        let wasm = compile_repl_pack("(i32.mul (i32.add a b) c)", &state).expect("compile failed");
+        assert_eq!(run_eval_i32(&wasm).expect("run failed"), 20);
     }
 
     // Tests for Pack package output
