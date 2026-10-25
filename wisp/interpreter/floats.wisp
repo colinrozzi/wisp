@@ -101,6 +101,13 @@
         (if (string=? name "f64") (double (f64.convert_i64_s n)) (apply-integer-conversion name v))))
     ((single n) (cast-double name (f64.promote_f32 n)))
     ((double n) (cast-double name n))
+    ; Unsigned host values: u64 keeps its bits as s64 (as i64.reinterpret would)
+    ; but converts to a float by its unsigned value; u32 and u16 widen exactly.
+    ((u64-value n)
+      (if (string=? name "f32") (single (f32.convert_i64_u n))
+        (if (string=? name "f64") (double (f64.convert_i64_u n)) (apply-integer-conversion name (wide-integer n)))))
+    ((u32-value n) (numeric-cast name (wide-integer (i64.extend_i32_u n))))
+    ((u16-value n) (numeric-cast name (wide-integer (i64.extend_i32_u n))))
     (else (failure "expected numeric argument"))))
 (fn apply-float-conversion ((name string) (v value)) value
   (let (target (substring name 0 3))

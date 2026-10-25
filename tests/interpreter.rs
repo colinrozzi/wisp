@@ -889,7 +889,10 @@ fn test_interpreter_ordering_comparisons() {
         ("(> 2.5f32 1.5f32)", "1"),
         ("(<= 2.5f32 1.5f32)", "0"),
         ("(>= 1.5f32 1.5f32)", "1"),
-        ("(> 1 2.0)", "error: expected matching integer types"),
+        (
+            "(> 1 2.0)",
+            "error: expected matching integer types, got s32 and f64; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
         ("(>= 1)", "error: expected two arguments"),
         ("(define gt >)", "#<builtin >>"),
         ("(gt 3 2)", "1"),
@@ -958,4 +961,39 @@ fn test_interpreter_lambda_and_let_bodies_are_implicit_begin() {
         "(let (x 1))",
         "error: let expects a binding and a body",
     );
+}
+
+#[test]
+fn test_interpreter_unsigned_arithmetic_and_casts() {
+    let mut s = session();
+    for (source, expected) in [
+        ("(- 10u64 3u64)", "7u64"),
+        ("(+ 10u64 3u64)", "13u64"),
+        ("(/ 5000u64 1000u64)", "5u64"),
+        ("(* 3u64 4u64)", "12u64"),
+        ("(- 0u64 1u64)", "18446744073709551615u64"),
+        ("(> (- 0u64 1u64) 1u64)", "1"),
+        ("(< 2u64 3u64)", "1"),
+        ("(= 2u64 2u64)", "1"),
+        ("(/ 1u64 0u64)", "error: division by zero"),
+        (
+            "(/ 5000u64 1000)",
+            "error: expected matching integer types, got u64 and s32; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
+        ("(s64 7u64)", "7s64"),
+        ("(s32 7u64)", "7"),
+        ("(f64 (- 0u64 1u64))", "1.8446744073709552e19f64"),
+        ("(s64 (- 0u64 1u64))", "-1s64"),
+        (
+            "(+ 1u64 2s64)",
+            "error: expected matching integer types, got u64 and s64; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
+        (
+            "(- 1 2u64)",
+            "error: expected matching integer types, got s32 and u64; give a literal the type, like 1000u64, or cast with (s64 x)",
+        ),
+        ("(let (x : u64 5) x)", "5u64"),
+    ] {
+        eval(&mut s, source, expected);
+    }
 }

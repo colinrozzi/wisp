@@ -169,7 +169,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | store (content-addressed) | `(store-new)` · `(store-put id text)` → ref · `(store-get id ref)` · `(store-label id lbl ref)` · `(store-get-by-label id lbl)` · `(store-list-labels id)` · `(store-exists id ref)` · `(store-size id)` · `(store-put-at id lbl text)` |
 | runtime (manage actors) | `(list-actors)` · `(actor-status id)` · `(actor-state id)`¹ · `(actor-manifest id)` · `(stop-actor id)` · `(kill-actor id)` · `(subscribe-spawns)` · `(unsubscribe-spawns)` · `(shutdown-runtime)` |
 | message-server | `(msg-register)` · `(msg-send id text)` · `(msg-request id text)` · `(msg-list-requests)` · `(msg-respond req text)` · `(msg-cancel req)` · `(msg-open id text)` · `(msg-send-channel cid text)` · `(msg-close-channel cid)` |
-| filesystem² | `(fs-read p)` · `(fs-write p text)` · `(fs-exists p)` · `(fs-list p)` · `(fs-meta p)` · `(fs-append p text)` · `(fs-delete p)` · `(fs-mkdir p)` · `(fs-rmdir p)` |
+| filesystem² | `(fs-read p)` (bytes) · `(fs-read-text p)` (a string) · `(fs-write p text)` · `(fs-exists p)` · `(fs-list p)` · `(fs-meta p)` · `(fs-append p text)` · `(fs-delete p)` · `(fs-mkdir p)` · `(fs-rmdir p)` |
 | http-client³ | `(http-get url)` · `(http-req method url)` |
 | assembler | `(wat-to-wasm wat-text)` → wasm bytes |
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
