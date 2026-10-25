@@ -321,6 +321,15 @@ impl Guest {
             "event-recorded",
             Value::Tuple(vec![]),
         );
+        // wisp-chain: the daemon's chain recorder; not exercised here.
+        for name in ["watch", "unwatch", "head", "tail", "verify"] {
+            mock_import(
+                &mut linker,
+                "wisp-chain",
+                name,
+                Value::String("chain not exercised".into()),
+            );
+        }
         // Any other host import the evaluator declares (store.get/...) traps.
         linker.define_unknown_imports_as_traps(&module).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();

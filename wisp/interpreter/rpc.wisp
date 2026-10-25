@@ -254,6 +254,18 @@
 (record session-info (id string) (name string) (actor string) (age-secs u64))
 (import wisp-sessions list-sessions () (list session-info))
 
+; wisp-chain: the theater-repl daemon's chain recorder (chain.pact). It keeps the
+; newest 256 events of each actor it watches, as hashes, types and payload sizes
+; (never payloads), from the watch until the actor stops.
+(record chain-event (hash string) (parent string) (event-type string) (data-bytes s32))
+(record chain-head (hash string) (count s32) (recording bool))
+(record chain-check (ok bool) (count s32) (kept s32) (dropped s32) (breaks s32) (from-root bool))
+(import wisp-chain watch ((actor string)) (result unit string))
+(import wisp-chain unwatch ((actor string)) (result unit string))
+(import wisp-chain head ((actor string)) (result chain-head string))
+(import wisp-chain tail ((actor string) (n s32)) (result (list chain-event) string))
+(import wisp-chain verify ((actor string)) (result chain-check string))
+
 ; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
 ; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
 ; actor, so they need a peer to exercise; register/list-requests are self-contained.)
@@ -424,6 +436,11 @@
     ((string=? name "shutdown-runtime") 1)
     ((string=? name "spawn-actor") 1)
     ((string=? name "sessions") 1)
+    ((string=? name "chain-watch") 1)
+    ((string=? name "chain-unwatch") 1)
+    ((string=? name "chain-head") 1)
+    ((string=? name "chain-tail") 1)
+    ((string=? name "chain-verify") 1)
     ((string=? name "msg-register") 1)
     ((string=? name "msg-send") 1)
     ((string=? name "msg-request") 1)
@@ -746,6 +763,38 @@
 (fn apply-sessions ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "sessions expects no arguments")
     (unmarshal (raw-invoke "wisp-sessions" "list-sessions" (arg-tuple (list-new value))))))
+
+; --- chain recorder (wisp-chain) ---------------------------------------------
+; (chain-watch id) starts recording actor id's chain; (chain-head id) ->
+; (ok (chain-head hash count recording)); (chain-tail id n) -> (ok list of
+; (chain-event hash parent event-type data-bytes)), oldest first;
+; (chain-verify id) -> (ok (chain-check ok count kept dropped breaks from-root));
+; (chain-unwatch id) stops and forgets. Each takes a full actor id.
+; i32.and evaluates both sides, so check the count before reading an argument.
+(fn chain-id-call ((args (list value))) s32
+  (if (i32.eq (list-len args) 1) (string-arg? (list-get args 0)) 0))
+(fn apply-chain-watch ((args (list value))) value
+  (if (chain-id-call args)
+    (unmarshal (raw-invoke "wisp-chain" "watch" (marshal (list-get args 0))))
+    (failure "chain-watch expects (chain-watch actor-id)")))
+(fn apply-chain-unwatch ((args (list value))) value
+  (if (chain-id-call args)
+    (unmarshal (raw-invoke "wisp-chain" "unwatch" (marshal (list-get args 0))))
+    (failure "chain-unwatch expects (chain-unwatch actor-id)")))
+(fn apply-chain-head ((args (list value))) value
+  (if (chain-id-call args)
+    (unmarshal (raw-invoke "wisp-chain" "head" (marshal (list-get args 0))))
+    (failure "chain-head expects (chain-head actor-id)")))
+(fn apply-chain-tail ((args (list value))) value
+  (if (if (i32.eq (list-len args) 2)
+        (i32.and (string-arg? (list-get args 0)) (num-arg? (list-get args 1))) 0)
+    (unmarshal (raw-invoke "wisp-chain" "tail"
+      (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1))))))
+    (failure "chain-tail expects (chain-tail actor-id n)")))
+(fn apply-chain-verify ((args (list value))) value
+  (if (chain-id-call args)
+    (unmarshal (raw-invoke "wisp-chain" "verify" (marshal (list-get args 0))))
+    (failure "chain-verify expects (chain-verify actor-id)")))
 
 ; --- message-server --------------------------------------------------------
 ; Shared shapes: (string, message) -> Tuple(String, list<u8>); a single string
@@ -1632,7 +1681,7 @@
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
-                        (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
+                        (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\nchain:     (chain-watch id) record actor id's event chain (newest 256, hashes + sizes, never payloads; stops when it stops)\n           (chain-head id) -> (chain-head hash count recording)   (chain-tail id n) -> latest n (chain-event hash parent event-type data-bytes)\n           (chain-verify id) -> (chain-check ok count kept dropped breaks from-root)   (chain-unwatch id); all (ok ...)/(err ...), full actor ids\n"
                         (string-append "core:      (define x v) (lambda (a b) body ...) (let (x v) body ...) (begin a ...)   a body of several forms runs them in order and gives the last value\nnumbers:   (+ a b) (- a b) (* a b) (/ a b) (= a b) (< a b) (> a b) (<= a b) (>= a b)   s32 s64 f32 f64 u64 u32 u16 (unsigned ones wrap)\n           both the same type (literals too: (/ (now) 1000u64))   casts: (s32 x) (s64 x) (f32 x) (f64 x)\nstrings:   (string-append s ...) any number, none gives \"\"   (string-len s) (string-ref s i) (substring s from to) (string=? a b) (bytes->string bs) (string->bytes s)\ncontrol:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
                         (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n           (list-len xs) (list-get xs i) (list-push xs x) take (list ...) and (list-new T) lists alike;\n           list-push returns the new list (use the result; do not count on xs changing)\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (events-after N) (event-read cursor) (event-ack cursor seq) (poll-events)   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
@@ -1676,6 +1725,11 @@
     ((string=? name "shutdown-runtime") (apply-runtime-shutdown args))
     ((string=? name "spawn-actor") (apply-spawn-actor args))
     ((string=? name "sessions") (apply-sessions args))
+    ((string=? name "chain-watch") (apply-chain-watch args))
+    ((string=? name "chain-unwatch") (apply-chain-unwatch args))
+    ((string=? name "chain-head") (apply-chain-head args))
+    ((string=? name "chain-tail") (apply-chain-tail args))
+    ((string=? name "chain-verify") (apply-chain-verify args))
     ((string=? name "msg-register") (apply-msg-register args))
     ((string=? name "msg-send") (apply-msg-send args))
     ((string=? name "msg-request") (apply-msg-request args))

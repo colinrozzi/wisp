@@ -177,6 +177,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | tcp⁴ | `(tcp-connect addr)` · `(tcp-send conn data)` → bytes · `(tcp-receive conn max)`⁵ · `(tcp-close conn)` · `(tcp-peer conn)` · `(tcp-is-tls conn)` · `(tcp-listen addr)`⁶ · `(tcp-accept lst)`⁶ · `(tcp-activate conn)` · `(tcp-set-active conn mode)` · `(tcp-transfer conn actor)` · `(tcp-transfer-async conn actor)` · `(tcp-tls-client conn name)` · `(tcp-tls-server conn)` · `(tcp-close-listener lst)` |
 | podman | `(podman-run image name)` · `(podman-stop name)` · `(podman-rm name force)` · `(podman-list)` |
 | lifecycle⁷ | `(monitor id)` · `(unmonitor id)` · `(link id)` · `(unlink id)` |
+| chain recorder⁸ | `(chain-watch id)` · `(chain-head id)` · `(chain-tail id n)` · `(chain-verify id)` · `(chain-unwatch id)` |
 | meta | `(help)` · `(help "tcp")` · `(help "triggers")` · `(events-after N)` · `(event-read c)` · `(event-ack c seq)` · `(event-cursors)` · `(poll-events)` · `(event-buffer N)` · `(handles)` · `(memory-stats)` |
 
 ¹ Self-targeted blocking calls — `(exports (self))`, `(implements (self) …)`,
@@ -215,6 +216,35 @@ fate-shares instead (no callback — if the subject dies, you are stopped);
 `"wasm"` events (call + result)** plus one per host-call it makes, so it is chatty —
 route on `event-type` (e.g. `"terminated"`) in your handler. (A host-side
 `monitor-filtered` + the raw `data` payload are follow-ups.)
+
+⁸ The **chain recorder** is in the daemon (`legacy-host/src/chain.rs`, interface
+`chain.pact`). Theater keeps only an actor's head hash and streams each event to
+subscribers; `(chain-watch id)` subscribes the daemon to actor `id`'s chain and
+keeps its newest 256 events, as hash, parent hash, event type and payload size.
+It never keeps payloads (they hold messages, file contents, request text), so no
+verb returns them. Recording stops at the actor's `terminated` event; the ring of
+a stopped actor stays readable (the newest 16 stopped actors are kept). At most
+64 actors are watched at once.
+
+```lisp
+(chain-watch (self))       ; (ok ...); a session may watch itself
+(chain-head (self))        ; (ok (chain-head hash count recording)): hex hash ("" before any event)
+(chain-tail (self) 3)      ; (ok #<list chain-event ((chain-event hash parent event-type data-bytes) ...)>), oldest first
+(chain-verify (self))      ; (ok (chain-check ok count kept dropped breaks from-root))
+```
+
+`breaks` counts events whose parent is not the previous event's hash, over every
+event seen, not only those still kept; `dropped` is how many the ring has let go;
+`from-root` says whether the first event seen was the actor's first. Sessions are
+**not** recorded by default: every subscriber gets its own copy of each event,
+payload included, and the actor waits for each subscriber to take it (theater
+`docs/messaging-and-lifecycle-behavior.md` §3.1), so recording costs the watched
+actor something, and most sessions are never inspected. Watch what you want to
+read. Event types seen (2026-10-25, `tests/chain.rs` and a local `/system` run):
+`wasm` (an export call, and its result: two per evaluation or trigger),
+`<interface>/<function>` for each host call (e.g. `theater:simple/tcp/activate`,
+`wisp-chain/head`), and `terminated`. Hashes are 20 bytes (40 hex digits). Serving
+one `/system` page is about 23 events, so the ring holds about the last 11 requests.
 
 ## Observing Theater — inbound triggers as live handlers
 
