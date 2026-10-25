@@ -24,7 +24,7 @@
       (let (pattern (items-of (list-get parts 0)))
         (if (string=? (symbol-name (list-get pattern 0)) case-name)
           (eval-expected (list-get parts 1)
-            (bind-args (copy-list pattern 1 (list-new value)) fields 0 (copy-env env 0 (list-new binding))) depth 0 expected)
+            (bind-args (copy-list pattern 1 (list-new value)) fields 0 env) depth 0 expected)
           (match-arms arms (i32.add index 1) case-name fields env depth expected))))))
 
 (fn eval-match ((items (list value)) (env (list binding)) (depth s32) (expected string)) value

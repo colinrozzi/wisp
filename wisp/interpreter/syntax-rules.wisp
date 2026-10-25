@@ -211,7 +211,7 @@
             (if repeated (copy-list (items-of v) 0 out) (list-push out v))))))))
 (fn sr-template-repeat ((template value) (vars (list value)) (captures (list binding)) (path (list value)) (scope string) (index s32) (count s32) (out (list value))) value
   (if (i32.ge_s index count) (sequence out)
-    (let (v (sr-template template vars captures (list-push (copy-list path 0 (list-new value)) (integer index)) scope))
+    (let (v (sr-template template vars captures (list-push path (integer index)) scope))
       (if (failed? v) v
         (sr-template-repeat template vars captures path scope (i32.add index 1) count (list-push out v))))))
 (fn expand-syntax-rules ((definition value) (input value)) value
