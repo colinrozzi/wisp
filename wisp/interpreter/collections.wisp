@@ -100,11 +100,11 @@
                 (if (failed? checked) checked (typed-list element (list-push items checked))))
               (list-index items (list-get args 1)))))
         ; An untyped list from (list ...) or a quote has no element type to check.
-        ; list-push copies it: the sequence may be a quoted literal in some code.
+        ; list-push leaves the original (maybe a quoted literal) unchanged.
         ((sequence items)
           (if (string=? name "list-len") (integer (list-len items))
             (if (string=? name "list-push")
-              (sequence (list-push (copy-list items 0 (list-new value)) (list-get args 1)))
+              (sequence (list-push items (list-get args 1)))
               (list-index items (list-get args 1)))))
         (else (failure "expected a list"))))))
 

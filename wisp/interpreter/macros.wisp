@@ -159,7 +159,7 @@
 (fn prepare-macros ((forms (list value))) value
   (begin
     (global.set $macro-steps 0)
-    (global.set $pending-macros (copy-env (global.get $session-macros) 0 (list-new binding)))
+    (global.set $pending-macros (global.get $session-macros))
     (let (checked (collect-session-macros forms 0))
       (if (failed? checked) checked
         (let (expanded (expand-macro-top forms 0 (list-new value)))

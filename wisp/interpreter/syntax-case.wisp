@@ -24,10 +24,7 @@
       (if (string=? name (sc-binding.name entry)) (sc-binding.item entry)
         (sc-lookup name env (i32.sub index 1))))))
 (fn sc-extend ((env (list sc-binding)) (entry sc-binding)) (list sc-binding)
-  (list-push (sc-copy-env env 0 (list-new sc-binding)) entry))
-(fn sc-copy-env ((env (list sc-binding)) (index s32) (out (list sc-binding))) (list sc-binding)
-  (if (i32.ge_s index (list-len env)) out
-    (sc-copy-env env (i32.add index 1) (list-push out (list-get env index)))))
+  (list-push env entry))
 (fn sc-syntax-value ((v sc-value) (scope string)) value
   (sc-case v
     ((sc-syntax expr) expr)

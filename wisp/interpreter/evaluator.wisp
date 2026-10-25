@@ -54,8 +54,9 @@
             found)))
       local)))
 
-; Wisp list-push mutates its list. Copy before extending a lexical environment
-; so sibling calls and nested lets cannot change an existing closure's bindings.
+; Concatenate environments (syntax-rules merges match bindings with it). Lexical
+; environments need no defensive copy: list-push leaves its argument unchanged
+; (reference counting, MEMORY.md §3.4), so extending one cannot change another.
 (fn copy-env ((env (list binding)) (index s32) (out (list binding))) (list binding)
   (if (i32.ge_s index (list-len env)) out
     (copy-env env (i32.add index 1) (list-push out (list-get env index)))))
@@ -79,7 +80,7 @@
       (replace-binding env 0 at (binding name v) (list-new binding)))))
 
 (fn extend-env ((env (list binding)) (entry binding)) (list binding)
-  (list-push (copy-env env 0 (list-new binding)) entry))
+  (list-push env entry))
 
 ; Locals are captured by value in immutable environment lists. Top-level names
 ; are looked up in the current session globals, supporting recursion/redefinition.
@@ -321,7 +322,7 @@
     ; would see the caller's env. Same-module calls skip the switch (no churn).
     ((closure params body captured home)
       (if (i32.ne (list-len params) (list-len args)) (failure "wrong number of arguments")
-        (let (call-env (bind-args params args 0 (copy-env captured 0 (list-new binding))))
+        (let (call-env (bind-args params args 0 captured))
           (if (i32.or (string=? home (global.get $current-module)) (i32.eq (module-loaded? home) 0))
             (eval-expected body call-env depth 0 expected)
             (let (previous (global.get $current-module))
