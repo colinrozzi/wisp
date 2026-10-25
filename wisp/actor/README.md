@@ -293,10 +293,12 @@ still run, and readers see each firing as dropped) and returns the old one.
 `(handles)` lists the timers, listeners, connections, processes and channels the
 session holds open, as `(kind id)`; the open and close verbs and the
 `on-close`/`on-exit`/`on-channel-close` events keep it current. `(memory-stats)`
-returns `(("heap-bytes" n) ("bindings" n) ("modules" n) ("types" n) ("macros" n)
-("events" n) ("events-dropped" n) ("handles" n) ("event-seq" n) ("cursors" n))`;
-`heap-bytes` is the allocator's live bytes (allocated and not yet freed; garbage
-nothing frees yet still counts), and
+returns `(("heap-bytes" n) ("heap-pages" n) ("bindings" n) ("modules" n)
+("types" n) ("macros" n) ("events" n) ("events-dropped" n) ("handles" n)
+("event-seq" n) ("cursors" n))`; `heap-bytes` is the allocator's live bytes
+(allocated and not yet freed; garbage nothing frees yet still counts),
+`heap-pages` is the memory's size in 64 KiB pages (memory never shrinks, so
+this is the high-water mark), and
 `events-dropped` counts every firing the limit has dropped.
 
 From the shell, **`theater-repl read <id>`** reads the firings (`--full` for the

@@ -1614,15 +1614,18 @@
 ; (memory-stats): heap bytes in use, and the sizes of the session's long-lived
 ; tables, as (name count) pairs. heap-bytes is the allocator's live bytes (block
 ; headers included): what is allocated and not yet freed, which still includes
-; garbage nothing frees yet.
+; garbage nothing frees yet. heap-pages is the linear memory's size in 64 KiB
+; pages (the stats record's +12): memory never shrinks, so it is the high-water
+; mark, and it is what runs into the session's memory limit.
 (fn stat ((name string) (n s32)) value
   (sequence (list-push (list-push (list-new value) (text name)) (integer n))))
 (fn apply-memory-stats ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "memory-stats expects no arguments")
     (begin
       (trim-events)
-      (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+      (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
         (stat "heap-bytes" (i32.load (heap-stats))))
+        (stat "heap-pages" (i32.load (i32.add (heap-stats) 12))))
         (stat "bindings" (list-len (global.get $bindings))))
         (stat "modules" (list-len (global.get $modules))))
         (stat "types" (list-len (global.get $types))))
