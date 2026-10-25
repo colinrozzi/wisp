@@ -23,23 +23,23 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-theater = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-native = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-rpc = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-self = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-store = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-runtime = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-message-server = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-timer = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-assembler = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-filesystem = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-terminal = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-http-client = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-tcp = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-udp = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-process = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-podman = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
-theater-handler-lifecycle = { git = "https://github.com/colinrozzi/theater.git", rev = "cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98" }
+theater = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-native = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-rpc = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-self = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-store = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-runtime = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-message-server = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-timer = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-assembler = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-filesystem = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-terminal = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-http-client = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-tcp = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-udp = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-process = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-podman = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
+theater-handler-lifecycle = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
