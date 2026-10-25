@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod deaths;
 pub mod eval_session;
 pub mod events;
 pub mod sessions;
@@ -25,6 +26,11 @@ use theater::{ManifestConfig, TheaterId};
 use tokio::sync::{mpsc, oneshot};
 
 pub const MANIFEST: &str = include_str!("../../manifest.toml");
+
+/// The keepalive actor (src/keepalive.wisp, compiled): see [`Runtime::new`].
+const KEEPALIVE_WASM: &[u8] = include_bytes!("keepalive.wasm");
+const KEEPALIVE_MANIFEST: &str =
+    "name = \"theater-repl-keepalive\"\nversion = \"0.1.0\"\npackage = \"keepalive.wasm\"\n";
 
 /// How the REPL actor's filesystem capability is granted. The default is the
 /// historical behavior: an ephemeral sandbox in the `serve` cwd. A configured
@@ -54,6 +60,16 @@ pub struct Runtime {
     pub sessions: sessions::Sessions,
     /// Each session's newest trigger-firing seq, for `wait` and `follow`.
     pub events: events::EventWatch,
+    /// One notice per actor that stops, from a global chain subscription made
+    /// before anything was spawned. The daemon takes it, once, to supervise its
+    /// boot-list services.
+    pub deaths: std::sync::Mutex<Option<mpsc::UnboundedReceiver<deaths::Death>>>,
+    /// Actors that have terminated, left out of the directory even while the
+    /// runtime still lists them (see [`deaths`]).
+    pub dead: deaths::Dead,
+    /// The keepalive actor (see [`Runtime::new`]): in `(list-actors)`, never a
+    /// session.
+    pub keepalive: TheaterId,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -75,7 +91,8 @@ impl Runtime {
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
-        let sessions = sessions::Sessions::new(commands.clone());
+        let dead = deaths::Dead::default();
+        let sessions = sessions::Sessions::new(commands.clone(), dead.clone());
         handlers.register(sessions.clone());
         let events = events::EventWatch::default();
         handlers.register(events.clone());
@@ -184,12 +201,34 @@ impl Runtime {
         if let Some(tx) = chain {
             runtime.add_global_subscription(tx);
         }
+        let (subscriber, deaths) = deaths::subscription(dead.clone());
+        runtime.add_global_subscription(subscriber);
         let task = tokio::spawn(async move { runtime.run().await });
-        Ok(Self {
+        let runtime = Self {
             commands,
             sessions,
             events,
+            deaths: std::sync::Mutex::new(Some(deaths)),
+            dead,
+            keepalive: TheaterId::generate(),
             task,
+        };
+        // The runtime exits once its last actor is finalized (theater
+        // `theater_runtime.rs`, the `ActorShutdownComplete` arm), and the
+        // daemon would go on serving with no runtime. One actor that never
+        // stops keeps it up; it is not an interpreter, so not a session.
+        let keepalive = runtime
+            .spawn_named(
+                KEEPALIVE_WASM.to_vec(),
+                ManifestConfig::from_toml_str(KEEPALIVE_MANIFEST)?,
+                "theater-repl-keepalive".into(),
+            )
+            .await
+            .context("starting the keepalive actor")?
+            .id;
+        Ok(Self {
+            keepalive,
+            ..runtime
         })
     }
 
@@ -231,7 +270,7 @@ impl Runtime {
 
     /// Every interpreter actor in the runtime; see [`interpreters`].
     pub async fn interpreters(&self) -> Result<Vec<Interpreter>> {
-        interpreters(&self.commands).await
+        interpreters(&self.commands, &self.dead).await
     }
 
     /// The interpreter actor `target` names: a full actor id, an id prefix, or a
@@ -277,15 +316,21 @@ pub struct Interpreter {
 }
 
 /// Every interpreter actor in the runtime (any actor that exports
-/// `theater:simple/wisp.evaluate`), in id order. The runtime is the directory:
-/// this asks it each time and keeps nothing.
+/// `theater:simple/wisp.evaluate`), in id order, apart from those `dead` says
+/// have terminated. The runtime is the directory: this asks it each time.
 pub async fn interpreters(
     commands: &mpsc::UnboundedSender<TheaterCommand>,
+    dead: &deaths::Dead,
 ) -> Result<Vec<Interpreter>> {
     let (response_tx, response_rx) = oneshot::channel();
     commands.send(TheaterCommand::GetActors { response_tx })?;
+    let actors = response_rx.await??;
+    dead.prune(&actors.iter().map(|(id, _, _)| *id).collect::<Vec<_>>());
     let mut found = Vec::new();
-    for (id, name, _) in response_rx.await?? {
+    for (id, name, _) in actors {
+        if dead.contains(&id) {
+            continue;
+        }
         // Served from the runtime's metadata cache: no call into the actor, so
         // this is safe from inside an actor's own host call.
         let (response_tx, response_rx) = oneshot::channel();

@@ -59,8 +59,10 @@ LISP
 | `follow [--full] [--from-now] <s>` | stream firings until Ctrl-C (same format as `read`), resuming from the `follow` cursor |
 | `wait [--timeout S] <s>` | block until there is a firing after the `wait` cursor, print all there are, move the cursor, exit (exit 2 on timeout). The wake-on-message monitor |
 | `cursors <s>` | the session's event cursors: name, acknowledged seq, how far behind |
-| `status [s]` | show a session (with one) or the daemon (without) |
-| `stop <s>` | stop the session's actor and reclaim its heap |
+| `status [s]` | show a session (with one) or the daemon and its services (without) |
+| `stop <s>` | stop the session's actor and reclaim its heap; a service stopped this way is not restarted |
+| `services` | each boot-list service: state, restarts, session id, last death |
+| `start <name>` | start a boot-list service that is stopped, exited or given up, with a fresh restart limit |
 | `repl` | interactive stdin/stdout prompt against a private session (for a human) |
 | `version` | print the installed version (also `--version`) |
 | `upgrade` | download the latest release and replace this binary in place |
@@ -119,6 +121,69 @@ theater-repl set-default wisp/actor/manifest.toml            # all later session
 does not, the default stays as it was. The daemon reads the files when you run the
 command, so rebuilding afterwards does not change running sessions or the default.
 Changes to the host itself (this crate) still need a daemon restart.
+
+### Services: a boot list, restarted when they die
+
+The config file (`--config PATH`, else `~/.config/theater-repl/config.toml`)
+grants the sessions' filesystem root, and can list **services**: sessions that
+`serve` creates at start and keeps running.
+
+```toml
+[filesystem]
+root = "~/srv/fs"            # sessions' filesystem; start files live under it
+
+[[service]]
+name = "web"                 # the session's name
+start = "serve.wisp"         # evaluated in each fresh session; relative to root
+# Optional, with their defaults:
+restart = "permanent"        # permanent | transient | temporary
+max_restarts = 5             # more restarts than this within period_secs,
+period_secs = 60             #   and the daemon gives up
+```
+
+For each service the daemon creates a session under its name and evaluates the
+start file in it, as `theater-repl new web && theater-repl eval web - < serve.wisp`
+would. A start file that returns an `error:` counts as a death: the daemon logs
+it, stops that session, and applies the policy. When a service's session dies
+(a trap, `kill-actor`, `stop-actor` from another session…), the daemon restarts
+it per policy, with a fresh session (a new actor id) under the same name, running
+the start file again (read again, so edits take effect):
+
+- `permanent` always restarts; `transient` restarts unless the session
+  completed or was stopped; `temporary` never restarts (state `exited`).
+- More than `max_restarts` restarts within `period_secs` and the daemon gives
+  up (state `given up`), and says so in its log and in `services`/`status`.
+- `theater-repl stop web` marks the service `stopped` before stopping it, so it
+  is not restarted. `theater-repl start web` starts it again (also after
+  `given up`), with the restart count and limit reset.
+
+```
+$ theater-repl services
+NAME             STATE      RESTARTS  ID        LAST DEATH
+web              running           1  ab42f587  killed (120s ago)
+mail             given up          5  -         start file failed: mail.wisp: error: unbound symbol: smtp (30s ago)
+```
+
+State does not survive a restart: a restarted session starts from the start
+file, not from what the old one held. A service that wants state across restarts
+keeps it in a file or `store` and loads it from its start file. Peers holding
+the old actor id must look the service up again (by name: `list`, the registry).
+
+How it works: this is the userland supervisor of theater#235's supervision
+design; the runtime itself neither restarts nor owns actors. Before spawning
+anything the daemon subscribes to every actor's chain
+(`add_global_subscription`) and keeps only `terminated` events, so it hears
+every death with its cause (`src/deaths.rs`); the policy is in `src/boot.rs`.
+Two runtime behaviors the daemon works around (theater `cbb48982`, 2026-10-25):
+
+- A force-killed (`kill-actor`) REPL session never finishes its teardown, so the
+  runtime keeps listing it. The daemon leaves actors whose `terminated` event it
+  has seen out of `list`, name lookups and `(sessions)`.
+- The runtime exits once its last actor is gone, which used to leave a daemon
+  with no runtime after `stop` of its last session (`error: channel closed`). The
+  daemon now spawns a small keepalive actor (`theater-repl-keepalive`,
+  `src/keepalive.wisp`) at start. It is not a session, but `(list-actors)`
+  shows it.
 
 ### Build from source (for hacking on the REPL itself)
 

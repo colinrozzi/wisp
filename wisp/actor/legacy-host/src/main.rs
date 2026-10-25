@@ -12,6 +12,8 @@ use wisp_interpreter_actor::{
     MANIFEST, Runtime, resolve, sessions::Note, short_id, source::SourceBundle, transport,
 };
 
+mod boot;
+
 /// The actor built into the binary (produced by actors/wisp-repl/build.sh). A
 /// released theater-repl is self-contained: it carries its own actor + bundle.
 const EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../actor.wasm"));
@@ -127,8 +129,14 @@ enum Command {
     Cursors { id: String },
     /// Show a session (with id) or the daemon (without).
     Status { id: Option<String> },
-    /// Stop a session's actor and reclaim its heap.
+    /// Stop a session's actor and reclaim its heap. A boot-list service stopped
+    /// this way stays stopped until `start`.
     Stop { id: String },
+    /// Show each boot-list service: state, restarts, session, last death.
+    Services,
+    /// Start a boot-list service that is stopped, exited, or given up, with a
+    /// fresh restart limit.
+    Start { name: String },
     /// Stop the daemon itself: end all sessions and exit (frees the port).
     Down,
     /// Interactive stdin/stdout prompt against a private session (for a human).
@@ -285,13 +293,16 @@ fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<Loaded>
 
 // ---- config ---------------------------------------------------------------
 
-/// theater-repl config (TOML). For now its one job is granting the REPL actor's
-/// filesystem capability — a root directory it may read/write. This is the human's
-/// slice of the actor manifest; other capability knobs can grow here later.
+/// theater-repl config (TOML). It grants the REPL actor's filesystem capability —
+/// a root directory it may read/write, the human's slice of the actor manifest —
+/// and lists the services `serve` starts and keeps running (`[[service]]`, see
+/// `boot`).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ReplConfig {
     filesystem: FilesystemConfig,
+    #[serde(rename = "service")]
+    services: Vec<boot::ServiceConfig>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -341,6 +352,8 @@ fn load_config(explicit: &Option<PathBuf>) -> Result<ReplConfig> {
     let mut config: ReplConfig =
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
     config.filesystem.root = config.filesystem.root.map(expand_tilde);
+    boot::validate(&config.services, config.filesystem.root.as_deref())
+        .with_context(|| format!("in config {}", path.display()))?;
     Ok(config)
 }
 
@@ -368,11 +381,12 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
 /// Everything a connection can touch. The session registry is `runtime.sessions`
 /// (shared with the actors, for `(sessions)`). `default` is what `new` starts
 /// sessions from; `startup` is the actor the daemon was launched with, for
-/// `set-default --reset`.
+/// `set-default --reset`. `services` is the boot list and its supervisor's state.
 struct Daemon {
     runtime: Runtime,
     default: Mutex<ActorSource>,
     startup: ActorSource,
+    services: boot::Services,
     shutdown: tokio::sync::Notify,
 }
 
@@ -386,8 +400,10 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
         runtime,
         default: Mutex::new(loaded.actor.clone()),
         startup: loaded.actor,
+        services: boot::Services::new(config.services, config.filesystem.root),
         shutdown: tokio::sync::Notify::new(),
     });
+    boot::boot(&daemon);
     let hint = if port == 7777 {
         String::new()
     } else {
@@ -420,6 +436,7 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
+    daemon.services.close();
     let _ = daemon
         .runtime
         .commands
@@ -427,7 +444,7 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn handle(stream: tokio::net::TcpStream, daemon: &Daemon) -> Result<()> {
+async fn handle(stream: tokio::net::TcpStream, daemon: &Arc<Daemon>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let Some(line) = transport::read_line(&mut reader).await? else {
         return Ok(());
@@ -467,7 +484,7 @@ async fn probe(runtime: &Runtime, actor: &ActorSource) -> Result<()> {
     }
 }
 
-async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
+async fn dispatch(request: &Value, daemon: &Arc<Daemon>) -> (bool, String) {
     match field(request, "op") {
         // `theater-repl down`: reply first, then wake the serve loop to exit.
         "shutdown" => {
@@ -575,24 +592,45 @@ async fn dispatch(request: &Value, daemon: &Daemon) -> (bool, String) {
                 }
             }
             None => match daemon.runtime.interpreters().await {
-                Ok(interpreters) => (
-                    true,
-                    format!(
+                Ok(interpreters) => {
+                    let mut out = format!(
                         "daemon up — {} session(s)\n  default actor: {}",
                         interpreters.len(),
                         daemon.default.lock().await.origin
-                    ),
-                ),
+                    );
+                    if !daemon.services.is_empty() {
+                        out.push_str("\nservices:");
+                        for line in daemon.services.render(&interpreters).lines() {
+                            out.push_str(&format!("\n  {line}"));
+                        }
+                    }
+                    (true, out)
+                }
                 Err(error) => (false, format!("error: {error:#}")),
             },
+        },
+        "services" => match daemon.runtime.interpreters().await {
+            Ok(interpreters) => (true, daemon.services.render(&interpreters)),
+            Err(error) => (false, format!("error: {error:#}")),
+        },
+        "start" => match boot::start(daemon, field(request, "name")) {
+            Ok(text) => (true, text),
+            Err(error) => (false, format!("error: {error:#}")),
         },
         "stop" => {
             let target = field(request, "id");
             match daemon.runtime.find(target).await {
-                Ok(session) => match session.stop().await {
-                    Ok(()) => (true, format!("stopped {target}")),
-                    Err(error) => (false, format!("error: could not stop {target}: {error:#}")),
-                },
+                Ok(session) => {
+                    // A service stopped on purpose is not restarted.
+                    daemon.services.stopping(session.id);
+                    match session.stop().await {
+                        Ok(()) => (true, format!("stopped {target}")),
+                        Err(error) => (false, format!("error: could not stop {target}: {error:#}")),
+                    }
+                }
+                Err(_) if daemon.services.stop_named(target) => {
+                    (true, format!("stopped service {target}"))
+                }
                 Err(error) => (false, error.to_string()),
             }
         }
@@ -808,7 +846,9 @@ async fn wait(daemon: &Daemon, request: &Value) -> (bool, String) {
                 }
                 _ = timeout => return (true, output),
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    if daemon.runtime.attach(session.id).await.is_err() {
+                    if daemon.runtime.dead.contains(&session.id)
+                        || daemon.runtime.attach(session.id).await.is_err()
+                    {
                         daemon.runtime.events.forget(&session.id);
                         return (false, format!("error: session {target} stopped"));
                     }
@@ -897,6 +937,8 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
         Command::Read { id, from } => read(port, id, from).await,
         Command::Status { id } => send(port, json!({ "op": "status", "id": id })).await,
         Command::Stop { id } => send(port, json!({ "op": "stop", "id": id })).await,
+        Command::Services => send(port, json!({ "op": "services" })).await,
+        Command::Start { name } => send(port, json!({ "op": "start", "name": name })).await,
         Command::Down => send(port, json!({ "op": "shutdown" })).await,
         Command::Follow { id, from, from_now } => follow(port, id, from, from_now).await,
         Command::Wait { id, from, timeout } => wait_once(port, id, from, timeout).await,
