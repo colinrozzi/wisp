@@ -373,12 +373,18 @@
               (begin
                 ; Unregister NAME so its (module NAME ...) form starts from an empty env.
                 (global.set $modules (drop-module (global.get $modules) 0 name (list-new module)))
-                (global.set $loading (list-push (global.get $loading) name))
-                (let (loaded (load-module-source (module.source old)))
+                (let (saved (begin-redeclaring name))
                   (begin
-                    (global.set $loading (drop-name (global.get $loading) 0 name (list-new string)))
-                    (if (failed? loaded) (restore-module name old loaded)
-                      (install-reloaded name old))))))))))))
+                    (global.set $loading (list-push (global.get $loading) name))
+                    (let (loaded (load-module-source (module.source old)))
+                      (begin
+                        (global.set $loading (drop-name (global.get $loading) 0 name (list-new string)))
+                        (let (retired (global.get $redeclarable))
+                          (let (problem (if (failed? loaded) loaded (retire-problem retired 0)))
+                            (let (result (if (failed? problem) problem (install-reloaded name old)))
+                              (if (failed? result)
+                                (begin (restore-declarations saved) (restore-module name old result))
+                                (begin (end-redeclaring) (retire-declarations retired 0) result)))))))))))))))))
 
 ; The new source evaluated cleanly; check it defined NAME with every provided name
 ; bound, then commit: keep the old source path and refresh the importers.
@@ -461,3 +467,251 @@
         (global.set $bindings (rebound.env r))
         (global.set $current-imports (rebound.imports r))
         (name-symbols (rebound.dropped r) 0 (list-new value))))))
+
+; ---- Declarations and reload ----------------------------------------------
+; Types, globals, traits and instances live in session-wide tables, not in a
+; module's env, so a fresh env does not clear them. $declared-by records which
+; module made each declaration, keyed "type NAME", "global $NAME", "trait NAME"
+; or "instance TRAIT (TYPES)". During (reload M), $reloading is M and
+; $redeclarable holds the keys M declared before that its new source has not yet
+; declared again: only those may be declared a second time (once each), and only
+; by M. What is left at the end was removed from the source and is retired.
+; Design: docs/proposals/RELOAD-DECLARATIONS.md.
+(global $declared-by (list binding) mut 0)
+(global $reloading string mut 0)
+(global $redeclarable (list string) mut 0)
+
+(fn type-key ((name string)) string (string-append "type " name))
+(fn global-key ((name string)) string (string-append "global " name))
+(fn trait-key ((name string)) string (string-append "trait " name))
+(fn instance-key ((trait string) (types (list value))) string
+  (string-append "instance " (string-append trait (string-append " " (show (sequence types))))))
+
+(fn declared! ((key string)) s32
+  (begin
+    (global.set $declared-by (upsert-binding (global.get $declared-by) key (symbol (global.get $current-module))))
+    0))
+
+; The module that declared KEY, or "".
+(fn declarer ((key string)) string
+  (let (owner (lookup-local key (global.get $declared-by) (i32.sub (list-len (global.get $declared-by)) 1)))
+    (if (failed? owner) "" (symbol-name owner))))
+
+; KEY may be declared again: M is being reloaded, M is evaluating, and M
+; declared KEY before and has not declared it again in this reload.
+(fn redeclarable? ((key string)) s32
+  (if (string=? (global.get $reloading) (global.get $current-module))
+    (name-member? (global.get $redeclarable) 0 key) 0))
+
+(fn redeclared! ((key string)) s32
+  (begin
+    (global.set $redeclarable (drop-name (global.get $redeclarable) 0 key (list-new string)))
+    (declared! key)))
+
+(fn replace-at ((items (list T)) (target s32) (v T) (index s32) (out (list T))) (list T)
+  (where T)
+  (if (i32.ge_s index (list-len items)) out
+    (replace-at items target v (i32.add index 1)
+      (list-push out (if (i32.eq index target) v (list-get items index))))))
+
+(fn drop-at ((items (list T)) (target s32) (index s32) (out (list T))) (list T)
+  (where T)
+  (if (i32.ge_s index (list-len items)) out
+    (drop-at items target (i32.add index 1)
+      (if (i32.eq index target) out (list-push out (list-get items index))))))
+
+; Declare a record or variant: a new entry, unless this replaces M's own
+; declaration and is identical to it (same kind, and the same field or case
+; names and types in order). Then the old id is kept, so values made before the
+; reload stay valid. A changed type gets a new id; the name resolves to it, and
+; old values keep their old entry (they print and match, but fail the new
+; type's checks). Returns the id.
+(fn declare-type ((name string) (variant s32) (schema (list value))) s32
+  (let (key (type-key name))
+    (let (old (type-index name))
+      (let (same (if (i32.and (redeclarable? key) (i32.ge_s old 0))
+                   (let (t (list-get (global.get $types) old))
+                     (i32.and (i32.eq (named-type.variant? t) variant)
+                       (string=? (show (sequence (named-type.schema t))) (show (sequence schema)))))
+                   0))
+        (begin
+          (if (redeclarable? key) (redeclared! key) (declared! key))
+          (if same old
+            (let (id (list-len (global.get $types)))
+              (begin
+                (global.set $types (list-push (global.get $types) (named-type name id variant schema)))
+                id))))))))
+
+; Whether NAME is taken for a new type declaration.
+(fn type-name-taken? ((name string)) s32
+  (if (redeclarable? (type-key name)) 0 (known-type? (symbol name) "")))
+
+; Declare a global. Replacing M's own mutable global of the same type keeps its
+; current value, so a reload does not reset the module's state; any other
+; replacement (a const, or a changed type or mutability) takes the new initializer.
+(fn declare-session-global ((entry global-binding)) value
+  (let (name (global-binding.name entry))
+    (let (index (global-index name))
+      (if (i32.and (redeclarable? (global-key name)) (i32.ge_s index 0))
+        (let (old (list-get (global.get $session-globals) index))
+          (begin
+            (redeclared! (global-key name))
+            (if (i32.and (i32.and (global-binding.mutable old) (global-binding.mutable entry))
+                  (string=? (show (global-binding.type old)) (show (global-binding.type entry))))
+              (nil)
+              (begin
+                (global.set $session-globals (replace-at (global.get $session-globals) index entry 0 (list-new global-binding)))
+                (nil)))))
+        (begin
+          (declared! (global-key name))
+          (global.set $session-globals (list-push (global.get $session-globals) entry))
+          (nil))))))
+
+(fn global-name-taken? ((name string)) s32
+  (if (redeclarable? (global-key name)) 0 (i32.ge_s (global-index name) 0)))
+
+; The index of the trait that a declaration of NAME replaces, or -1.
+(fn replaced-trait ((name string)) s32
+  (if (redeclarable? (trait-key name)) (trait-index name) -1))
+
+(fn trait-name-taken? ((name string)) s32
+  (if (redeclarable? (trait-key name)) 0 (i32.ge_s (trait-index name) 0)))
+
+; The first instance of trait NAME, or -1. During a reload M's own instances
+; are already removed, so this finds only other modules' instances.
+(fn instance-of ((name string) (index s32)) s32
+  (if (i32.ge_s index (list-len (global.get $instances))) -1
+    (if (string=? name (trait-implementation.name (list-get (global.get $instances) index))) index
+      (instance-of name (i32.add index 1)))))
+
+(fn instance-owner ((index s32)) string
+  (let (entry (list-get (global.get $instances) index))
+    (declarer (instance-key (trait-implementation.name entry) (trait-implementation.types entry)))))
+
+; Declare a trait. Replacing M's own identical trait keeps it; a changed one
+; replaces it in place, unless another module has an instance of it.
+(fn declare-session-trait ((def trait-definition)) value
+  (let (name (trait-definition.name def))
+    (let (old (replaced-trait name))
+      (if (i32.lt_s old 0)
+        (begin
+          (declared! (trait-key name))
+          (global.set $traits (list-push (global.get $traits) def))
+          (nil))
+        (let (prev (list-get (global.get $traits) old))
+          (if (i32.and (string=? (show (sequence (trait-definition.vars prev))) (show (sequence (trait-definition.vars def))))
+                (string=? (show (sequence (trait-definition.methods prev))) (show (sequence (trait-definition.methods def)))))
+            (begin (redeclared! (trait-key name)) (nil))
+            (let (other (instance-of name 0))
+              (if (i32.ge_s other 0)
+                (failure (string-append "trait " (string-append name
+                  (string-append " changed, but module " (string-append (instance-owner other) " has an instance of it")))))
+                (begin
+                  (redeclared! (trait-key name))
+                  (global.set $traits (replace-at (global.get $traits) old def 0 (list-new trait-definition)))
+                  (nil))))))))))
+
+(fn declare-session-instance ((entry trait-implementation)) value
+  (begin
+    (declared! (instance-key (trait-implementation.name entry) (trait-implementation.types entry)))
+    (global.set $instances (list-push (global.get $instances) entry))
+    (nil)))
+
+; The keys MODULE declared (instances aside).
+(fn declared-keys ((owners (list binding)) (index s32) (module string) (out (list string))) (list string)
+  (if (i32.ge_s index (list-len owners)) out
+    (let (entry (list-get owners index))
+      (declared-keys owners (i32.add index 1) module
+        (if (i32.and (string=? module (symbol-name (binding.item entry)))
+              (i32.eq (string-prefix? (binding.name entry) "instance ") 0))
+          (list-push out (binding.name entry)) out)))))
+
+(fn string-prefix? ((s string) (prefix string)) s32
+  (if (i32.lt_s (string-len s) (string-len prefix)) 0
+    (string=? (substring s 0 (string-len prefix)) prefix)))
+
+(fn other-instances ((items (list trait-implementation)) (index s32) (module string) (out (list trait-implementation))) (list trait-implementation)
+  (if (i32.ge_s index (list-len items)) out
+    (let (entry (list-get items index))
+      (other-instances items (i32.add index 1) module
+        (if (string=? module (declarer (instance-key (trait-implementation.name entry) (trait-implementation.types entry)))) out
+          (list-push out entry))))))
+
+; What a reload must restore if it fails.
+(record reload-snapshot (modules (list string)) (types (list named-type)) (globals (list global-binding))
+  (traits (list trait-definition)) (instances (list trait-implementation)) (owners (list binding)))
+
+; Start reloading NAME: snapshot the tables, open NAME's own declarations for
+; replacement, and remove NAME's instances (its new source declares them again).
+(fn begin-redeclaring ((name string)) reload-snapshot
+  (let (saved (reload-snapshot (module-names (global.get $modules) 0 (list-new string))
+                (global.get $types) (global.get $session-globals) (global.get $traits)
+                (global.get $instances) (global.get $declared-by)))
+    (begin
+      (global.set $reloading name)
+      (global.set $redeclarable (declared-keys (global.get $declared-by) 0 name (list-new string)))
+      (global.set $instances (other-instances (global.get $instances) 0 name (list-new trait-implementation)))
+      saved)))
+
+(fn end-redeclaring () s32
+  (begin (global.set $reloading "") (global.set $redeclarable (list-new string)) 0))
+
+; Restore the snapshot. A type made since keeps its slot (values may carry its
+; id) but loses its name, as a failed require does.
+(fn restore-declarations ((saved reload-snapshot)) s32
+  (begin
+    (global.set $modules (keep-modules (global.get $modules) 0 (reload-snapshot.modules saved) (list-new module)))
+    (global.set $types (restore-types (reload-snapshot.types saved) (global.get $types) (list-len (reload-snapshot.types saved))))
+    (global.set $session-globals (reload-snapshot.globals saved))
+    (global.set $traits (reload-snapshot.traits saved))
+    (global.set $instances (reload-snapshot.instances saved))
+    (global.set $declared-by (reload-snapshot.owners saved))
+    (end-redeclaring)))
+
+(fn restore-types ((saved (list named-type)) (now (list named-type)) (index s32)) (list named-type)
+  (if (i32.ge_s index (list-len now)) saved
+    (let (t (list-get now index))
+      (restore-types (list-push saved (named-type "" (named-type.id t) (named-type.variant? t) (named-type.schema t))) now (i32.add index 1)))))
+
+; Why the declarations left in $redeclarable cannot be retired, or nil: a trait
+; that another module has an instance of.
+(fn retire-problem ((keys (list string)) (index s32)) value
+  (if (i32.ge_s index (list-len keys)) (nil)
+    (let (key (list-get keys index))
+      (if (string-prefix? key "trait ")
+        (let (name (substring key 6 (string-len key)))
+          (let (other (instance-of name 0))
+            (if (i32.ge_s other 0)
+              (failure (string-append "trait " (string-append name
+                (string-append " was removed, but module " (string-append (instance-owner other) " has an instance of it")))))
+              (retire-problem keys (i32.add index 1)))))
+        (retire-problem keys (i32.add index 1))))))
+
+; Retire what the new source no longer declares: the name is free again. A
+; type keeps its slot for old values.
+(fn retire-declarations ((keys (list string)) (index s32)) s32
+  (if (i32.ge_s index (list-len keys)) 0
+    (let (key (list-get keys index))
+      (begin
+        (global.set $declared-by (drop-binding (global.get $declared-by) 0 key (list-new binding)))
+        (if (string-prefix? key "type ")
+          (let (at (type-index (substring key 5 (string-len key))))
+            (if (i32.ge_s at 0)
+              (let (t (list-get (global.get $types) at))
+                (begin
+                  (global.set $types (replace-at (global.get $types) at
+                    (named-type "" (named-type.id t) (named-type.variant? t) (named-type.schema t)) 0 (list-new named-type)))
+                  0))
+              0))
+          (if (string-prefix? key "global ")
+            (let (at (global-index (substring key 7 (string-len key))))
+              (if (i32.ge_s at 0)
+                (begin (global.set $session-globals (drop-at (global.get $session-globals) at 0 (list-new global-binding))) 0)
+                0))
+            (if (string-prefix? key "trait ")
+              (let (at (trait-index (substring key 6 (string-len key))))
+                (if (i32.ge_s at 0)
+                  (begin (global.set $traits (drop-at (global.get $traits) at 0 (list-new trait-definition))) 0)
+                  0))
+              0)))
+        (retire-declarations keys (i32.add index 1))))))

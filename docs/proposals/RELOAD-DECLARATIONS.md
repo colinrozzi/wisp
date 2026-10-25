@@ -1,6 +1,8 @@
 # Reload of modules that declare types, globals, traits or instances
 
-Status: proposal (ticket 0037, item 5), waiting for approval by tova.
+Status: approved by tova (2026-10-25, a to f, b and c over always-replace) and
+built in ticket 0037 (`modules.wisp`, "Declarations and reload"; tested by
+`reload_declarations_session` in `tests/interpreter_engine.rs`).
 Written 2026-10-25 against `ticket-0037` (base `efb58d1`).
 
 ## The problem
@@ -44,9 +46,12 @@ b. **Types.** If the new declaration is the same as the old one (same kind,
    new accessors, and constructors that expect the new type. Nothing converts
    them.
 
-c. **Globals.** If the type and mutability are the same, keep the current
+c. **Globals.** A `mut` global whose type is the same keeps its current
    value, as `defonce` does, so a reload does not reset the module's state.
-   If they changed, reset the global to the new initializer.
+   Otherwise the global takes the new initializer. A `const` always does: it
+   holds no state, and keeping it would hide an edit to its initializer. To
+   reset a `mut` global, `(global.set $g value)` after the reload (the
+   `(help "modules")` text says so).
 
 d. **Traits.** If the trait is the same, keep it. If it changed, replace it.
    If another module has an instance of a changed trait, the reload fails, and

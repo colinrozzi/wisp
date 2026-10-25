@@ -39,16 +39,14 @@
         (let (ty (list-get items (i32.sub (list-len items) 3)))
           (let (mode (symbol-name (list-get items (i32.sub (list-len items) 2))))
             (if (i32.eq (global-name? name) 0) (failure "global name must start with $")
-              (if (i32.ge_s (global-index (symbol-name name)) 0) (failure "global is already declared")
+              (if (global-name-taken? (symbol-name name)) (failure "global is already declared")
                 (if (i32.eq (known-type? ty "") 0) (failure "unsupported global type")
                   (if (i32.eq (i32.or (string=? mode "mut") (string=? mode "const")) 0)
                     (failure "global mutability must be mut or const")
                     (let (initial (global-initializer ty (list-get items (i32.sub (list-len items) 1))))
                       (if (failed? initial) initial
-                        (begin
-                          (global.set $session-globals (list-push (global.get $session-globals)
-                            (global-binding (symbol-name name) ty (string=? mode "mut") (items-of initial))))
-                          (nil)))))))))))
+                        (declare-session-global
+                          (global-binding (symbol-name name) ty (string=? mode "mut") (items-of initial))))))))))))
       (failure "global expects name, type, mutability, and initializer"))))
 
 (fn replace-global ((entries (list global-binding)) (index s32) (target s32) (replacement global-binding) (out (list global-binding))) (list global-binding)
