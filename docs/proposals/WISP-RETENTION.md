@@ -464,6 +464,36 @@ These figures come from the layout in §1.1, not from a collector run:
 - Everything else (modules, types, traits, globals, macros once upserted) is
   bounded by the code loaded and is KB-sized.
 
+### 4.3 Measured with reference counting: an HTTP server (ticket 0030)
+
+Measured 2026-10-25 on main at `77b0b60` (#93 RC on by default, #95 no
+defensive env copies), release `theater-repl serve` on a private port. The
+session runs `experiment/site/web.wisp` (colin's site): each request is three
+firings (`on-connection`, `on-data`, `on-close`) and the host calls
+`tcp-activate`, `tcp-set-active`, `fs-read`, `tcp-send` and `tcp-close`.
+Requests were `curl` GETs of `/` (a 1 KB page); `heap-bytes` and `heap-pages`
+come from `(memory-stats)`.
+
+| Actor | Retained per request | After 10,000 requests |
+|---|---|---|
+| RC off (main at `7cd5740`) | **127,235 B** (13.0 MB at 100 requests, 63.9 MB at 500) | — (runs out at ~16k) |
+| RC on (main at `77b0b60`) | **0 B** | heap-bytes 104,048 (104,016 at 1,000), 19 pages throughout |
+
+- **Everything §1.4 lists is freed on this path**: the marshal buffers, byte
+  lists, lookup-failure strings, `$session-macros` copies and `show` strings
+  of a request are all gone once it ends. Nothing per request is retained.
+- **The only growth is the event buffer filling**: 160 B per firing for this
+  server (`(event-buffer 0)` took heap-bytes from 104,016 to 63,056 with 256
+  firings buffered). The buffer keeps 256 firings and trims when it reaches
+  512 (`record-event`, `rpc.wisp`), so its peak here is ~80 KB. The rest
+  (~63 KB) is the loaded code and tables.
+- **Memory does not grow either**: `heap-pages` stays at 19 (1.2 MiB) over
+  10,000 requests, so freed blocks are reused rather than the frontier moving.
+- **Guard:** `wisp/actor/legacy-host/tests/web_heap.rs` serves 1,000 requests
+  (`WISP_WEB_REQUESTS=n` for more) to a copy of `web.wisp` and asserts under
+  4 KB of growth and no new pages. With the RC-off actor
+  (`WISP_ACTOR_WASM=...`) it fails at ~85 KB per request.
+
 ## 5. Problems found outside this ticket
 
 These are for the PR description; I have not fixed them. Items 1 and 2 are

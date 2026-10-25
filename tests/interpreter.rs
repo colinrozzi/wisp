@@ -823,6 +823,7 @@ fn test_interpreter_memory_stats() {
     let out = s.evaluate("(memory-stats)").unwrap();
     for name in [
         "heap-bytes",
+        "heap-pages",
         "bindings",
         "modules",
         "types",
