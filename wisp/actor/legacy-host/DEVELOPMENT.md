@@ -8,9 +8,15 @@ The source and shareable package live together in this directory; see [README.md
 The `build` command compiles it explicitly; `repl` and `serve` load the built
 Wasm without compiling anything.
 
-This crate has its own Cargo workspace and lockfile. Theater is pinned to
-`e2546700e00cb8c4a8050f27c62388bd57646483`, matching the root flake. Packr resolves
-to 0.24.1 alongside Wisp; the upstream CLI's separate lockfile uses 0.24.0.
+This crate has its own Cargo workspace and lockfile. Theater is pinned by git
+rev in `Cargo.toml` (`cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98` as of 2026-10-25).
+Packr resolves to 0.24.1 alongside Wisp; the upstream CLI's separate lockfile uses 0.24.0.
+
+The lockfile also locks `granite` (the root crate, a path dependency). When the
+root `Cargo.toml` changes its dependencies, commit this `Cargo.lock` as it was
+after a build here. Otherwise every later build rewrites it. That happened when
+5772328 removed `wit-component` and `wit-parser` from granite; the lock was
+corrected in ticket 0037.
 
 ## Run
 
@@ -19,7 +25,7 @@ From the repository root:
 ```sh
 nix develop .#theater
 ./actors/wisp-repl/build.sh
-cargo run --locked --manifest-path actors/wisp-repl/Cargo.toml -- repl
+cargo run --locked --manifest-path wisp/actor/legacy-host/Cargo.toml -- repl
 ```
 
 ```text
@@ -33,7 +39,7 @@ wisp> :quit
 Build just the actor artifacts:
 
 ```sh
-cargo run --locked --manifest-path actors/wisp-repl/Cargo.toml -- build
+cargo run --locked --manifest-path wisp/actor/legacy-host/Cargo.toml -- build
 ```
 
 This writes `actor.wasm` and `actor.wat` under `actors/wisp-repl/`, alongside the
@@ -47,7 +53,7 @@ spawn` does not register this project-specific handler. Use this host or registe
 ## Socket REPL
 
 ```sh
-cargo run --locked --manifest-path actors/wisp-repl/Cargo.toml -- serve --listen 127.0.0.1:7777
+cargo run --locked --manifest-path wisp/actor/legacy-host/Cargo.toml -- serve --listen 127.0.0.1:7777
 ```
 
 Each connection gets a fresh actor; definitions persist until disconnect.
@@ -115,14 +121,14 @@ are recoverable; a Wasm trap or memory exhaustion may require a fresh actor.
 ## Validation
 
 ```sh
-cargo test --locked --manifest-path actors/wisp-repl/Cargo.toml
-cargo clippy --locked --manifest-path actors/wisp-repl/Cargo.toml --all-targets -- -D warnings
-cargo fmt --manifest-path actors/wisp-repl/Cargo.toml -- --check
+cargo test --locked --manifest-path wisp/actor/legacy-host/Cargo.toml
+cargo clippy --locked --manifest-path wisp/actor/legacy-host/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path wisp/actor/legacy-host/Cargo.toml -- --check
 ```
 
 Integration tests exercise real actor spawn/init, persistent closures, isolation,
 relative includes, failure recovery, limits, guest-to-guest RPC, typed discovery,
-socket framing and disconnect cleanup. Replay drives the recorded call sequence
+the daemon and its readers (`daemon.rs`, `inbox.rs`). Replay drives the recorded call sequence
 through a fresh actor with Theater's replay interceptor and an empty source
 bundle, asserting every event hash matches. It does not yet provide a user-facing
 chain archive or resume command.

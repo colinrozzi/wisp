@@ -15,11 +15,12 @@ use theater::handler::{Handler, HandlerContext};
 use theater::pack_bridge::{HostImports, InterfaceImpl, Value, parse_pact, plain_host_fn};
 use tokio::sync::watch;
 
-/// The newest recorded seq of each session that has fired, as a watch channel.
-/// Cloning shares the table.
+/// The newest recorded seq of each session that has fired, as a watch channel,
+/// and how many readers are parked on each of its cursors. Cloning shares both.
 #[derive(Clone, Default)]
 pub struct EventWatch {
     seqs: Arc<Mutex<HashMap<TheaterId, Arc<watch::Sender<u64>>>>>,
+    parked: Parked,
 }
 
 impl EventWatch {
@@ -45,6 +46,61 @@ impl EventWatch {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(id);
+    }
+
+    /// Count a `wait` parked on `id`'s cursor `cursor` (it has read and found
+    /// nothing) until the guard drops. `theater-repl cursors` shows the count,
+    /// so a test or a person can see that a monitor is in place.
+    pub fn park(&self, id: TheaterId, cursor: &str) -> ParkGuard {
+        let key = (id, cursor.to_string());
+        *self.parked.lock().entry(key.clone()).or_default() += 1;
+        ParkGuard {
+            parked: self.parked.clone(),
+            key,
+        }
+    }
+
+    /// `id`'s cursors that have parked readers, with how many.
+    pub fn parked(&self, id: TheaterId) -> Vec<(String, usize)> {
+        let mut parked: Vec<_> = self
+            .parked
+            .lock()
+            .iter()
+            .filter(|((session, _), _)| *session == id)
+            .map(|((_, cursor), count)| (cursor.clone(), *count))
+            .collect();
+        parked.sort();
+        parked
+    }
+}
+
+type ParkKey = (TheaterId, String);
+
+#[derive(Clone, Default)]
+struct Parked(Arc<Mutex<HashMap<ParkKey, usize>>>);
+
+impl Parked {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ParkKey, usize>> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// One parked reader; dropping it (the wait returned, or its client went away)
+/// uncounts it.
+pub struct ParkGuard {
+    parked: Parked,
+    key: ParkKey,
+}
+
+impl Drop for ParkGuard {
+    fn drop(&mut self) {
+        let mut parked = self.parked.lock();
+        if let Some(count) = parked.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                parked.remove(&self.key);
+            }
+        }
     }
 }
 

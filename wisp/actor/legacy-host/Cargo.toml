@@ -45,3 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.dev]
 debug = 0
+
+# tests/support builds a tiny RPC relay guest by hand (Pack metadata + WAT).
+[dev-dependencies]
+pack = { package = "packr", version = "=0.24.1" }
+wat = "1.242.0"

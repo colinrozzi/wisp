@@ -15,6 +15,7 @@ pub const EVALUATE: &str = "theater:simple/wisp.evaluate";
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use theater::actor::handle::ActorHandle;
+use theater::chain::ChainEvent;
 use theater::handler::HandlerRegistry;
 use theater::messages::{TheaterCommand, default_init_state};
 use theater::pack_bridge::Value;
@@ -58,6 +59,19 @@ pub struct Runtime {
 
 impl Runtime {
     pub async fn new(bundle: source::SourceBundle, fs: FsAccess) -> Result<Self> {
+        Self::with_chain(bundle, fs, None, None).await
+    }
+
+    /// A runtime that replays `replay` (a chain recorded earlier) instead of
+    /// calling the real handlers, and sends every chain event to `chain`. Theater's
+    /// replay interceptor answers each host call from the recording, so every
+    /// handler is still registered (the actor's imports must link).
+    pub async fn with_chain(
+        bundle: source::SourceBundle,
+        fs: FsAccess,
+        replay: Option<Vec<ChainEvent>>,
+        chain: Option<mpsc::Sender<(TheaterId, ChainEvent)>>,
+    ) -> Result<Self> {
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
@@ -156,6 +170,9 @@ impl Runtime {
         handlers.register(theater_handler_lifecycle::LifecycleHandler::new(
             commands.clone(),
         ));
+        if let Some(events) = replay {
+            handlers.set_replay_chain(events);
+        }
         let mut runtime = TheaterRuntime::new(
             commands.clone(),
             rx,
@@ -164,6 +181,9 @@ impl Runtime {
             theater_native::TokioSpawn,
         )
         .await?;
+        if let Some(tx) = chain {
+            runtime.add_global_subscription(tx);
+        }
         let task = tokio::spawn(async move { runtime.run().await });
         Ok(Self {
             commands,

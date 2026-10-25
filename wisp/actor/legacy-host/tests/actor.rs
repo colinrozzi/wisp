@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use theater::pack_bridge::{Value, ValueType};
-use wisp_interpreter_actor::{Runtime, adapter, source::SourceBundle};
+use wisp_interpreter_actor::{EVALUATE, Runtime, source::SourceBundle};
 mod support;
 
 #[tokio::test]
 async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
-    let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/actor-test");
-    let wasm = adapter::build(&output)?;
+    let wasm = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../actor.wasm"))?;
     let bundle = SourceBundle::new(BTreeMap::from([
         (
             "lib/main.wisp".into(),
@@ -56,7 +55,7 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
     // Exercise the guest limit too, bypassing Session's host-side size check.
     let too_large = first
         .handle
-        .call_function(adapter::EVALUATE.into(), Value::String(" ".repeat(4097)))
+        .call_function(EVALUATE.into(), Value::String(" ".repeat(4097)))
         .await?;
     assert!(matches!(too_large, Value::String(message) if message.starts_with("error:")));
     assert_eq!(first.evaluate("(add-two 40)").await?, "42");
@@ -79,7 +78,7 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
                 "test:rpc/relay.call".into(),
                 Value::Tuple(vec![
                     Value::String(first.id.to_string()),
-                    Value::String(adapter::EVALUATE.into()),
+                    Value::String(EVALUATE.into()),
                     Value::String(source.into()),
                     Value::Option {
                         inner_type: ValueType::String,
@@ -101,9 +100,7 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
     let functions = support::items(support::field(&description, "exports"));
     let evaluation = functions
         .iter()
-        .find(|function| {
-            support::field(function, "name") == &Value::String(adapter::EVALUATE.into())
-        })
+        .find(|function| support::field(function, "name") == &Value::String(EVALUATE.into()))
         .expect("discoverable evaluation function");
     assert_eq!(
         support::items(support::field(evaluation, "params")).len(),
