@@ -125,7 +125,7 @@
       (if (string=? name "-") ".sub"
         (if (string=? name "*") ".mul"
           (if (string=? name "=") ".eq"
-            (if (string=? name "<") ".lt" ".div")))))))
+            (if (comparison? name) (comparison-suffix name) ".div")))))))
 (fn apply-numeric-builtin ((name string) (left value) (right value)) value
   (value-case left
     ((single a)

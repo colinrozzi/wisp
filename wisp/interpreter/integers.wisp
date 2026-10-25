@@ -92,7 +92,18 @@
     (if (string=? name "-") "i64.sub"
       (if (string=? name "*") "i64.mul"
         (if (string=? name "=") "i64.eq"
-          (if (string=? name "<") "i64.lt_s" "i64.div_s"))))))
+          (if (comparison? name) (integer-comparison-name name "i64") "i64.div_s"))))))
+
+; The ordering builtins < > <= >= work on every numeric type; integers compare signed.
+(fn comparison? ((name string)) s32
+  (i32.or (i32.or (string=? name "<") (string=? name ">"))
+    (i32.or (string=? name "<=") (string=? name ">="))))
+(fn comparison-suffix ((name string)) string
+  (if (string=? name "<") ".lt"
+    (if (string=? name ">") ".gt"
+      (if (string=? name "<=") ".le" ".ge"))))
+(fn integer-comparison-name ((name string) (prefix string)) string
+  (string-append prefix (string-append (comparison-suffix name) "_s")))
 
 (fn apply-integer-builtin ((name string) (left value) (right value)) value
   (value-case left

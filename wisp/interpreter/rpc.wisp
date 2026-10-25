@@ -438,6 +438,7 @@
     ((string=? name "set-interval") 1)
     ((string=? name "clear-interval") 1)
     ((string=? name "fs-read") 1)
+    ((string=? name "fs-read-text") 1)
     ((string=? name "fs-exists") 1)
     ((string=? name "fs-list") 1)
     ((string=? name "fs-meta") 1)
@@ -864,6 +865,19 @@
   (if (i32.ne (list-len args) 1) (failure "fs-read expects (fs-read path)")
     (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "read-file" (marshal (list-get args 0))))
       (failure "fs-read expects a string path"))))
+; fs-read-text is fs-read with the bytes decoded: (ok "text") or the same (err ...).
+(fn apply-fs-read-text ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-read-text expects (fs-read-text path)")
+    (let (res (apply-fs-read args))
+      (value-case res
+        ((compound ty case-name fields)
+          (if (i32.and (string=? case-name "ok") (i32.eq (list-len fields) 1))
+            (let (decoded (apply-bytes-to-string fields))
+              (if (failed? decoded) decoded
+                (compound (result-type (symbol "string") (list-get (items-of ty) 2)) "ok"
+                  (list-push (list-new value) decoded))))
+            res))
+        (else res)))))
 (fn apply-fs-exists ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "fs-exists expects (fs-exists path)")
     (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "exists" (marshal (list-get args 0))))
@@ -1602,7 +1616,7 @@
     ((string=? topic "triggers")
       "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\nread with theater-repl read / follow / wait <id> (or (events-after N) here).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name handler-result), or (handler-name event\nhandler-result) when the event was not handled (no handler, or it failed);\n(poll-events) returns those lists. (poll-events \"text\") returns one\n\"handler: result\" line per firing instead (event left out, a string result raw);\ntheater-repl read/follow print that, and read --full / follow --full print the\nlists. Scripts should parse --full: a raw result can span lines.\n\nThe buffer keeps the newest 256 firings and drops older ones. After drops,\n(poll-events) puts the count first, (N firing ...), and the text form starts with\n\"(N earlier firings dropped)\". (event-buffer N) sets the limit (0 = keep none;\nhandlers still run) and returns the old one.\n\nReading never removes firings. Each has a seq (1, 2, 3, ...):\n  (events-after N [max] [\"text\"])  firings after seq N: (next lost (seq handler result) ...)\n  (event-read NAME [max] [\"text\"])  the same, after cursor NAME (new cursors start at 0)\n  (event-ack NAME SEQ)    NAME has handled up to SEQ (never moves back)\n  (event-cursors) (event-cursor NAME) (event-cursor-drop NAME) (event-head)\nlost counts firings after N that the limit dropped. Acknowledge NEXT once handled.\ntheater-repl read, follow and wait use cursors \"read\", \"follow\" and \"wait\";\n(poll-events) uses \"poll\", so none of them takes firings from another. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
     ((string=? topic "modules")
-      "Modules — load a library with (require NAME \"path\") at top level.\n\n  (require greet \"lib/greet.wisp\")   ; read the file, bind greet's provides\n  (hi \"bob\")                          ; provided names come in UNQUALIFIED (not greet.hi)\n  (require greet)                     ; reuse an already-loaded greet\n  (reload greet)                      ; re-read lib/greet.wisp after editing it\n\nrequire loads a module once per session: requiring an already-loaded NAME does\nnot re-read the file. To pick up an edit, (reload NAME) re-reads the source NAME\nwas loaded from into a fresh module env and rebinds the copies in EVERY module of\nthis session that imported it. It returns the names the new version no longer\nprovides (now unbound; () if none); newly provided names need (require NAME)\nagain. Shallow: NAME's own requires are not reloaded. If the new source fails,\nnothing changes and reload returns the error. A value copied by hand, like\n(define f hi), is not an import and keeps the old code.")
+      "Modules — load a library with (require NAME \"path\") at top level.\n\n  (require greet \"lib/greet.wisp\")   ; read the file, bind greet's provides\n  (hi \"bob\")                          ; provided names come in UNQUALIFIED (not greet.hi)\n  (require greet)                     ; reuse an already-loaded greet\n  (reload greet)                      ; re-read lib/greet.wisp after editing it\n\nrequire loads a module once per session: requiring an already-loaded NAME does\nnot re-read the file. To pick up an edit, (reload NAME) re-reads the source NAME\nwas loaded from into a fresh module env and rebinds the copies in EVERY module of\nthis session that imported it. It returns the names the new version no longer\nprovides (now unbound; () if none); newly provided names need (require NAME)\nagain. Shallow: NAME's own requires are not reloaded. If the new source fails,\nnothing changes and reload returns the error. A value copied by hand, like\n(define f hi), is not an import and keeps the old code.\n\nIf a require fails (the file cannot be read or parsed, a form in it fails, or it\nprovides a name it does not define), nothing it loaded is kept, and the error\nnames the form that failed: cannot load module web: web.wisp: in (define x ...):\nunbound symbol: y. Fix the file and run the same (require NAME \"path\") again.")
     (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\"), (help \"modules\")")))))
 
 (fn apply-help ((args (list value))) value
@@ -1612,14 +1626,14 @@
         (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
           (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
-              (string-append "files:     (fs-read p) (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
+              (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\n"
-                        (string-append "control:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
+                        (string-append "core:      (define x v) (lambda (a b) body ...) (let (x v) body ...) (begin a ...)   a body of several forms runs them in order and gives the last value\nnumbers:   (+ a b) (- a b) (* a b) (/ a b) (= a b) (< a b) (> a b) (<= a b) (>= a b)   s32 s64 f32 f64, both arguments the same type\nstrings:   (string-append s ...) any number, none gives \"\"   (string-len s) (string-ref s i) (substring s from to) (string=? a b) (bytes->string bs) (string->bytes s)\ncontrol:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
                         (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n           (list-len xs) (list-get xs i) (list-push xs x) take (list ...) and (list-new T) lists alike;\n           list-push returns the new list (use the result; do not count on xs changing)\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (events-after N) (event-read cursor) (event-ack cursor seq) (poll-events)   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
                         (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes\n"
@@ -1678,6 +1692,7 @@
     ((string=? name "set-interval") (apply-timer-set args))
     ((string=? name "clear-interval") (apply-timer-clear args))
     ((string=? name "fs-read") (apply-fs-read args))
+    ((string=? name "fs-read-text") (apply-fs-read-text args))
     ((string=? name "fs-exists") (apply-fs-exists args))
     ((string=? name "fs-list") (apply-fs-list args))
     ((string=? name "fs-meta") (apply-fs-meta args))

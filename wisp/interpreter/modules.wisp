@@ -84,11 +84,36 @@
         (let (previous (global.get $current-module))
           (begin
             (switch-module (symbol-name (list-get items 1)))
-            (let (result (eval-body (declaration-tail items) 0 (list-new binding) depth 1 (nil)))
+            (let (result (eval-module-body (declaration-tail items) 0 depth))
               (begin
                 (switch-module previous)
                 (if (failed? result) result (nil))))))
         (failure "module expects a symbol name")))))
+
+; Evaluate a module's forms in order. A failure names the form it came from.
+(fn eval-module-body ((forms (list value)) (index s32) (depth s32)) value
+  (if (i32.ge_s index (list-len forms)) (nil)
+    (let (v (eval (list-get forms index) (list-new binding) (i32.add depth 1) 1))
+      (if (failed? v)
+        (failure (string-append "in " (string-append (form-summary (list-get forms index)) (string-append ": " (failure-message v)))))
+        (eval-module-body forms (i32.add index 1) depth)))))
+
+; A short picture of a source form for an error: the head and the atoms after it,
+; up to three items, then "..." for the rest: (define web-connection ...).
+(fn form-summary ((form value)) string
+  (value-case form
+    ((sequence items) (summary-items items 0 "("))
+    (else (show-syntax form))))
+(fn summary-items ((items (list value)) (index s32) (out string)) string
+  (if (i32.ge_s index (list-len items)) (string-append out ")")
+    (let (sep (if (i32.eq index 0) "" " "))
+      (if (i32.or (i32.ge_s index 3) (sequence? (list-get items index)))
+        (string-append out (string-append sep "...)"))
+        (summary-items items (i32.add index 1) (string-append out (string-append sep (show-syntax (list-get items index)))))))))
+(fn show-syntax ((v value)) string
+  (value-case v
+    ((integer-literal n) (let (q (quote-value v)) (if (failed? q) (show-wide n) (show q))))
+    (else (show v))))
 
 ; (provide name...) records names on the current module's export set.
 (fn add-exports ((items (list value)) (index s32)) value
@@ -170,7 +195,7 @@
       ((text text-source)
         (let (forms (expand-source text-source path 0))
           (value-case forms
-            ((sequence items) (eval-body items 0 (list-new binding) 0 1 (nil)))
+            ((sequence items) (source-failure (eval-body items 0 (list-new binding) 0 1 (nil)) path))
             (else forms))))
       (else source))))
 
@@ -183,14 +208,79 @@
       (if (i32.eq (string-len path) 0)
         (failure (string-append "module is not loaded; give its source like (require name \"path\"): " name))
         (if (name-member? (global.get $loading) 0 name) (failure (string-append "module dependency cycle: " name))
-          (begin
-            (global.set $loading (list-push (global.get $loading) name))
-            (let (loaded (load-module-source path))
-              (begin
-                (global.set $loading (drop-name (global.get $loading) 0 name (list-new string)))
-                (if (failed? loaded) loaded
-                  (if (module-loaded? name) (set-module-source name path)
-                    (failure (string-append "source did not define module " name))))))))))))
+          (let (mark (load-mark-now))
+            (begin
+              (global.set $loading (list-push (global.get $loading) name))
+              (let (loaded (load-module-source path))
+                (begin
+                  (global.set $loading (drop-name (global.get $loading) 0 name (list-new string)))
+                  (let (problem (if (failed? loaded) loaded (loaded-module-problem name)))
+                    (if (failed? problem)
+                      (roll-back-load mark (failure (string-append "cannot load module " (string-append name (string-append ": " (failure-message problem))))))
+                      (set-module-source name path))))))))))))
+
+; Why a load that evaluated cleanly still did not give a usable NAME, or nil.
+(fn loaded-module-problem ((name string)) value
+  (let (index (find-module (global.get $modules) (i32.sub (list-len (global.get $modules)) 1) name))
+    (if (i32.lt_s index 0) (failure (string-append "source did not define module " name))
+      (let (m (list-get (global.get $modules) index))
+        (let (missing (undefined-export (module.env m) (module.exports m) 0))
+          (if (string-len missing)
+            (failure (string-append "module " (string-append name (string-append " provides undefined name " missing))))
+            (nil)))))))
+
+(fn failure-message ((v value)) string
+  (value-case v ((failure message) message) (else (show v))))
+
+; A failed load leaves nothing behind, so a later require reads the file again
+; and can declare the same names. The mark is taken before the load: the modules
+; that existed then, and the sizes of the session-wide tables a module's forms add
+; to (types, globals, traits, instances, macros). Rolling back drops every module
+; registered since (the half-built one and any dependency it loaded) and shrinks
+; the tables back. A type keeps its slot, because values carry its index as their
+; id, but loses its name.
+(record load-mark (modules (list string)) (types s32) (globals s32) (traits s32) (instances s32) (macros s32))
+
+(fn module-names ((modules (list module)) (index s32) (out (list string))) (list string)
+  (if (i32.ge_s index (list-len modules)) out
+    (module-names modules (i32.add index 1) (list-push out (module.name (list-get modules index))))))
+
+(fn load-mark-now () load-mark
+  (load-mark (module-names (global.get $modules) 0 (list-new string))
+    (list-len (global.get $types)) (list-len (global.get $session-globals)) (list-len (global.get $traits))
+    (list-len (global.get $instances)) (list-len (global.get $session-macros))))
+
+(fn keep-modules ((modules (list module)) (index s32) (names (list string)) (out (list module))) (list module)
+  (if (i32.ge_s index (list-len modules)) out
+    (keep-modules modules (i32.add index 1) names
+      (if (name-member? names 0 (module.name (list-get modules index))) (list-push out (list-get modules index)) out))))
+
+(fn unname-types ((types (list named-type)) (index s32) (keep s32) (out (list named-type))) (list named-type)
+  (if (i32.ge_s index (list-len types)) out
+    (unname-types types (i32.add index 1) keep
+      (list-push out
+        (let (t (list-get types index))
+          (if (i32.lt_s index keep) t (named-type "" (named-type.id t) (named-type.variant? t) (named-type.schema t))))))))
+
+(fn list-prefix ((items (list T)) (n s32) (index s32) (out (list T))) (list T)
+  (where T)
+  (if (i32.ge_s index n) out
+    (list-prefix items n (i32.add index 1) (list-push out (list-get items index)))))
+
+(fn roll-back-load ((mark load-mark) (error value)) value
+  (begin
+    (global.set $modules (keep-modules (global.get $modules) 0 (load-mark.modules mark) (list-new module)))
+    (if (i32.gt_s (list-len (global.get $types)) (load-mark.types mark))
+      (begin (global.set $types (unname-types (global.get $types) 0 (load-mark.types mark) (list-new named-type))) 0) 0)
+    (if (i32.gt_s (list-len (global.get $session-globals)) (load-mark.globals mark))
+      (begin (global.set $session-globals (list-prefix (global.get $session-globals) (load-mark.globals mark) 0 (list-new global-binding))) 0) 0)
+    (if (i32.gt_s (list-len (global.get $traits)) (load-mark.traits mark))
+      (begin (global.set $traits (list-prefix (global.get $traits) (load-mark.traits mark) 0 (list-new trait-definition))) 0) 0)
+    (if (i32.gt_s (list-len (global.get $instances)) (load-mark.instances mark))
+      (begin (global.set $instances (list-prefix (global.get $instances) (load-mark.instances mark) 0 (list-new trait-implementation))) 0) 0)
+    (if (i32.gt_s (list-len (global.get $session-macros)) (load-mark.macros mark))
+      (begin (global.set $session-macros (list-prefix (global.get $session-macros) (load-mark.macros mark) 0 (list-new binding))) 0) 0)
+    error))
 
 ; Remember where a just-loaded (suspended) module came from, for (reload NAME).
 (fn set-module-source ((name string) (path string)) value

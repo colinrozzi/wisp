@@ -499,7 +499,126 @@ async fn engine_session() {
     );
     assert_eq!(
         evaluate(&mut first, "(require broken \"lib/broken.wisp\")").await,
-        "error: lib/broken.wisp: line 1, column 1: unclosed parenthesis: the one that opens here is never closed"
+        "error: cannot load module broken: lib/broken.wisp: line 1, column 1: unclosed parenthesis: the one that opens here is never closed"
+    );
+    failed_require_session(&mut first, &files, &calls).await;
+    read_text_session(&mut first, &files).await;
+}
+
+// A require that fails leaves nothing behind: the next require of the same name
+// reads the file again, and the error names the form that failed.
+async fn failed_require_session(
+    first: &mut WasmtimeInstance,
+    files: &Files,
+    calls: &Arc<Mutex<Vec<String>>>,
+) {
+    let set = |path: &str, text: &str| {
+        files
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), text.to_string());
+    };
+    let reads = |path: &str| calls.lock().unwrap().iter().filter(|p| *p == path).count();
+    // The record, global, trait and instance come before the failing form, so a
+    // retry must be able to declare them again.
+    let good_body = "(provide web-connection make-page)
+  (record page (title string))
+  (global $hits s32 mut 0)
+  (trait (Shown T) (fn shown ((x T)) : string))
+  (instance (Shown s32) (fn shown ((x s32)) string \"s32\"))
+  (define make-page (lambda (t) (page t)))";
+    set(
+        "lib/web.wisp",
+        &format!(
+            "(module web {good_body}\n  (define broken (nope 1))\n  (define web-connection 1))"
+        ),
+    );
+    let failed =
+        "error: cannot load module web: lib/web.wisp: in (define broken ...): unbound symbol: nope";
+    assert_eq!(
+        evaluate(first, "(require web \"lib/web.wisp\")").await,
+        failed
+    );
+    // Not "provides undefined name": the file is read again and fails the same way.
+    assert_eq!(
+        evaluate(first, "(require web \"lib/web.wisp\")").await,
+        failed
+    );
+    assert_eq!(reads("lib/web.wisp"), 2);
+    assert_eq!(
+        evaluate(first, "(require web)").await,
+        "error: module is not loaded; give its source like (require name \"path\"): web"
+    );
+    assert!(evaluate(first, "make-page").await.contains("unbound"));
+    // Fixed, the same require loads it.
+    set(
+        "lib/web.wisp",
+        &format!("(module web {good_body}\n  (define web-connection 1))"),
+    );
+    assert_eq!(
+        evaluate(first, "(require web \"lib/web.wisp\") web-connection").await,
+        "1"
+    );
+    assert_eq!(
+        evaluate(first, "(make-page \"home\")").await,
+        "(page \"home\")"
+    );
+    // A provided name the module never defines is a failed load too.
+    set("lib/half.wisp", "(module half (provide a b) (define a 1))");
+    assert_eq!(
+        evaluate(first, "(require half \"lib/half.wisp\")").await,
+        "error: cannot load module half: module half provides undefined name b"
+    );
+    set(
+        "lib/half.wisp",
+        "(module half (provide a b) (define a 1) (define b 2))",
+    );
+    assert_eq!(
+        evaluate(first, "(require half \"lib/half.wisp\") (+ a b)").await,
+        "3"
+    );
+    // A dependency's failure is named inside its requirer's, and neither stays.
+    set(
+        "lib/dep.wisp",
+        "(module dep (provide d) (define d (car 5)))",
+    );
+    set(
+        "lib/top.wisp",
+        "(module top (require dep \"lib/dep.wisp\") (provide t) (define t d))",
+    );
+    assert_eq!(
+        evaluate(first, "(require top \"lib/top.wisp\")").await,
+        "error: cannot load module top: lib/top.wisp: in (require dep \"lib/dep.wisp\"): \
+         cannot load module dep: lib/dep.wisp: in (define d ...): car/cdr expects a list"
+    );
+    set("lib/dep.wisp", "(module dep (provide d) (define d 5))");
+    assert_eq!(
+        evaluate(first, "(require top \"lib/top.wisp\") t").await,
+        "5"
+    );
+}
+
+// fs-read gives bytes; fs-read-text gives the same result with a string.
+async fn read_text_session(first: &mut WasmtimeInstance, files: &Files) {
+    files
+        .lock()
+        .unwrap()
+        .insert("notes.txt".to_string(), "hi\nthere".to_string());
+    assert_eq!(
+        evaluate(first, "(fs-read-text \"notes.txt\")").await,
+        "(ok string string \"hi\\nthere\")"
+    );
+    assert_eq!(
+        evaluate(
+            first,
+            "(match (fs-read-text \"notes.txt\") ((ok s) (string-len s)) ((err e) e))"
+        )
+        .await,
+        "8"
+    );
+    assert_eq!(
+        evaluate(first, "(fs-read-text \"missing.txt\")").await,
+        "(err (list u8) string \"no such file\")"
     );
 }
 
