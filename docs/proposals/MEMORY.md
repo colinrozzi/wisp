@@ -9,6 +9,10 @@ compilation?"), [changes/LIVE-REPL-DYNAMIC-LINKING.md](../changes/LIVE-REPL-DYNA
 
 ## Summary
 
+*Status: implemented. Stages 0-5 shipped and stage 6 cleaned up; §9 says what was
+built, what it measured, and what is still open. The rest of this document is the
+design as approved, written before the work.*
+
 Granite never frees memory. Every allocation bumps `$__heap_ptr`, `__pack_free` is a
 `nop`, and the compiled module declares a fixed 2 GiB memory. A Wisp REPL session is a
 Granite program, so every session grows until it traps.
@@ -690,9 +694,55 @@ language docs.
 - The export output buffer is a fixed 16 KiB for most types, and the encoder cursor is
   not checked; the import argument buffer is a fixed 4 or 16 KiB, also unchecked.
   `marshal.wisp` uses a fixed 16,388-byte buffer with no bounds check.
-- The import wrappers ignore the host's ownership status (4534, 1704).
+- ~~The import wrappers ignore the host's ownership status (4534, 1704).~~ Fixed in
+  stage 2 (#90).
 - The recursive CGRF encoder and decoder have `TODO` arms for records, variants and
   `any` (5554, 6094).
-- The legacy `generate_wat` starts the heap at 0, on top of user data segments, and
-  its ABI wrapper allocates 4 bytes for a record parameter and writes all its fields.
-- `granite eval` and compiled code disagree on `list-push` (§2.2).
+- ~~The legacy `generate_wat` starts the heap at 0, on top of user data segments, and
+  its ABI wrapper allocates 4 bytes for a record parameter and writes all its fields.~~
+  `generate_wat` is retired (stage 6).
+- ~~`granite eval` and compiled code disagree on `list-push` (§2.2).~~ They agree with
+  reference counting on (stage 4).
+- The export output buffer overflow is issue #89.
+
+---
+
+## 9. As built (stages 0-6)
+
+| Stage | PR | What shipped |
+|---|---|---|
+| 0a | #84 | `list-push` grows its data buffer by doubling. |
+| 0b | #83 | String literals live once in static data, below `$__heap_base`. |
+| 1 | #86 | The 8-byte header (rc, size); size classes up to 1 KiB with free lists, power-of-two buckets above; a memory that starts small and grows (no maximum, a named trap when a grow fails); `__pack_free` frees; the debug heap; `__granite_heap_stats`. The Pack metadata moved into static data (it overlapped the heap). |
+| 2 | #90 | Frees at obvious owners: import wrappers and `raw-invoke` free their buffers by the host's ownership status, `list-push` frees its old buffer, `heap-free`/`heap-stats`, Wisp `(memory-stats)` reports live bytes. |
+| 3 | #91 | Value-semantics `list-push` behind a flag (a syntactic escape check, replaced in stage 4). |
+| 4 | #92, #93 | Reference counting, correct before fast: ownership decided in codegen, per-type drop functions, `list-push` in place only at count 1, the raw-memory rules (§3.6), `__granite_heap_verify` after every export call in debug builds. #93 turns it on by default. |
+| 5 | #94, #95 | Making it cheap: borrowed reads, string literals never counted, inline dups, borrowed parameters (with a tail-call guard), borrowed let/match bindings, the take rule, `string-append` in place, drop-guided reuse for variant matches. #95 removes the interpreter's defensive environment copies (the interpreter now needs RC). |
+| 6 | ticket 0028 | `generate_wat` retired (nothing used it), with the last inline heap bumps; the self-hosted compiler's runtime has the header and a growing memory; this section; the cycle rule in the README. |
+
+**Measured** (release, `tests/memory_baseline.rs` and a min-of-30 benchmark):
+
+- A Wisp evaluation retains **0 bytes** with RC (1.1 KB to 794 KB without). The
+  evaluator ends at 2,304 live bytes in 19 pages (67.6 MB, 1,165 pages without).
+  A private-daemon session of 120 rounds (loops, defines, requires, reloads,
+  messages) holds exactly 80,216 live bytes from round 52 on.
+- The self-compile went from **1408 MiB and 0.79 s** (before stage 0) to 80 MiB
+  and 0.04 s (after stage 1), and with RC peaks at 187 pages in 0.02 s.
+- Interpreter time, RC on vs off: **1.9-3.7x** after stage 4; after stage 5 a
+  session with 300 bindings is **0.99-1.16x**, a fresh session 1.15x on loops and
+  1.19-1.28x on single short evaluations; after #95 loops are faster than without
+  RC (`(count 1000)` 3474 µs against 3964 µs).
+- Pushing 20,000 items onto a global: 1.19 GB without the take rule, under 270 KB
+  with it.
+
+**Open:**
+
+- #89: the export output buffer is a fixed 16 KiB with no bounds check (also the
+  import argument buffers, §8).
+- Borrowed returns: a getter such as `symbol-name` dups the field it returns and
+  its caller drops it; only borrowed returns would remove that pair.
+- Drop-guided reuse covers variant matches whose arm builds the same variant
+  directly; options, results and records are not covered.
+- The self-hosted compiler has the header and growth but no free lists and no RC
+  (ticket 0029, with a size estimate).
+- `string-to-bytes`/`string-from-bytes` layouts and `u64` payload stores (§8).

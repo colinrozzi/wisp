@@ -1334,14 +1334,25 @@ fn test_selfhosted_runtime_headers_and_growth() {
         let p = alloc.call(&mut store, 13).expect("alloc") as usize;
         let mut h = [0u8; 8];
         memory.read(&store, p - 8, &mut h).unwrap();
-        assert_eq!(u32::from_le_bytes(h[..4].try_into().unwrap()), 1, "rc at birth");
-        assert_eq!(u32::from_le_bytes(h[4..].try_into().unwrap()), 24, "13 + 8, 8-aligned");
+        assert_eq!(
+            u32::from_le_bytes(h[..4].try_into().unwrap()),
+            1,
+            "rc at birth"
+        );
+        assert_eq!(
+            u32::from_le_bytes(h[4..].try_into().unwrap()),
+            24,
+            "13 + 8, 8-aligned"
+        );
         assert_eq!(p % 8, 0);
 
         let big = instance
             .get_typed_func::<(), i32>(&mut store, "big")
             .expect("big");
         assert_eq!(big.call(&mut store, ()).expect("call"), 100_000);
-        assert!(memory.data_size(&store) > 400_000, "the memory grew for the list");
+        assert!(
+            memory.data_size(&store) > 400_000,
+            "the memory grew for the list"
+        );
     })
 }
