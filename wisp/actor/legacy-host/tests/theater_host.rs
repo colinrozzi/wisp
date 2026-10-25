@@ -29,7 +29,10 @@ const LIST_ACTORS: &str = r#"
 
 /// Evaluate `(list-actors)` with the shared interpreter + a `TheaterHost`, on a
 /// blocking thread (eval is sync; the host `blocking_recv`s the runtime's reply).
-async fn live_actor_ids(commands: UnboundedSender<TheaterCommand>) -> anyhow::Result<Vec<String>> {
+/// The daemon's keepalive actor is left out.
+async fn live_actor_ids(runtime: &Runtime) -> anyhow::Result<Vec<String>> {
+    let commands: UnboundedSender<TheaterCommand> = runtime.commands.clone();
+    let keepalive = runtime.keepalive.to_string();
     let value = tokio::task::spawn_blocking(move || {
         let mut host = TheaterHost::new(commands);
         granite::compiler::eval_source_with_host(LIST_ACTORS, &mut host)
@@ -42,6 +45,7 @@ async fn live_actor_ids(commands: UnboundedSender<TheaterCommand>) -> anyhow::Re
                 Value::Str(s) => s,
                 other => panic!("expected a string id, got {other:?}"),
             })
+            .filter(|id| *id != keepalive)
             .collect()),
         other => panic!("expected a list, got {other:?}"),
     }
@@ -52,12 +56,12 @@ async fn eval_reaches_live_runtime_through_theater_host() -> anyhow::Result<()> 
     let runtime = Runtime::new(SourceBundle::new(BTreeMap::new())?, Default::default()).await?;
 
     // Nothing spawned yet: the interpreter's (list-actors) sees an empty runtime.
-    assert!(live_actor_ids(runtime.commands.clone()).await?.is_empty());
+    assert!(live_actor_ids(&runtime).await?.is_empty());
 
     // Spawn the interpreter actor; now the same form sees exactly it.
     let wasm = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../actor.wasm"))?;
     let session = runtime.spawn(wasm).await?;
-    let ids = live_actor_ids(runtime.commands.clone()).await?;
+    let ids = live_actor_ids(&runtime).await?;
     assert_eq!(ids, vec![session.id.to_string()]);
 
     runtime.shutdown().await?;
@@ -89,7 +93,12 @@ async fn eval_session_runs_on_shared_interpreter() -> anyhow::Result<()> {
 
     assert_eq!(pure, Value::Int(42));
     assert_eq!(bound, Value::Int(42));
-    assert_eq!(live, Value::List(vec![Value::Str(expected_id)]));
+    let keepalive = Value::Str(runtime.keepalive.to_string());
+    let Value::List(mut live) = live else {
+        panic!("expected a list, got {live:?}")
+    };
+    live.retain(|id| *id != keepalive);
+    assert_eq!(live, vec![Value::Str(expected_id)]);
 
     runtime.shutdown().await?;
     Ok(())

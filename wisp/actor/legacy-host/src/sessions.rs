@@ -6,7 +6,7 @@
 //! What the runtime does not know, when an actor started and which manifest the
 //! daemon loaded it from, the daemon notes here for the actors it spawns. Notes
 //! are for display only; finding a session never reads them.
-use crate::{Interpreter, interpreters, short_id};
+use crate::{Interpreter, deaths::Dead, interpreters, short_id};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,13 +31,15 @@ pub struct Note {
 #[derive(Clone)]
 pub struct Sessions {
     commands: UnboundedSender<TheaterCommand>,
+    dead: Dead,
     notes: Arc<Mutex<HashMap<TheaterId, Note>>>,
 }
 
 impl Sessions {
-    pub fn new(commands: UnboundedSender<TheaterCommand>) -> Self {
+    pub fn new(commands: UnboundedSender<TheaterCommand>, dead: Dead) -> Self {
         Self {
             commands,
+            dead,
             notes: Arc::default(),
         }
     }
@@ -60,7 +62,7 @@ impl Sessions {
     /// Every session, in id order. Notes for actors that have stopped, however
     /// they stopped, are dropped on the way.
     pub async fn list(&self) -> Result<Vec<Interpreter>> {
-        let found = interpreters(&self.commands).await?;
+        let found = interpreters(&self.commands, &self.dead).await?;
         self.notes()
             .retain(|id, _| found.iter().any(|interpreter| interpreter.id == *id));
         Ok(found)
