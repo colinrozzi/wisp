@@ -306,6 +306,10 @@
 (import theater:simple/filesystem delete-file ((path string)) (result unit filesystem-error))
 (import theater:simple/filesystem create-dir ((path string)) (result unit filesystem-error))
 (import theater:simple/filesystem remove-dir ((path string)) (result unit filesystem-error))
+(import theater:simple/filesystem sync-file ((path string)) (result unit filesystem-error))
+(import theater:simple/filesystem sync-dir ((path string)) (result unit filesystem-error))
+(import theater:simple/filesystem rename ((from string) (to string)) (result unit filesystem-error))
+(import theater:simple/filesystem write-file-durable ((path string) (content (list u8))) (result unit filesystem-error))
 
 ; terminal: stdio + tty control. Exercises u16 (get-size tuple) and bool (set-raw).
 (import theater:simple/terminal write-stdout ((data (list u8))) (result u64 string))
@@ -464,6 +468,10 @@
     ((string=? name "fs-delete") 1)
     ((string=? name "fs-mkdir") 1)
     ((string=? name "fs-rmdir") 1)
+    ((string=? name "fs-sync") 1)
+    ((string=? name "fs-sync-dir") 1)
+    ((string=? name "fs-rename") 1)
+    ((string=? name "fs-write-durable") 1)
     ((string=? name "term-write") 1)
     ((string=? name "term-write-err") 1)
     ((string=? name "term-raw") 1)
@@ -961,6 +969,23 @@
     (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
       (unmarshal (raw-invoke "theater:simple/filesystem" "append-file" (str-bytes-tuple (list-get args 0) (list-get args 1))))
       (failure "fs-append expects two strings: path and content"))))
+(fn apply-fs-sync ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-sync expects (fs-sync path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "sync-file" (marshal (list-get args 0))))
+      (failure "fs-sync expects a string path"))))
+(fn apply-fs-sync-dir ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "fs-sync-dir expects (fs-sync-dir path)")
+    (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "sync-dir" (marshal (list-get args 0))))
+      (failure "fs-sync-dir expects a string path"))))
+(fn apply-fs-rename ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "fs-rename expects (fs-rename from to)")
+    (if (all-strings? args 0) (unmarshal (raw-invoke "theater:simple/filesystem" "rename" (arg-tuple args)))
+      (failure "fs-rename expects two strings: from and to"))))
+(fn apply-fs-write-durable ((args (list value))) value
+  (if (i32.ne (list-len args) 2) (failure "fs-write-durable expects (fs-write-durable path content)")
+    (if (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1)))
+      (unmarshal (raw-invoke "theater:simple/filesystem" "write-file-durable" (str-bytes-tuple (list-get args 0) (list-get args 1))))
+      (failure "fs-write-durable expects two strings: path and content"))))
 
 ; --- terminal --------------------------------------------------------------
 (fn bool-arg? ((v value)) s32 (value-case v ((boolean b) 1) (else 0)))
@@ -1678,7 +1703,7 @@
         (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
           (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
-              (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n"
+              (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n           durable: (fs-write-durable p text) replaces p all-or-nothing, on disk when it returns   (fs-sync p) (fs-sync-dir p) (fs-rename from to)\n"
                 (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
@@ -1758,6 +1783,10 @@
     ((string=? name "fs-delete") (apply-fs-delete args))
     ((string=? name "fs-mkdir") (apply-fs-mkdir args))
     ((string=? name "fs-rmdir") (apply-fs-rmdir args))
+    ((string=? name "fs-sync") (apply-fs-sync args))
+    ((string=? name "fs-sync-dir") (apply-fs-sync-dir args))
+    ((string=? name "fs-rename") (apply-fs-rename args))
+    ((string=? name "fs-write-durable") (apply-fs-write-durable args))
     ((string=? name "term-write") (apply-term-write args))
     ((string=? name "term-write-err") (apply-term-write-err args))
     ((string=? name "term-raw") (apply-term-raw args))

@@ -209,6 +209,10 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
         "delete-file",
         "create-dir",
         "remove-dir",
+        "sync-file",
+        "sync-dir",
+        "rename",
+        "write-file-durable",
     ] {
         imports.define(
             "theater:simple/filesystem",
