@@ -3481,6 +3481,8 @@ pub(crate) fn generate_pack_wrapper(
     out.push_str("    (local $enc_save_child i32)\n");
     out.push_str("    (local $enc_save_root i32)\n");
     out.push_str("    (local $enc_result_ptr i32)\n");
+    out.push_str("    (local $enc_result_tag i32)\n");
+    out.push_str("    (local $enc_str_ptr i32)\n");
     out.push_str("    (local $enc_tuple_header i32)\n");
     out.push_str("    (local $enc_tuple_ci_pos i32)\n");
     out.push_str("    (local $enc_list_header i32)\n");
@@ -3869,6 +3871,8 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
         out.push_str("    (local $enc_save_child i32)\n");
         out.push_str("    (local $enc_save_root i32)\n");
         out.push_str("    (local $enc_result_ptr i32)\n");
+        out.push_str("    (local $enc_result_tag i32)\n");
+        out.push_str("    (local $enc_str_ptr i32)\n");
         out.push_str("    (local $enc_tuple_header i32)\n");
         out.push_str("    (local $enc_tuple_ci_pos i32)\n");
         out.push_str("    (local $enc_list_header i32)\n");
@@ -4914,6 +4918,78 @@ pub(crate) fn generate_cgrf_decode_array(out: &mut String, elem_ty: &Type) {
     ));
 }
 
+/// Whether encoding or decoding `ty` reaches a node for which `node` holds:
+/// `ty` itself or anything nested in it (a packed Array has no child nodes).
+pub(crate) fn codec_reaches(ty: &Type, node: &dyn Fn(&Type) -> bool) -> bool {
+    node(ty)
+        || match ty {
+            Type::List(elem) => cgrf_array_width(elem).is_none() && codec_reaches(elem, node),
+            Type::Option(inner) | Type::Borrow(inner) => codec_reaches(inner, node),
+            Type::Result(ok, err) => codec_reaches(ok, node) || codec_reaches(err, node),
+            Type::Tuple(elems) => elems.iter().any(|e| codec_reaches(e, node)),
+            _ => false,
+        }
+}
+
+fn is_opt_node(ty: &Type) -> bool {
+    matches!(ty, Type::Option(_) | Type::Result(_, _))
+}
+
+fn is_list_node(ty: &Type) -> bool {
+    matches!(ty, Type::List(elem) if cgrf_array_width(elem).is_none())
+}
+
+/// The codec's per-arm locals are shared by every level of a nested value, so an
+/// arm whose child can reach the same arm keeps its locals on the codec stack
+/// (`$enc_tuple_sp`) while the child is encoded or decoded. The stack is as deep
+/// as the type is nested.
+pub(crate) fn emit_codec_push(out: &mut String, locals: &[&str]) {
+    for (i, l) in locals.iter().enumerate() {
+        out.push_str(&format!(
+            "    global.get $enc_tuple_sp\n    local.get ${l}\n    i32.store offset={}\n",
+            4 * i
+        ));
+    }
+    out.push_str(&format!(
+        "    global.get $enc_tuple_sp\n    i32.const {}\n    i32.add\n    global.set $enc_tuple_sp\n",
+        4 * locals.len()
+    ));
+}
+
+pub(crate) fn emit_codec_pop(out: &mut String, locals: &[&str]) {
+    out.push_str(&format!(
+        "    global.get $enc_tuple_sp\n    i32.const {}\n    i32.sub\n    global.set $enc_tuple_sp\n",
+        4 * locals.len()
+    ));
+    for (i, l) in locals.iter().enumerate() {
+        out.push_str(&format!(
+            "    global.get $enc_tuple_sp\n    i32.load offset={}\n    local.set ${l}\n",
+            4 * i
+        ));
+    }
+}
+
+/// The list encoder's locals.
+const ENC_LIST_LOCALS: [&str; 6] = [
+    "enc_list_header",
+    "enc_list_ci_pos",
+    "enc_list_i",
+    "enc_list_len",
+    "enc_list_data",
+    "enc_list_root_idx",
+];
+/// The list decoder's locals.
+const DEC_LIST_LOCALS: [&str; 5] = [
+    "dec_list_ptr",
+    "dec_list_data",
+    "dec_list_len",
+    "dec_list_i",
+    "dec_list_node_offset",
+];
+const DEC_TUPLE_LOCALS: [&str; 2] = ["dec_tuple_ptr", "dec_tuple_node_offset"];
+/// Option and result decoding share this local.
+const DEC_OPT_LOCALS: [&str; 1] = ["dec_opt_ptr"];
+
 /// Recursively encode a Wisp value as CGRF nodes using the wrapper's encoder
 /// and array scratch locals. Advances $buf_cursor and $node_idx and leaves the
 /// encoded subtree's root index in $enc_root_idx.
@@ -4972,11 +5048,12 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             out.push_str("    local.get $node_idx\n");
             out.push_str("    local.set $enc_root_idx\n");
             generate_write_node_header(out, CGRF_STRING);
-            // Save string pointer (in case value_local is $enc_tmp which will be overwritten)
+            // Save string pointer (value_local may be $enc_tmp, overwritten below). Its own
+            // local: a result around it still needs $enc_result_ptr.
             out.push_str(&format!("    local.get {}\n", value_local));
-            out.push_str("    local.set $enc_result_ptr\n");
+            out.push_str("    local.set $enc_str_ptr\n");
             // Read string length
-            out.push_str("    local.get $enc_result_ptr\n");
+            out.push_str("    local.get $enc_str_ptr\n");
             out.push_str("    i32.load\n");
             out.push_str("    local.set $enc_tmp\n");
             generate_enc_reserve(
@@ -4995,7 +5072,7 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             out.push_str("    i32.add\n");
             out.push_str("    i32.const 4\n");
             out.push_str("    i32.add\n"); // dest
-            out.push_str("    local.get $enc_result_ptr\n");
+            out.push_str("    local.get $enc_str_ptr\n");
             out.push_str("    i32.const 4\n");
             out.push_str("    i32.add\n"); // src
             out.push_str("    local.get $enc_tmp\n"); // len
@@ -5110,12 +5187,15 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             generate_load_inner_value(out, err_ty, "$enc_result_ptr", 4);
             let err_local = enc_local_for_type(err_ty);
             generate_cgrf_encode_recursive(out, err_ty, err_local);
+            // The tag, set after the child: a result inside it reuses these locals
+            out.push_str("        i32.const 1\n        local.set $enc_result_tag\n");
             out.push_str("      )\n");
             out.push_str("      (else\n");
             out.push_str("        ;; Ok branch: encode ok value\n");
             generate_load_inner_value(out, ok_ty, "$enc_result_ptr", 4);
             let ok_local = enc_local_for_type(ok_ty);
             generate_cgrf_encode_recursive(out, ok_ty, ok_local);
+            out.push_str("        i32.const 0\n        local.set $enc_result_tag\n");
             out.push_str("      )\n");
             out.push_str("    )\n");
             // Save child index
@@ -5130,12 +5210,11 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             // Write err_type tag
             generate_write_type_tag_at_cursor(out, err_ty);
             generate_enc_reserve_const(out, 9);
-            // Write tag (0=ok, 1=err) - use saved result pointer
+            // Write tag (0=ok, 1=err)
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $buf_cursor\n");
             out.push_str("    i32.add\n");
-            out.push_str("    local.get $enc_result_ptr\n");
-            out.push_str("    i32.load\n");
+            out.push_str("    local.get $enc_result_tag\n");
             out.push_str("    i32.store\n");
             out.push_str("    local.get $buf_cursor\n");
             out.push_str("    i32.const 4\n");
@@ -5422,7 +5501,14 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             }
 
             let child_local = enc_local_for_type(elem_ty);
+            let save = codec_reaches(elem_ty, &is_list_node);
+            if save {
+                emit_codec_push(out, &ENC_LIST_LOCALS);
+            }
             generate_cgrf_encode_recursive(out, elem_ty, child_local);
+            if save {
+                emit_codec_pop(out, &ENC_LIST_LOCALS);
+            }
 
             // Write child's node index to child_indices[$enc_list_i]
             out.push_str("        local.get $out_ptr\n");
@@ -5715,7 +5801,14 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             generate_dec_find_node_by_index(out);
 
             // Recursively decode child
+            let save = codec_reaches(inner_ty, &is_opt_node);
+            if save {
+                emit_codec_push(out, &DEC_OPT_LOCALS);
+            }
             generate_cgrf_decode_recursive(out, inner_ty);
+            if save {
+                emit_codec_pop(out, &DEC_OPT_LOCALS);
+            }
 
             // Store decoded value at $dec_opt_ptr + 4
             out.push_str("        local.get $dec_opt_ptr\n");
@@ -5816,7 +5909,14 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             generate_dec_find_node_by_index(out);
 
             // Decode child
+            let save = codec_reaches(elem_ty, &is_list_node);
+            if save {
+                emit_codec_push(out, &DEC_LIST_LOCALS);
+            }
             generate_cgrf_decode_recursive(out, elem_ty);
+            if save {
+                emit_codec_pop(out, &DEC_LIST_LOCALS);
+            }
 
             // Store decoded value in data array
             out.push_str("        local.get $dec_list_data\n");
@@ -5874,7 +5974,14 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
                 generate_dec_find_node_by_index(out);
 
                 // Decode child
+                let save = codec_reaches(elem_ty, &|t| matches!(t, Type::Tuple(_)));
+                if save {
+                    emit_codec_push(out, &DEC_TUPLE_LOCALS);
+                }
                 generate_cgrf_decode_recursive(out, elem_ty);
+                if save {
+                    emit_codec_pop(out, &DEC_TUPLE_LOCALS);
+                }
 
                 // Store decoded value at tuple_ptr + field_offset
                 out.push_str("    local.get $dec_tuple_ptr\n");
@@ -5955,6 +6062,10 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             generate_dec_find_node_by_index(out);
 
             // Decode based on tag: if tag == 0, it's ok (decode ok_ty), else err (decode err_ty)
+            let save = codec_reaches(ok_ty, &is_opt_node) || codec_reaches(err_ty, &is_opt_node);
+            if save {
+                emit_codec_push(out, &DEC_OPT_LOCALS);
+            }
             out.push_str("        local.get $dec_tmp\n"); // tag
             out.push_str("        (if\n");
             out.push_str("          (then\n");
@@ -5966,6 +6077,9 @@ pub(crate) fn generate_cgrf_decode_recursive(out: &mut String, ty: &Type) {
             generate_cgrf_decode_recursive(out, ok_ty);
             out.push_str("          )\n");
             out.push_str("        )\n");
+            if save {
+                emit_codec_pop(out, &DEC_OPT_LOCALS);
+            }
 
             // Store payload at result_ptr + 4
             out.push_str("        local.get $dec_opt_ptr\n");
