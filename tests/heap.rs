@@ -5,7 +5,7 @@
 // owners (import buffers, raw-invoke, list-push growth, heap-free).
 
 use granite::compiler;
-use pack::abi::Value;
+use pack::abi::{Value, ValueType};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::{
@@ -685,4 +685,117 @@ fn heap_stats_and_heap_free_from_granite() {
         assert_eq!(h.call("alloc-free", Value::S32(n)), Value::S32(0));
     }
     assert_eq!(h.stats().live_bytes, before.live_bytes);
+}
+
+// ---- Issue #89: outputs and arguments of any size ----
+
+/// Exports whose results go through the CGRF encoder, and imports whose
+/// arguments do. The encoder grows its buffer as it writes, so none of these
+/// has a size limit.
+const BIG: &str = r#"
+(import host echo ((s string)) string)
+(export (fn str-id ((s string)) string s))
+(export (fn some-str ((s string)) (option string) (some string s)))
+(export (fn ok-nums ((xs (list s32))) (result (list s32) s32) (ok (list s32) s32 xs)))
+(export (fn pair-id ((value (tuple string s32))) (tuple string s32) value))
+(export (fn strs-id ((xs (list string))) (list string) xs))
+(export (fn nums-id ((xs (list s32))) (list s32) xs))
+(export (fn via-host ((s string)) string (echo s)))
+"#;
+
+/// The host's `echo` takes any value, so the same import name can be declared
+/// with a list type.
+const BIG_LIST_IMPORT: &str = r#"
+(import host echo ((xs (list string))) (list string))
+(export (fn strs-via-host ((xs (list string))) (list string) (echo xs)))
+"#;
+
+/// `n` bytes of text that differ from position to position, so a lost or
+/// moved byte shows.
+fn text(n: usize, seed: usize) -> String {
+    (0..n)
+        .map(|i| (b'a' + ((i * 7 + seed) % 26) as u8) as char)
+        .collect()
+}
+
+fn strings(count: usize, each: usize) -> Value {
+    Value::List {
+        elem_type: ValueType::String,
+        items: (0..count).map(|i| Value::String(text(each, i))).collect(),
+    }
+}
+
+/// Each export returns its 1 MiB value intact (32 times the old 32 KiB block),
+/// in release and debug builds (the debug build verifies the heap after every
+/// export call), and repeated calls leave live memory flat.
+#[test]
+fn large_values_round_trip_with_flat_memory() {
+    const MIB: usize = 1 << 20;
+    let s = || Value::String(text(MIB, 3));
+    let nums = || Value::List {
+        elem_type: ValueType::S32,
+        items: (0..MIB as i32 / 4).map(Value::S32).collect(),
+    };
+    let cases: Vec<(&str, &str, Value, Value)> = vec![
+        (BIG, "str-id", s(), s()),
+        (
+            BIG,
+            "some-str",
+            s(),
+            Value::Option {
+                inner_type: ValueType::String,
+                value: Some(Box::new(s())),
+            },
+        ),
+        // Not a string payload: the string encoder overwrites $enc_result_ptr,
+        // so a result holding a string comes back as err (a separate bug).
+        (
+            BIG,
+            "ok-nums",
+            nums(),
+            Value::Result {
+                ok_type: ValueType::List(Box::new(ValueType::S32)),
+                err_type: ValueType::S32,
+                value: Ok(Box::new(nums())),
+            },
+        ),
+        (
+            BIG,
+            "pair-id",
+            Value::Tuple(vec![s(), Value::S32(-7)]),
+            Value::Tuple(vec![s(), Value::S32(-7)]),
+        ),
+        (BIG, "strs-id", strings(1024, 1024), strings(1024, 1024)),
+        (BIG, "strs-id", strings(65536, 4), strings(65536, 4)),
+        (BIG, "nums-id", nums(), nums()),
+        (BIG, "via-host", s(), s()),
+        (
+            BIG_LIST_IMPORT,
+            "strs-via-host",
+            strings(1024, 1024),
+            strings(1024, 1024),
+        ),
+    ];
+    for debug in [false, true] {
+        let mut programs = [BIG, BIG_LIST_IMPORT].map(|p| (p, Heap::new(&compile(p, debug))));
+        for (program, name, input, expect) in &cases {
+            let h = &mut programs.iter_mut().find(|(p, _)| p == program).unwrap().1;
+            for _ in 0..2 {
+                assert!(
+                    h.call(name, input.clone()) == *expect,
+                    "{name} debug={debug}"
+                );
+            }
+            let warm = h.stats();
+            for _ in 0..3 {
+                assert!(
+                    h.call(name, input.clone()) == *expect,
+                    "{name} debug={debug}"
+                );
+            }
+            let after = h.stats();
+            assert_eq!(after.live_bytes, warm.live_bytes, "{name} debug={debug}");
+            assert_eq!(after.live_blocks, warm.live_blocks, "{name} debug={debug}");
+        }
+    }
 }

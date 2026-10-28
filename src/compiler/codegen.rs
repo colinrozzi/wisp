@@ -3698,9 +3698,8 @@ pub(crate) fn generate_pack_wrapper(
             out.push_str("    local.set $out_ptr\n");
         }
         _ => {
-            // For other types, use a generous fixed size
-            // TODO: compute dynamically for nested variable-size types
-            out.push_str("    i32.const 16384\n");
+            // A first guess: the encoder grows the buffer as it writes (issue #89)
+            out.push_str("    i32.const 256\n");
             out.push_str("    call $__alloc\n");
             out.push_str("    local.set $out_ptr\n");
         }
@@ -3891,9 +3890,9 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
     out.push_str("    i64.const 0\n");
     out.push_str("    i64.store\n");
 
-    // Input buffer: allocate enough space for CGRF-encoded arguments
-    // Use larger buffer for complex types (tuples with options, nested lists, etc.)
-    let input_buf_size = if needs_complex_encode { 16384 } else { 4096 };
+    // Input buffer for the CGRF-encoded arguments. A string argument sizes it
+    // exactly below; the CGRF encoder grows it as it writes (issue #89).
+    let input_buf_size = 4096;
     out.push_str(&format!(
         "    ;; Allocate input buffer from heap ({} bytes)\n",
         input_buf_size
@@ -3908,6 +3907,11 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
         // String is passed as (ptr, len) in WASM
         // We need to encode it as CGRF string node
         let param_name = &import.params[0].name;
+
+        // Room for header(16) + node header(8) + length(4) + the bytes
+        out.push_str("    local.get $in_buf\n    i32.const 28\n");
+        out.push_str(&format!("    local.get ${}\n", param_name));
+        out.push_str("    i32.load\n    i32.add\n    call $__buf_reserve\n    local.set $in_buf\n");
 
         // Write CGRF header
         out.push_str("    ;; Write CGRF header for string argument\n");
@@ -4246,6 +4250,7 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
         // Reserve space for: header(8) + child_count(4) + N*child_idx(4*N)
         let tuple_payload_len = 4 + 4 * n;
         out.push_str("    ;; Write tuple node header (placeholder)\n");
+        generate_enc_reserve_const(out, 8 + tuple_payload_len);
         out.push_str("    local.get $buf_cursor\n");
         out.push_str("    local.set $enc_tuple_header\n");
         out.push_str("    local.get $out_ptr\n");
@@ -4324,6 +4329,9 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
         // Set root index to tuple's node index
         out.push_str("    local.get $enc_save_root\n");
         out.push_str("    local.set $enc_root_idx\n");
+        // The encoder may have moved the buffer
+        out.push_str("    local.get $out_ptr\n");
+        out.push_str("    local.set $in_buf\n");
 
         // Write CGRF header
         out.push_str("    ;; Write CGRF header\n");
@@ -4525,6 +4533,9 @@ pub(crate) fn generate_import_generic_encode(out: &mut String, param: &Parameter
     // Encode the parameter value
     let value_local = format!("${}", param_name);
     generate_cgrf_encode_recursive(out, param_ty, &value_local);
+    // The encoder may have moved the buffer
+    out.push_str("    local.get $out_ptr\n");
+    out.push_str("    local.set $in_buf\n");
 
     // Write CGRF header at offset 0
     out.push_str("    ;; Write CGRF header\n");
@@ -4604,9 +4615,24 @@ pub(crate) fn type_tag_bytes(ty: &Type) -> Vec<u8> {
     bytes
 }
 
+/// Grow the encoder's buffer ($out_ptr) to hold `$buf_cursor + more` bytes, where
+/// `more` is WAT that pushes an i32. Every encoder write is at an offset from
+/// $out_ptr, so the buffer can move between writes (issue #89).
+pub(crate) fn generate_enc_reserve(out: &mut String, more: &str) {
+    out.push_str("    local.get $out_ptr\n    local.get $buf_cursor\n");
+    out.push_str(more);
+    out.push_str("    i32.add\n    call $__buf_reserve\n    local.set $out_ptr\n");
+}
+
+/// `generate_enc_reserve` for a compile-time byte count.
+pub(crate) fn generate_enc_reserve_const(out: &mut String, more: usize) {
+    generate_enc_reserve(out, &format!("    i32.const {more}\n"));
+}
+
 /// Generate WAT to write type tag bytes at $out_ptr + $buf_cursor, advancing $buf_cursor.
 pub(crate) fn generate_write_type_tag_at_cursor(out: &mut String, ty: &Type) {
     let bytes = type_tag_bytes(ty);
+    generate_enc_reserve_const(out, bytes.len());
     for (i, byte) in bytes.iter().enumerate() {
         out.push_str("    local.get $out_ptr\n");
         out.push_str("    local.get $buf_cursor\n");
@@ -4628,6 +4654,7 @@ pub(crate) fn generate_write_type_tag_at_cursor(out: &mut String, ty: &Type) {
 /// Write a CGRF node header at $buf_cursor (kind, flags=0, reserved=0, payload_len=0).
 /// Advances $buf_cursor by 8. Caller must patch payload_len at $enc_header_start + 4.
 pub(crate) fn generate_write_node_header(out: &mut String, kind: u8) {
+    generate_enc_reserve_const(out, 8);
     // Save header start position
     out.push_str("    local.get $buf_cursor\n");
     out.push_str("    local.set $enc_header_start\n");
@@ -4767,6 +4794,12 @@ pub(crate) fn generate_cgrf_encode_array(out: &mut String, elem_ty: &Type, value
     );
     generate_write_node_header(out, CGRF_ARRAY);
     generate_write_type_tag_at_cursor(out, elem_ty);
+    generate_enc_reserve(
+        out,
+        &format!(
+            "    local.get $array_len\n    i32.const {width}\n    i32.mul\n    i32.const 4\n    i32.add\n"
+        ),
+    );
     out.push_str(&format!(
         r#"    local.get $out_ptr
     local.get $buf_cursor
@@ -4914,6 +4947,7 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             out.push_str("    local.get $node_idx\n");
             out.push_str("    local.set $enc_root_idx\n");
             generate_write_node_header(out, kind);
+            generate_enc_reserve_const(out, payload_size);
             // Write payload
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $buf_cursor\n");
@@ -4945,6 +4979,10 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             out.push_str("    local.get $enc_result_ptr\n");
             out.push_str("    i32.load\n");
             out.push_str("    local.set $enc_tmp\n");
+            generate_enc_reserve(
+                out,
+                "    local.get $enc_tmp\n    i32.const 4\n    i32.add\n",
+            );
             // Write length to payload
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $buf_cursor\n");
@@ -4999,6 +5037,7 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             generate_write_node_header(out, CGRF_OPTION);
             // Write type tag
             generate_write_type_tag_at_cursor(out, inner_ty);
+            generate_enc_reserve_const(out, 5);
             // Write presence = 1
             out.push_str("        local.get $out_ptr\n");
             out.push_str("        local.get $buf_cursor\n");
@@ -5033,6 +5072,7 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             out.push_str("        local.set $enc_root_idx\n");
             generate_write_node_header(out, CGRF_OPTION);
             generate_write_type_tag_at_cursor(out, inner_ty);
+            generate_enc_reserve_const(out, 1);
             // Write presence = 0
             out.push_str("        local.get $out_ptr\n");
             out.push_str("        local.get $buf_cursor\n");
@@ -5089,6 +5129,7 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             generate_write_type_tag_at_cursor(out, ok_ty);
             // Write err_type tag
             generate_write_type_tag_at_cursor(out, err_ty);
+            generate_enc_reserve_const(out, 9);
             // Write tag (0=ok, 1=err) - use saved result pointer
             out.push_str("    local.get $out_ptr\n");
             out.push_str("    local.get $buf_cursor\n");
@@ -5156,6 +5197,7 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
             // Save header start for later payload_len patching
             out.push_str("    local.get $enc_header_start\n");
             out.push_str("    local.set $enc_tuple_header\n");
+            generate_enc_reserve_const(out, 4 + 4 * n);
 
             // Write child_count
             out.push_str("    local.get $out_ptr\n");
@@ -5310,6 +5352,10 @@ pub(crate) fn generate_cgrf_encode_recursive(out: &mut String, ty: &Type, value_
 
             // Write type tag
             generate_write_type_tag_at_cursor(out, elem_ty);
+            generate_enc_reserve(
+                out,
+                "    local.get $enc_list_len\n    i32.const 4\n    i32.mul\n    i32.const 4\n    i32.add\n",
+            );
 
             // Write count
             out.push_str("    local.get $out_ptr\n");

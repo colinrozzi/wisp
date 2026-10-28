@@ -691,9 +691,12 @@ language docs.
   Nothing uses them yet.
 - A `u64` payload in `some`/`ok`/`err`, and a `u64` list element, are written with
   `i32.store` (upper half lost).
-- The export output buffer is a fixed 16 KiB for most types, and the encoder cursor is
-  not checked; the import argument buffer is a fixed 4 or 16 KiB, also unchecked.
-  `marshal.wisp` uses a fixed 16,388-byte buffer with no bounds check.
+- ~~The export output buffer is a fixed 16 KiB for most types, and the encoder cursor is
+  not checked; the import argument buffer is a fixed 4 or 16 KiB, also unchecked.~~
+  Fixed (#89): the CGRF encoder calls `$__buf_reserve` before each write, which
+  moves the buffer to a block twice as big when it is full, and a single string
+  argument sizes its buffer exactly. `marshal.wisp` already sizes its buffer from
+  `enc-bound` before it encodes.
 - ~~The import wrappers ignore the host's ownership status (4534, 1704).~~ Fixed in
   stage 2 (#90).
 - The recursive CGRF encoder and decoder have `TODO` arms for records, variants and
@@ -703,7 +706,7 @@ language docs.
   `generate_wat` is retired (stage 6).
 - ~~`granite eval` and compiled code disagree on `list-push` (§2.2).~~ They agree with
   reference counting on (stage 4).
-- The export output buffer overflow is issue #89.
+- ~~The export output buffer overflow is issue #89.~~ Fixed.
 
 ---
 

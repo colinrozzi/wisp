@@ -484,6 +484,56 @@ pub(crate) fn emit_heap_runtime(
         live_count = l.live_count(),
     ));
 
+    // $__buf_reserve(buf, need): a block with room for `need` payload bytes, holding
+    // `buf`'s bytes. Returns `buf` when it is big enough; else moves the bytes to a
+    // block at least twice as big and frees `buf`. The CGRF encoder calls it before
+    // each write, so its buffer grows to fit the value (issue #89).
+    out.push_str(&format!(
+        r#"  (func $__buf_reserve (param $buf i32) (param $need i32) (result i32)
+    (local $cap i32)
+    (local $new i32)
+    local.get $buf
+    i32.const {BLOCK_HEADER}
+    i32.sub
+    i32.load offset=4
+    i32.const {BLOCK_HEADER}
+    i32.sub
+    local.tee $cap
+    local.get $need
+    i32.ge_u
+    if
+      local.get $buf
+      return
+    end
+    local.get $cap
+    i32.const {half_max}
+    i32.ge_u
+    if (result i32)
+      i32.const {MAX_PAYLOAD}
+    else
+      local.get $cap
+      i32.const 1
+      i32.shl
+    end
+    local.tee $new
+    local.get $need
+    local.get $new
+    local.get $need
+    i32.gt_u
+    select
+    call $__alloc
+    local.tee $new
+    local.get $buf
+    local.get $cap
+    memory.copy
+    local.get $buf
+    call $__free
+    local.get $new
+  )
+"#,
+        half_max = MAX_PAYLOAD / 2,
+    ));
+
     // Pack ABI (§4): the host allocates every input buffer with __pack_alloc and
     // frees every input and output buffer with __pack_free.
     let check_len = if debug {
