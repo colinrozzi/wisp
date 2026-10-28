@@ -169,6 +169,11 @@ impl Heap {
     /// Call export `name` the way the packr host does: input from __pack_alloc,
     /// freed after the call; the output read, then freed.
     fn call(&mut self, name: &str, input: Value) -> Value {
+        self.try_call(name, input).unwrap()
+    }
+
+    /// `call`, with a trap or an output the host cannot decode as an error.
+    fn try_call(&mut self, name: &str, input: Value) -> Result<Value, String> {
         let bytes = pack::encode(&input).unwrap();
         let in_ptr = self.alloc(bytes.len() as u32);
         self.memory
@@ -187,7 +192,7 @@ impl Heap {
                     slots as i32 + 4,
                 ),
             )
-            .unwrap();
+            .map_err(|e| format!("trap: {e:?}"))?;
         assert_eq!(status, 0);
         self.free(in_ptr, bytes.len() as u32);
         let out_ptr = self.u32_at(slots);
@@ -195,7 +200,7 @@ impl Heap {
         let value = pack::decode(
             &self.memory.data(&self.store)[out_ptr as usize..(out_ptr + out_len) as usize],
         )
-        .unwrap();
+        .map_err(|e| format!("decode: {e:?}"));
         self.free(out_ptr, out_len);
         self.free(slots, 8);
         value
@@ -798,4 +803,184 @@ fn large_values_round_trip_with_flat_memory() {
             assert_eq!(after.live_blocks, warm.live_blocks, "{name} debug={debug}");
         }
     }
+}
+
+// ---- Nested values through the CGRF encoder ----
+
+/// Identity exports over nested shapes: a string inside a result, a result
+/// inside a result, and lists whose elements hold lists.
+const NESTED: &str = r#"
+(export (fn ok-str ((s string)) (result string s32) (ok string s32 s)))
+(export (fn err-str ((s string)) (result s32 string) (err s32 string s)))
+(export (fn ok-ok ((s string)) (result (result string s32) s32)
+  (ok (result string s32) s32 (ok string s32 s))))
+(export (fn lls-id ((v (list (list string)))) (list (list string)) v))
+(export (fn lts-id ((v (list (tuple string s32)))) (list (tuple string s32)) v))
+(export (fn ltl-id ((v (list (tuple string (list string))))) (list (tuple string (list string))) v))
+(export (fn tll-id ((v (tuple (list string) (list string)))) (tuple (list string) (list string)) v))
+(export (fn los-id ((v (list (option string)))) (list (option string)) v))
+(export (fn ol-id ((v (option (list (list string))))) (option (list (list string))) v))
+(export (fn tt-id ((v (tuple (tuple string s32) (tuple string s32)))) (tuple (tuple string s32) (tuple string s32)) v))
+(export (fn oo-id ((v (option (option string)))) (option (option string)) v))
+(export (fn lll-id ((v (list (list (list string))))) (list (list (list string))) v))
+(export (fn lr-id ((v (list (result (list string) string)))) (list (result (list string) string)) v))
+"#;
+
+fn str_list(xs: &[&str]) -> Value {
+    Value::List {
+        elem_type: ValueType::String,
+        items: xs.iter().map(|x| Value::String(x.to_string())).collect(),
+    }
+}
+
+#[test]
+fn nested_values_round_trip() {
+    let s = |x: &str| Value::String(x.into());
+    let ls = ValueType::List(Box::new(ValueType::String));
+    let lls = Value::List {
+        elem_type: ls.clone(),
+        items: vec![str_list(&["a", "bc"]), str_list(&[]), str_list(&["def"])],
+    };
+    let pair_t = ValueType::Tuple(vec![ValueType::String, ValueType::S32]);
+    let deep_t = ValueType::Tuple(vec![ValueType::String, ls.clone()]);
+    let res = |ok: ValueType, err: ValueType, value| Value::Result {
+        ok_type: ok,
+        err_type: err,
+        value,
+    };
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "ok-str",
+            s("hello"),
+            res(ValueType::String, ValueType::S32, Ok(Box::new(s("hello")))),
+        ),
+        (
+            "err-str",
+            s("oops"),
+            res(ValueType::S32, ValueType::String, Err(Box::new(s("oops")))),
+        ),
+        (
+            "ok-ok",
+            s("in"),
+            res(
+                ValueType::Result {
+                    ok: Box::new(ValueType::String),
+                    err: Box::new(ValueType::S32),
+                },
+                ValueType::S32,
+                Ok(Box::new(res(
+                    ValueType::String,
+                    ValueType::S32,
+                    Ok(Box::new(s("in"))),
+                ))),
+            ),
+        ),
+        ("lls-id", lls.clone(), lls.clone()),
+        {
+            let v = Value::List {
+                elem_type: pair_t.clone(),
+                items: (0..3)
+                    .map(|i| Value::Tuple(vec![s(&"x".repeat(i + 1)), Value::S32(i as i32)]))
+                    .collect(),
+            };
+            ("lts-id", v.clone(), v)
+        },
+        {
+            let v = Value::List {
+                elem_type: deep_t.clone(),
+                items: vec![
+                    Value::Tuple(vec![s("p"), str_list(&["1", "22"])]),
+                    Value::Tuple(vec![s("q"), str_list(&[])]),
+                    Value::Tuple(vec![s("r"), str_list(&["333"])]),
+                ],
+            };
+            ("ltl-id", v.clone(), v)
+        },
+        {
+            let v = Value::Tuple(vec![str_list(&["a", "b"]), str_list(&["c"])]);
+            ("tll-id", v.clone(), v)
+        },
+        {
+            let v = Value::List {
+                elem_type: ValueType::Option(Box::new(ValueType::String)),
+                items: vec![
+                    Value::Option {
+                        inner_type: ValueType::String,
+                        value: Some(Box::new(s("y"))),
+                    },
+                    Value::Option {
+                        inner_type: ValueType::String,
+                        value: None,
+                    },
+                ],
+            };
+            ("los-id", v.clone(), v)
+        },
+        {
+            let v = Value::Option {
+                inner_type: ValueType::List(Box::new(ls.clone())),
+                value: Some(Box::new(lls.clone())),
+            };
+            ("ol-id", v.clone(), v)
+        },
+        {
+            let v = Value::Tuple(vec![
+                Value::Tuple(vec![s("l"), Value::S32(1)]),
+                Value::Tuple(vec![s("r"), Value::S32(2)]),
+            ]);
+            ("tt-id", v.clone(), v)
+        },
+        {
+            let v = Value::Option {
+                inner_type: ValueType::Option(Box::new(ValueType::String)),
+                value: Some(Box::new(Value::Option {
+                    inner_type: ValueType::String,
+                    value: Some(Box::new(s("deep"))),
+                })),
+            };
+            ("oo-id", v.clone(), v)
+        },
+        {
+            let v = Value::List {
+                elem_type: ValueType::List(Box::new(ls.clone())),
+                items: vec![
+                    lls.clone(),
+                    Value::List {
+                        elem_type: ls.clone(),
+                        items: vec![],
+                    },
+                    lls.clone(),
+                ],
+            };
+            ("lll-id", v.clone(), v)
+        },
+        {
+            let item = |value| res(ls.clone(), ValueType::String, value);
+            let v = Value::List {
+                elem_type: ValueType::Result {
+                    ok: Box::new(ls.clone()),
+                    err: Box::new(ValueType::String),
+                },
+                items: vec![
+                    item(Ok(Box::new(str_list(&["x", "yz"])))),
+                    item(Err(Box::new(s("bad")))),
+                    item(Ok(Box::new(str_list(&[])))),
+                ],
+            };
+            ("lr-id", v.clone(), v)
+        },
+    ];
+    let mut failed = vec![];
+    for debug in [false, true] {
+        let wasm = compile(NESTED, debug);
+        for (name, input, expect) in &cases {
+            // A fresh instance each, so one case's trap cannot affect the next.
+            let mut h = Heap::new(&wasm);
+            let got = h.try_call(name, input.clone());
+            if !matches!(&got, Ok(v) if v == expect) {
+                failed.push(format!("{name} debug={debug}: got {got:?}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
