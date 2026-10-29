@@ -295,12 +295,13 @@ fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<Loaded>
 
 /// theater-repl config (TOML). It grants the REPL actor's filesystem capability —
 /// a root directory it may read/write, the human's slice of the actor manifest —
-/// and lists the services `serve` starts and keeps running (`[[service]]`, see
+/// and the hosts its http-client may reach (`[http]`), and lists the services `serve` starts and keeps running (`[[service]]`, see
 /// `boot`).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ReplConfig {
     filesystem: FilesystemConfig,
+    http: Option<HttpConfig>,
     #[serde(rename = "service")]
     services: Vec<boot::ServiceConfig>,
 }
@@ -323,6 +324,15 @@ impl Default for FilesystemConfig {
             write: true,
         }
     }
+}
+
+/// `[http]`: the hosts the REPL's http-client capability may reach (exact host
+/// match, no port or wildcard). No section keeps the built-in default list; a
+/// section with no `allowed_hosts` allows none.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HttpConfig {
+    allowed_hosts: Vec<String>,
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -373,7 +383,17 @@ fn fs_access(config: &ReplConfig) -> Result<wisp_interpreter_actor::FsAccess> {
 
 async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
     let sources: BTreeMap<String, String> = serde_json::from_str(&loaded.bundle_json)?;
-    Runtime::new(SourceBundle::new(sources)?, fs_access(config)?).await
+    let http = match &config.http {
+        Some(http) => wisp_interpreter_actor::HttpAccess {
+            allowed_hosts: http.allowed_hosts.clone(),
+        },
+        None => Default::default(),
+    };
+    let grants = wisp_interpreter_actor::Grants {
+        fs: fs_access(config)?,
+        http,
+    };
+    Runtime::new(SourceBundle::new(sources)?, grants).await
 }
 
 // ---- the daemon -----------------------------------------------------------
@@ -1317,6 +1337,17 @@ mod tests {
         );
         assert!(c.filesystem.read);
         assert!(!c.filesystem.write);
+    }
+
+    #[test]
+    fn config_http_section_sets_allowed_hosts() {
+        let c: ReplConfig = toml::from_str("").unwrap();
+        assert!(c.http.is_none());
+        let c: ReplConfig =
+            toml::from_str("[http]\nallowed_hosts = [\"api.weather.gov\"]\n").unwrap();
+        assert_eq!(c.http.unwrap().allowed_hosts, ["api.weather.gov"]);
+        let c: ReplConfig = toml::from_str("[http]\n").unwrap();
+        assert!(c.http.unwrap().allowed_hosts.is_empty());
     }
 
     #[test]

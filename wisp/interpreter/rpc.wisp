@@ -1009,24 +1009,48 @@
     (unmarshal (raw-invoke "theater:simple/terminal" "enable-input" (arg-tuple (list-new value))))))
 
 ; --- http-client -----------------------------------------------------------
-; Build an http-request record value (empty headers, no body) and marshal it as
-; the record ARG. field names/order match the pact; headers is an empty
-; list<http-header>, body a none option<list<u8>> — their element/inner type tags
-; are emitted by the codec from the descriptors below.
-(fn http-request-blob ((method string) (url string)) any
+; Build an http-request record value and marshal it as the record ARG. Field
+; names/order match the pact. headers is a list<http-header> of aggregates (the
+; record type self-registers via register-record, the same type a response's
+; headers arrive as); body is an option<list<u8>> compound. The element/inner
+; type tags are emitted by the codec from the descriptors below.
+(fn http-header-names () (list value)
+  (list-push (list-push (list-new value) (symbol "name")) (symbol "value")))
+; Each Wisp header is a 2-element (name value) list of strings.
+(fn build-http-headers ((pairs (list value)) (i s32) (out (list value))) (list value)
+  (if (i32.ge_s i (list-len pairs)) out
+    (let (vals (items-of (list-get pairs i)))
+      (build-http-headers pairs (i32.add i 1)
+        (list-push out (aggregate "http-header" (register-record "http-header" (http-header-names) vals) "http-header" vals))))))
+(fn http-body-type () value (unary-type "option" (unary-type "list" (symbol "u8"))))
+(fn http-request-full ((method string) (url string) (headers (list value)) (body value)) any
   (marshal-record "http-request"
     (list-push (list-push (list-push (list-push (list-new value)
       (symbol "method")) (symbol "url")) (symbol "headers")) (symbol "body"))
     (list-push (list-push (list-push (list-push (list-new value)
       (text method)) (text url))
-      (typed-list (symbol "http-header") (list-new value)))
-      (compound (unary-type "option" (unary-type "list" (symbol "u8"))) "none" (list-new value)))))
+      (typed-list (symbol "http-header") (build-http-headers headers 0 (list-new value))))
+      body)))
+(fn http-request-blob ((method string) (url string)) any
+  (http-request-full method url (list-new value) (compound (http-body-type) "none" (list-new value))))
+(fn bytes-arg? ((v value)) s32 (value-case v ((typed-list element items) 1) (else 0)))
+; (http-req method url [headers [body]]): headers ((name value) ...), body a string
+; or bytes.
 (fn apply-http-req ((args (list value))) value
-  (if (i32.ne (list-len args) 2) (failure "http-req expects (http-req method url)")
-    (if (all-strings? args 0)
-      (unmarshal (raw-invoke "theater:simple/http-client" "request"
-        (http-request-blob (as-string (list-get args 0)) (as-string (list-get args 1)))))
-      (failure "http-req expects two strings: method and url"))))
+  (let (n (list-len args))
+    (if (i32.or (i32.lt_s n 2) (i32.gt_s n 4)) (failure "http-req expects (http-req method url [headers [body]])")
+      (if (i32.eq (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) 0)
+        (failure "http-req expects two strings: method and url")
+        (if (i32.and (i32.ge_s n 3) (i32.eq (env-pairs? (list-get args 2)) 0))
+          (failure "http-req headers must be a list of (name value) string pairs")
+          (if (i32.and (i32.eq n 4) (i32.eq (i32.or (string-arg? (list-get args 3)) (bytes-arg? (list-get args 3))) 0))
+            (failure "http-req body must be a string or bytes")
+            (unmarshal (raw-invoke "theater:simple/http-client" "request"
+              (http-request-full (as-string (list-get args 0)) (as-string (list-get args 1))
+                (if (i32.ge_s n 3) (items-of (list-get args 2)) (list-new value))
+                (if (i32.eq n 4)
+                  (compound (http-body-type) "some" (list-push (list-new value) (str-to-bytes (list-get args 3))))
+                  (compound (http-body-type) "none" (list-new value))))))))))))
 (fn apply-http-get ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "http-get expects (http-get url)")
     (if (string-arg? (list-get args 0))
@@ -1704,7 +1728,7 @@
           (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n           durable: (fs-write-durable p text) replaces p all-or-nothing, on disk when it returns   (fs-sync p) (fs-sync-dir p) (fs-rename from to)\n"
-                (string-append "http:      (http-get url) (http-req method url)        assembler: (wat-to-wasm wat-text)\n"
+                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
