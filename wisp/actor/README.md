@@ -125,12 +125,15 @@ Changes to the host itself (this crate) still need a daemon restart.
 ### Services: a boot list, restarted when they die
 
 The config file (`--config PATH`, else `~/.config/theater-repl/config.toml`)
-grants the sessions' filesystem root, and can list **services**: sessions that
-`serve` creates at start and keeps running.
+grants the sessions' filesystem root and the hosts they may reach over HTTP, and
+can list **services**: sessions that `serve` creates at start and keeps running.
 
 ```toml
 [filesystem]
 root = "~/srv/fs"            # sessions' filesystem; start files live under it
+
+[http]
+allowed_hosts = ["api.weather.gov", "gbfs.citibikenyc.com"]
 
 [[service]]
 name = "web"                 # the session's name
@@ -140,6 +143,14 @@ restart = "permanent"        # permanent | transient | temporary
 max_restarts = 5             # more restarts than this within period_secs,
 period_secs = 60             #   and the daemon gives up
 ```
+
+`[http] allowed_hosts` is the http-client allowlist: an exact match on the URL's
+host (no port, no wildcards; `localhost` and `127.0.0.1` are different hosts), as
+Theater's handler checks it. A request to any other host fails with
+`host '...' not in allowed_hosts` before it is sent. Without an `[http]` section
+the built-in list applies (example.com, api.github.com, httpbin.org,
+raw.githubusercontent.com); a section replaces it, and `[http]` with no
+`allowed_hosts` allows none. The daemon reads it at start.
 
 For each service the daemon creates a session under its name and evaluates the
 start file in it, as `theater-repl new web && theater-repl eval web - < serve.wisp`
@@ -235,7 +246,7 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 | runtime (manage actors) | `(list-actors)` · `(actor-status id)` · `(actor-state id)`¹ · `(actor-manifest id)` · `(stop-actor id)` · `(kill-actor id)` · `(subscribe-spawns)` · `(unsubscribe-spawns)` · `(shutdown-runtime)` |
 | message-server | `(msg-register)` · `(msg-send id text)` · `(msg-request id text)` · `(msg-list-requests)` · `(msg-respond req text)` · `(msg-cancel req)` · `(msg-open id text)` · `(msg-send-channel cid text)` · `(msg-close-channel cid)` |
 | filesystem² | `(fs-read p)` (bytes) · `(fs-read-text p)` (a string) · `(fs-write p text)` · `(fs-exists p)` · `(fs-list p)` · `(fs-meta p)` · `(fs-append p text)` · `(fs-delete p)` · `(fs-mkdir p)` · `(fs-rmdir p)` · `(fs-write-durable p text)` (all-or-nothing, on disk when it returns) · `(fs-sync p)` · `(fs-sync-dir p)` · `(fs-rename from to)` |
-| http-client³ | `(http-get url)` · `(http-req method url)` |
+| http-client³ | `(http-get url)` · `(http-req method url [headers [body]])`, headers `((name value) …)`, body a string or bytes → `(ok (http-response status headers body))` |
 | assembler | `(wat-to-wasm wat-text)` → wasm bytes |
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
@@ -250,8 +261,8 @@ as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
 service its own request mid-eval), so they now return an immediate error instead
 of hanging. Query *other* actors; for your own metadata use `(describe (self))`,
 which Theater serves without calling back into the actor. ² filesystem paths are relative to the sandbox root (the dir
-`serve` runs in). ³ http hosts are an exact-match allowlist set when the host
-registers the handler.
+`serve` runs in). ³ http hosts are an exact-match allowlist, `[http] allowed_hosts`
+in the config (see Services, above).
 
 ⁴ TCP works both directions (verified live). **Client:** `(tcp-connect addr)` →
 connection id; `(tcp-send conn text)` → byte count; `(tcp-receive conn max)` →

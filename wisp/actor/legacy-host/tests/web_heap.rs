@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use wisp_interpreter_actor::{FsAccess, Runtime, Session, source::SourceBundle};
+use wisp_interpreter_actor::{FsAccess, Grants, Runtime, Session, source::SourceBundle};
 
 fn actor_path() -> PathBuf {
     std::env::var_os("WISP_ACTOR_WASM")
@@ -76,7 +76,11 @@ async fn test_web_server_requests_keep_memory_flat() -> anyhow::Result<()> {
         root: Some(root.clone()),
         ..Default::default()
     };
-    let runtime = Runtime::new(SourceBundle::default(), fs).await?;
+    let grants = Grants {
+        fs,
+        ..Default::default()
+    };
+    let runtime = Runtime::new(SourceBundle::default(), grants).await?;
     let session = runtime.spawn(wasm).await?;
     // site/serve.wisp, on a free port.
     for form in [

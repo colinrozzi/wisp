@@ -53,6 +53,37 @@ impl Default for FsAccess {
     }
 }
 
+/// Which hosts the REPL actor's http-client capability may reach: an exact
+/// match on the URL's host (no port, no wildcard), as Theater's handler checks
+/// it. The default is the historical seed list; a config `[http]` section
+/// replaces it.
+pub struct HttpAccess {
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for HttpAccess {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: [
+                "example.com",
+                "api.github.com",
+                "httpbin.org",
+                "raw.githubusercontent.com",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+}
+
+/// The capabilities the human grants the REPL actor (the role an actor
+/// manifest plays in real Theater).
+#[derive(Default)]
+pub struct Grants {
+    pub fs: FsAccess,
+    pub http: HttpAccess,
+}
+
 pub struct Runtime {
     pub commands: mpsc::UnboundedSender<TheaterCommand>,
     /// The session directory (the runtime's interpreter actors, plus the daemon's
@@ -74,8 +105,8 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub async fn new(bundle: source::SourceBundle, fs: FsAccess) -> Result<Self> {
-        Self::with_chain(bundle, fs, None, None).await
+    pub async fn new(bundle: source::SourceBundle, grants: Grants) -> Result<Self> {
+        Self::with_chain(bundle, grants, None, None).await
     }
 
     /// A runtime that replays `replay` (a chain recorded earlier) instead of
@@ -84,10 +115,11 @@ impl Runtime {
     /// handler is still registered (the actor's imports must link).
     pub async fn with_chain(
         bundle: source::SourceBundle,
-        fs: FsAccess,
+        grants: Grants,
         replay: Option<Vec<ChainEvent>>,
         chain: Option<mpsc::Sender<(TheaterId, ChainEvent)>>,
     ) -> Result<Self> {
+        let Grants { fs, http } = grants;
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
@@ -153,16 +185,11 @@ impl Runtime {
         handlers.register(theater_handler_terminal::TerminalHandler::new(
             theater_handler_terminal::TerminalHandlerConfig::default(),
         ));
-        // Outbound HTTP. allowed_hosts is an exact-match allowlist (no wildcard);
-        // seed a few well-known hosts so the REPL can make real requests.
+        // Outbound HTTP. allowed_hosts is an exact-match allowlist (no wildcard),
+        // from config `[http]` or the default seed list (see [`HttpAccess`]).
         handlers.register(theater_handler_http_client::HttpClientHandler::new(
             theater::config::actor_manifest::HttpClientHandlerConfig {
-                allowed_hosts: vec![
-                    "example.com".to_string(),
-                    "api.github.com".to_string(),
-                    "httpbin.org".to_string(),
-                    "raw.githubusercontent.com".to_string(),
-                ],
+                allowed_hosts: http.allowed_hosts,
             },
         ));
         // Raw TCP + UDP sockets and Podman container control.
