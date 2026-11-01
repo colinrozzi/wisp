@@ -632,6 +632,20 @@ async fn read_text_session(first: &mut WasmtimeInstance, files: &Files) {
         evaluate(first, "(fs-read-text \"missing.txt\")").await,
         "(err (list u8) string \"no such file\")"
     );
+    // The same match takes a host result and one a library built.
+    evaluate(
+        first,
+        "(define read-or-fail (lambda (path) (match (fs-read-text path) ((ok s) (ok (string-len s))) ((err e) (err e)))))",
+    )
+    .await;
+    assert_eq!(
+        evaluate(first, "(read-or-fail \"notes.txt\")").await,
+        "(ok s32 (tuple) 8)"
+    );
+    assert_eq!(
+        evaluate(first, "(read-or-fail \"missing.txt\")").await,
+        "(err (tuple) string \"no such file\")"
+    );
 }
 
 // (reload NAME) re-reads a loaded module from its original source and refreshes

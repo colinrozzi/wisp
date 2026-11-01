@@ -2584,3 +2584,74 @@ fn test_syntax_case_failures_do_not_publish() {
     assert!(out.contains("macro expansion step limit"), "{out}");
     assert_eq!(s.evaluate("(good)").unwrap(), "42");
 }
+
+#[test]
+fn test_inferred_result_constructors() {
+    let mut s = session();
+    for (source, expected) in [
+        // Same printing as a host result: (case ok-type err-type payload).
+        ("(ok 1)", "(ok s32 (tuple) 1)"),
+        ("(err \"x\")", "(err (tuple) string \"x\")"),
+        (
+            "(ok (list 1 \"a\"))",
+            "(ok (tuple s32 string) (tuple) (1 \"a\"))",
+        ),
+        ("(ok (list))", "(ok (tuple) (tuple) ())"),
+        ("(err 'nope)", "(err (tuple) (tuple) nope)"),
+        (
+            "(ok (ok 1))",
+            "(ok (result s32 (tuple)) (tuple) (ok s32 (tuple) 1))",
+        ),
+        // The form they print as builds the same value.
+        ("(ok s32 (tuple) 1)", "(ok s32 (tuple) 1)"),
+        // Matching.
+        ("(match (ok 7) ((ok v) v) ((err e) e))", "7"),
+        ("(match (err \"x\") ((ok v) v) ((err e) e))", "\"x\""),
+        (
+            "(match (ok (lambda (x) x)) ((ok f) (f 3)) ((err e) e))",
+            "3",
+        ),
+        // Through a closure.
+        (
+            "(define safe (lambda (n) (if n (ok n) (err \"zero\"))))",
+            "#<closure>",
+        ),
+        (
+            "(define unwrap (lambda (r) (match r ((ok v) v) ((err e) e))))",
+            "#<closure>",
+        ),
+        ("(unwrap (safe 2))", "2"),
+        ("(unwrap (safe 0))", "\"zero\""),
+        // The payload is evaluated once, in the caller's scope.
+        ("(let (x 5) (ok (+ x 1)))", "(ok s32 (tuple) 6)"),
+        // The wire keeps the labels.
+        ("(unmarshal (marshal (ok 1)))", "(ok s32 (tuple) 1)"),
+        (
+            "(unmarshal (marshal (err \"x\")))",
+            "(err (tuple) string \"x\")",
+        ),
+        (
+            "(unmarshal (marshal (ok (list 1 \"a\"))))",
+            "(ok (tuple s32 string) (tuple) (1 \"a\"))",
+        ),
+        // Through a generic function: the payload is not a type position.
+        (
+            "(fn wrap ((x T)) (result T (tuple)) (where T) (ok x)) (wrap 42)",
+            "(ok s32 (tuple) 42)",
+        ),
+    ] {
+        assert_eq!(s.evaluate(source).unwrap(), expected, "{source}");
+    }
+    for source in [
+        // Failures propagate rather than being wrapped.
+        "(ok unbound-name)",
+        // A typed slot still wants the typed form: the labels differ.
+        "(fn typed () (result s32 string) (ok 1)) (typed)",
+        // Only one and three arguments construct.
+        "(ok 1 2)",
+        "(match (ok 1) ((ok) 0))",
+    ] {
+        let output = s.evaluate(source).unwrap();
+        assert!(output.starts_with("error:"), "{source}: {output}");
+    }
+}

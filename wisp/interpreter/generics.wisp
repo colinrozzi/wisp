@@ -137,7 +137,7 @@
     (let (item (list-get items index))
       (let (type-position
         (if (i32.or (string=? name "list-new") (i32.or (string=? name "some") (string=? name "none"))) (i32.eq index 1)
-          (if (i32.or (string=? name "ok") (string=? name "err")) (i32.or (i32.eq index 1) (i32.eq index 2))
+          (if (i32.or (string=? name "ok") (string=? name "err")) (i32.and (i32.eq (list-len items) 4) (i32.or (i32.eq index 1) (i32.eq index 2)))
             (if (if (i32.eq (list-len items) 3) (string=? (symbol-name (list-get items 1)) ":") 0) (i32.eq index 2) 0))))
         (let (next (if type-position (substitute-type item bindings)
           (if (i32.and (string=? name "lambda") (i32.eq index 1)) item

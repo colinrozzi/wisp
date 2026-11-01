@@ -59,9 +59,32 @@
 (fn collection-builtin? ((name string)) s32
   (i32.or (string=? name "tuple")
     (i32.or (string=? name "list-push") (i32.or (string=? name "list-get") (string=? name "list-len")))))
+; The label for a payload of (ok v) / (err e): its type, the tuple marshal encodes
+; for an untyped list, and otherwise (closures, symbols) the empty tuple marshal
+; encodes as a placeholder.
+(fn inferred-type ((v value)) value
+  (value-case v
+    ((sequence items) (inferred-types items 0 (list-push (list-new value) (symbol "tuple"))))
+    (else
+      (let (ty (value-type v))
+        (if (failed? ty) (sequence (list-push (list-new value) (symbol "tuple"))) ty)))))
+(fn inferred-types ((items (list value)) (index s32) (out (list value))) value
+  (if (i32.ge_s index (list-len items)) (sequence out)
+    (inferred-types items (i32.add index 1) (list-push out (inferred-type (list-get items index))))))
+; (ok v) / (err e) infer the payload's label; the other side is (tuple), as a host
+; result prints the side it does not declare. So (ok 1) is (ok s32 (tuple) 1).
+(fn eval-inferred-result ((name string) (expr value) (env (list binding)) (depth s32)) value
+  (let (payload (eval expr env (i32.add depth 1) 0))
+    (if (failed? payload) payload
+      (let (ty (inferred-type payload))
+        (let (other (sequence (list-push (list-new value) (symbol "tuple"))))
+          (compound (if (string=? name "ok") (result-type ty other) (result-type other ty))
+            name (list-push (list-new value) payload)))))))
 (fn eval-collection-form ((name string) (items (list value)) (env (list binding)) (depth s32)) value
   (let (empty (i32.or (string=? name "list-new") (string=? name "none")))
     (let (result (i32.or (string=? name "ok") (string=? name "err")))
+      (if (i32.and result (i32.eq (list-len items) 2))
+        (eval-inferred-result name (list-get items 1) env depth)
       (if (i32.ne (list-len items) (if empty 2 (if result 4 3)))
         (failure "wrong number of constructor arguments")
         (let (first (list-get items 1))
@@ -73,7 +96,7 @@
                     (let (payload-type (if (string=? name "err") (list-get items 2) first))
                       (let (payload (require-type
                         (eval-expected (list-get items (i32.sub (list-len items) 1)) env (i32.add depth 1) 0 (symbol-name payload-type)) payload-type))
-                        (if (failed? payload) payload (compound ty name (list-push (list-new value) payload)))))))))))))))
+                        (if (failed? payload) payload (compound ty name (list-push (list-new value) payload))))))))))))))))
 
 ; The second list-push argument can adopt the list's element type when it is
 ; a literal. Stored values retain their types. Evaluation remains left-to-right.

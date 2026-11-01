@@ -238,6 +238,8 @@ shorthand is not supported.
 Every verb hands results back as ordinary, inspectable Wisp values (records,
 variants, lists, options…). Results are left **faithful**, e.g. a `result` prints
 as `(ok <ok-ty> <err-ty> <value>)` / `(err …)`.
+A library can return the same shape with `(ok v)` / `(err e)`; see
+[the interpreter README](../interpreter/README.md) for the labels they print.
 
 | Interface | Verbs |
 | --- | --- |
