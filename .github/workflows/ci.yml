@@ -1,10 +1,15 @@
 name: CI
 
+# Pull requests run the quick checks (Format, Clippy, Build) and merge on those.
+# A push to main runs everything; when all of it passes, release.yml publishes a
+# release. workflow_dispatch runs everything on any branch, for a PR that wants
+# the full suite before it merges. See CONTRIBUTING.md.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   fmt:
@@ -15,44 +20,15 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: Check formatting
-        run: nix develop -c cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - name: Run clippy
-        run: nix develop -c cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - name: Build
-        run: nix develop -c cargo build --locked --workspace --all-targets
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-      - uses: Swatinem/rust-cache@v2
-      - name: Run tests
-        run: nix develop -c cargo test --locked --workspace -- --test-threads=2
+        run: |
+          nix develop -c cargo fmt --all -- --check
+          nix develop -c cargo fmt --manifest-path wisp/actor/legacy-host/Cargo.toml -- --check
 
   # The theater-repl daemon (wisp/actor/legacy-host) is its own Cargo workspace,
-  # so the jobs above never build or test it. It builds Theater from git; the
-  # cache keeps the second run fast.
-  legacy-host:
-    name: Daemon tests (legacy-host)
+  # so Clippy and Build each cover it separately. It builds Theater from git; the
+  # cache keeps later runs fast. Its build.rs generates wisp/actor/actor.wasm.
+  clippy:
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,10 +39,52 @@ jobs:
           workspaces: |
             . -> target
             wisp/actor/legacy-host -> target
-      # The tests load the checked-in actor.wasm; fail if it is stale.
-      - name: actor.wasm matches its source
-        run: nix develop -c bash wisp/actor/build.sh && git diff --exit-code --stat wisp/actor/actor.wasm
-      - name: Clippy
+      - name: Run clippy
+        run: nix develop -c cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Run clippy on the daemon
         run: nix develop -c cargo clippy --locked --manifest-path wisp/actor/legacy-host/Cargo.toml --all-targets -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            wisp/actor/legacy-host -> target
+      - name: Build
+        run: nix develop -c cargo build --locked --workspace --all-targets
+      - name: Build the daemon
+        run: nix develop -c cargo build --locked --manifest-path wisp/actor/legacy-host/Cargo.toml --all-targets
+
+  test:
+    name: Test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: nix develop -c cargo test --locked --workspace -- --test-threads=2
+
+  legacy-host:
+    name: Daemon tests (legacy-host)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            wisp/actor/legacy-host -> target
       - name: Run tests
         run: nix develop -c cargo test --locked --manifest-path wisp/actor/legacy-host/Cargo.toml -- --test-threads=2
