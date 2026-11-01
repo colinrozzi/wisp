@@ -330,6 +330,21 @@ impl Guest {
                 Value::String("chain not exercised".into()),
             );
         }
+        for name in [
+            "sha256",
+            "key-new",
+            "key-public",
+            "key-list",
+            "sign",
+            "verify",
+        ] {
+            mock_import(
+                &mut linker,
+                "wisp-crypto",
+                name,
+                Value::String("crypto not exercised".into()),
+            );
+        }
         // Any other host import the evaluator declares (store.get/...) traps.
         linker.define_unknown_imports_as_traps(&module).unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
