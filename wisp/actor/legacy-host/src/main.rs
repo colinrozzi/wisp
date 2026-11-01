@@ -20,6 +20,25 @@ const EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), 
 /// The immutable source bundle served to the guest for relative `(include …)`.
 const EMBEDDED_SOURCES: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../sources.json"));
+/// The Wisp standard library (`wisp/std/`), served as `(require list "std/list.wisp")`
+/// on every daemon, whatever its filesystem root.
+const STD_SOURCES: &[(&str, &str)] = &[
+    (
+        "std/list.wisp",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../std/list.wisp")),
+    ),
+    (
+        "std/str.wisp",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../std/str.wisp")),
+    ),
+    (
+        "std/result.wisp",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../std/result.wisp"
+        )),
+    ),
+];
 
 const VERSION: &str = env!("THEATER_REPL_VERSION");
 
@@ -34,7 +53,8 @@ struct Args {
     /// the copies built into the binary (for hacking on the REPL itself).
     #[arg(long, global = true)]
     actor_dir: Option<PathBuf>,
-    /// JSON object mapping bundle paths to source strings; overrides the built-in bundle.
+    /// JSON object mapping bundle paths to source strings; replaces the built-in bundle, except
+    /// that the standard library (std/*) stays unless this file has its own entry for that path.
     #[arg(long, global = true)]
     bundle: Option<PathBuf>,
     /// Path to a theater-repl config file (TOML). Without one, the default config
@@ -395,7 +415,14 @@ fn fs_access(config: &ReplConfig) -> Result<wisp_interpreter_actor::FsAccess> {
 }
 
 async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
-    let sources: BTreeMap<String, String> = serde_json::from_str(&loaded.bundle_json)?;
+    // The standard library is in every bundle; a bundle's own entry for the same
+    // path wins.
+    let mut sources: BTreeMap<String, String> = STD_SOURCES
+        .iter()
+        .map(|(path, text)| (path.to_string(), text.to_string()))
+        .collect();
+    let bundled: BTreeMap<String, String> = serde_json::from_str(&loaded.bundle_json)?;
+    sources.extend(bundled);
     let http = match &config.http {
         Some(http) => wisp_interpreter_actor::HttpAccess {
             allowed_hosts: http.allowed_hosts.clone(),

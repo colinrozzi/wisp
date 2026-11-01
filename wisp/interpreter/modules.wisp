@@ -183,8 +183,21 @@
   (i32.and (i32.eq (char-at s 0) 104)
     (i32.and (i32.eq (char-at s 1) 116)
       (i32.and (i32.eq (char-at s 2) 116) (i32.eq (char-at s 3) 112)))))
+; A path the filesystem cannot give (absent, or the capability denied) falls back
+; to the daemon's source bundle, which is how std/* reaches every session whatever
+; its filesystem root. Disk comes first, so a file at the same path shadows the
+; bundled one. If the bundle has no such path either, report the filesystem error.
+(fn read-source-from-bundle ((path string) (not-found value)) value
+  (match (resolve-path "" path)
+    ((err message) not-found)
+    ((ok canonical)
+      (match (read-source canonical)
+        ((err message) not-found)
+        ((ok source) (text source))))))
 (fn read-source-at ((source string)) value
-  (if (url-source? source) (read-source-from-url source) (read-source-from-path source)))
+  (if (url-source? source) (read-source-from-url source)
+    (let (on-disk (read-source-from-path source))
+      (if (failed? on-disk) (read-source-from-bundle source on-disk) on-disk))))
 
 ; Load an explicit source as a module and evaluate its forms at top level. A
 ; well-formed file defines (module NAME ...), which registers NAME in $modules on
