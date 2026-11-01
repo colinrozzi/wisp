@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use pack::abi::{Value, ValueType};
-use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, Store, TypedFunc};
 
 const FILE_LIMIT: usize = 65536;
 const SOURCE_LIMIT: usize = 1024 * 1024;
@@ -124,6 +124,14 @@ fn source_import(
     Ok(0)
 }
 
+/// A compiled interpreter, linked and ready to instantiate. Compiling is the slow
+/// part of a load; every session from one image shares that work and its Engine
+/// (fuel, tail calls), but owns its Store, memory and globals, so nothing leaks
+/// between sessions.
+pub struct InterpreterImage {
+    instance_pre: InstancePre<SourceBudget>,
+}
+
 pub struct Interpreter {
     store: Store<SourceBudget>,
     memory: Memory,
@@ -131,8 +139,8 @@ pub struct Interpreter {
     evaluate: TypedFunc<(i32, i32, i32, i32), i32>,
 }
 
-impl Interpreter {
-    /// Load an already compiled interpreter. Reuse this instance across inputs.
+impl InterpreterImage {
+    /// Compile an interpreter package. Create sessions from it with `session`.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let mut config = Config::new();
         config.wasm_tail_call(true);
@@ -140,7 +148,6 @@ impl Interpreter {
         config.consume_fuel(true);
         let engine = Engine::new(&config)?;
         let module = Module::from_file(&engine, path)?;
-        let mut store = Store::new(&engine, SourceBudget::default());
         let mut linker = Linker::new(&engine);
         linker.func_wrap(
             "wisp-source",
@@ -179,8 +186,17 @@ impl Interpreter {
         // traps if invoked — the local host has no Theater. One line instead of a
         // stub per import; real Theater supplies them all.
         linker.define_unknown_imports_as_traps(&module)?;
-        let instance = linker.instantiate(&mut store, &module)?;
         Ok(Self {
+            instance_pre: linker.instantiate_pre(&module)?,
+        })
+    }
+
+    /// Start a fresh session: a new Store and instance of the compiled image.
+    pub fn session(&self) -> Result<Interpreter> {
+        let engine = self.instance_pre.module().engine();
+        let mut store = Store::new(engine, SourceBudget::default());
+        let instance = self.instance_pre.instantiate(&mut store)?;
+        Ok(Interpreter {
             memory: instance
                 .get_memory(&mut store, "memory")
                 .context("interpreter has no memory")?,
@@ -188,6 +204,14 @@ impl Interpreter {
             evaluate: instance.get_typed_func(&mut store, "evaluate-from")?,
             store,
         })
+    }
+}
+
+impl Interpreter {
+    /// Load an already compiled interpreter. Reuse this instance across inputs.
+    /// To start several sessions, use `InterpreterImage`, which compiles once.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        InterpreterImage::load(path)?.session()
     }
 
     /// Return the printed value or reader/evaluator diagnostic for an input.

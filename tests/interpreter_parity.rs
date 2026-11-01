@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use granite::{compiler, interpreter::Interpreter};
+use granite::{
+    compiler,
+    interpreter::{Interpreter, InterpreterImage},
+};
 use pack::abi::{Value, ValueType};
 use wasmtime::Module;
 
@@ -36,12 +39,17 @@ fn compile(source: &Path, name: &str) -> PathBuf {
     })
 }
 fn session() -> Interpreter {
-    static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
-    Interpreter::load(
-        PACKAGE
-            .get_or_init(|| compile(&root().join("wisp/interpreter/evaluator.wisp"), "evaluator")),
-    )
-    .unwrap()
+    static IMAGE: OnceLock<InterpreterImage> = OnceLock::new();
+    IMAGE
+        .get_or_init(|| {
+            InterpreterImage::load(compile(
+                &root().join("wisp/interpreter/evaluator.wisp"),
+                "evaluator",
+            ))
+            .unwrap()
+        })
+        .session()
+        .unwrap()
 }
 fn self_hosted_compiler() -> &'static Module {
     static MODULE: OnceLock<Module> = OnceLock::new();

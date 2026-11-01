@@ -92,17 +92,26 @@ fn mock_import(linker: &mut Linker<()>, module: &'static str, name: &'static str
         .unwrap();
 }
 
-impl Guest {
-    fn new() -> Self {
+// Compiled once per test binary; each Guest gets its own Store and instance.
+fn module() -> &'static Module {
+    static MODULE: OnceLock<Module> = OnceLock::new();
+    MODULE.get_or_init(|| {
         let mut config = Config::new();
         config.wasm_tail_call(true);
         let engine = Engine::new(&config).unwrap();
-        let module = Module::from_file(&engine, package()).unwrap();
-        let mut store = Store::new(&engine, ());
+        Module::from_file(&engine, package()).unwrap()
+    })
+}
+
+impl Guest {
+    fn new() -> Self {
+        let module = module();
+        let engine = module.engine();
+        let mut store = Store::new(engine, ());
         // The codec now lives in the full interpreter, which imports wisp-source
         // for `(include ...)`. The marshal tests never trigger includes, so these
         // are unreachable stubs that only need to exist to satisfy linking.
-        let mut linker = Linker::new(&engine);
+        let mut linker = Linker::new(engine);
         for name in ["resolve-path", "read-source"] {
             linker
                 .func_wrap(
@@ -331,8 +340,8 @@ impl Guest {
             );
         }
         // Any other host import the evaluator declares (store.get/...) traps.
-        linker.define_unknown_imports_as_traps(&module).unwrap();
-        let instance = linker.instantiate(&mut store, &module).unwrap();
+        linker.define_unknown_imports_as_traps(module).unwrap();
+        let instance = linker.instantiate(&mut store, module).unwrap();
         let memory = instance.get_memory(&mut store, "memory").unwrap();
         Self {
             store,

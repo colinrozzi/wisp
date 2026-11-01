@@ -36,3 +36,8 @@ anyhow = "1.0"
 packr-core = "=0.24.1"
 packr-wasmtime = "=0.24.1"
 tokio = { version = "1", features = ["rt"] }
+
+# The tests JIT-compile large wasm modules; an unoptimized Cranelift is the slow
+# part. Applies to dependencies only, so workspace crates still rebuild quickly.
+[profile.dev.package."*"]
+opt-level = 2
