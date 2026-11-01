@@ -21,8 +21,12 @@ fn main() {
     println!("cargo:rustc-env=THEATER_REPL_VERSION={version}");
     println!("cargo:rerun-if-env-changed=THEATER_REPL_VERSION");
     // Re-stamp when the checked-out commit/tag moves.
-    for path in ["../../../.git/HEAD", "../../../.git/packed-refs"] {
-        println!("cargo:rerun-if-changed={path}");
+    // Ask git where they are: in a worktree `.git` is a file, and a path that doesn't
+    // exist would rerun this script, and so recompile the actor, on every build.
+    for name in ["HEAD", "packed-refs"] {
+        if let Some(path) = git_path(name).filter(|p| Path::new(p).exists()) {
+            println!("cargo:rerun-if-changed={path}");
+        }
     }
 }
 
@@ -76,6 +80,17 @@ fn publish(from: &Path, to: &Path) {
     let temporary = to.with_extension(format!("wasm.{}", std::process::id()));
     std::fs::write(&temporary, &bytes).unwrap();
     std::fs::rename(&temporary, to).unwrap();
+}
+
+fn git_path(name: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-path", name])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn git_describe() -> Option<String> {
