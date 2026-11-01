@@ -1,19 +1,28 @@
 name: release theater-repl
 
-# The supported path for publishing a theater-repl binary. Push a tag like
-# v0.1.0 and this builds the self-contained binary and attaches it to a GitHub
-# release, which is where install.sh (/releases/latest/download) fetches it.
+# The one path that publishes a theater-repl binary: when every CI job passes on a
+# push to main, build that commit's self-contained binary and attach it to a new
+# GitHub release, which is where install.sh (/releases/latest/download) fetches it.
+# A red commit never gets here. If this workflow itself fails, re-run it from the
+# Actions tab. A workflow_run workflow always runs from main's copy of this file.
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: write
 
+# One at a time, so two green commits can't pick the same tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   linux-x86_64:
+    # event == push: branches above also matches a pull request from a fork's main.
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     # Build a fully-static musl binary: no dynamic loader, so one asset runs on
     # every Linux — glibc distros, Alpine, AND NixOS (which ships no generic
     # /lib64 loader). aws-lc-sys is in the tree, so install musl-tools + cmake and
@@ -22,44 +31,61 @@ jobs:
     env:
       TARGET: x86_64-unknown-linux-musl
       CC_x86_64_unknown_linux_musl: musl-gcc
-      # Stamp the release tag (e.g. v0.1.3) into the binary for `theater-repl version`.
-      THEATER_REPL_VERSION: ${{ github.ref_name }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Pick the tag
+        id: tag
+        run: |
+          tag="$(bash .github/next-release-tag.sh "$SHA")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release: ${tag:-none}"
 
       - name: Install build tools (musl toolchain + cmake for aws-lc-sys)
+        if: steps.tag.outputs.tag != ''
         run: sudo apt-get update && sudo apt-get install -y musl-tools cmake
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.tag.outputs.tag != ''
         with:
           targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
+        if: steps.tag.outputs.tag != ''
         with:
           workspaces: |
             .
             wisp/actor/legacy-host
 
-      - name: Build the actor (embeds into the binary)
-        # The compiler (granite) is a host tool built for the native (glibc) target.
-        # A debug build is fine and much faster: the emitted actor.wasm doesn't depend
-        # on granite's own optimization level (this is exactly what wisp/actor/build.sh
-        # does locally), so skip a release build of the compiler.
-        run: cargo run -- compile wisp/actor/actor.wisp wisp/actor/actor
-
+      # build.rs compiles the actor with Granite, a build-dependency: built for the
+      # native (glibc) host and unoptimized, which doesn't change the actor.wasm it emits.
       - name: Build theater-repl (static musl)
+        if: steps.tag.outputs.tag != ''
         working-directory: wisp/actor/legacy-host
+        # Stamp the release tag (e.g. v0.1.3) into the binary for `theater-repl version`.
+        env:
+          THEATER_REPL_VERSION: ${{ steps.tag.outputs.tag }}
         run: cargo build --release --target "$TARGET"
 
       - name: Stage asset
+        if: steps.tag.outputs.tag != ''
         run: |
           install -m755 "wisp/actor/legacy-host/target/$TARGET/release/theater-repl" theater-repl-linux-x86_64
           strip theater-repl-linux-x86_64 || true
           file theater-repl-linux-x86_64
           ./theater-repl-linux-x86_64 --help
+          ./theater-repl-linux-x86_64 version | grep -F "${{ steps.tag.outputs.tag }}"
 
-      - name: Publish to the release
+      # Last, so a failed build leaves no tag behind. This creates the tag.
+      - name: Publish the release
+        if: steps.tag.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.event.workflow_run.head_sha }}
           files: theater-repl-linux-x86_64
           fail_on_unmatched_files: true

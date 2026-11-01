@@ -14,9 +14,9 @@ use wisp_interpreter_actor::{
 
 mod boot;
 
-/// The actor built into the binary (produced by actors/wisp-repl/build.sh). A
-/// released theater-repl is self-contained: it carries its own actor + bundle.
-const EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../actor.wasm"));
+/// The actor built into the binary (compiled by build.rs). A released
+/// theater-repl is self-contained: it carries its own actor + bundle.
+const EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/actor.wasm"));
 /// The immutable source bundle served to the guest for relative `(include …)`.
 const EMBEDDED_SOURCES: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../sources.json"));

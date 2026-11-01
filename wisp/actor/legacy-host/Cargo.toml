@@ -12,7 +12,7 @@ edition = "2024"
 name = "theater-repl"
 path = "src/main.rs"
 
-# The host loads a prebuilt actor.wasm and runs it under a local Theater runtime.
+# The host embeds the actor.wasm build.rs generates and runs it under a local Theater runtime.
 # It also embeds the shared Rust interpreter (`wisp`) so a session can evaluate
 # forms host-side and reach the live runtime through a `TheaterHost` — the
 # convergence onto one interpreter (see src/theater_host.rs).
@@ -48,6 +48,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.dev]
 debug = 0
+
+# build.rs compiles the Wisp actor with Granite in-process (no nested cargo).
+[build-dependencies]
+granite = { path = "../../.." }
 
 # tests/support builds a tiny RPC relay guest by hand (Pack metadata + WAT).
 [dev-dependencies]

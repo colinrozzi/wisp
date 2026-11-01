@@ -5,8 +5,9 @@ persistent session. The local host supplies immutable source bundles and routes
 calls through Theater's mailbox; it does not evaluate Wisp itself.
 
 The source and shareable package live together in this directory; see [README.md](README.md).
-The `build` command compiles it explicitly; `repl` and `serve` load the built
-Wasm without compiling anything.
+`build.rs` compiles `../actor.wisp` whenever the actor's source or the compiler
+changes, so a plain `cargo build` here is all a fresh clone needs. `actor.wasm` is
+generated and not in git. `repl` and `serve` compile nothing at run time.
 
 This crate has its own Cargo workspace and lockfile. Theater is pinned by git
 rev in `Cargo.toml` (`cbb48982a66ab6adbf71b3ad9c6067a90c5dfb98` as of 2026-10-25).
@@ -24,7 +25,6 @@ From the repository root:
 
 ```sh
 nix develop .#theater
-./actors/wisp-repl/build.sh
 cargo run --locked --manifest-path wisp/actor/legacy-host/Cargo.toml -- repl
 ```
 
@@ -36,19 +36,29 @@ wisp> (add-two 40)
 wisp> :quit
 ```
 
-Build just the actor artifacts:
+Build just the actor, without building this crate:
 
 ```sh
-cargo run --locked --manifest-path wisp/actor/legacy-host/Cargo.toml -- build
+bash wisp/actor/build.sh
 ```
 
-This writes `actor.wasm` and `actor.wat` under `actors/wisp-repl/`, alongside the
-tracked manifest, interfaces, and bundle. `--actor-dir DIR` before the subcommand
-selects a different package directory. The build script additionally creates
-`target/wisp-repl.tar.gz` for sharing. The Wasm requires the `wisp-source` handler
-below: stock `theater
+Either way `wisp/actor/actor.wasm` appears beside the tracked manifest, interfaces,
+and bundle. The binary embeds its own copy; `--actor-dir DIR` before the subcommand
+loads `DIR/manifest.toml` and its package from disk instead (`actor.wasm` must be
+built first). The Wasm requires the `wisp-source` handler below: stock `theater
 spawn` does not register this project-specific handler. Use this host or register
 `SourceBundle` in the embedding runtime.
+
+### How the build behaves
+
+Granite is a build-dependency of this crate, so `build.rs` compiles the actor
+in-process, with no nested `cargo`. That matters with a shared build lock such as
+the experiment's `lib/shims/cargo`: the outer `cargo` holds the lock for the whole
+build, and a nested one would wait on it forever. Compiling the actor needs no
+lock of its own. Each worktree has its own `target/` and its own `actor.wasm`, and
+`build.rs` replaces the file by rename, so concurrent worktrees can't touch each
+other and a reader never sees half a file. Cargo itself serializes two builds in
+the same worktree.
 
 ## Socket REPL
 
