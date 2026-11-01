@@ -39,5 +39,8 @@ tokio = { version = "1", features = ["rt"] }
 
 # The tests JIT-compile large wasm modules; an unoptimized Cranelift is the slow
 # part. Applies to dependencies only, so workspace crates still rebuild quickly.
+# No debuginfo: optimized dependencies with it fill the CI disk across the many
+# test binaries.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
