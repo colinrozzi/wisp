@@ -73,7 +73,8 @@ cargo run -p wisp-repl
 
 # --- Wisp (the dynamic Lisp, as a Theater actor) ---
 
-# Rebuild the Wisp actor (wisp/actor/actor.wasm) after editing the interpreter
+# Rebuild the Wisp actor (wisp/actor/actor.wasm, generated, not in git) without
+# building the daemon. Building the daemon generates it too (its build.rs).
 bash wisp/actor/build.sh
 
 # Interactive Dynamic Wisp REPL (spawns the Wisp actor, evaluates the Lisp live)
@@ -195,6 +196,8 @@ wisp/actor/legacy-host/Cargo.toml --test theater_host`).
   `run_big_stack` rather than the default 2 MiB test stack.
 
 Test fixtures live in `tests/fixtures/` for manual `cargo run -- compile` checks.
+
+CI runs quick checks on pull requests and everything on main; see `CONTRIBUTING.md`.
 
 ## Coding Style
 

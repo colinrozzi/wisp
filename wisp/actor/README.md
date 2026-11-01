@@ -10,7 +10,8 @@ the working code into an actor.
 `actor.wisp` is the whole actor: it `(include …)`s the shared evaluator
 (`interpreter/evaluator.wisp`, which includes the codec `marshal.wisp` and the host
 bridge `rpc.wisp`) and declares the Theater ABI in Wisp. The stock compiler emits
-`actor.wasm`.
+`actor.wasm`, which is generated and not in git: building `legacy-host` or running
+`build.sh` writes it.
 
 ## Install and run (zero to a live REPL)
 
@@ -215,19 +216,20 @@ Needs a Rust toolchain and network access (crates.io for the compiler; GitHub fo
 the host's pinned Theater deps):
 
 ```sh
-# 1. Build the actor -> actors/wisp-repl/actor.wasm (embedded into the binary).
-#    Re-run after editing actor.wisp or any interpreter/*.wisp it includes.
-actors/wisp-repl/build.sh
-
-# 2. Build + run the host. First build pulls Theater from git (pinned rev) and is
-#    slow (~minutes); later builds are fast. --actor-dir loads the just-built actor
-#    from disk instead of the copy embedded at compile time.
-cd actors/wisp-repl/legacy-host && cargo build
-./target/debug/theater-repl --actor-dir .. serve
+# Build + run the host. Its build.rs compiles the actor (to wisp/actor/actor.wasm
+# and into the binary), again whenever actor.wisp, interpreter/*.wisp or the
+# compiler change. First build pulls Theater from git (pinned rev) and is slow
+# (~minutes); later builds are fast.
+cd wisp/actor/legacy-host && cargo build
+./target/debug/theater-repl serve
 ```
 
-Releases are published by `.github/workflows/release.yml` on a `v*` tag (the
-supported path); `install.sh` pulls the latest release asset. (`cargo run -p
+`--actor-dir ..` loads the actor from disk instead of the copy embedded at compile
+time; `bash wisp/actor/build.sh` refreshes that file without rebuilding the host.
+
+`.github/workflows/release.yml` publishes a release when all of main's CI passes
+(see [CONTRIBUTING.md](../../CONTRIBUTING.md)); `install.sh` pulls the latest
+release asset. (`cargo run -p
 test-runtime -- --repl` gives a pure-language REPL, but it traps the Theater host
 imports — use `theater-repl` above for the full surface.)
 
@@ -486,7 +488,7 @@ reclaim its heap. Validated against Theater rev
 | File | Purpose |
 | --- | --- |
 | `actor.wisp` | The actor: includes the evaluator, declares ABI + inbound callbacks |
-| `actor.wasm` | Compiled actor (interface-qualified exports + CGRF metadata) |
+| `actor.wasm` | Compiled actor, generated and not in git (interface-qualified exports + CGRF metadata) |
 | `manifest.toml` | Manifest; grants the `runtime` control capability |
 | `crypto.pact` | The `wisp-crypto` host interface (hashing, signing) |
 | `source.pact` / `sources.json` | The `wisp-source` host interface + example bundle |

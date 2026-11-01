@@ -535,15 +535,31 @@ fn export_called_10000_times_keeps_memory_flat() {
     }
 }
 
-/// The Wisp actor (committed `wisp/actor/actor.wasm`) declares a small, growable
-/// memory instead of a fixed 2 GiB.
+/// The Wisp actor declares a small, growable memory instead of a fixed 2 GiB.
 #[test]
 fn actor_memory_is_growable() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wisp/actor/actor.wasm");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let out = std::env::temp_dir().join(format!("granite_heap_actor_{}", std::process::id()));
+    // Compiling the actor recurses deeply: 1 GiB, as `granite` itself uses.
+    let path = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            compiler::compile(
+                &root.join("wisp/actor/actor.wisp"),
+                &out,
+                compiler::EmitOptions::default(),
+            )
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap()
+        .wasm;
     let mut config = Config::new();
     config.wasm_tail_call(true);
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_file(&engine, path).unwrap();
+    let module = Module::from_file(&engine, &path).unwrap();
+    std::fs::remove_file(&path).unwrap();
     let memory = module
         .exports()
         .find_map(|e| match e.ty() {
