@@ -266,6 +266,15 @@
 (import wisp-chain tail ((actor string) (n s32)) (result (list chain-event) string))
 (import wisp-chain verify ((actor string)) (result chain-check string))
 
+; wisp-crypto: the theater-repl daemon's hashing and signing (crypto.pact). Signing
+; keys stay in the daemon, in the [keys] directory; a session only names them.
+(import wisp-crypto sha256 ((data (list u8))) string)
+(import wisp-crypto key-new ((name string)) (result string string))
+(import wisp-crypto key-public ((name string)) (result string string))
+(import wisp-crypto key-list () (result (list string) string))
+(import wisp-crypto sign ((name string) (data (list u8))) (result string string))
+(import wisp-crypto verify ((public-key string) (signature string) (data (list u8))) bool)
+
 ; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
 ; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
 ; actor, so they need a peer to exercise; register/list-requests are self-contained.)
@@ -445,6 +454,12 @@
     ((string=? name "chain-head") 1)
     ((string=? name "chain-tail") 1)
     ((string=? name "chain-verify") 1)
+    ((string=? name "sha256") 1)
+    ((string=? name "key-new") 1)
+    ((string=? name "key-public") 1)
+    ((string=? name "key-list") 1)
+    ((string=? name "sign") 1)
+    ((string=? name "verify") 1)
     ((string=? name "msg-register") 1)
     ((string=? name "msg-send") 1)
     ((string=? name "msg-request") 1)
@@ -771,6 +786,49 @@
 (fn apply-sessions ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "sessions expects no arguments")
     (unmarshal (raw-invoke "wisp-sessions" "list-sessions" (arg-tuple (list-new value))))))
+
+; --- crypto (wisp-crypto) ----------------------------------------------------
+; (sha256 x) -> 64 hex chars, x a string or bytes. (key-new name) / (key-public name)
+; -> (ok public-key-hex). (key-list) -> (ok names); like the others it fails with no
+; [keys] section, so it wraps. (sign name text) -> (ok sig-hex), text a string or
+; bytes. (verify public-key-hex sig-hex text) -> true/false; bad hex is false.
+(fn all-bytes? ((items (list value)) (i s32)) s32
+  (if (i32.ge_s i (list-len items)) 1
+    (value-case (list-get items i)
+      ((byte-value b) (all-bytes? items (i32.add i 1)))
+      (else 0))))
+(fn crypto-data? ((v value)) s32
+  (value-case v
+    ((text s) 1)
+    ((typed-list element items) (all-bytes? items 0))
+    (else 0)))
+(fn apply-sha256 ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (crypto-data? (list-get args 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "sha256" (marshal (str-to-bytes (list-get args 0)))))
+    (failure "sha256 expects (sha256 string-or-bytes)")))
+(fn apply-key-new ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (string-arg? (list-get args 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "key-new" (marshal (list-get args 0))))
+    (failure "key-new expects (key-new name)")))
+(fn apply-key-public ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (string-arg? (list-get args 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "key-public" (marshal (list-get args 0))))
+    (failure "key-public expects (key-public name)")))
+(fn apply-key-list ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "key-list expects no arguments")
+    (unmarshal (raw-invoke "wisp-crypto" "key-list" (arg-tuple (list-new value))))))
+(fn apply-sign ((args (list value))) value
+  (if (if (i32.eq (list-len args) 2)
+        (i32.and (string-arg? (list-get args 0)) (crypto-data? (list-get args 1))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "sign"
+      (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (str-to-bytes (list-get args 1)))))))
+    (failure "sign expects (sign key-name text)")))
+(fn apply-verify ((args (list value))) value
+  (if (if (i32.eq (list-len args) 3)
+        (i32.and (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) (crypto-data? (list-get args 2))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "verify"
+      (marshal (sequence (list-push (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1)) (str-to-bytes (list-get args 2)))))))
+    (failure "verify expects (verify public-key-hex sig-hex text)")))
 
 ; --- chain recorder (wisp-chain) ---------------------------------------------
 ; (chain-watch id) starts recording actor id's chain; (chain-head id) ->
@@ -1728,7 +1786,7 @@
           (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n           durable: (fs-write-durable p text) replaces p all-or-nothing, on disk when it returns   (fs-sync p) (fs-sync-dir p) (fs-rename from to)\n"
-                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\n"
+                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\ncrypto:    (sha256 string-or-bytes) -> 64 hex chars   (verify public-key-hex sig-hex text) -> true/false\n           (key-new name) (key-public name) -> (ok public-key-hex)   (key-list) -> (ok names)   (sign name text) -> (ok sig-hex); keys stay in the daemon, config.toml [keys] dir\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
@@ -1777,6 +1835,12 @@
     ((string=? name "shutdown-runtime") (apply-runtime-shutdown args))
     ((string=? name "spawn-actor") (apply-spawn-actor args))
     ((string=? name "sessions") (apply-sessions args))
+    ((string=? name "sha256") (apply-sha256 args))
+    ((string=? name "key-new") (apply-key-new args))
+    ((string=? name "key-public") (apply-key-public args))
+    ((string=? name "key-list") (apply-key-list args))
+    ((string=? name "sign") (apply-sign args))
+    ((string=? name "verify") (apply-verify args))
     ((string=? name "chain-watch") (apply-chain-watch args))
     ((string=? name "chain-unwatch") (apply-chain-unwatch args))
     ((string=? name "chain-head") (apply-chain-head args))
