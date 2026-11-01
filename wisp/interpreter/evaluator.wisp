@@ -25,6 +25,16 @@
 (global $started s32 mut 0)
 (global $bindings (list binding) mut 0)
 (global $steps s32 mut 0)
+; The limit the running evaluation or handler call obeys, and the one (step-limit N)
+; sets. start-steps copies one to the other, so a runaway loop cannot raise its own.
+(global $step-limit s32 mut 1000000)
+(global $next-step-limit s32 mut 1000000)
+
+(fn start-steps () s32
+  (begin
+    (global.set $steps 0)
+    (global.set $step-limit (global.get $next-step-limit))
+    0))
 
 (fn nil () value (sequence (list-new value)))
 
@@ -97,7 +107,7 @@
 ; apply) carries depth unchanged.
 (fn eval-expected ((expr value) (env (list binding)) (depth s32) (top s32) (expected string)) value
   (if (i32.ge_s depth 128) (failure "evaluation nesting limit")
-    (if (i32.ge_s (global.get $steps) 1000000) (failure "evaluation step limit")
+    (if (i32.ge_s (global.get $steps) (global.get $step-limit)) (failure "evaluation step limit")
       (begin
         (global.set $steps (i32.add (global.get $steps) 1))
         (value-case expr
@@ -459,7 +469,7 @@
 (export (fn evaluate-from ((source string) (base string)) string
   (begin
     (ensure-started)
-    (global.set $steps 0)
+    (start-steps)
     (global.set $include-seen (list-new string))
     (global.set $loading (list-new string))
     (if (string-len base) (begin (global.set $include-seen (list-push (global.get $include-seen) base)) 0) 0)
