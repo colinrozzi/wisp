@@ -998,3 +998,22 @@ fn test_interpreter_unsigned_arithmetic_and_casts() {
         eval(&mut s, source, expected);
     }
 }
+
+#[test]
+fn test_inferred_results_cross_a_module_boundary() {
+    let mut s = session();
+    eval(
+        &mut s,
+        "(module results (provide check) (define check (lambda (n) (if n (ok n) (err \"zero\")))))",
+        "()",
+    );
+    eval(&mut s, "(require results)", "()");
+    eval(&mut s, "(check 1)", "(ok s32 (tuple) 1)");
+    eval(&mut s, "(check 0)", "(err (tuple) string \"zero\")");
+    eval(&mut s, "(match (check 1) ((ok v) v) ((err e) e))", "1");
+    eval(
+        &mut s,
+        "(match (check 0) ((ok v) v) ((err e) e))",
+        "\"zero\"",
+    );
+}

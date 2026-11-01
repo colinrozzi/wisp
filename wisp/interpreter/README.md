@@ -161,9 +161,23 @@ there is currently no tuple projection form.
 (some s32 42)                        ; (some s32 42)
 (none (list s32))                    ; (none (list s32))
 (err s32 string "oops")              ; (err s32 string "oops")
+(ok 1)                               ; (ok s32 (tuple) 1)
+(err "oops")                         ; (err (tuple) string "oops")
+(match (ok 1) ((ok v) v) ((err e) e)) ; 1
 (match (some s32 42) ((some n) n) ((none) 0)) ; 42
 (tuple 42 "x" (none s32))             ; (tuple 42 "x" (none s32))
 ```
+
+A result prints as `(ok <ok-type> <err-type> <value>)` or `(err <ok-type>
+<err-type> <value>)`. The two types are labels, not fields: a `match` arm still
+binds one payload, `((ok v) ...)`. `(ok v)` and `(err e)` take the payload's label
+from its value, and label the other side `(tuple)`, which is what a host result
+shows for a side it does not declare. An untyped list is labelled with a tuple of
+its element labels, and a closure or a symbol with `(tuple)`. So `(ok 1)` builds
+the same value as `(ok s32 (tuple) 1)`. A function declared to return
+`(result s32 string)` compares both labels, so it still needs the typed form,
+`(ok s32 string 1)`. `ok` and `err` are forms, not functions: `(map ok xs)` does
+not work; wrap them in a lambda.
 
 `list-push` mutates a typed list and returns it, matching compiled Wisp. Aliases,
 closures, and containers holding that list observe the update. Both operands
