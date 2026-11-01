@@ -375,6 +375,20 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("chain not exercised".into())) }),
         );
     }
+    for name in [
+        "sha256",
+        "key-new",
+        "key-public",
+        "key-list",
+        "sign",
+        "verify",
+    ] {
+        imports.define(
+            "wisp-crypto",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("crypto not exercised".into())) }),
+        );
+    }
     imports
 }
 

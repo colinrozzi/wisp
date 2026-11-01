@@ -41,6 +41,9 @@ theater-handler-process = { git = "https://github.com/colinrozzi/theater.git", r
 theater-handler-podman = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
 theater-handler-lifecycle = { git = "https://github.com/colinrozzi/theater.git", rev = "7e5f6ed630032bb8fcb4da401976697ab2e76f38" }
 tokio = { version = "1", features = ["full"] }
+ed25519-dalek = "2"
+getrandom = "0.2"
+sha2 = "0.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.dev]

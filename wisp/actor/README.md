@@ -125,8 +125,8 @@ Changes to the host itself (this crate) still need a daemon restart.
 ### Services: a boot list, restarted when they die
 
 The config file (`--config PATH`, else `~/.config/theater-repl/config.toml`)
-grants the sessions' filesystem root and the hosts they may reach over HTTP, and
-can list **services**: sessions that `serve` creates at start and keeps running.
+grants the sessions' filesystem root and the hosts they may reach over HTTP, names
+the directory of signing keys the daemon holds for them, and can list **services**: sessions that `serve` creates at start and keeps running.
 
 ```toml
 [filesystem]
@@ -134,6 +134,9 @@ root = "~/srv/fs"            # sessions' filesystem; start files live under it
 
 [http]
 allowed_hosts = ["api.weather.gov", "gbfs.citibikenyc.com"]
+
+[keys]
+dir = "/var/lib/theater-repl/keys"
 
 [[service]]
 name = "web"                 # the session's name
@@ -151,6 +154,16 @@ Theater's handler checks it. A request to any other host fails with
 the built-in list applies (example.com, api.github.com, httpbin.org,
 raw.githubusercontent.com); a section replaces it, and `[http]` with no
 `allowed_hosts` allows none. The daemon reads it at start.
+
+`[keys] dir` is where the daemon keeps ed25519 signing keys: one file per key,
+`<name>.key`, holding the 32-byte seed as hex. Names are 1-64 of `A-Za-z0-9._-`, so
+never a path. `(key-new name)` creates the directory mode 0700 if it is missing and
+the file mode 0600; a directory that already exists keeps its mode. To bring in a
+key, put its file there; the daemon reads the file on each use. No verb returns a
+seed: `(sign name text)` signs in the daemon. **Every session may use every key**;
+per-session grants come with the permissions rework (theater#240). Without a `[keys]`
+section the key verbs return `(err "no key directory configured")`; `sha256` and
+`verify` need no keys and still work.
 
 For each service the daemon creates a session under its name and evaluates the
 start file in it, as `theater-repl new web && theater-repl eval web - < serve.wisp`
@@ -249,6 +262,7 @@ A library can return the same shape with `(ok v)` / `(err e)`; see
 | message-server | `(msg-register)` · `(msg-send id text)` · `(msg-request id text)` · `(msg-list-requests)` · `(msg-respond req text)` · `(msg-cancel req)` · `(msg-open id text)` · `(msg-send-channel cid text)` · `(msg-close-channel cid)` |
 | filesystem² | `(fs-read p)` (bytes) · `(fs-read-text p)` (a string) · `(fs-write p text)` · `(fs-exists p)` · `(fs-list p)` · `(fs-meta p)` · `(fs-append p text)` · `(fs-delete p)` · `(fs-mkdir p)` · `(fs-rmdir p)` · `(fs-write-durable p text)` (all-or-nothing, on disk when it returns) · `(fs-sync p)` · `(fs-sync-dir p)` · `(fs-rename from to)` |
 | http-client³ | `(http-get url)` · `(http-req method url [headers [body]])`, headers `((name value) …)`, body a string or bytes → `(ok (http-response status headers body))` |
+| crypto | `(sha256 x)`, x a string or bytes → 64 hex chars · `(key-new name)` · `(key-public name)` → `(ok public-key-hex)` · `(key-list)` → `(ok names)` · `(sign name text)` → `(ok sig-hex)` · `(verify public-key-hex sig-hex text)` → true/false, bad hex is false. Keys: `[keys]` in the config (see Services, above) |
 | assembler | `(wat-to-wasm wat-text)` → wasm bytes |
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
@@ -445,5 +459,6 @@ reclaim its heap. Validated against Theater rev
 | `actor.wisp` | The actor: includes the evaluator, declares ABI + inbound callbacks |
 | `actor.wasm` | Compiled actor (interface-qualified exports + CGRF metadata) |
 | `manifest.toml` | Manifest; grants the `runtime` control capability |
+| `crypto.pact` | The `wisp-crypto` host interface (hashing, signing) |
 | `source.pact` / `sources.json` | The `wisp-source` host interface + example bundle |
 | `legacy-host/` | The local Theater runtime + socket server that hosts the REPL |
