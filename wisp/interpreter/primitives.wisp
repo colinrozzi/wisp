@@ -109,7 +109,7 @@
       (else (failure "expected s32 arguments")))))
 
 (fn string-primitive? ((name string)) s32
-  (i32.or (i32.or (string=? name "string-len") (string=? name "string-ref"))
+  (i32.or (i32.or (string=? name "string-len") (i32.or (string=? name "string-ref") (string=? name "string-index")))
     (i32.or (string=? name "string-append")
       (i32.or (string=? name "string=?")
         (i32.or (string=? name "substring")
@@ -166,7 +166,71 @@
       ((text s) (append-strings args (i32.add index 1) (string-append out s)))
       (else (failure "string-append expects string arguments")))))
 
+; string-index is one evaluation step at any length, so its time must stay linear
+; like the other string primitives: a string needle uses Knuth-Morris-Pratt, because
+; a plain scan is quadratic on input like "aaaa...". The table holds, for each needle
+; prefix, the length of its longest proper prefix that is also a suffix.
+(fn scan-byte ((s string) (b s32) (i s32)) s32
+  (if (i32.ge_s i (string-len s)) -1
+    (if (i32.eq (string-ref s i) b) i
+      (scan-byte s b (i32.add i 1)))))
+
+(fn kmp-entry ((table s32) (i s32)) s32
+  (i32.load (i32.add table (i32.mul i 4))))
+
+; The matched length after byte C, given K bytes of the needle matched so far.
+(fn kmp-step ((needle string) (table s32) (k s32) (c s32)) s32
+  (if (i32.eq (string-ref needle k) c) (i32.add k 1)
+    (if (i32.eq k 0) 0
+      (kmp-step needle table (kmp-entry table (i32.sub k 1)) c))))
+
+(fn kmp-fill ((needle string) (table s32) (i s32)) s32
+  (if (i32.ge_s i (string-len needle)) table
+    (begin
+      (i32.store (i32.add table (i32.mul i 4))
+        (kmp-step needle table (kmp-entry table (i32.sub i 1)) (string-ref needle i)))
+      (kmp-fill needle table (i32.add i 1)))))
+
+(fn kmp-scan ((s string) (needle string) (table s32) (k s32) (i s32)) s32
+  (if (i32.eq k (string-len needle)) (i32.sub i k)
+    (if (i32.ge_s i (string-len s)) -1
+      (kmp-scan s needle table (kmp-step needle table k (string-ref s i)) (i32.add i 1)))))
+
+(fn scan-string ((s string) (needle string) (from s32)) s32
+  (if (i32.eq (string-len needle) 0) (if (i32.le_s from (string-len s)) from -1)
+    (if (i32.eq (string-len needle) 1) (scan-byte s (string-ref needle 0) from)
+      (if (i32.gt_s from (i32.sub (string-len s) (string-len needle))) -1
+        (let (table (heap-alloc (i32.mul (string-len needle) 4)))
+          (begin
+            (i32.store table 0)
+            (kmp-fill needle table 1)
+            (let (found (kmp-scan s needle table 0 from))
+              (begin (heap-free table) found))))))))
+
+(fn string-index-from ((s string) (needle value) (from s32)) value
+  (value-case needle
+    ((text t) (integer (scan-string s t from)))
+    ((integer b) (integer (scan-byte s b from)))
+    ((byte-value b) (integer (scan-byte s b from)))
+    (else (failure "string-index expects a byte or a string to find"))))
+
+; (string-index s byte-or-string [from]): the position of the first match at or
+; after FROM, or -1. A FROM past the end finds nothing.
+(fn apply-string-index ((args (list value))) value
+  (if (i32.or (i32.lt_s (list-len args) 2) (i32.gt_s (list-len args) 3))
+    (failure "string-index expects (string-index s byte-or-string [from])")
+    (value-case (list-get args 0)
+      ((text s)
+        (if (i32.eq (list-len args) 2) (string-index-from s (list-get args 1) 0)
+          (value-case (list-get args 2)
+            ((integer from)
+              (if (i32.lt_s from 0) (failure "string-index expects a start of 0 or more")
+                (string-index-from s (list-get args 1) from)))
+            (else (failure "string-index expects an integer start")))))
+      (else (failure "string-index expects a string to search")))))
+
 (fn apply-string ((name string) (args (list value))) value
+  (if (string=? name "string-index") (apply-string-index args)
   (if (string=? name "bytes->string") (apply-bytes-to-string args)
     (if (string=? name "string->bytes") (apply-string-to-bytes args)
     (if (string=? name "string-append") (append-strings args 0 "")
@@ -191,4 +255,4 @@
                           (text (substring s start end)) (failure "substring bounds out of range")))
                       (else (failure "expected s32 bounds")))))
                 (else (failure "expected s32 index"))))))
-        (else (failure "expected string argument")))))))))
+        (else (failure "expected string argument"))))))))))

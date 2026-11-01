@@ -87,7 +87,7 @@
 ; close events also update the (handles) table.
 (fn dispatch-event ((handler string) (event value)) value
   (begin
-    (global.set $steps (i32.const 0))
+    (start-steps)
     (ensure-started)
     (track-event handler event)
     (let (h (lookup handler (list-new binding)))
@@ -503,6 +503,7 @@
     ((string=? name "event-cursors") 1)
     ((string=? name "event-cursor-drop") 1)
     ((string=? name "event-buffer") 1)
+    ((string=? name "step-limit") 1)
     ((string=? name "handles") 1)
     ((string=? name "memory-stats") 1)
     ((string=? name "help") 1)
@@ -1718,6 +1719,24 @@
               (integer old)))))
       (else (failure "event-buffer expects an integer limit")))))
 
+; (step-limit) is the limit the next evaluation or handler call gets; (step-limit N)
+; sets it and returns the old one. The ceiling keeps a runaway loop short enough for
+; `theater-repl stop` to reach the actor (it gives up after 15 s; a step took 0.12 to
+; 0.5 us when measured, so 20M is 2.5 to 10 s). The floor keeps enough steps to
+; evaluate another (step-limit N), so a session cannot lock itself out.
+(fn apply-step-limit ((args (list value))) value
+  (if (i32.eq (list-len args) 0) (integer (global.get $next-step-limit))
+    (if (i32.ne (list-len args) 1) (failure "step-limit expects (step-limit) or (step-limit N)")
+      (value-case (list-get args 0)
+        ((integer limit)
+          (if (i32.or (i32.lt_s limit 1000) (i32.gt_s limit 20000000))
+            (failure "step-limit expects a limit from 1000 to 20000000")
+            (let (old (global.get $next-step-limit))
+              (begin
+                (global.set $next-step-limit limit)
+                (integer old)))))
+        (else (failure "step-limit expects an integer limit"))))))
+
 ; (memory-stats): heap bytes in use, and the sizes of the session's long-lived
 ; tables, as (name count) pairs. heap-bytes is the allocator's live bytes (block
 ; headers included): what is allocated and not yet freed, which still includes
@@ -1792,10 +1811,10 @@
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\nchain:     (chain-watch id) record actor id's event chain (newest 256, hashes + sizes, never payloads; stops when it stops)\n           (chain-head id) -> (chain-head hash count recording)   (chain-tail id n) -> latest n (chain-event hash parent event-type data-bytes)\n           (chain-verify id) -> (chain-check ok count kept dropped breaks from-root)   (chain-unwatch id); all (ok ...)/(err ...), full actor ids\n"
-                        (string-append "core:      (define x v) (lambda (a b) body ...) (let (x v) body ...) (begin a ...)   a body of several forms runs them in order and gives the last value\nnumbers:   (+ a b) (- a b) (* a b) (/ a b) (= a b) (< a b) (> a b) (<= a b) (>= a b)   s32 s64 f32 f64 u64 u32 u16 (unsigned ones wrap)\n           both the same type (literals too: (/ (now) 1000u64))   casts: (s32 x) (s64 x) (f32 x) (f64 x)\nstrings:   (string-append s ...) any number, none gives \"\"   (string-len s) (string-ref s i) (substring s from to) (string=? a b) (bytes->string bs) (string->bytes s)\ncontrol:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
+                        (string-append "core:      (define x v) (lambda (a b) body ...) (let (x v) body ...) (begin a ...)   a body of several forms runs them in order and gives the last value\nnumbers:   (+ a b) (- a b) (* a b) (/ a b) (= a b) (< a b) (> a b) (<= a b) (>= a b)   s32 s64 f32 f64 u64 u32 u16 (unsigned ones wrap)\n           both the same type (literals too: (/ (now) 1000u64))   casts: (s32 x) (s64 x) (f32 x) (f64 x)\nstrings:   (string-append s ...) any number, none gives \"\"   (string-len s) (string-ref s i) (string-index s byte-or-string [from]) -> position or -1   (substring s from to) (string=? a b) (bytes->string bs) (string->bytes s)\ncontrol:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
                         (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n           (list-len xs) (list-get xs i) (list-push xs x) take (list ...) and (list-new T) lists alike;\n           list-push returns the new list (use the result; do not count on xs changing)\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (events-after N) (event-read cursor) (event-ack cursor seq) (poll-events)   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
-                        (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes\n"
+                        (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes   (step-limit [N]) steps per evaluation or handler call (default 1000000, at most 20000000), from the next one\n"
                         (string-append "modules:   (require NAME \"path\") load once, bind provides unqualified   (reload NAME) re-read an edited module   see (help \"modules\")\n"
                           "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")"))))))))))))))))))
     (if (string-arg? (list-get args 0))
@@ -1891,6 +1910,7 @@
     ((string=? name "event-cursors") (apply-event-cursors args))
     ((string=? name "event-cursor-drop") (apply-event-cursor-drop args))
     ((string=? name "event-buffer") (apply-event-buffer args))
+    ((string=? name "step-limit") (apply-step-limit args))
     ((string=? name "handles") (apply-handles args))
     ((string=? name "memory-stats") (apply-memory-stats args))
     ((string=? name "help") (apply-help args))

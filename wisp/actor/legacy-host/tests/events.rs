@@ -349,3 +349,45 @@ async fn test_firings_report_their_seq_to_the_daemon() -> anyhow::Result<()> {
     runtime.shutdown().await?;
     Ok(())
 }
+
+/// A handler call runs under the session's step limit, set from an evaluation or
+/// from an earlier handler call, and takes its own fresh budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_step_limit_applies_to_handler_firings() -> anyhow::Result<()> {
+    let (runtime, session) = ticking().await?;
+    session
+        .evaluate(
+            r#"(define spin (lambda (n) (if (= n 0) 0 (spin (- n 1)))))
+               (define on-tick (lambda (name) (if (string=? name "raise") (step-limit 2000000) (spin 100000))))"#,
+        )
+        .await?;
+
+    fire(&session, "over").await?;
+    assert!(
+        session
+            .evaluate("(poll-events \"text\")")
+            .await?
+            .contains("evaluation step limit")
+    );
+
+    session.evaluate("(step-limit 2000000)").await?;
+    fire(&session, "fits").await?;
+    assert_eq!(
+        session.evaluate("(poll-events \"text\")").await?,
+        r#""on-tick: 0""#
+    );
+
+    // Raised by a handler call: it applies to the next call.
+    session.evaluate("(step-limit 1000000)").await?;
+    fire(&session, "raise").await?;
+    assert_eq!(session.evaluate("(step-limit)").await?, "2000000");
+    fire(&session, "fits").await?;
+    assert!(
+        session
+            .evaluate("(poll-events \"text\")")
+            .await?
+            .ends_with(r#"on-tick: 0""#)
+    );
+    session.shutdown().await?;
+    runtime.shutdown().await
+}
