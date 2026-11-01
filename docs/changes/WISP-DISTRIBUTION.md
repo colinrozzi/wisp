@@ -98,9 +98,12 @@ write capability, or placed in a directory the deployment roots the handler at. 
 `(require greet "greet.wisp")` — authored and loaded entirely inside the actor's
 sandbox, no privileged channel.
 
-The old `wisp-source` bundle (`resolve-path`/`read-source`) is **no longer** on the
-`require` path; it remains only for `(include …)` and built-in/image modules. This
-supersedes Brick B's implicit `NAME.wisp` lookup.
+The `wisp-source` bundle (`resolve-path`/`read-source`) serves `(include …)` and
+built-in/image modules. On the `require` path it is only a fallback: a path the
+filesystem cannot give is looked up in the bundle, which is how the standard library
+(`std/list.wisp`, `std/str.wisp`, `std/result.wisp`) reaches every daemon. A file on
+disk at the same path shadows it. This supersedes Brick B's implicit `NAME.wisp`
+lookup.
 
 ## Lineage
 

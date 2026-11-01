@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod crypto;
 pub mod deaths;
 pub mod eval_session;
 pub mod events;
@@ -82,6 +83,7 @@ impl Default for HttpAccess {
 pub struct Grants {
     pub fs: FsAccess,
     pub http: HttpAccess,
+    pub keys: crypto::KeyAccess,
 }
 
 pub struct Runtime {
@@ -119,7 +121,7 @@ impl Runtime {
         replay: Option<Vec<ChainEvent>>,
         chain: Option<mpsc::Sender<(TheaterId, ChainEvent)>>,
     ) -> Result<Self> {
-        let Grants { fs, http } = grants;
+        let Grants { fs, http, keys } = grants;
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
@@ -129,6 +131,7 @@ impl Runtime {
         let events = events::EventWatch::default();
         handlers.register(events.clone());
         handlers.register(chain::ChainRecorder::new(commands.clone()));
+        handlers.register(keys);
         handlers.register(theater_handler_rpc::RpcHandler::new(commands.clone()));
         // Per-interface handlers the local runtime provides. Each is one line;
         // real Theater deployments enable handlers via the actor manifest.

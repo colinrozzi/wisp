@@ -1021,3 +1021,160 @@ fn test_inferred_results_cross_a_module_boundary() {
         "\"zero\"",
     );
 }
+
+#[test]
+fn test_interpreter_string_index() {
+    let mut s = session();
+    for (source, expected) in [
+        (r#"(string-index "hello" 108)"#, "2"),
+        (r#"(string-index "hello" 108 3)"#, "3"),
+        (r#"(string-index "hello" 108 4)"#, "-1"),
+        (r#"(string-index "hello" 122)"#, "-1"),
+        (r#"(string-index "hello" 300)"#, "-1"),
+        (r#"(string-index "a\xFFb" 255)"#, "1"),
+        (r#"(string-index "a\0b" 0)"#, "1"),
+        (r#"(string-index "hello" (car (string->bytes "o")))"#, "4"),
+        (r#"(string-index "hello" "l")"#, "2"),
+        (r#"(string-index "hello" "lo")"#, "3"),
+        (r#"(string-index "hello" "hello")"#, "0"),
+        (r#"(string-index "hello" "hello!")"#, "-1"),
+        (r#"(string-index "abab" "ab" 1)"#, "2"),
+        (r#"(string-index "abab" "ab" 3)"#, "-1"),
+        (r#"(string-index "aaab" "aab")"#, "1"),
+        (r#"(string-index "abcabcabd" "abcabd")"#, "3"),
+        (r#"(string-index "abacabab" "abab")"#, "4"),
+        (r#"(string-index "hello" "xyz")"#, "-1"),
+        // A position past the end finds nothing; the end itself holds only "".
+        (r#"(string-index "hello" 108 6)"#, "-1"),
+        (r#"(string-index "hello" "lo" 99)"#, "-1"),
+        (r#"(string-index "hello" "" 2)"#, "2"),
+        (r#"(string-index "hello" "" 5)"#, "5"),
+        (r#"(string-index "hello" "" 6)"#, "-1"),
+        (r#"(string-index "" 97)"#, "-1"),
+        (
+            r#"(string-index "hello" 108 -1)"#,
+            "error: string-index expects a start of 0 or more",
+        ),
+        (
+            r#"(string-index "hello" 'x)"#,
+            "error: string-index expects a byte or a string to find",
+        ),
+        (
+            r#"(string-index 5 108)"#,
+            "error: string-index expects a string to search",
+        ),
+        (
+            r#"(string-index "hello")"#,
+            "error: string-index expects (string-index s byte-or-string [from])",
+        ),
+    ] {
+        eval(&mut s, source, expected);
+    }
+}
+
+/// The smallest step limit SOURCE succeeds under.
+/// A limit below the 1000 floor can't be set, so callers pad SOURCE past it.
+fn steps_needed(s: &mut Interpreter, source: &str) -> i32 {
+    let (mut low, mut high) = (1000, 20_000_000);
+    while low < high {
+        let limit = (low + high) / 2;
+        s.evaluate(&format!("(step-limit {limit})")).unwrap();
+        if s.evaluate(source).unwrap() == "error: evaluation step limit" {
+            low = limit + 1;
+        } else {
+            high = limit;
+        }
+    }
+    s.evaluate("(step-limit 1000000)").unwrap();
+    low
+}
+
+/// A native scan costs the same few steps at any length; an interpreted one costs
+/// steps per byte.
+#[test]
+fn test_interpreter_string_index_step_cost() {
+    let mut s = session();
+    eval(
+        &mut s,
+        "(define grow (lambda (t n) (if (= n 0) t (grow (string-append t t) (- n 1)))))
+         (define scan (lambda (t b i)
+           (if (= i (string-len t)) -1
+             (if (= (string-ref t i) b) i (scan t b (+ i 1))))))
+         (define spin (lambda (n) (if (= n 0) 0 (spin (- n 1)))))
+         0",
+        "0",
+    );
+    eval(&mut s, "(define long (grow \"a\" 16)) 0", "0");
+    eval(&mut s, "(define needle (grow \"a\" 15)) 0", "0");
+
+    let padding = steps_needed(&mut s, "(spin 1000)");
+    let native = |s: &mut Interpreter, call: &str| {
+        steps_needed(s, &format!("(begin (spin 1000) {call})")) - padding
+    };
+    let byte = native(&mut s, "(string-index long 98)");
+    let string = native(&mut s, "(string-index long \"ab\")");
+    assert_eq!(byte, native(&mut s, "(string-index \"a\" 98)"));
+    let interpreted = steps_needed(&mut s, "(scan long 98 0)");
+    println!(
+        "65536-byte scan: native byte {byte}, native string {string}, interpreted {interpreted}"
+    );
+    assert!(byte < 10, "{byte}");
+    assert!(string < 10, "{string}");
+    assert!(interpreted > 65536 * 10, "{interpreted}");
+
+    // Input that a plain scan would take 2^31 comparisons over stays linear.
+    eval(
+        &mut s,
+        "(string-index long (string-append needle \"b\"))",
+        "-1",
+    );
+}
+
+#[test]
+fn test_interpreter_step_limit() {
+    let mut s = session();
+    eval(&mut s, "(step-limit)", "1000000");
+    eval(
+        &mut s,
+        "(define spin (lambda (n) (if (= n 0) 0 (spin (- n 1)))))",
+        "#<closure>",
+    );
+    // Past the default: it fails, and succeeds once the limit is raised.
+    eval(&mut s, "(spin 100000)", "error: evaluation step limit");
+    eval(&mut s, "(step-limit 2000000)", "1000000");
+    eval(&mut s, "(step-limit)", "2000000");
+    eval(&mut s, "(spin 100000)", "0");
+
+    // A new limit waits for the next evaluation, so a loop can't raise its own.
+    eval(&mut s, "(step-limit 1000000)", "2000000");
+    eval(
+        &mut s,
+        "(begin (step-limit 2000000) (spin 100000))",
+        "error: evaluation step limit",
+    );
+    eval(&mut s, "(spin 100000)", "0");
+
+    // The limit can be lowered, and a session at the floor can still raise it.
+    eval(&mut s, "(step-limit 1000)", "2000000");
+    eval(&mut s, "(spin 1000)", "error: evaluation step limit");
+    eval(&mut s, "(step-limit 20000000)", "1000");
+
+    for refused in ["20000001", "999", "0", "-1", "2147483647"] {
+        eval(
+            &mut s,
+            &format!("(step-limit {refused})"),
+            "error: step-limit expects a limit from 1000 to 20000000",
+        );
+    }
+    eval(
+        &mut s,
+        "(step-limit 99999999999)",
+        "error: integer out of s32 range",
+    );
+    eval(
+        &mut s,
+        "(step-limit \"many\")",
+        "error: step-limit expects an integer limit",
+    );
+    eval(&mut s, "(step-limit)", "20000000");
+}

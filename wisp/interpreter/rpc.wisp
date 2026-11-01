@@ -87,7 +87,7 @@
 ; close events also update the (handles) table.
 (fn dispatch-event ((handler string) (event value)) value
   (begin
-    (global.set $steps (i32.const 0))
+    (start-steps)
     (ensure-started)
     (track-event handler event)
     (let (h (lookup handler (list-new binding)))
@@ -265,6 +265,15 @@
 (import wisp-chain head ((actor string)) (result chain-head string))
 (import wisp-chain tail ((actor string) (n s32)) (result (list chain-event) string))
 (import wisp-chain verify ((actor string)) (result chain-check string))
+
+; wisp-crypto: the theater-repl daemon's hashing and signing (crypto.pact). Signing
+; keys stay in the daemon, in the [keys] directory; a session only names them.
+(import wisp-crypto sha256 ((data (list u8))) string)
+(import wisp-crypto key-new ((name string)) (result string string))
+(import wisp-crypto key-public ((name string)) (result string string))
+(import wisp-crypto key-list () (result (list string) string))
+(import wisp-crypto sign ((name string) (data (list u8))) (result string string))
+(import wisp-crypto verify ((public-key string) (signature string) (data (list u8))) bool)
 
 ; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
 ; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
@@ -445,6 +454,12 @@
     ((string=? name "chain-head") 1)
     ((string=? name "chain-tail") 1)
     ((string=? name "chain-verify") 1)
+    ((string=? name "sha256") 1)
+    ((string=? name "key-new") 1)
+    ((string=? name "key-public") 1)
+    ((string=? name "key-list") 1)
+    ((string=? name "sign") 1)
+    ((string=? name "verify") 1)
     ((string=? name "msg-register") 1)
     ((string=? name "msg-send") 1)
     ((string=? name "msg-request") 1)
@@ -488,6 +503,7 @@
     ((string=? name "event-cursors") 1)
     ((string=? name "event-cursor-drop") 1)
     ((string=? name "event-buffer") 1)
+    ((string=? name "step-limit") 1)
     ((string=? name "handles") 1)
     ((string=? name "memory-stats") 1)
     ((string=? name "help") 1)
@@ -771,6 +787,49 @@
 (fn apply-sessions ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "sessions expects no arguments")
     (unmarshal (raw-invoke "wisp-sessions" "list-sessions" (arg-tuple (list-new value))))))
+
+; --- crypto (wisp-crypto) ----------------------------------------------------
+; (sha256 x) -> 64 hex chars, x a string or bytes. (key-new name) / (key-public name)
+; -> (ok public-key-hex). (key-list) -> (ok names); like the others it fails with no
+; [keys] section, so it wraps. (sign name text) -> (ok sig-hex), text a string or
+; bytes. (verify public-key-hex sig-hex text) -> true/false; bad hex is false.
+(fn all-bytes? ((items (list value)) (i s32)) s32
+  (if (i32.ge_s i (list-len items)) 1
+    (value-case (list-get items i)
+      ((byte-value b) (all-bytes? items (i32.add i 1)))
+      (else 0))))
+(fn crypto-data? ((v value)) s32
+  (value-case v
+    ((text s) 1)
+    ((typed-list element items) (all-bytes? items 0))
+    (else 0)))
+(fn apply-sha256 ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (crypto-data? (list-get args 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "sha256" (marshal (str-to-bytes (list-get args 0)))))
+    (failure "sha256 expects (sha256 string-or-bytes)")))
+(fn apply-key-new ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (string-arg? (list-get args 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "key-new" (marshal (list-get args 0))))
+    (failure "key-new expects (key-new name)")))
+(fn apply-key-public ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (string-arg? (list-get args 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "key-public" (marshal (list-get args 0))))
+    (failure "key-public expects (key-public name)")))
+(fn apply-key-list ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "key-list expects no arguments")
+    (unmarshal (raw-invoke "wisp-crypto" "key-list" (arg-tuple (list-new value))))))
+(fn apply-sign ((args (list value))) value
+  (if (if (i32.eq (list-len args) 2)
+        (i32.and (string-arg? (list-get args 0)) (crypto-data? (list-get args 1))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "sign"
+      (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (str-to-bytes (list-get args 1)))))))
+    (failure "sign expects (sign key-name text)")))
+(fn apply-verify ((args (list value))) value
+  (if (if (i32.eq (list-len args) 3)
+        (i32.and (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) (crypto-data? (list-get args 2))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "verify"
+      (marshal (sequence (list-push (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1)) (str-to-bytes (list-get args 2)))))))
+    (failure "verify expects (verify public-key-hex sig-hex text)")))
 
 ; --- chain recorder (wisp-chain) ---------------------------------------------
 ; (chain-watch id) starts recording actor id's chain; (chain-head id) ->
@@ -1660,6 +1719,24 @@
               (integer old)))))
       (else (failure "event-buffer expects an integer limit")))))
 
+; (step-limit) is the limit the next evaluation or handler call gets; (step-limit N)
+; sets it and returns the old one. The ceiling keeps a runaway loop short enough for
+; `theater-repl stop` to reach the actor (it gives up after 15 s; a step took 0.12 to
+; 0.5 us when measured, so 20M is 2.5 to 10 s). The floor keeps enough steps to
+; evaluate another (step-limit N), so a session cannot lock itself out.
+(fn apply-step-limit ((args (list value))) value
+  (if (i32.eq (list-len args) 0) (integer (global.get $next-step-limit))
+    (if (i32.ne (list-len args) 1) (failure "step-limit expects (step-limit) or (step-limit N)")
+      (value-case (list-get args 0)
+        ((integer limit)
+          (if (i32.or (i32.lt_s limit 1000) (i32.gt_s limit 20000000))
+            (failure "step-limit expects a limit from 1000 to 20000000")
+            (let (old (global.get $next-step-limit))
+              (begin
+                (global.set $next-step-limit limit)
+                (integer old)))))
+        (else (failure "step-limit expects an integer limit"))))))
+
 ; (memory-stats): heap bytes in use, and the sizes of the session's long-lived
 ; tables, as (name count) pairs. heap-bytes is the allocator's live bytes (block
 ; headers included): what is allocated and not yet freed, which still includes
@@ -1717,7 +1794,7 @@
     ((string=? topic "triggers")
       "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\nread with theater-repl read / follow / wait <id> (or (events-after N) here).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name handler-result), or (handler-name event\nhandler-result) when the event was not handled (no handler, or it failed);\n(poll-events) returns those lists. (poll-events \"text\") returns one\n\"handler: result\" line per firing instead (event left out, a string result raw);\ntheater-repl read/follow print that, and read --full / follow --full print the\nlists. Scripts should parse --full: a raw result can span lines.\n\nThe buffer keeps the newest 256 firings and drops older ones. After drops,\n(poll-events) puts the count first, (N firing ...), and the text form starts with\n\"(N earlier firings dropped)\". (event-buffer N) sets the limit (0 = keep none;\nhandlers still run) and returns the old one.\n\nReading never removes firings. Each has a seq (1, 2, 3, ...):\n  (events-after N [max] [\"text\"])  firings after seq N: (next lost (seq handler result) ...)\n  (event-read NAME [max] [\"text\"])  the same, after cursor NAME (new cursors start at 0)\n  (event-ack NAME SEQ)    NAME has handled up to SEQ (never moves back)\n  (event-cursors) (event-cursor NAME) (event-cursor-drop NAME) (event-head)\nlost counts firings after N that the limit dropped. Acknowledge NEXT once handled.\ntheater-repl read, follow and wait use cursors \"read\", \"follow\" and \"wait\";\n(poll-events) uses \"poll\", so none of them takes firings from another. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
     ((string=? topic "modules")
-      "Modules — load a library with (require NAME \"path\") at top level.\n\n  (require greet \"lib/greet.wisp\")   ; read the file, bind greet's provides\n  (hi \"bob\")                          ; provided names come in UNQUALIFIED (not greet.hi)\n  (require greet)                     ; reuse an already-loaded greet\n  (reload greet)                      ; re-read lib/greet.wisp after editing it\n\nrequire loads a module once per session: requiring an already-loaded NAME does\nnot re-read the file. To pick up an edit, (reload NAME) re-reads the source NAME\nwas loaded from into a fresh module env and rebinds the copies in EVERY module of\nthis session that imported it. It returns the names the new version no longer\nprovides (now unbound; () if none); newly provided names need (require NAME)\nagain. Shallow: NAME's own requires are not reloaded.\n\nNAME's records, variants, globals, traits and instances are declared again.\nAn unchanged record or variant stays the same type, so values made before the\nreload still work; a changed one is a new type, and old values fail its checks.\nA mut global whose type is unchanged KEEPS its value across reload (a const\ntakes its new initializer); to reset one, (global.set $g value) after reload.\nIf the new source fails,\nnothing changes and reload returns the error. A value copied by hand, like\n(define f hi), is not an import and keeps the old code.\n\nIf a require fails (the file cannot be read or parsed, a form in it fails, or it\nprovides a name it does not define), nothing it loaded is kept, and the error\nnames the form that failed: cannot load module web: web.wisp: in (define x ...):\nunbound symbol: y. Fix the file and run the same (require NAME \"path\") again.")
+      "Modules — load a library with (require NAME \"path\") at top level.\n\n  (require greet \"lib/greet.wisp\")   ; read the file, bind greet's provides\n  (hi \"bob\")                          ; provided names come in UNQUALIFIED (not greet.hi)\n  (require greet)                     ; reuse an already-loaded greet\n  (reload greet)                      ; re-read lib/greet.wisp after editing it\n\nrequire loads a module once per session: requiring an already-loaded NAME does\nnot re-read the file. To pick up an edit, (reload NAME) re-reads the source NAME\nwas loaded from into a fresh module env and rebinds the copies in EVERY module of\nthis session that imported it. It returns the names the new version no longer\nprovides (now unbound; () if none); newly provided names need (require NAME)\nagain. Shallow: NAME's own requires are not reloaded.\n\nNAME's records, variants, globals, traits and instances are declared again.\nAn unchanged record or variant stays the same type, so values made before the\nreload still work; a changed one is a new type, and old values fail its checks.\nA mut global whose type is unchanged KEEPS its value across reload (a const\ntakes its new initializer); to reset one, (global.set $g value) after reload.\nIf the new source fails,\nnothing changes and reload returns the error. A value copied by hand, like\n(define f hi), is not an import and keeps the old code.\n\nIf a require fails (the file cannot be read or parsed, a form in it fails, or it\nprovides a name it does not define), nothing it loaded is kept, and the error\nnames the form that failed: cannot load module web: web.wisp: in (define x ...):\nunbound symbol: y. Fix the file and run the same (require NAME \"path\") again.\n\nThe standard library is built into the daemon, whatever its filesystem root; a\nfile at the same path under the root shadows it:\n  (require list \"std/list.wisp\")     ; map filter fold reverse append nth member sort\n  (require str \"std/str.wisp\")       ; split join number->string u64->string string->number index-of index-of-sub ...\n  (require result \"std/result.wisp\") ; is-some is-none opt-or is-ok is-err res-or res-or-else err-or\nA session has one module per NAME, so requiring str after loading another str\nreuses the first.")
     (else (string-append "no such help topic: " (string-append topic "\ntry (help), (help \"tcp\"), (help \"triggers\"), (help \"modules\")")))))
 
 (fn apply-help ((args (list value))) value
@@ -1728,16 +1805,16 @@
           (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n           durable: (fs-write-durable p text) replaces p all-or-nothing, on disk when it returns   (fs-sync p) (fs-sync-dir p) (fs-rename from to)\n"
-                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\n"
+                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\ncrypto:    (sha256 string-or-bytes) -> 64 hex chars   (verify public-key-hex sig-hex text) -> true/false\n           (key-new name) (key-public name) -> (ok public-key-hex)   (key-list) -> (ok names)   (sign name text) -> (ok sig-hex); keys stay in the daemon, config.toml [keys] dir\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
                       (string-append "podman:    (podman-run image name [env [cmd [mounts]]])  env=((K V)...) cmd=(a b...) mounts=((src tgt [ro])...)   (podman-stop name) (podman-rm name force) (podman-list)\n"
                         (string-append "lifecycle: (monitor id) (unmonitor id) (link id) (unlink id)   watch/fate-share another actor; monitor -> on-actor-event\nchain:     (chain-watch id) record actor id's event chain (newest 256, hashes + sizes, never payloads; stops when it stops)\n           (chain-head id) -> (chain-head hash count recording)   (chain-tail id n) -> latest n (chain-event hash parent event-type data-bytes)\n           (chain-verify id) -> (chain-check ok count kept dropped breaks from-root)   (chain-unwatch id); all (ok ...)/(err ...), full actor ids\n"
-                        (string-append "core:      (define x v) (lambda (a b) body ...) (let (x v) body ...) (begin a ...)   a body of several forms runs them in order and gives the last value\nnumbers:   (+ a b) (- a b) (* a b) (/ a b) (= a b) (< a b) (> a b) (<= a b) (>= a b)   s32 s64 f32 f64 u64 u32 u16 (unsigned ones wrap)\n           both the same type (literals too: (/ (now) 1000u64))   casts: (s32 x) (s64 x) (f32 x) (f64 x)\nstrings:   (string-append s ...) any number, none gives \"\"   (string-len s) (string-ref s i) (substring s from to) (string=? a b) (bytes->string bs) (string->bytes s)\ncontrol:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
+                        (string-append "core:      (define x v) (lambda (a b) body ...) (let (x v) body ...) (begin a ...)   a body of several forms runs them in order and gives the last value\nnumbers:   (+ a b) (- a b) (* a b) (/ a b) (= a b) (< a b) (> a b) (<= a b) (>= a b)   s32 s64 f32 f64 u64 u32 u16 (unsigned ones wrap)\n           both the same type (literals too: (/ (now) 1000u64))   casts: (s32 x) (s64 x) (f32 x) (f64 x)\nstrings:   (string-append s ...) any number, none gives \"\"   (string-len s) (string-ref s i) (string-index s byte-or-string [from]) -> position or -1   (substring s from to) (string=? a b) (bytes->string bs) (string->bytes s)\ncontrol:   (if c then else) (cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)\n           and/or stop early and return the deciding value; false, 0 and () are false, all else true\n"
                         (string-append "lists:     (list a ...) (car xs) (cdr xs) (length xs) (null? xs) (cons x quoted-xs)   errors: (error msg) aborts with msg\n           (list-len xs) (list-get xs i) (list-push xs x) take (list ...) and (list-new T) lists alike;\n           list-push returns the new list (use the result; do not count on xs changing)\n"
                         (string-append "triggers:  define on-tick/on-spawn/on-message/on-connection/on-data/on-close/on-actor-event; (events-after N) (event-read cursor) (event-ack cursor seq) (poll-events)   (event-buffer N) keep N (256)   see (help \"triggers\")\n"
-                        (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes\n"
+                        (string-append "session:   (handles) open timers/listeners/connections/processes/channels as (kind id)   (memory-stats) heap bytes + table sizes   (step-limit [N]) steps per evaluation or handler call (default 1000000, at most 20000000), from the next one\n"
                         (string-append "modules:   (require NAME \"path\") load once, bind provides unqualified   (reload NAME) re-read an edited module   see (help \"modules\")\n"
                           "topics:    (help \"tcp\")   (help \"triggers\")   (help \"modules\")"))))))))))))))))))
     (if (string-arg? (list-get args 0))
@@ -1777,6 +1854,12 @@
     ((string=? name "shutdown-runtime") (apply-runtime-shutdown args))
     ((string=? name "spawn-actor") (apply-spawn-actor args))
     ((string=? name "sessions") (apply-sessions args))
+    ((string=? name "sha256") (apply-sha256 args))
+    ((string=? name "key-new") (apply-key-new args))
+    ((string=? name "key-public") (apply-key-public args))
+    ((string=? name "key-list") (apply-key-list args))
+    ((string=? name "sign") (apply-sign args))
+    ((string=? name "verify") (apply-verify args))
     ((string=? name "chain-watch") (apply-chain-watch args))
     ((string=? name "chain-unwatch") (apply-chain-unwatch args))
     ((string=? name "chain-head") (apply-chain-head args))
@@ -1827,6 +1910,7 @@
     ((string=? name "event-cursors") (apply-event-cursors args))
     ((string=? name "event-cursor-drop") (apply-event-cursor-drop args))
     ((string=? name "event-buffer") (apply-event-buffer args))
+    ((string=? name "step-limit") (apply-step-limit args))
     ((string=? name "handles") (apply-handles args))
     ((string=? name "memory-stats") (apply-memory-stats args))
     ((string=? name "help") (apply-help args))

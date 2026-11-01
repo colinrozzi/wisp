@@ -20,6 +20,25 @@ const EMBEDDED_WASM: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), 
 /// The immutable source bundle served to the guest for relative `(include …)`.
 const EMBEDDED_SOURCES: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../sources.json"));
+/// The Wisp standard library (`wisp/std/`), served as `(require list "std/list.wisp")`
+/// on every daemon, whatever its filesystem root.
+const STD_SOURCES: &[(&str, &str)] = &[
+    (
+        "std/list.wisp",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../std/list.wisp")),
+    ),
+    (
+        "std/str.wisp",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../std/str.wisp")),
+    ),
+    (
+        "std/result.wisp",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../std/result.wisp"
+        )),
+    ),
+];
 
 const VERSION: &str = env!("THEATER_REPL_VERSION");
 
@@ -34,7 +53,8 @@ struct Args {
     /// the copies built into the binary (for hacking on the REPL itself).
     #[arg(long, global = true)]
     actor_dir: Option<PathBuf>,
-    /// JSON object mapping bundle paths to source strings; overrides the built-in bundle.
+    /// JSON object mapping bundle paths to source strings; replaces the built-in bundle, except
+    /// that the standard library (std/*) stays unless this file has its own entry for that path.
     #[arg(long, global = true)]
     bundle: Option<PathBuf>,
     /// Path to a theater-repl config file (TOML). Without one, the default config
@@ -295,13 +315,15 @@ fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<Loaded>
 
 /// theater-repl config (TOML). It grants the REPL actor's filesystem capability —
 /// a root directory it may read/write, the human's slice of the actor manifest —
-/// and the hosts its http-client may reach (`[http]`), and lists the services `serve` starts and keeps running (`[[service]]`, see
+/// and the hosts its http-client may reach (`[http]`), names the directory of signing
+/// keys the daemon holds for it (`[keys]`), and lists the services `serve` starts and keeps running (`[[service]]`, see
 /// `boot`).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ReplConfig {
     filesystem: FilesystemConfig,
     http: Option<HttpConfig>,
+    keys: Option<KeysConfig>,
     #[serde(rename = "service")]
     services: Vec<boot::ServiceConfig>,
 }
@@ -335,6 +357,14 @@ struct HttpConfig {
     allowed_hosts: Vec<String>,
 }
 
+/// `[keys]`: the directory of signing keys, one `<name>.key` per key. No section:
+/// the key verbs return an error.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeysConfig {
+    dir: PathBuf,
+}
+
 fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/theater-repl/config.toml"))
 }
@@ -362,6 +392,9 @@ fn load_config(explicit: &Option<PathBuf>) -> Result<ReplConfig> {
     let mut config: ReplConfig =
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
     config.filesystem.root = config.filesystem.root.map(expand_tilde);
+    if let Some(keys) = &mut config.keys {
+        keys.dir = expand_tilde(std::mem::take(&mut keys.dir));
+    }
     boot::validate(&config.services, config.filesystem.root.as_deref())
         .with_context(|| format!("in config {}", path.display()))?;
     Ok(config)
@@ -382,7 +415,14 @@ fn fs_access(config: &ReplConfig) -> Result<wisp_interpreter_actor::FsAccess> {
 }
 
 async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
-    let sources: BTreeMap<String, String> = serde_json::from_str(&loaded.bundle_json)?;
+    // The standard library is in every bundle; a bundle's own entry for the same
+    // path wins.
+    let mut sources: BTreeMap<String, String> = STD_SOURCES
+        .iter()
+        .map(|(path, text)| (path.to_string(), text.to_string()))
+        .collect();
+    let bundled: BTreeMap<String, String> = serde_json::from_str(&loaded.bundle_json)?;
+    sources.extend(bundled);
     let http = match &config.http {
         Some(http) => wisp_interpreter_actor::HttpAccess {
             allowed_hosts: http.allowed_hosts.clone(),
@@ -392,6 +432,9 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
     let grants = wisp_interpreter_actor::Grants {
         fs: fs_access(config)?,
         http,
+        keys: wisp_interpreter_actor::crypto::KeyAccess {
+            dir: config.keys.as_ref().map(|keys| keys.dir.clone()),
+        },
     };
     Runtime::new(SourceBundle::new(sources)?, grants).await
 }
@@ -1348,6 +1391,15 @@ mod tests {
         assert_eq!(c.http.unwrap().allowed_hosts, ["api.weather.gov"]);
         let c: ReplConfig = toml::from_str("[http]\n").unwrap();
         assert!(c.http.unwrap().allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn config_keys_section_names_the_directory() {
+        let c: ReplConfig = toml::from_str("").unwrap();
+        assert!(c.keys.is_none());
+        let c: ReplConfig = toml::from_str("[keys]\ndir = \"/k\"\n").unwrap();
+        assert_eq!(c.keys.unwrap().dir, PathBuf::from("/k"));
+        assert!(toml::from_str::<ReplConfig>("[keys]\n").is_err());
     }
 
     #[test]

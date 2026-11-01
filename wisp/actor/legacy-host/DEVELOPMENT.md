@@ -106,9 +106,20 @@ file is a JSON object mapping logical paths to source strings:
 ```
 
 Then evaluate `(include "lib/math.wisp") (increment 41)`. Relative includes
-resolve within the bundle; `..` cannot escape its root. Guest paths never read
+resolve within the bundle; `..` cannot escape its root. Bundle reads never touch
 the host filesystem. The host registers `resolve-path` and `read-source` through
 Theater's import registry, so their responses are recorded and replayable.
+
+The standard library (`wisp/std/*.wisp`) is compiled into the binary and added to
+every bundle as `std/list.wisp`, `std/str.wisp` and `std/result.wisp`; an entry
+for the same path in `sources.json` or `--bundle` replaces it.
+
+`(require NAME "path")` and `(reload NAME)` read the filesystem capability first
+and fall back to the bundle on any failed read (`read-source-at` in
+`wisp/interpreter/modules.wisp`). So `(require list "std/list.wisp")` works on a
+daemon with any filesystem root or none, and a file at `std/list.wisp` under the
+root shadows the bundled one. A file that exists but cannot be read also falls
+through to the bundle. `(include …)` reads only the bundle. URLs never fall back.
 
 Limits: 4096 source bytes per evaluation, 32 KiB socket frames, 256 bundle files,
 64 KiB per file, 1 MiB total bundle, and 256 MiB maximum Wasm memory per session

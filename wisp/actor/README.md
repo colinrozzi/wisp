@@ -125,8 +125,8 @@ Changes to the host itself (this crate) still need a daemon restart.
 ### Services: a boot list, restarted when they die
 
 The config file (`--config PATH`, else `~/.config/theater-repl/config.toml`)
-grants the sessions' filesystem root and the hosts they may reach over HTTP, and
-can list **services**: sessions that `serve` creates at start and keeps running.
+grants the sessions' filesystem root and the hosts they may reach over HTTP, names
+the directory of signing keys the daemon holds for them, and can list **services**: sessions that `serve` creates at start and keeps running.
 
 ```toml
 [filesystem]
@@ -134,6 +134,9 @@ root = "~/srv/fs"            # sessions' filesystem; start files live under it
 
 [http]
 allowed_hosts = ["api.weather.gov", "gbfs.citibikenyc.com"]
+
+[keys]
+dir = "/var/lib/theater-repl/keys"
 
 [[service]]
 name = "web"                 # the session's name
@@ -151,6 +154,16 @@ Theater's handler checks it. A request to any other host fails with
 the built-in list applies (example.com, api.github.com, httpbin.org,
 raw.githubusercontent.com); a section replaces it, and `[http]` with no
 `allowed_hosts` allows none. The daemon reads it at start.
+
+`[keys] dir` is where the daemon keeps ed25519 signing keys: one file per key,
+`<name>.key`, holding the 32-byte seed as hex. Names are 1-64 of `A-Za-z0-9._-`, so
+never a path. `(key-new name)` creates the directory mode 0700 if it is missing and
+the file mode 0600; a directory that already exists keeps its mode. To bring in a
+key, put its file there; the daemon reads the file on each use. No verb returns a
+seed: `(sign name text)` signs in the daemon. **Every session may use every key**;
+per-session grants come with the permissions rework (theater#240). Without a `[keys]`
+section the key verbs return `(err "no key directory configured")`; `sha256` and
+`verify` need no keys and still work.
 
 For each service the daemon creates a session under its name and evaluates the
 start file in it, as `theater-repl new web && theater-repl eval web - < serve.wisp`
@@ -233,6 +246,35 @@ $id '…'`), so you grow an environment as you go:
 Note: use `(define name (lambda (args) body))` — the `(define (f args) …)`
 shorthand is not supported.
 
+## The standard library
+
+Built into every daemon, whatever its filesystem root (sources in `wisp/std/`):
+
+```lisp
+(require list "std/list.wisp")
+(map (lambda (x) (+ x 1)) (list 1 2))      ; => (2 3)
+(fold + 0 (list 1 2 3))                    ; => 6, f takes (acc x)
+(member "a" (list "a" "b") string=?)       ; => 1, you pass the equality
+(sort (lambda (a b) (< a b)) (list 2 1))   ; => (1 2), stable
+
+(require str "std/str.wisp")
+(split "a,b" ",")                          ; => ("a" "b")
+(join (list "a" "b") "-")                  ; => "a-b"
+(number->string -5)  (u64->string (now))   ; decimal text, s32 and u64
+```
+
+`std/list`: `map filter fold reverse append nth member sort`. `std/str`: `split join
+number->string u64->string string->number mod index-of index-of-from index-of-sub
+field-between starts-with drop after byte-space byte-cr byte-nl`. `std/result`:
+`is-some is-none opt-or is-ok is-err res-or res-or-else err-or`.
+
+The list walks are tail calls by index, so a list of 10000 is fine. One top-level
+evaluation still has a budget of 1,000,000 steps, and `sort` reaches it at about
+1800 elements. Evaluate `(step-limit 10000000)` first to sort 10000.
+
+`require` reads the filesystem first and falls back to the bundle, so a file at
+`std/list.wisp` under the filesystem root shadows the built-in one.
+
 ## Driving Theater — host verbs
 
 Every verb hands results back as ordinary, inspectable Wisp values (records,
@@ -249,6 +291,7 @@ A library can return the same shape with `(ok v)` / `(err e)`; see
 | message-server | `(msg-register)` · `(msg-send id text)` · `(msg-request id text)` · `(msg-list-requests)` · `(msg-respond req text)` · `(msg-cancel req)` · `(msg-open id text)` · `(msg-send-channel cid text)` · `(msg-close-channel cid)` |
 | filesystem² | `(fs-read p)` (bytes) · `(fs-read-text p)` (a string) · `(fs-write p text)` · `(fs-exists p)` · `(fs-list p)` · `(fs-meta p)` · `(fs-append p text)` · `(fs-delete p)` · `(fs-mkdir p)` · `(fs-rmdir p)` · `(fs-write-durable p text)` (all-or-nothing, on disk when it returns) · `(fs-sync p)` · `(fs-sync-dir p)` · `(fs-rename from to)` |
 | http-client³ | `(http-get url)` · `(http-req method url [headers [body]])`, headers `((name value) …)`, body a string or bytes → `(ok (http-response status headers body))` |
+| crypto | `(sha256 x)`, x a string or bytes → 64 hex chars · `(key-new name)` · `(key-public name)` → `(ok public-key-hex)` · `(key-list)` → `(ok names)` · `(sign name text)` → `(ok sig-hex)` · `(verify public-key-hex sig-hex text)` → true/false, bad hex is false. Keys: `[keys]` in the config (see Services, above) |
 | assembler | `(wat-to-wasm wat-text)` → wasm bytes |
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
@@ -445,5 +488,6 @@ reclaim its heap. Validated against Theater rev
 | `actor.wisp` | The actor: includes the evaluator, declares ABI + inbound callbacks |
 | `actor.wasm` | Compiled actor (interface-qualified exports + CGRF metadata) |
 | `manifest.toml` | Manifest; grants the `runtime` control capability |
+| `crypto.pact` | The `wisp-crypto` host interface (hashing, signing) |
 | `source.pact` / `sources.json` | The `wisp-source` host interface + example bundle |
 | `legacy-host/` | The local Theater runtime + socket server that hosts the REPL |
