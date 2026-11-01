@@ -246,6 +246,35 @@ $id '…'`), so you grow an environment as you go:
 Note: use `(define name (lambda (args) body))` — the `(define (f args) …)`
 shorthand is not supported.
 
+## The standard library
+
+Built into every daemon, whatever its filesystem root (sources in `wisp/std/`):
+
+```lisp
+(require list "std/list.wisp")
+(map (lambda (x) (+ x 1)) (list 1 2))      ; => (2 3)
+(fold + 0 (list 1 2 3))                    ; => 6, f takes (acc x)
+(member "a" (list "a" "b") string=?)       ; => 1, you pass the equality
+(sort (lambda (a b) (< a b)) (list 2 1))   ; => (1 2), stable
+
+(require str "std/str.wisp")
+(split "a,b" ",")                          ; => ("a" "b")
+(join (list "a" "b") "-")                  ; => "a-b"
+(number->string -5)  (u64->string (now))   ; decimal text, s32 and u64
+```
+
+`std/list`: `map filter fold reverse append nth member sort`. `std/str`: `split join
+number->string u64->string string->number mod index-of index-of-from index-of-sub
+field-between starts-with drop after byte-space byte-cr byte-nl`. `std/result`:
+`is-some is-none opt-or is-ok is-err res-or res-or-else err-or`.
+
+The list walks are tail calls by index, so a list of 10000 is fine. One top-level
+evaluation still has a budget of 1,000,000 steps, and `sort` reaches it at about
+1800 elements. Evaluate `(step-limit 10000000)` first to sort 10000.
+
+`require` reads the filesystem first and falls back to the bundle, so a file at
+`std/list.wisp` under the filesystem root shadows the built-in one.
+
 ## Driving Theater — host verbs
 
 Every verb hands results back as ordinary, inspectable Wisp values (records,
