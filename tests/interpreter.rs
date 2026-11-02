@@ -437,6 +437,56 @@ fn test_interpreter_u64_literals() {
 }
 
 #[test]
+fn test_interpreter_results_are_valid_utf8() {
+    let mut s = session();
+    for (source, expected) in [
+        // Bytes outside a well-formed sequence print as \xHH.
+        (
+            "(bytes->string (list 255 0 200 13 10))",
+            r#""\xff\0\xc8\r\n""#,
+        ),
+        // Valid sequences of every length stay as they are, at the limits too.
+        (
+            "(bytes->string (list 65 194 128 239 191 191 240 144 128 128 244 143 191 191))",
+            "\"A\u{80}\u{ffff}\u{10000}\u{10ffff}\"",
+        ),
+        // Overlong forms, surrogates, past U+10FFFF, a lone continuation byte.
+        ("(bytes->string (list 192 128))", r#""\xc0\x80""#),
+        ("(bytes->string (list 224 128 128))", r#""\xe0\x80\x80""#),
+        ("(bytes->string (list 237 160 128))", r#""\xed\xa0\x80""#),
+        (
+            "(bytes->string (list 240 128 128 128))",
+            r#""\xf0\x80\x80\x80""#,
+        ),
+        (
+            "(bytes->string (list 244 144 128 128))",
+            r#""\xf4\x90\x80\x80""#,
+        ),
+        ("(bytes->string (list 245))", r#""\xf5""#),
+        ("(bytes->string (list 128))", r#""\x80""#),
+        // A sequence cut off by the end of the string, and by another character.
+        ("(bytes->string (list 226 130))", r#""\xe2\x82""#),
+        ("(bytes->string (list 226 65 195 169))", "\"\\xe2A\u{e9}\""),
+        // What is printed reads back as the same bytes.
+        (
+            r#"(string->bytes "\xff\xc8")"#,
+            "#<list u8 (#<u8 255> #<u8 200>)>",
+        ),
+    ] {
+        eval(&mut s, source, expected);
+    }
+    // Long output neither grows the stack nor takes quadratic time.
+    eval(
+        &mut s,
+        r#"(define grow (lambda (t n) (if (= n 0) t (grow (string-append t t) (- n 1)))))"#,
+        "#<closure>",
+    );
+    let long = s.evaluate(r#"(grow "\xff" 20)"#).unwrap();
+    assert_eq!(long.len(), 2 + 4 * (1 << 20));
+    assert!(long.starts_with(r#""\xff\xff"#));
+}
+
+#[test]
 fn test_interpreter_control_character_escapes() {
     let mut s = session();
     for (source, expected) in [

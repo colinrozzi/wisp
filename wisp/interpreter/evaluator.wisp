@@ -475,10 +475,11 @@
     (if (string-len base) (begin (global.set $include-seen (list-push (global.get $include-seen) base)) 0) 0)
     (if (i32.gt_s (string-len source) (if (string-len base) 65536 4096)) "error: source exceeds input limit"
       (let (forms (expand-source source base 0))
-        (value-case forms
-          ((sequence items)
-            (let (expanded (prepare-macros items))
-              (value-case expanded
-                ((sequence ready) (show (eval-body ready 0 (list-new binding) 0 1 (nil))))
-                (else (show expanded)))))
-          (else (show forms))))))))
+        (utf8-safe
+          (value-case forms
+            ((sequence items)
+              (let (expanded (prepare-macros items))
+                (value-case expanded
+                  ((sequence ready) (show (eval-body ready 0 (list-new binding) 0 1 (nil))))
+                  (else (show expanded)))))
+            (else (show forms)))))))))

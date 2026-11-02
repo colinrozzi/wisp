@@ -43,6 +43,77 @@
 (fn hex-nibble ((n s32)) string
   (substring "0123456789abcdef" n (i32.add n 1)))
 
+; The bytes a string may hold are not limited to UTF-8 (bytes->string makes any
+; string, and sessions read bytes from strangers), but the host rejects a returned
+; string that isn't UTF-8, and that failure kills the session. So everything leaving
+; through evaluate passes utf8-safe: each byte outside a well-formed sequence becomes
+; the text \xHH. Inside a printed "..." that is what the reader reads back as the same
+; byte, so nothing is lost, and in raw text a reader can still see what the bytes were.
+(fn utf8-byte-in? ((s string) (pos s32) (low s32) (high s32)) s32
+  (if (i32.ge_s pos (string-len s)) 0
+    (let (c (string-ref s pos))
+      (i32.and (i32.ge_s c low) (i32.le_s c high)))))
+
+; The length of the well-formed sequence at POS, or 0. The limits on the second byte
+; rule out overlong forms, surrogates and anything past U+10FFFF.
+(fn utf8-sequence ((s string) (pos s32)) s32
+  (let (c (string-ref s pos))
+    (if (i32.lt_s c 128) 1
+      (if (i32.lt_s c 194) 0
+        (if (i32.lt_s c 224)
+          (if (utf8-byte-in? s (i32.add pos 1) 128 191) 2 0)
+          (if (i32.lt_s c 240)
+            (if (i32.and
+                  (utf8-byte-in? s (i32.add pos 1) (if (i32.eq c 224) 160 128) (if (i32.eq c 237) 159 191))
+                  (utf8-byte-in? s (i32.add pos 2) 128 191))
+              3 0)
+            (if (i32.lt_s c 245)
+              (if (i32.and
+                    (utf8-byte-in? s (i32.add pos 1) (if (i32.eq c 240) 144 128) (if (i32.eq c 244) 143 191))
+                    (i32.and (utf8-byte-in? s (i32.add pos 2) 128 191)
+                             (utf8-byte-in? s (i32.add pos 3) 128 191)))
+                4 0)
+              0)))))))
+
+(fn invalid-utf8-bytes ((s string) (pos s32) (n s32) (bad s32)) s32
+  (if (i32.ge_s pos n) bad
+    (let (len (utf8-sequence s pos))
+      (if len (invalid-utf8-bytes s (i32.add pos len) n bad)
+        (invalid-utf8-bytes s (i32.add pos 1) n (i32.add bad 1))))))
+
+(fn copy-bytes ((s string) (pos s32) (end s32) (dest s32)) s32
+  (if (i32.ge_s pos end) dest
+    (begin
+      (i32.store8 dest (u8 (string-ref s pos)))
+      (copy-bytes s (i32.add pos 1) end (i32.add dest 1)))))
+
+(fn copy-escaping ((s string) (pos s32) (n s32) (dest s32)) s32
+  (if (i32.ge_s pos n) dest
+    (let (len (utf8-sequence s pos))
+      (if len
+        (copy-escaping s (i32.add pos len) n (copy-bytes s pos (i32.add pos len) dest))
+        (let (c (string-ref s pos))
+          (begin
+            (i32.store8 dest (u8 92))
+            (i32.store8 (i32.add dest 1) (u8 120))
+            (i32.store8 (i32.add dest 2) (u8 (string-ref "0123456789abcdef" (i32.shr_u c 4))))
+            (i32.store8 (i32.add dest 3) (u8 (string-ref "0123456789abcdef" (i32.and c 15))))
+            (copy-escaping s (i32.add pos 1) n (i32.add dest 4))))))))
+
+; Linear in the length of S, and S itself when it is valid: a read of a full event
+; buffer can hold megabytes, so this writes one buffer rather than appending.
+(fn utf8-safe ((s string)) string
+  (let (n (string-len s))
+    (let (bad (invalid-utf8-bytes s 0 n 0))
+      (if (i32.eq bad 0) s
+        (let (size (i32.add n (i32.mul bad 3)))
+          (let (buf (heap-alloc (i32.add size 4)))
+            (begin
+              (i32.store buf size)
+              (copy-escaping s 0 n (i32.add buf 4))
+              (let (out (string-from-addr buf))
+                (begin (heap-free buf) out)))))))))
+
 ; Granite has no tail-call optimization, so this recurses once per list element
 ; and would overflow the wasm stack on a long list (e.g. a (list u8) of hundreds
 ; of bytes drained from on-data events). Cap rendering at 64 elements and append
