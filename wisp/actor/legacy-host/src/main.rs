@@ -316,7 +316,8 @@ fn load(actor_dir: &Option<PathBuf>, bundle: &Option<PathBuf>) -> Result<Loaded>
 /// theater-repl config (TOML). It grants the REPL actor's filesystem capability —
 /// a root directory it may read/write, the human's slice of the actor manifest —
 /// and the hosts its http-client may reach (`[http]`), names the directory of signing
-/// keys the daemon holds for it (`[keys]`), and lists the services `serve` starts and keeps running (`[[service]]`, see
+/// keys the daemon holds for it (`[keys]`), gives its TCP listeners a certificate
+/// (`[tcp.server_tls]`), and lists the services `serve` starts and keeps running (`[[service]]`, see
 /// `boot`).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -324,6 +325,7 @@ struct ReplConfig {
     filesystem: FilesystemConfig,
     http: Option<HttpConfig>,
     keys: Option<KeysConfig>,
+    tcp: Option<TcpConfig>,
     #[serde(rename = "service")]
     services: Vec<boot::ServiceConfig>,
 }
@@ -363,6 +365,22 @@ struct HttpConfig {
 #[serde(deny_unknown_fields)]
 struct KeysConfig {
     dir: PathBuf,
+}
+
+/// `[tcp.server_tls]`: the certificate and key (PEM) for `(tcp-tls-server conn)`.
+/// Read once, when the daemon starts. A file that can't be read logs an error and
+/// the verb reports TLS as not configured; the daemon still starts.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TcpConfig {
+    server_tls: ServerTlsConfig,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerTlsConfig {
+    cert: PathBuf,
+    key: PathBuf,
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -434,6 +452,19 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
         http,
         keys: wisp_interpreter_actor::crypto::KeyAccess {
             dir: config.keys.as_ref().map(|keys| keys.dir.clone()),
+        },
+        tcp: theater_handler_tcp::TcpHandlerConfig {
+            server_tls: config
+                .tcp
+                .as_ref()
+                .map(|tcp| theater_handler_tcp::ServerTlsConfig {
+                    enabled: true,
+                    cert: tcp.server_tls.cert.clone(),
+                    key: tcp.server_tls.key.clone(),
+                    // Plain on accept; STARTTLS upgrades a connection when asked.
+                    auto_handshake: false,
+                }),
+            ..Default::default()
         },
     };
     Runtime::new(SourceBundle::new(sources)?, grants).await
@@ -1400,6 +1431,10 @@ mod tests {
         let c: ReplConfig = toml::from_str("[keys]\ndir = \"/k\"\n").unwrap();
         assert_eq!(c.keys.unwrap().dir, PathBuf::from("/k"));
         assert!(toml::from_str::<ReplConfig>("[keys]\n").is_err());
+        let c: ReplConfig =
+            toml::from_str("[tcp.server_tls]\ncert = \"/c\"\nkey = \"/k\"\n").unwrap();
+        assert_eq!(c.tcp.unwrap().server_tls.cert, PathBuf::from("/c"));
+        assert!(toml::from_str::<ReplConfig>("[tcp.server_tls]\ncert = \"/c\"\n").is_err());
     }
 
     #[test]

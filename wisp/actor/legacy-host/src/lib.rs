@@ -84,6 +84,7 @@ pub struct Grants {
     pub fs: FsAccess,
     pub http: HttpAccess,
     pub keys: crypto::KeyAccess,
+    pub tcp: theater_handler_tcp::TcpHandlerConfig,
 }
 
 pub struct Runtime {
@@ -121,7 +122,12 @@ impl Runtime {
         replay: Option<Vec<ChainEvent>>,
         chain: Option<mpsc::Sender<(TheaterId, ChainEvent)>>,
     ) -> Result<Self> {
-        let Grants { fs, http, keys } = grants;
+        let Grants {
+            fs,
+            http,
+            keys,
+            tcp,
+        } = grants;
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);
@@ -196,9 +202,7 @@ impl Runtime {
             },
         ));
         // Raw TCP + UDP sockets and Podman container control.
-        handlers.register(theater_handler_tcp::TcpHandler::new(
-            theater_handler_tcp::TcpHandlerConfig::default(),
-        ));
+        handlers.register(theater_handler_tcp::TcpHandler::new(tcp));
         handlers.register(theater_handler_udp::UdpHandler::new(
             theater_handler_udp::UdpHandlerConfig::default(),
         ));
