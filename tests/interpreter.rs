@@ -1,15 +1,18 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use granite::{compiler, interpreter::Interpreter};
+use granite::{
+    compiler,
+    interpreter::{Interpreter, InterpreterImage},
+};
 
 fn session() -> Interpreter {
-    static PACKAGE: OnceLock<PathBuf> = OnceLock::new();
-    let package = PACKAGE.get_or_init(|| {
+    static IMAGE: OnceLock<InterpreterImage> = OnceLock::new();
+    let image = IMAGE.get_or_init(|| {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         // Compiling the evaluator recurses per expression node and exceeds the
         // default 2 MiB test stack, so build it on a large stack.
-        std::thread::scope(|s| {
+        let package = std::thread::scope(|s| {
             std::thread::Builder::new()
                 .stack_size(1 << 30)
                 .spawn_scoped(s, || {
@@ -27,9 +30,10 @@ fn session() -> Interpreter {
                 .expect("spawn big-stack compile thread")
                 .join()
                 .expect("big-stack compile thread panicked")
-        })
+        });
+        InterpreterImage::load(package).unwrap()
     });
-    Interpreter::load(package).unwrap()
+    image.session().unwrap()
 }
 
 fn eval(session: &mut Interpreter, source: &str, expected: &str) {
