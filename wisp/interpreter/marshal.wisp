@@ -514,10 +514,21 @@
         (unmarshal-node cgrf
           (find-node cgrf (i32.load (i32.add indices (i32.mul i (i32.const 4)))) (i32.const 16)))))))
 
+; A host call that fails before it reaches its function (the usual cause: a string
+; argument that isn't UTF-8, which the host cannot decode) writes no result, so its
+; `any` is empty. There is no node to read: past the length is whatever the heap
+; held, and walking it traps and kills the session. Give the caller an (err ...).
+(fn host-call-failed () value
+  (compound (mk-result-type (symbol "unknown") (symbol "string")) "err"
+    (list-push (list-new value)
+      (text "host call failed (a string argument that is not valid UTF-8?)"))))
+
 (fn unmarshal ((x any)) value
   (let (cgrf (i32.add (any-addr x) (i32.const 4)))
-    (unmarshal-node cgrf
-      (find-node cgrf (i32.load (i32.add cgrf (i32.const 12))) (i32.const 16)))))
+    (if (i32.eq (i32.load (i32.sub cgrf (i32.const 4))) (i32.const 0))
+      (host-call-failed)
+      (unmarshal-node cgrf
+        (find-node cgrf (i32.load (i32.add cgrf (i32.const 12))) (i32.const 16))))))
 
 ; ---------------------------------------------------------------------------
 ; record register-on-arrival (nominal). The codec now lives in the interpreter,
