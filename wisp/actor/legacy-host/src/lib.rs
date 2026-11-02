@@ -122,7 +122,12 @@ impl Runtime {
         replay: Option<Vec<ChainEvent>>,
         chain: Option<mpsc::Sender<(TheaterId, ChainEvent)>>,
     ) -> Result<Self> {
-        let Grants { fs, http, keys, tcp } = grants;
+        let Grants {
+            fs,
+            http,
+            keys,
+            tcp,
+        } = grants;
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
         handlers.register(bundle);

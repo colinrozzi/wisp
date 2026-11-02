@@ -454,13 +454,16 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
             dir: config.keys.as_ref().map(|keys| keys.dir.clone()),
         },
         tcp: theater_handler_tcp::TcpHandlerConfig {
-            server_tls: config.tcp.as_ref().map(|tcp| theater_handler_tcp::ServerTlsConfig {
-                enabled: true,
-                cert: tcp.server_tls.cert.clone(),
-                key: tcp.server_tls.key.clone(),
-                // Plain on accept; STARTTLS upgrades a connection when asked.
-                auto_handshake: false,
-            }),
+            server_tls: config
+                .tcp
+                .as_ref()
+                .map(|tcp| theater_handler_tcp::ServerTlsConfig {
+                    enabled: true,
+                    cert: tcp.server_tls.cert.clone(),
+                    key: tcp.server_tls.key.clone(),
+                    // Plain on accept; STARTTLS upgrades a connection when asked.
+                    auto_handshake: false,
+                }),
             ..Default::default()
         },
     };
