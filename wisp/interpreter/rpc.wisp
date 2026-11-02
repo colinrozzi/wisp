@@ -620,7 +620,7 @@
 (fn apply-log ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "log expects (log message)")
     (if (string-arg? (list-get args 0))
-      (begin (log (as-string (list-get args 0))) (nil))
+      (begin (log (utf8-safe (as-string (list-get args 0)))) (nil))
       (failure "log expects a string message"))))
 
 ; store verbs (raw-CGRF convention). Each marshals its string args into a CGRF

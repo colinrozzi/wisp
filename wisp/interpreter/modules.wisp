@@ -187,13 +187,17 @@
 ; to the daemon's source bundle, which is how std/* reaches every session whatever
 ; its filesystem root. Disk comes first, so a file at the same path shadows the
 ; bundled one. If the bundle has no such path either, report the filesystem error.
+; A typed import decodes its result with no check that the call worked, so a path
+; the host can't decode must not reach it.
 (fn read-source-from-bundle ((path string) (not-found value)) value
-  (match (resolve-path "" path)
-    ((err message) not-found)
-    ((ok canonical)
-      (match (read-source canonical)
-        ((err message) not-found)
-        ((ok source) (text source))))))
+  (if (utf8-valid? path)
+    (match (resolve-path "" path)
+      ((err message) not-found)
+      ((ok canonical)
+        (match (read-source canonical)
+          ((err message) not-found)
+          ((ok source) (text source)))))
+    not-found))
 (fn read-source-at ((source string)) value
   (if (url-source? source) (read-source-from-url source)
     (let (on-disk (read-source-from-path source))

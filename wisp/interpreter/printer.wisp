@@ -100,6 +100,9 @@
             (i32.store8 (i32.add dest 3) (u8 (string-ref "0123456789abcdef" (i32.and c 15))))
             (copy-escaping s (i32.add pos 1) n (i32.add dest 4))))))))
 
+(fn utf8-valid? ((s string)) s32
+  (i32.eq (invalid-utf8-bytes s 0 (string-len s) 0) (i32.const 0)))
+
 ; Linear in the length of S, and S itself when it is valid: a read of a full event
 ; buffer can hold megabytes, so this writes one buffer rather than appending.
 (fn utf8-safe ((s string)) string
