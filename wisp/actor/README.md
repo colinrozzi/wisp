@@ -314,7 +314,12 @@ in the config (see Services, above).
 ⁴ TCP works both directions (verified live). **Client:** `(tcp-connect addr)` →
 connection id; `(tcp-send conn text)` → byte count; `(tcp-receive conn max)` →
 `list<u8>`. Data moves as `list<u8>` built from a string, so non-UTF-8 bytes need
-care. ⁵ `(tcp-receive …)` takes a `u32` `max` — the codec carries it as a proper
+care. **TLS:** `(tcp-tls-client conn name)` upgrades an outbound connection,
+checking the certificate against the web roots and `name`; `(tcp-tls-server conn)`
+upgrades an accepted one with the `[tcp.server_tls]` certificate (on a public
+listener, call it in active mode: the handshake then runs in the read loop with a
+10 s deadline, while in passive mode it blocks the handler until the client
+speaks). Connections are plain until upgraded. ⁵ `(tcp-receive …)` takes a `u32` `max` — the codec carries it as a proper
 CGRF `u32` (via `as-u32`), so a plain integer like `1024` works. ⁶ The **server**
 path is Erlang/OTP-style and *event-driven* — you do **not** call `(tcp-accept)`.
 `(tcp-listen addr)` starts a background accept loop; Theater then calls the actor's
