@@ -464,6 +464,15 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
                     // Plain on accept; STARTTLS upgrades a connection when asked.
                     auto_handshake: false,
                 }),
+            // (tcp-tls-client conn name) upgrades an outbound connection, checking
+            // the server's certificate against the web roots and `name`. Plain on
+            // connect, so nothing changes for a session that never asks.
+            client_tls: Some(theater_handler_tcp::ClientTlsConfig {
+                enabled: true,
+                ca_cert: None,
+                skip_verify: false,
+                auto_handshake: false,
+            }),
             ..Default::default()
         },
     };
