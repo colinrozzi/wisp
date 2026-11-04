@@ -274,6 +274,16 @@
 (import wisp-crypto key-list () (result (list string) string))
 (import wisp-crypto sign ((name string) (data (list u8))) (result string string))
 (import wisp-crypto verify ((public-key string) (signature string) (data (list u8))) bool)
+(import wisp-crypto p256-key-new ((name string)) (result string string))
+(import wisp-crypto p256-public ((name string)) (result string string))
+(import wisp-crypto vapid-header ((name string) (audience string) (subject string)) (result string string))
+(import wisp-crypto webpush-encrypt ((p256dh string) (auth string) (payload (list u8))) (result (list u8) string))
+(import wisp-crypto x25519-key-new ((name string)) (result string string))
+(import wisp-crypto x25519-public ((name string)) (result string string))
+(import wisp-crypto seal ((recipient string) (plaintext (list u8))) (result (list u8) string))
+(import wisp-crypto open ((name string) (sealed (list u8))) (result (list u8) string))
+(import wisp-crypto scrypt-hash ((password (list u8))) (result string string))
+(import wisp-crypto scrypt-check ((password (list u8)) (line string)) bool)
 
 ; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
 ; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
@@ -460,6 +470,16 @@
     ((string=? name "key-list") 1)
     ((string=? name "sign") 1)
     ((string=? name "verify") 1)
+    ((string=? name "p256-key-new") 1)
+    ((string=? name "p256-public") 1)
+    ((string=? name "vapid-header") 1)
+    ((string=? name "webpush-encrypt") 1)
+    ((string=? name "x25519-key-new") 1)
+    ((string=? name "x25519-public") 1)
+    ((string=? name "seal") 1)
+    ((string=? name "open") 1)
+    ((string=? name "scrypt-hash") 1)
+    ((string=? name "scrypt-check") 1)
     ((string=? name "msg-register") 1)
     ((string=? name "msg-send") 1)
     ((string=? name "msg-request") 1)
@@ -830,6 +850,65 @@
     (unmarshal (raw-invoke "wisp-crypto" "verify"
       (marshal (sequence (list-push (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1)) (str-to-bytes (list-get args 2)))))))
     (failure "verify expects (verify public-key-hex sig-hex text)")))
+
+; Web Push: (p256-key-new name) / (p256-public name) -> (ok public-key-base64url);
+; (vapid-header name audience subject) -> (ok "vapid t=..., k=...");
+; (webpush-encrypt p256dh auth payload) -> (ok bytes), payload a string or bytes.
+(fn apply-p256-key-new ((args (list value))) value
+  (if (one-str? args)
+    (unmarshal (raw-invoke "wisp-crypto" "p256-key-new" (marshal (list-get args 0))))
+    (failure "p256-key-new expects (p256-key-new name)")))
+(fn apply-p256-public ((args (list value))) value
+  (if (one-str? args)
+    (unmarshal (raw-invoke "wisp-crypto" "p256-public" (marshal (list-get args 0))))
+    (failure "p256-public expects (p256-public name)")))
+(fn apply-vapid-header ((args (list value))) value
+  (if (i32.and (i32.eq (list-len args) 3) (all-strings? args 0))
+    (unmarshal (raw-invoke "wisp-crypto" "vapid-header" (arg-tuple args)))
+    (failure "vapid-header expects (vapid-header key-name audience subject)")))
+(fn apply-webpush-encrypt ((args (list value))) value
+  (if (if (i32.eq (list-len args) 3)
+        (i32.and (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) (crypto-data? (list-get args 2))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "webpush-encrypt"
+      (marshal (sequence (list-push (list-push (list-push (list-new value) (list-get args 0)) (list-get args 1)) (str-to-bytes (list-get args 2)))))))
+    (failure "webpush-encrypt expects (webpush-encrypt p256dh auth payload)")))
+
+; Sealed boxes: (x25519-key-new name) / (x25519-public name) -> (ok public-key-hex);
+; (seal public-key-hex text) -> (ok bytes); (open name sealed) -> (ok bytes) or
+; (err "cannot open").
+(fn apply-x25519-key-new ((args (list value))) value
+  (if (one-str? args)
+    (unmarshal (raw-invoke "wisp-crypto" "x25519-key-new" (marshal (list-get args 0))))
+    (failure "x25519-key-new expects (x25519-key-new name)")))
+(fn apply-x25519-public ((args (list value))) value
+  (if (one-str? args)
+    (unmarshal (raw-invoke "wisp-crypto" "x25519-public" (marshal (list-get args 0))))
+    (failure "x25519-public expects (x25519-public name)")))
+(fn apply-seal ((args (list value))) value
+  (if (if (i32.eq (list-len args) 2)
+        (i32.and (string-arg? (list-get args 0)) (crypto-data? (list-get args 1))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "seal"
+      (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (str-to-bytes (list-get args 1)))))))
+    (failure "seal expects (seal public-key-hex text)")))
+(fn apply-open ((args (list value))) value
+  (if (if (i32.eq (list-len args) 2)
+        (i32.and (string-arg? (list-get args 0)) (crypto-data? (list-get args 1))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "open"
+      (marshal (sequence (list-push (list-push (list-new value) (list-get args 0)) (str-to-bytes (list-get args 1)))))))
+    (failure "open expects (open key-name sealed-bytes)")))
+
+; Passwords: (scrypt-hash password) -> (ok "scrypt$N$r$p$salt-hex$hash-hex");
+; (scrypt-check password line) -> true/false.
+(fn apply-scrypt-hash ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (crypto-data? (list-get args 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "scrypt-hash" (marshal (str-to-bytes (list-get args 0)))))
+    (failure "scrypt-hash expects (scrypt-hash password)")))
+(fn apply-scrypt-check ((args (list value))) value
+  (if (if (i32.eq (list-len args) 2)
+        (i32.and (crypto-data? (list-get args 0)) (string-arg? (list-get args 1))) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "scrypt-check"
+      (marshal (sequence (list-push (list-push (list-new value) (str-to-bytes (list-get args 0))) (list-get args 1))))))
+    (failure "scrypt-check expects (scrypt-check password line)")))
 
 ; --- chain recorder (wisp-chain) ---------------------------------------------
 ; (chain-watch id) starts recording actor id's chain; (chain-head id) ->
@@ -1811,7 +1890,7 @@
           (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n           durable: (fs-write-durable p text) replaces p all-or-nothing, on disk when it returns   (fs-sync p) (fs-sync-dir p) (fs-rename from to)\n"
-                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\ncrypto:    (sha256 string-or-bytes) -> 64 hex chars   (verify public-key-hex sig-hex text) -> true/false\n           (key-new name) (key-public name) -> (ok public-key-hex)   (key-list) -> (ok names)   (sign name text) -> (ok sig-hex); keys stay in the daemon, config.toml [keys] dir\n"
+                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\ncrypto:    (sha256 string-or-bytes) -> 64 hex chars   (verify public-key-hex sig-hex text) -> true/false\n           (key-new name) (key-public name) -> (ok public-key-hex)   (key-list) -> (ok names)   (sign name text) -> (ok sig-hex); keys stay in the daemon, config.toml [keys] dir\n           (p256-key-new name) (p256-public name) -> (ok public-key-base64url)   (vapid-header name audience subject) -> (ok \"vapid t=..., k=...\")\n           (webpush-encrypt p256dh auth payload) -> (ok bytes)   RFC 8291 aes128gcm, for (http-req \"POST\" endpoint headers bytes)\n           (x25519-key-new name) (x25519-public name) -> (ok public-key-hex)   (seal public-key-hex text) -> (ok bytes)   (open name sealed) -> (ok bytes)\n           (scrypt-hash password) -> (ok \"scrypt$N$r$p$salt$hash\")   (scrypt-check password line) -> true/false\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
@@ -1866,6 +1945,16 @@
     ((string=? name "key-list") (apply-key-list args))
     ((string=? name "sign") (apply-sign args))
     ((string=? name "verify") (apply-verify args))
+    ((string=? name "p256-key-new") (apply-p256-key-new args))
+    ((string=? name "p256-public") (apply-p256-public args))
+    ((string=? name "vapid-header") (apply-vapid-header args))
+    ((string=? name "webpush-encrypt") (apply-webpush-encrypt args))
+    ((string=? name "x25519-key-new") (apply-x25519-key-new args))
+    ((string=? name "x25519-public") (apply-x25519-public args))
+    ((string=? name "seal") (apply-seal args))
+    ((string=? name "open") (apply-open args))
+    ((string=? name "scrypt-hash") (apply-scrypt-hash args))
+    ((string=? name "scrypt-check") (apply-scrypt-check args))
     ((string=? name "chain-watch") (apply-chain-watch args))
     ((string=? name "chain-unwatch") (apply-chain-unwatch args))
     ((string=? name "chain-head") (apply-chain-head args))

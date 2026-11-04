@@ -73,8 +73,9 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Serve requests on `listener` forever, answering each `200 hi`, and send the
-/// request head (lowercased) and body of each to `seen`.
+/// Serve requests on `listener` forever, answering each `200 hi` (`410 Gone` for
+/// a path under /gone), and send the request head (lowercased) and body of each
+/// to `seen`; a body that isn't UTF-8 is sent as its bytes in hex.
 fn serve(listener: TcpListener, seen: mpsc::Sender<(String, String)>) {
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
@@ -93,10 +94,19 @@ fn serve(listener: TcpListener, seen: mpsc::Sender<(String, String)>) {
             .map_or(0, |n| n.trim().parse().unwrap());
         let mut body = vec![0; len];
         reader.read_exact(&mut body).unwrap();
-        let _ = stream.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Reply: yes\r\nConnection: close\r\n\r\nhi",
-        );
-        let _ = seen.send((head, String::from_utf8(body).unwrap()));
+        let reply: &[u8] = if head
+            .split(' ')
+            .nth(1)
+            .is_some_and(|p| p.starts_with("/gone"))
+        {
+            b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        } else {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Reply: yes\r\nConnection: close\r\n\r\nhi"
+        };
+        let _ = stream.write_all(reply);
+        let body = String::from_utf8(body)
+            .unwrap_or_else(|bad| bad.as_bytes().iter().map(|b| format!("{b:02x}")).collect());
+        let _ = seen.send((head, body));
     }
 }
 
@@ -170,6 +180,18 @@ fn http_allowlist_comes_from_config_and_http_req_sends_headers() {
     let (head, body) = seen.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(head.starts_with("put /put "), "{head}");
     assert_eq!(body, "raw");
+
+    // A body that isn't text, as webpush-encrypt makes, goes byte for byte, and
+    // a push service's 410 for a dead subscription comes back as the status.
+    let form = format!(
+        "(http-req \"POST\" \"http://127.0.0.1:{port}/gone/sub\" (list (list \"Content-Encoding\" \"aes128gcm\")) (string->bytes \"\\x00\\xFF\\x80\\n\"))"
+    );
+    let got = daemon.ok(&["eval", &id, &form]);
+    assert!(got.contains("(http-response 410 "), "{got}");
+    let (head, body) = seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(head.starts_with("post /gone/sub "), "{head}");
+    assert!(head.contains("content-length: 4\r\n"), "{head}");
+    assert_eq!(body, "00ff800a");
 
     // The two- and three-argument forms read no argument past the last one
     // (ticket 0050): no headers, no body.

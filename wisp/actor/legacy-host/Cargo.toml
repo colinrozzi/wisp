@@ -44,10 +44,26 @@ tokio = { version = "1", features = ["full"] }
 ed25519-dalek = "2"
 getrandom = "0.2"
 sha2 = "0.10"
+# Web Push (P-256, AES-128-GCM), sealed boxes (X25519, ChaCha20-Poly1305), scrypt.
+aes-gcm = "0.10"
+base64 = "0.21"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pem", "pkcs8"] }
+scrypt = { version = "0.11", default-features = false }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.dev]
 debug = 0
+
+# scrypt at N = 2^15 takes seconds unoptimized; tests and debug daemons check passwords.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
 
 # build.rs compiles the Wisp actor with Granite in-process (no nested cargo).
 [build-dependencies]

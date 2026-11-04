@@ -127,7 +127,7 @@ Changes to the host itself (this crate) still need a daemon restart.
 
 The config file (`--config PATH`, else `~/.config/theater-repl/config.toml`)
 grants the sessions' filesystem root and the hosts they may reach over HTTP, names
-the directory of signing keys the daemon holds for them, and can list **services**: sessions that `serve` creates at start and keeps running.
+the directory of private keys the daemon holds for them, and can list **services**: sessions that `serve` creates at start and keeps running.
 
 ```toml
 [filesystem]
@@ -156,15 +156,80 @@ the built-in list applies (example.com, api.github.com, httpbin.org,
 raw.githubusercontent.com); a section replaces it, and `[http]` with no
 `allowed_hosts` allows none. The daemon reads it at start.
 
-`[keys] dir` is where the daemon keeps ed25519 signing keys: one file per key,
-`<name>.key`, holding the 32-byte seed as hex. Names are 1-64 of `A-Za-z0-9._-`, so
-never a path. `(key-new name)` creates the directory mode 0700 if it is missing and
-the file mode 0600; a directory that already exists keeps its mode. To bring in a
-key, put its file there; the daemon reads the file on each use. No verb returns a
-seed: `(sign name text)` signs in the daemon. **Every session may use every key**;
+`[keys] dir` is where the daemon keeps private keys, one file per key:
+
+| File | Holds | Made by | Used by |
+|------|-------|---------|---------|
+| `<name>.key` | an ed25519 seed, 32 bytes as hex | `(key-new name)` | `key-public`, `sign` |
+| `<name>.p256` | a P-256 key, PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`) | `(p256-key-new name)` | `p256-public`, `vapid-header` |
+| `<name>.x25519` | an X25519 secret, 32 bytes as hex | `(x25519-key-new name)` | `x25519-public`, `open` |
+
+Names are 1-64 of `A-Za-z0-9._-`, so never a path; the same name may have one key of
+each kind. A `-new` verb creates the directory mode 0700 if it is missing and the
+file mode 0600, refuses a name that has a key of that kind, and returns the public
+key; a directory that already exists keeps its mode. To bring in a key, put its file
+there; the daemon reads the file on each use. A `.p256` file is the format
+`openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` and Python's
+`cryptography` (`PrivateFormat.PKCS8`) write, so an existing VAPID key (chat-push's
+`vapid.pem`) can be copied in as `<name>.p256` and current push subscriptions keep
+working. `(key-list)` lists the `.key` names only. No verb returns a private key:
+signing and opening happen in the daemon. **Every session may use every key**;
 per-session grants come with the permissions rework (theater#240). Without a `[keys]`
-section the key verbs return `(err "no key directory configured")`; `sha256` and
-`verify` need no keys and still work.
+section the key verbs return `(err "no key directory configured")`; `sha256`,
+`verify`, `webpush-encrypt`, `seal` and the scrypt verbs need no keys and still work.
+
+**Web Push.** `(p256-public name)` is the key's uncompressed point (65 bytes,
+`04 || x || y`) as unpadded base64url: the `applicationServerKey` a page subscribes
+with. `(vapid-header name audience subject)` is the RFC 8292 `Authorization` value,
+`vapid t=<JWT>, k=<public key>`: an ES256 JWT, header `{"typ":"JWT","alg":"ES256"}`,
+claims `{"aud":audience,"exp":now + 12 h,"sub":subject}`. The audience is the push
+service's origin (`https://fcm.googleapis.com`, from the endpoint), the subject a
+contact `https:` or `mailto:` URL. `(webpush-encrypt p256dh auth payload)` encrypts
+a payload (a string or bytes, at most 3993 bytes) for the subscription whose
+`keys.p256dh` and `keys.auth` are given (base64url, padded or not), per RFC 8291:
+one `aes128gcm` record, record size 4096, with a fresh ephemeral P-256 key and
+16-byte salt each call. The result is the body to POST to the subscription's
+endpoint:
+
+```
+(define body (match (webpush-encrypt p256dh auth "{\"title\":\"hi\"}") ((ok b) b)))
+(http-req "POST" endpoint
+  (list (list "Content-Encoding" "aes128gcm") (list "Content-Type" "application/octet-stream")
+        (list "TTL" "86400") (list "Authorization" (match (vapid-header "vapid" origin "https://colinrozzi.com") ((ok h) h))))
+  body)
+; -> (ok (http-response 201 ...)); 404 or 410 means the subscription is gone
+```
+
+`http-req` sends a bytes body byte for byte and returns any status the service
+answers (the push service's host must be in `[http] allowed_hosts`). A printed byte list
+shows its first 64 bytes and then `... k more` (`interpreter/printer.wisp`); the
+value itself is whole, and `(list-len body)` gives its length.
+
+**Sealed boxes.** `(seal recipient-public-hex text)` encrypts text (a string or
+bytes) so that only the holder of the X25519 key can read it; `(open name sealed)`
+reads it with the key file `<name>.x25519`, or returns `(err "cannot open")` for a
+box that is not for that key, is cut short, or was changed. The format, in bytes:
+
+```
+sealed = E || C            E: the ephemeral X25519 public key (32 bytes)
+                           C: ChaCha20-Poly1305 ciphertext || 16-byte tag
+shared = X25519(e, R)      e: E's private key, fresh per box; R: the recipient's public key
+key    = HKDF-SHA256(salt = E || R, ikm = shared, info = "wisp sealed box v1", 32 bytes)
+C      = ChaCha20-Poly1305(key, nonce = 12 zero bytes, aad = none, text)
+```
+
+So a box is 48 bytes longer than its text. The zero nonce is safe because each key
+encrypts one box. A recipient key of low order (whose shared secret is zero) is
+refused. The sender is not authenticated: sign the text, or the box, for that.
+
+**Passwords.** `(scrypt-hash password)` returns a line
+`scrypt$N$r$p$salt-hex$hash-hex` with N = 32768, r = 8, p = 1, a fresh 16-byte salt
+and a 32-byte hash: the format and parameters of the site's auth-helper, so its
+stored lines still check. `(scrypt-check password line)` is true when the password
+matches. It is false for a wrong password and for a line that is malformed or would
+cost too much: N not a power of two from 2 to 2^17, r below 1, p not 1-16, more than
+256 MiB of memory (128 * r * N bytes), or a hash not 16-64 bytes. One check at the
+default parameters takes about 0.1 s and 32 MiB; the crypto verbs run on the daemon's blocking pool, so a check does not hold up other sessions.
 
 For each service the daemon creates a session under its name and evaluates the
 start file in it, as `theater-repl new web && theater-repl eval web - < serve.wisp`
@@ -293,7 +358,7 @@ A library can return the same shape with `(ok v)` / `(err e)`; see
 | message-server | `(msg-register)` · `(msg-send id text)` · `(msg-request id text)` · `(msg-list-requests)` · `(msg-respond req text)` · `(msg-cancel req)` · `(msg-open id text)` · `(msg-send-channel cid text)` · `(msg-close-channel cid)` |
 | filesystem² | `(fs-read p)` (bytes) · `(fs-read-text p)` (a string) · `(fs-write p text)` · `(fs-exists p)` · `(fs-list p)` · `(fs-meta p)` · `(fs-append p text)` · `(fs-delete p)` · `(fs-mkdir p)` · `(fs-rmdir p)` · `(fs-write-durable p text)` (all-or-nothing, on disk when it returns) · `(fs-sync p)` · `(fs-sync-dir p)` · `(fs-rename from to)` |
 | http-client³ | `(http-get url)` · `(http-req method url [headers [body]])`, headers `((name value) …)`, body a string or bytes → `(ok (http-response status headers body))` |
-| crypto | `(sha256 x)`, x a string or bytes → 64 hex chars · `(key-new name)` · `(key-public name)` → `(ok public-key-hex)` · `(key-list)` → `(ok names)` · `(sign name text)` → `(ok sig-hex)` · `(verify public-key-hex sig-hex text)` → true/false, bad hex is false. Keys: `[keys]` in the config (see Services, above) |
+| crypto | `(sha256 x)`, x a string or bytes → 64 hex chars · `(key-new name)` · `(key-public name)` → `(ok public-key-hex)` · `(key-list)` → `(ok names)` · `(sign name text)` → `(ok sig-hex)` · `(verify public-key-hex sig-hex text)` → true/false, bad hex is false · Web Push: `(p256-key-new name)` · `(p256-public name)` → `(ok public-key-base64url)` · `(vapid-header name audience subject)` → `(ok "vapid t=..., k=...")` · `(webpush-encrypt p256dh auth payload)` → `(ok bytes)` · sealed boxes: `(x25519-key-new name)` · `(x25519-public name)` → `(ok public-key-hex)` · `(seal public-key-hex text)` → `(ok bytes)` · `(open name sealed)` → `(ok bytes)` or `(err "cannot open")` · passwords: `(scrypt-hash password)` → `(ok "scrypt$N$r$p$salt$hash")` · `(scrypt-check password line)` → true/false. Keys and formats: `[keys]` in the config (see Services, above) |
 | assembler | `(wat-to-wasm wat-text)` → wasm bytes |
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
@@ -506,6 +571,6 @@ reclaim its heap. Validated against Theater rev
 | `actor.wisp` | The actor: includes the evaluator, declares ABI + inbound callbacks |
 | `actor.wasm` | Compiled actor, generated and not in git (interface-qualified exports + CGRF metadata) |
 | `manifest.toml` | Manifest; grants the `runtime` control capability |
-| `crypto.pact` | The `wisp-crypto` host interface (hashing, signing) |
+| `crypto.pact` | The `wisp-crypto` host interface (hashing, signing, Web Push, sealed boxes, scrypt) |
 | `source.pact` / `sources.json` | The `wisp-source` host interface + example bundle |
 | `legacy-host/` | The local Theater runtime + socket server that hosts the REPL |
