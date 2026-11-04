@@ -171,6 +171,27 @@ fn http_allowlist_comes_from_config_and_http_req_sends_headers() {
     assert!(head.starts_with("put /put "), "{head}");
     assert_eq!(body, "raw");
 
+    // The two- and three-argument forms read no argument past the last one
+    // (ticket 0050): no headers, no body.
+    let got = daemon.ok(&[
+        "eval",
+        &id,
+        &format!("(http-req \"GET\" \"http://127.0.0.1:{port}/two\")"),
+    ]);
+    assert!(got.contains("(http-response 200 "), "{got}");
+    let (head, body) = seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(head.starts_with("get /two "), "{head}");
+    assert_eq!(body, "");
+    let form = format!(
+        "(http-req \"DELETE\" \"http://127.0.0.1:{port}/three\" (list (list \"X-Three\" \"3\")))"
+    );
+    let got = daemon.ok(&["eval", &id, &form]);
+    assert!(got.contains("(http-response 200 "), "{got}");
+    let (head, body) = seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(head.starts_with("delete /three "), "{head}");
+    assert!(head.contains("x-three: 3\r\n"), "{head}");
+    assert_eq!(body, "");
+
     // Bad arguments are reported, not sent.
     let out = daemon.cli(&[
         "eval",
@@ -180,5 +201,18 @@ fn http_allowlist_comes_from_config_and_http_req_sends_headers() {
     assert!(!out.status.success());
     let bad = text(&out.stderr);
     assert!(bad.contains("(name value) string pairs"), "{bad}");
+    // A header with too few parts is checked by its length first.
+    for header in ["(list)", "(list \"X-One\")"] {
+        let out = daemon.cli(&[
+            "eval",
+            &id,
+            &format!("(http-req \"GET\" \"http://127.0.0.1:{port}/\" (list {header}))"),
+        ]);
+        assert!(!out.status.success());
+        let bad = text(&out.stderr);
+        assert!(bad.contains("(name value) string pairs"), "{bad}");
+    }
     assert!(seen.try_recv().is_err());
+    // And the session is still there.
+    assert_eq!(daemon.ok(&["eval", &id, "(+ 40 2)"]), "42");
 }

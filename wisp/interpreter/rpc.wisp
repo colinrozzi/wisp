@@ -924,12 +924,17 @@
     (let (addr (any-addr (marshal (list-get args 0))))
       (typed-list (symbol "u8")
         (read-bytes addr (i32.add (i32.const 4) (i32.load addr)) (i32.const 0) (list-new value))))))
+; The blob's [len:u32] prefix says how much to copy, so it must not claim more
+; bytes than the list holds; the rest is checked by unmarshal.
 (fn unmarshal-bytevals ((items (list value))) value
   (let (buf (heap-alloc (i32.add (list-len items) (i32.const 16))))
     (begin
       (write-bytes buf items (i32.const 0))
-      (let (blob (any-from-addr buf))
-        (begin (heap-free buf) (unmarshal blob))))))
+      (if (if (i32.ge_s (list-len items) (i32.const 4))
+            (i32.le_u (i32.load buf) (i32.sub (list-len items) (i32.const 4))) 0)
+        (let (blob (any-from-addr buf))
+          (begin (heap-free buf) (unmarshal blob)))
+        (begin (heap-free buf) (unmarshal-failed "unmarshal: the length prefix is longer than the bytes"))))))
 (fn apply-unmarshal ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "unmarshal expects (unmarshal bytes)")
     (value-case (list-get args 0)
@@ -1100,9 +1105,10 @@
     (if (i32.or (i32.lt_s n 2) (i32.gt_s n 4)) (failure "http-req expects (http-req method url [headers [body]])")
       (if (i32.eq (i32.and (string-arg? (list-get args 0)) (string-arg? (list-get args 1))) 0)
         (failure "http-req expects two strings: method and url")
-        (if (i32.and (i32.ge_s n 3) (i32.eq (env-pairs? (list-get args 2)) 0))
+        ; i32.and/or evaluate both sides, so guard each list-get with an if
+        (if (if (i32.ge_s n 3) (i32.eq (env-pairs? (list-get args 2)) 0) 0)
           (failure "http-req headers must be a list of (name value) string pairs")
-          (if (i32.and (i32.eq n 4) (i32.eq (i32.or (string-arg? (list-get args 3)) (bytes-arg? (list-get args 3))) 0))
+          (if (if (i32.eq n 4) (i32.eq (i32.or (string-arg? (list-get args 3)) (bytes-arg? (list-get args 3))) 0) 0)
             (failure "http-req body must be a string or bytes")
             (unmarshal (raw-invoke "theater:simple/http-client" "request"
               (http-request-full (as-string (list-get args 0)) (as-string (list-get args 1))
@@ -1120,7 +1126,7 @@
 ; --- tcp -------------------------------------------------------------------
 ; raw-invoke needs a literal import name, so one verb per import. one-str? and
 ; two-str? guard the common arg shapes; send/receive handle list<u8> / u32.
-(fn one-str? ((args (list value))) s32 (i32.and (i32.eq (list-len args) 1) (string-arg? (list-get args 0))))
+(fn one-str? ((args (list value))) s32 (if (i32.eq (list-len args) 1) (string-arg? (list-get args 0)) 0))
 (fn two-str? ((args (list value))) s32 (i32.and (i32.eq (list-len args) 2) (all-strings? args 0)))
 (fn apply-tcp-connect ((args (list value))) value
   (if (one-str? args) (unmarshal (raw-invoke "theater:simple/tcp" "connect" (marshal (list-get args 0)))) (failure "tcp-connect expects an address")))
@@ -1228,7 +1234,7 @@
   (if (i32.ge_s i (list-len items)) 1
     (value-case (list-get items i)
       ((sequence pair)
-        (if (i32.and (i32.eq (list-len pair) 2) (i32.and (string-arg? (list-get pair 0)) (string-arg? (list-get pair 1))))
+        (if (if (i32.eq (list-len pair) 2) (i32.and (string-arg? (list-get pair 0)) (string-arg? (list-get pair 1))) 0)
           (all-string-pairs? items (i32.add i 1)) 0))
       (else 0))))
 (fn env-pairs? ((v value)) s32
@@ -1259,8 +1265,8 @@
 (fn valid-mount? ((v value)) s32
   (value-case v
     ((sequence m)
-      (if (i32.and (i32.or (i32.eq (list-len m) 2) (i32.eq (list-len m) 3))
-            (i32.and (string-arg? (list-get m 0)) (string-arg? (list-get m 1))))
+      (if (if (i32.or (i32.eq (list-len m) 2) (i32.eq (list-len m) 3))
+            (i32.and (string-arg? (list-get m 0)) (string-arg? (list-get m 1))) 0)
         (if (i32.eq (list-len m) 3) (bool-arg? (list-get m 2)) 1) 0))
     (else 0)))
 (fn all-mounts? ((items (list value)) (i s32)) s32

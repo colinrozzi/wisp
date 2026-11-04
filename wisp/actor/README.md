@@ -450,6 +450,10 @@ The bridge (`interpreter/rpc.wisp`) is uniform, so adding a verb is small:
    `arg-tuple` marshals a positional tuple; a single string arg marshals bare; a
    `list<u8>` arg is built from a string via `str->bytes` / `str-bytes-tuple`; a
    record arg via `marshal-record`.
+   Check the argument count before any `(list-get args i)`: `list-get` has no
+   bounds check, and `i32.and`/`i32.or` evaluate both sides, so guard an optional
+   argument with `(if (i32.ge_s n 3) (check (list-get args 2)) 0)`, not
+   `(i32.and (i32.ge_s n 3) (check (list-get args 2)))` (ticket 0050).
 3. One clause each in `host-builtin?` and `apply-host-builtin` (flat `cond`).
 4. Register the interface's handler once in `legacy-host/src/lib.rs` (real Theater
    deployments enable handlers via the manifest instead), and stub it in
@@ -459,6 +463,13 @@ For an inbound trigger: add an `export` in `actor.wisp` for the callback
 (`handle-*`) that calls `(dispatch-event "on-…" <event>)` — the arg is a bare value
 for single-arg callbacks, or the raw `any` unmarshalled to a `(sequence …)` for
 Tuple-wrapped ones.
+
+`unmarshal` trusts nothing in the bytes, so it is also safe on a stranger's
+`(unmarshal bytes)`. Every read is checked against the buffer, a child index
+against the node count, and nesting against a depth limit of 256 (nodes and type
+tags). A node may be used only once (Pack and `marshal` write trees). Bad bytes
+give `(err "unmarshal: …")`. See `decode-cgrf` in `interpreter/marshal.wisp` and
+`legacy-host/tests/bad_input.rs`.
 
 ## The actor ABI and `wisp-source`
 
