@@ -268,3 +268,217 @@ fn hashing_and_verifying_need_no_keys() {
         assert!(help.contains(verb), "{verb} not in (help)");
     }
 }
+
+/// The bytes in a printed `#<list u8 (#<u8 1> #<u8 2> ...)>`: the first 64, as
+/// many as the printer shows.
+fn printed_bytes(printed: &str) -> Vec<u8> {
+    printed
+        .split("#<u8 ")
+        .skip(1)
+        .map(|item| item.split('>').next().unwrap().parse().unwrap())
+        .collect()
+}
+
+// A PKCS#8 PEM P-256 key from `openssl genpkey -algorithm EC -pkeyopt
+// ec_paramgen_curve:P-256`, the format chat-push wrote vapid.pem in, and its
+// public key as `openssl pkey -pubout` gives it, base64url.
+const VAPID_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgCTnwKoB7DF7+1jjj
+O2ORjdy2h8D0o5/7uBVjSNwaeRChRANCAASo4xK0S/lzMAAbghFKZ8DRxVA29JfZ
+o8JVXCM2ujdLxglu4NRUURIzlXWTwxCN/OtayyUSHcfp+K1G7/MAUqkX
+-----END PRIVATE KEY-----
+";
+const VAPID_PUBLIC: &str =
+    "BKjjErRL-XMwABuCEUpnwNHFUDb0l9mjwlVcIza6N0vGCW7g1FRREjOVdZPDEI3861rLJRIdx-n4rUbv8wBSqRc";
+
+#[test]
+fn web_push_sealed_boxes_and_passwords() {
+    let root = workdir("push-seal-scrypt");
+    let dir = root.join("state/keys");
+    let config = root.join("config.toml");
+    std::fs::write(&config, format!("[keys]\ndir = {:?}\n", dir)).unwrap();
+    let daemon = Daemon::start(&root, &config);
+    let eval = daemon.session();
+    let ok = |form: &str| eval(&format!("(match {form} ((ok v) v) ((err e) e))"));
+
+    // p256 keys: a new one is a 0600 PEM; an existing PEM copied in works.
+    let public = ok("(p256-key-new \"push\")");
+    assert_eq!(public.len(), 87, "{public}");
+    assert!(public.starts_with('B'), "{public}");
+    let file = dir.join("push.p256");
+    assert_eq!(mode(&file), 0o600);
+    let pem = std::fs::read_to_string(&file).unwrap();
+    assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{pem}");
+    assert_eq!(ok("(p256-public \"push\")"), public);
+    assert!(eval("(p256-key-new \"push\")").contains("p256 key 'push' exists"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), pem);
+    assert!(eval("(p256-key-new \"../x\")").contains("bad key name"));
+    assert!(eval("(p256-public \"gone\")").contains("no p256 key named 'gone'"));
+    std::fs::write(dir.join("vapid.p256"), VAPID_PEM).unwrap();
+    assert_eq!(ok("(p256-public \"vapid\")"), VAPID_PUBLIC);
+    std::fs::write(dir.join("bad.p256"), "not a pem").unwrap();
+    assert!(eval("(p256-public \"bad\")").contains("not a PKCS#8 PEM P-256 key"));
+
+    let header =
+        ok("(vapid-header \"vapid\" \"https://push.example.net\" \"https://colinrozzi.com\")");
+    assert!(header.starts_with("vapid t=eyJ"), "{header}");
+    assert!(header.ends_with(&format!(", k={VAPID_PUBLIC}")), "{header}");
+    assert_eq!(header.matches('.').count(), 2, "{header}");
+    assert!(eval("(vapid-header \"gone\" \"a\" \"b\")").contains("no p256 key named 'gone'"));
+
+    // RFC 8291's subscription keys: one record, the header, a fresh salt and
+    // ephemeral key each call. The unit tests decrypt it.
+    let p256dh =
+        "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
+    let auth = "BTBZMqHH6r4Tts7J_aSIgg";
+    eval(&format!(
+        "(define one (match (webpush-encrypt \"{p256dh}\" \"{auth}\" \"hi\") ((ok v) v)))"
+    ));
+    eval(&format!(
+        "(define two (match (webpush-encrypt \"{p256dh}\" \"{auth}\" (string->bytes \"hi\")) ((ok v) v)))"
+    ));
+    assert_eq!(eval("(list-len one)"), (86 + 2 + 17).to_string());
+    assert_eq!(eval("(list-len two)"), (86 + 2 + 17).to_string());
+    let (one, two) = (printed_bytes(&eval("one")), printed_bytes(&eval("two")));
+    assert_eq!(one[16..22], [0, 0, 16, 0, 65, 4]);
+    assert_ne!(one[..16], two[..16], "same salt");
+    assert_ne!(one[22..64], two[22..64], "same ephemeral key");
+    let got = eval(&format!("(webpush-encrypt \"{p256dh}\" \"AAAA\" \"hi\")"));
+    assert!(got.contains("auth is not 16 bytes"), "{got}");
+    let got = eval(&format!("(webpush-encrypt \"!\" \"{auth}\" \"hi\")"));
+    assert!(got.contains("p256dh is not base64url"), "{got}");
+
+    // Sealed boxes, to RFC 7748's Bob from a key file put there by hand.
+    std::fs::write(
+        dir.join("bob.x25519"),
+        "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb\n",
+    )
+    .unwrap();
+    let bob = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f";
+    assert_eq!(ok("(x25519-public \"bob\")"), bob);
+    eval(&format!(
+        "(define box (match (seal \"{bob}\" \"for bob\") ((ok v) v)))"
+    ));
+    assert_eq!(printed_bytes(&eval("box")).len(), 32 + 7 + 16);
+    assert_eq!(
+        ok("(open \"bob\" box)"),
+        eval("(string->bytes \"for bob\")")
+    );
+    let other = ok("(x25519-key-new \"other\")");
+    assert_eq!(other.len(), 64, "{other}");
+    assert_eq!(mode(&dir.join("other.x25519")), 0o600);
+    assert_eq!(ok("(x25519-public \"other\")"), other);
+    assert!(eval("(x25519-key-new \"other\")").contains("x25519 key 'other' exists"));
+    assert_eq!(
+        eval("(open \"other\" box)"),
+        "(err (list u8) string \"cannot open\")"
+    );
+    assert_eq!(
+        eval("(open \"bob\" \"short\")"),
+        "(err (list u8) string \"cannot open\")"
+    );
+    assert!(eval("(open \"gone\" box)").contains("no x25519 key named 'gone'"));
+    assert!(eval("(seal \"zz\" \"m\")").contains("not a 32-byte hex public key"));
+    let back = ok(&format!(
+        "(open \"other\" (match (seal \"{other}\" (string->bytes \"\\xFF\\x00\")) ((ok v) v)))"
+    ));
+    assert_eq!(printed_bytes(&back), [255, 0]);
+
+    // Passwords: RFC 7914's second vector, then one of our own.
+    let rfc = "scrypt$16384$8$1$536f6469756d43686c6f72696465$7023bdcb3afd7348461c06cd81fd38ebfda8fbba904f8e3ea9b543f6545da1f2";
+    assert_eq!(
+        eval(&format!("(scrypt-check \"pleaseletmein\" \"{rfc}\")")),
+        "true"
+    );
+    assert_eq!(
+        eval(&format!("(scrypt-check \"pleaseletmeim\" \"{rfc}\")")),
+        "false"
+    );
+    assert_eq!(
+        eval(&format!(
+            "(scrypt-check (string->bytes \"pleaseletmein\") \"{rfc}\")"
+        )),
+        "true"
+    );
+    let line = ok("(scrypt-hash \"hunter2hunter2\")");
+    assert!(line.starts_with("scrypt$32768$8$1$"), "{line}");
+    assert_eq!(
+        eval(&format!("(scrypt-check \"hunter2hunter2\" \"{line}\")")),
+        "true"
+    );
+    assert_eq!(
+        eval(&format!("(scrypt-check \"hunter2hunter3\" \"{line}\")")),
+        "false"
+    );
+    let costly = format!("scrypt$262144$8$1$00${}", "00".repeat(32));
+    assert_eq!(eval(&format!("(scrypt-check \"x\" \"{costly}\")")), "false");
+
+    // key-list is the signing keys only; no output carries a private key.
+    assert_eq!(
+        eval("(key-list)"),
+        "(ok (list string) string #<list string ()>)"
+    );
+    let pem_body = pem.lines().nth(1).unwrap();
+    for output in [&public, &header, &other] {
+        assert!(!output.contains(pem_body));
+    }
+
+    // Arguments of the wrong kind fail before reaching the host.
+    for (form, want) in [
+        ("(seal 1 \"m\")", "seal expects"),
+        ("(open \"bob\")", "open expects"),
+        ("(webpush-encrypt \"a\" \"b\")", "webpush-encrypt expects"),
+        ("(vapid-header \"a\" \"b\" 3)", "vapid-header expects"),
+        ("(scrypt-check \"pw\")", "scrypt-check expects"),
+        ("(scrypt-hash 1)", "scrypt-hash expects"),
+        ("(p256-key-new)", "p256-key-new expects"),
+        ("(x25519-public 1)", "x25519-public expects"),
+    ] {
+        let out = daemon.cli(&["eval", "crypto", form]);
+        assert!(text(&out.stderr).contains(want), "{form}: {out:?}");
+    }
+    let help = eval("(help)");
+    for verb in [
+        "(p256-key-new",
+        "(p256-public",
+        "(vapid-header",
+        "(webpush-encrypt",
+        "(x25519-key-new",
+        "(x25519-public",
+        "(seal",
+        "(open",
+        "(scrypt-hash",
+        "(scrypt-check",
+    ] {
+        assert!(help.contains(verb), "{verb} not in (help)");
+    }
+}
+
+#[test]
+fn sealing_and_password_checks_need_no_keys() {
+    let root = workdir("seal-no-keys");
+    let config = root.join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    let daemon = Daemon::start(&root, &config);
+    let eval = daemon.session();
+    let bob = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f";
+    assert!(eval(&format!("(seal \"{bob}\" \"m\")")).starts_with("(ok "));
+    let p256dh =
+        "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
+    let got = eval(&format!(
+        "(webpush-encrypt \"{p256dh}\" \"BTBZMqHH6r4Tts7J_aSIgg\" \"m\")"
+    ));
+    assert!(got.starts_with("(ok "), "{got}");
+    assert!(eval("(match (scrypt-hash \"pw\") ((ok v) v))").starts_with("scrypt$"));
+    for form in [
+        "(p256-key-new \"a\")",
+        "(p256-public \"a\")",
+        "(vapid-header \"a\" \"b\" \"c\")",
+        "(x25519-key-new \"a\")",
+        "(x25519-public \"a\")",
+        "(open \"a\" \"m\")",
+    ] {
+        let got = eval(form);
+        assert!(got.contains("no key directory configured"), "{form}: {got}");
+    }
+}
