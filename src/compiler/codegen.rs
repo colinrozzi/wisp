@@ -4415,6 +4415,7 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
     // The scalar value is at $out_ptr + 24
     // Unit type (empty tuple) has no return value
     if !is_unit_type(&import.return_type) {
+        generate_import_failed(out, &import.return_type);
         out.push_str("    ;; Decode result from CGRF\n");
         match &import.return_type {
             Type::S32 => {
@@ -4513,6 +4514,52 @@ pub(crate) fn generate_import_wrapper(out: &mut String, import: &Import) {
     out.push_str("    end\n");
 
     out.push_str("  )\n");
+}
+
+/// The message an import wrapper's `(err ...)` carries when the call failed.
+pub(crate) const IMPORT_FAILED_MESSAGE: &str = "host call failed";
+
+/// A failed host call (status -1, e.g. a string argument that is not UTF-8)
+/// writes no result: the slots hold 0, so decoding would read from address 0.
+/// Return early instead: a `(result T string)` gives `(err "host call failed")`,
+/// built the way the decoder builds one ([tag][payload], the string [len][bytes]);
+/// `any` keeps its empty blob, which `unmarshal` reports; any other type traps,
+/// since there is no value to give.
+pub(crate) fn generate_import_failed(out: &mut String, ty: &Type) {
+    if matches!(ty, Type::Any) {
+        return;
+    }
+    out.push_str("    ;; A failed call has no result to decode\n");
+    out.push_str("    local.get $status\n    i32.const 0\n    i32.lt_s\n    if\n");
+    match ty {
+        Type::Result(ok_ty, err_ty) if matches!(err_ty.as_ref(), Type::Str) => {
+            let payload_size = std::cmp::max(type_size(ok_ty), type_size(err_ty));
+            emit_alloc_const(out, "      ", 4 + payload_size);
+            out.push_str("      local.set $dec_result\n");
+            out.push_str("      local.get $dec_result\n      i32.const 1\n      i32.store\n");
+            let msg = IMPORT_FAILED_MESSAGE.as_bytes();
+            out.push_str(&format!(
+                "      i32.const {}\n      call $__alloc\n      local.set $dec_tmp\n",
+                4 + msg.len()
+            ));
+            out.push_str(&format!(
+                "      local.get $dec_tmp\n      i32.const {}\n      i32.store\n",
+                msg.len()
+            ));
+            for (i, b) in msg.iter().enumerate() {
+                out.push_str(&format!(
+                    "      local.get $dec_tmp\n      i32.const {b}\n      i32.store8 offset={}\n",
+                    4 + i
+                ));
+            }
+            out.push_str(
+                "      local.get $dec_result\n      local.get $dec_tmp\n      i32.store offset=4\n",
+            );
+            out.push_str("      local.get $dec_result\n      return\n");
+        }
+        _ => out.push_str("      unreachable\n"),
+    }
+    out.push_str("    end\n");
 }
 
 /// Generate WAT to encode a single complex parameter to CGRF using the recursive encoder.

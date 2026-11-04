@@ -392,56 +392,120 @@
 ; ---------------------------------------------------------------------------
 ; unmarshal — Pack dynamic `any` (CGRF) back into an interpreter `value`.
 ; The mirror of marshal: walk the node graph from the root, dispatch on the
-; node-kind byte, build the interp value. Nodes are laid out sequentially in
-; index order from cgrf+16, so node[i] is found by skipping i nodes.
+; node-kind byte, build the interp value.
+;
+; The bytes may come from a stranger (`(unmarshal bytes)` on a tcp frame), so
+; nothing in them is trusted: every read is checked against the buffer first
+; (dec-has), and the first bad one records why ($dec-why) and stops the walk,
+; which then returns (err why) instead of trapping. One scan up front checks
+; each node header + payload fits and records its offset ($dec-offs), so a
+; child index is an O(1) lookup. A walk deeper than $dec-max-depth (nodes or
+; nested type tags) is refused, which also stops a cycle, and so is visiting
+; more nodes than the buffer holds (a node used twice): the encoders here and
+; in Pack write trees, children first.
 
-; Offset (relative to cgrf base) of node `index`, scanning from `off`.
-(fn find-node ((cgrf s32) (index s32) (off s32)) s32
-  (if (i32.eq index 0) off
-    (find-node cgrf (i32.sub index 1)
-      (i32.add off (i32.add (i32.const 8)
-        (i32.load (i32.add (i32.add cgrf off) (i32.const 4))))))))
+(global $dec-start s32 mut 0)          ; the cgrf being decoded
+(global $dec-end s32 mut 0)            ; address just past it
+(global $dec-count s32 mut 0)          ; its node count (header)
+(global $dec-offs (list s32) mut 0)    ; node index -> offset from $dec-start
+(global $dec-left s32 mut 0)           ; nodes the walk may still visit
+(global $dec-depth s32 mut 0)          ; current nesting (nodes + type tags)
+(global $dec-bad s32 mut 0)            ; 1 once a check has failed
+(global $dec-why string mut 0)         ; the first failure's reason
+(global $dec-max-depth s32 const 256)
+
+(fn dec-fail ((why string)) s32
+  (begin
+    (if (global.get $dec-bad) 0 (begin (global.set $dec-why why) 0))
+    (global.set $dec-bad 1)
+    0))
+; 1 if the N bytes at ADDR lie inside the buffer (unsigned, so a wrapped address
+; or a huge N fails too); 0, recording why, if not or if the walk already failed.
+(fn dec-has ((addr s32) (n s32)) s32
+  (if (global.get $dec-bad) 0
+    (if (if (i32.ge_u addr (global.get $dec-start)) (i32.le_u addr (global.get $dec-end)) 0)
+      (if (i32.le_u n (i32.sub (global.get $dec-end) addr)) 1 (dec-fail "unmarshal: data runs past the end"))
+      (dec-fail "unmarshal: data runs past the end"))))
+(fn rd8 ((addr s32)) s32 (if (dec-has addr 1) (i32.load8_u addr) 0))
+(fn rd32 ((addr s32)) s32 (if (dec-has addr 4) (i32.load addr) 0))
+; A Pack string [len:u32][bytes] at addr, checked; "" after a failure.
+(fn rdstr ((addr s32)) string
+  (if (dec-has (i32.add addr (i32.const 4)) (rd32 addr)) (string-from-addr addr) ""))
+; Address just past the Pack string at addr.
+(fn str-end ((addr s32)) s32 (i32.add addr (i32.add (i32.const 4) (rd32 addr))))
+(fn dec-enter () s32
+  (begin
+    (global.set $dec-depth (i32.add (global.get $dec-depth) (i32.const 1)))
+    (if (i32.gt_s (global.get $dec-depth) (global.get $dec-max-depth))
+      (dec-fail "unmarshal: nested too deep") 1)))
+(fn dec-leave ((v value)) value
+  (begin (global.set $dec-depth (i32.sub (global.get $dec-depth) (i32.const 1))) v))
+
+; Record each node's offset, checking its header and payload fit the buffer.
+(fn dec-scan ((off s32) (i s32) (acc (list s32))) (list s32)
+  (if (i32.ge_u i (global.get $dec-count)) acc
+    (let (base (i32.add (global.get $dec-start) off))
+      (if (dec-has base (i32.const 8))
+        (let (plen (i32.load (i32.add base (i32.const 4))))
+          (if (dec-has (i32.add base (i32.const 8)) plen)
+            (dec-scan (i32.add off (i32.add (i32.const 8) plen)) (i32.add i (i32.const 1)) (list-push acc off))
+            acc))
+        acc))))
+
+; Decode node `index`: in range, within the visit budget and the depth limit.
+(fn dec-node ((index s32)) value
+  (if (global.get $dec-bad) (nil)
+    (if (i32.ge_u index (global.get $dec-count)) (begin (dec-fail "unmarshal: node index out of range") (nil))
+      (if (i32.le_s (global.get $dec-left) 0) (begin (dec-fail "unmarshal: a node is used more than once") (nil))
+        (begin
+          (global.set $dec-left (i32.sub (global.get $dec-left) (i32.const 1)))
+          (if (dec-enter)
+            (dec-leave (unmarshal-node (global.get $dec-start) (list-get (global.get $dec-offs) index)))
+            (dec-leave (nil))))))))
 
 (fn unmarshal-node ((cgrf s32) (off s32)) value
   (let (base (i32.add cgrf off))
     (let (kind (i32.load8_u base))
       (let (payload (i32.add base (i32.const 8)))
-        (if (i32.eq kind (i32.const 1)) (boolean (i32.load8_u payload))
-          (if (i32.eq kind (i32.const 2)) (integer (i32.load payload))
-            (if (i32.eq kind (i32.const 3)) (wide-integer (i64.load payload))
-              (if (i32.eq kind (i32.const 4)) (single (f32.load payload))
-                (if (i32.eq kind (i32.const 5)) (double (f64.load payload))
-                  (if (i32.eq kind (i32.const 12)) (byte-value (i32.load8_u payload))
-                    (if (i32.eq kind (i32.const 13)) (integer (i32.load16_u payload))
-                    (if (i32.eq kind (i32.const 14)) (integer (i32.load payload))
-                    (if (i32.eq kind (i32.const 15)) (u64-value (i64.load payload))
+        (if (i32.eq kind (i32.const 1)) (if (dec-has payload 1) (boolean (i32.load8_u payload)) (nil))
+          (if (i32.eq kind (i32.const 2)) (if (dec-has payload 4) (integer (i32.load payload)) (nil))
+            (if (i32.eq kind (i32.const 3)) (if (dec-has payload 8) (wide-integer (i64.load payload)) (nil))
+              (if (i32.eq kind (i32.const 4)) (if (dec-has payload 4) (single (f32.load payload)) (nil))
+                (if (i32.eq kind (i32.const 5)) (if (dec-has payload 8) (double (f64.load payload)) (nil))
+                  (if (i32.eq kind (i32.const 12)) (if (dec-has payload 1) (byte-value (i32.load8_u payload)) (nil))
+                    (if (i32.eq kind (i32.const 13)) (if (dec-has payload 2) (integer (i32.load16_u payload)) (nil))
+                    (if (i32.eq kind (i32.const 14)) (if (dec-has payload 4) (integer (i32.load payload)) (nil))
+                    (if (i32.eq kind (i32.const 15)) (if (dec-has payload 8) (u64-value (i64.load payload)) (nil))
                       ; A CGRF string payload is [len:u32][bytes] — a Wisp string.
-                      (if (i32.eq kind (i32.const 6)) (text (string-from-addr payload))
+                      (if (i32.eq kind (i32.const 6)) (text (rdstr payload))
                         ; Tuple payload: [count:u32][child-indices:u32*].
                         (if (i32.eq kind (i32.const 11))
-                          (sequence (unmarshal-children cgrf (i32.add payload (i32.const 4))
-                                      (i32.load payload) 0 (list-new value)))
+                          (sequence (unmarshal-children (i32.add payload (i32.const 4))
+                                      (rd32 payload) 0 (list-new value)))
                           ; Option payload: [inner-tag:u8][presence:u8][child:u32?].
-                          (if (i32.eq kind (i32.const 10)) (unmarshal-option cgrf payload)
+                          (if (i32.eq kind (i32.const 10)) (unmarshal-option payload)
                             ; Result payload: [ok-tag:u8][err-tag:u8][tag:u32][has:u8][child:u32].
-                            (if (i32.eq kind (i32.const 20)) (unmarshal-result cgrf payload)
-                              (if (i32.eq kind (i32.const 7)) (unmarshal-list cgrf payload)
+                            (if (i32.eq kind (i32.const 20)) (unmarshal-result payload)
+                              (if (i32.eq kind (i32.const 7)) (unmarshal-list payload)
                                 (if (i32.eq kind (i32.const 21)) (unmarshal-array payload)
                                   ; Record payload: [name][field_count][field-names][child-indices].
-                                  (if (i32.eq kind (i32.const 9)) (unmarshal-record cgrf payload)
+                                  (if (i32.eq kind (i32.const 9)) (unmarshal-record payload)
                                     ; Variant payload: [name][case][tag:u32][count:u32][child-indices].
-                                    (if (i32.eq kind (i32.const 8)) (unmarshal-variant cgrf payload)
-                                      (failure "unmarshal: unsupported CGRF node kind"))))))))))))))))))))))
+                                    (if (i32.eq kind (i32.const 8)) (unmarshal-variant payload)
+                                      (begin (dec-fail "unmarshal: unsupported CGRF node kind") (nil)))))))))))))))))))))))
 
 ; Decode a CGRF value-type tag at addr (mirrors pack-abi decode_value_type).
 ; Returns the type descriptor and sets $tag-end to the address just past the tag.
 ; Variable-length — this is what lets a nested ok/err/element type skip correctly.
 (fn read-tuple-tag ((addr s32) (count s32) (i s32) (acc (list value))) value
-  (if (i32.ge_s i count) (sequence acc)
+  (if (i32.or (i32.ge_u i count) (global.get $dec-bad)) (sequence acc)
     (let (elem (read-type-tag addr))
       (read-tuple-tag (global.get $tag-end) count (i32.add i (i32.const 1)) (list-push acc elem)))))
 (fn read-type-tag ((addr s32)) value
-  (let (tag (i32.load8_u addr))
+  (if (dec-enter) (dec-leave (read-type-tag-in addr))
+    (begin (global.set $tag-end addr) (dec-leave (symbol "unknown")))))
+(fn read-type-tag-in ((addr s32)) value
+  (let (tag (rd8 addr))
     (if (i32.eq tag (i32.const 7))                       ; LIST (0x07): tag + elem
       (unary-type "list" (read-type-tag (i32.add addr (i32.const 1))))
       (if (i32.eq tag (i32.const 10))                    ; OPTION (0x0A): tag + inner
@@ -455,33 +519,33 @@
               (let (k (read-type-tag (i32.add addr (i32.const 1))))
                 (unary-type "map" (read-type-tag (global.get $tag-end))))
               (if (i32.or (i32.eq tag (i32.const 9)) (i32.eq tag (i32.const 8))) ; RECORD/VARIANT: tag + namelen + name
-                (begin
-                  (global.set $tag-end (i32.add addr (i32.add (i32.const 5) (i32.load (i32.add addr (i32.const 1))))))
-                  (symbol (string-from-addr (i32.add addr (i32.const 1)))))
+                (let (name (rdstr (i32.add addr (i32.const 1))))
+                  (begin
+                    (global.set $tag-end (str-end (i32.add addr (i32.const 1))))
+                    (symbol name)))
                 (if (i32.eq tag (i32.const 11))          ; TUPLE (0x0B): tag + count + elems
                   (begin
                     (global.set $tag-end (i32.add addr (i32.const 5)))
-                    (read-tuple-tag (i32.add addr (i32.const 5)) (i32.load (i32.add addr (i32.const 1)))
+                    (read-tuple-tag (i32.add addr (i32.const 5)) (rd32 (i32.add addr (i32.const 1)))
                       0 (list-push (list-new value) (symbol "tuple"))))
                   (begin                                 ; scalar: a single tag byte
                     (global.set $tag-end (i32.add addr (i32.const 1)))
                     (type-of-tag tag)))))))))))
 
-(fn unmarshal-option ((cgrf s32) (payload s32)) value
+(fn unmarshal-option ((payload s32)) value
   (let (inner (read-type-tag payload))
     (let (p (global.get $tag-end))
-      (if (i32.load8_u p)
+      (if (rd8 p)
         (compound (mk-option-type inner) "some"
-          (list-push (list-new value)
-            (unmarshal-node cgrf (find-node cgrf (i32.load (i32.add p (i32.const 1))) (i32.const 16)))))
+          (list-push (list-new value) (dec-node (rd32 (i32.add p (i32.const 1))))))
         (compound (mk-option-type inner) "none" (list-new value))))))
 
 ; List node (0x07): [elem-type-tag][count:u32][child-indices:u32*] -> typed-list.
-(fn unmarshal-list ((cgrf s32) (payload s32)) value
+(fn unmarshal-list ((payload s32)) value
   (let (elem (read-type-tag payload))
     (let (p (global.get $tag-end))
       (typed-list elem
-        (unmarshal-children cgrf (i32.add p (i32.const 4)) (i32.load p) 0 (list-new value))))))
+        (unmarshal-children (i32.add p (i32.const 4)) (rd32 p) 0 (list-new value))))))
 
 ; Array node (0x15): [elem-type-tag][count:u32][contiguous data]. Only u8 (width 1)
 ; is handled for now; other widths are the next increment.
@@ -492,27 +556,28 @@
 (fn unmarshal-array ((payload s32)) value
   (let (elem (read-type-tag payload))
     (let (p (global.get $tag-end))
-      (typed-list elem (read-bytes (i32.add p (i32.const 4)) (i32.load p) 0 (list-new value))))))
+      (let (count (rd32 p))
+        (if (dec-has (i32.add p (i32.const 4)) count)
+          (typed-list elem (read-bytes (i32.add p (i32.const 4)) count 0 (list-new value)))
+          (nil))))))
 
 ; Result node (0x14): [ok-type-tag][err-type-tag][tag:u32][has:u8][child:u32].
 ; The type tags are variable-length (recursive), so read them to find the fields.
-(fn unmarshal-result ((cgrf s32) (payload s32)) value
+(fn unmarshal-result ((payload s32)) value
   (let (ok-ty (read-type-tag payload))
     (let (err-ty (read-type-tag (global.get $tag-end)))
       (let (p (global.get $tag-end))
-        (let (is-err (i32.load p))
-          (if (i32.load8_u (i32.add p (i32.const 4)))
+        (let (is-err (rd32 p))
+          (if (rd8 (i32.add p (i32.const 4)))
             (compound (mk-result-type ok-ty err-ty) (if is-err "err" "ok")
-              (list-push (list-new value)
-                (unmarshal-node cgrf (find-node cgrf (i32.load (i32.add p (i32.const 5))) (i32.const 16)))))
+              (list-push (list-new value) (dec-node (rd32 (i32.add p (i32.const 5))))))
             (compound (mk-result-type ok-ty err-ty) (if is-err "err" "ok") (list-new value))))))))
 
-(fn unmarshal-children ((cgrf s32) (indices s32) (count s32) (i s32) (acc (list value))) (list value)
-  (if (i32.ge_s i count) acc
-    (unmarshal-children cgrf indices count (i32.add i (i32.const 1))
-      (list-push acc
-        (unmarshal-node cgrf
-          (find-node cgrf (i32.load (i32.add indices (i32.mul i (i32.const 4)))) (i32.const 16)))))))
+; COUNT child indices (u32 each) from `indices`; stops at the first bad one.
+(fn unmarshal-children ((indices s32) (count s32) (i s32) (acc (list value))) (list value)
+  (if (i32.or (i32.ge_u i count) (global.get $dec-bad)) acc
+    (unmarshal-children indices count (i32.add i (i32.const 1))
+      (list-push acc (dec-node (rd32 (i32.add indices (i32.mul i (i32.const 4)))))))))
 
 ; A host call that fails before it reaches its function (the usual cause: a string
 ; argument that isn't UTF-8, which the host cannot decode) writes no result, so its
@@ -522,13 +587,38 @@
   (compound (mk-result-type (symbol "unknown") (symbol "string")) "err"
     (list-push (list-new value)
       (text "host call failed (a string argument that is not valid UTF-8?)"))))
+(fn unmarshal-failed ((why string)) value
+  (compound (mk-result-type (symbol "unknown") (symbol "string")) "err"
+    (list-push (list-new value) (text why))))
+
+; Decode the LEN-byte cgrf at CGRF: header [magic][version:u16][flags:u16]
+; [node_count:u32][root:u32], then the nodes.
+(fn decode-cgrf ((cgrf s32) (len s32)) value
+  (begin
+    (global.set $dec-start cgrf)
+    (global.set $dec-end (i32.add cgrf len))
+    (global.set $dec-bad 0)
+    (global.set $dec-depth 0)
+    (let (v (if (dec-has cgrf (i32.const 16))
+              (if (if (i32.eq (i32.load cgrf) (i32.const 1179797315))
+                      (i32.eq (i32.load16_u (i32.add cgrf (i32.const 4))) (i32.const 3)) 0)
+                (begin
+                  (global.set $dec-count (i32.load (i32.add cgrf (i32.const 8))))
+                  (global.set $dec-offs (dec-scan (i32.const 16) 0 (list-new s32)))
+                  (global.set $dec-left (global.get $dec-count))
+                  (dec-node (i32.load (i32.add cgrf (i32.const 12)))))
+                (begin (dec-fail "unmarshal: not a CGRF v3 blob") (nil)))
+              (nil)))
+      (begin
+        (global.set $dec-offs (list-new s32))
+        (if (global.get $dec-bad) (unmarshal-failed (global.get $dec-why)) v)))))
 
 (fn unmarshal ((x any)) value
   (let (cgrf (i32.add (any-addr x) (i32.const 4)))
-    (if (i32.eq (i32.load (i32.sub cgrf (i32.const 4))) (i32.const 0))
-      (host-call-failed)
-      (unmarshal-node cgrf
-        (find-node cgrf (i32.load (i32.add cgrf (i32.const 12))) (i32.const 16))))))
+    (let (len (i32.load (i32.sub cgrf (i32.const 4))))
+      (if (i32.eq len (i32.const 0))
+        (host-call-failed)
+        (decode-cgrf cgrf len)))))
 
 ; ---------------------------------------------------------------------------
 ; record register-on-arrival (nominal). The codec now lives in the interpreter,
@@ -578,14 +668,15 @@
 
 ; --- unmarshal side ---
 ; Collect field-name symbols by walking the variable-length name run.
+; Both stop at the first bad read (see dec-has).
 (fn read-field-names ((addr s32) (count s32) (i s32) (acc (list value))) (list value)
-  (if (i32.ge_s i count) acc
-    (read-field-names (i32.add addr (i32.add (i32.const 4) (i32.load addr))) count (i32.add i (i32.const 1))
-      (list-push acc (symbol (string-from-addr addr))))))
+  (if (i32.or (i32.ge_u i count) (global.get $dec-bad)) acc
+    (let (name (rdstr addr))
+      (read-field-names (str-end addr) count (i32.add i (i32.const 1)) (list-push acc (symbol name))))))
 ; Address just past `count` names (where the child-index array begins).
 (fn skip-field-names ((addr s32) (count s32) (i s32)) s32
-  (if (i32.ge_s i count) addr
-    (skip-field-names (i32.add addr (i32.add (i32.const 4) (i32.load addr))) count (i32.add i (i32.const 1)))))
+  (if (i32.or (i32.ge_u i count) (global.get $dec-bad)) addr
+    (skip-field-names (str-end addr) count (i32.add i (i32.const 1)))))
 
 ; Build schema field descriptors (name type) from names + field values.
 (fn build-schema ((names (list value)) (values (list value)) (i s32) (acc (list value))) (list value)
@@ -622,14 +713,16 @@
             id))))))
 
 ; Record node (0x09): [name][field_count][field-names][child-indices].
-(fn unmarshal-record ((cgrf s32) (payload s32)) value
-  (let (name (string-from-addr payload))
-    (let (p1 (i32.add payload (i32.add (i32.const 4) (i32.load payload))))
-      (let (fcount (i32.load p1))
+; Nothing is registered from bytes that failed a check.
+(fn unmarshal-record ((payload s32)) value
+  (let (name (rdstr payload))
+    (let (p1 (str-end payload))
+      (let (fcount (rd32 p1))
         (let (names-start (i32.add p1 (i32.const 4)))
           (let (names (read-field-names names-start fcount 0 (list-new value)))
-            (let (values (unmarshal-children cgrf (skip-field-names names-start fcount 0) fcount 0 (list-new value)))
-              (aggregate name (register-record name names values) name values))))))))
+            (let (values (unmarshal-children (skip-field-names names-start fcount 0) fcount 0 (list-new value)))
+              (if (global.get $dec-bad) (nil)
+                (aggregate name (register-record name names values) name values)))))))))
 
 ; ---------------------------------------------------------------------------
 ; Variants. A *sum* value reveals only its active case, so a single value can
@@ -662,10 +755,10 @@
     (if (string=? (symbol-name (list-get (items-of (list-get cases i)) 0)) cn) i
       (variant-tag cases cn (i32.add i (i32.const 1))))))
 
-(fn unmarshal-variant ((cgrf s32) (payload s32)) value
-  (let (tn (string-from-addr payload))
-    (let (p1 (i32.add payload (i32.add (i32.const 4) (i32.load payload))))
-      (let (cn (string-from-addr p1))
-        (let (p2 (i32.add p1 (i32.add (i32.const 4) (i32.load p1))))
-          (open-variant tn cn (i32.load p2)
-            (unmarshal-children cgrf (i32.add p2 (i32.const 8)) (i32.load (i32.add p2 (i32.const 4))) 0 (list-new value))))))))
+(fn unmarshal-variant ((payload s32)) value
+  (let (tn (rdstr payload))
+    (let (p1 (str-end payload))
+      (let (cn (rdstr p1))
+        (let (p2 (str-end p1))
+          (open-variant tn cn (rd32 p2)
+            (unmarshal-children (i32.add p2 (i32.const 8)) (rd32 (i32.add p2 (i32.const 4))) 0 (list-new value))))))))
