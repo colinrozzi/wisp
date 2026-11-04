@@ -382,6 +382,16 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
         "key-list",
         "sign",
         "verify",
+        "p256-key-new",
+        "p256-public",
+        "vapid-header",
+        "webpush-encrypt",
+        "x25519-key-new",
+        "x25519-public",
+        "seal",
+        "open",
+        "scrypt-hash",
+        "scrypt-check",
     ] {
         imports.define(
             "wisp-crypto",
