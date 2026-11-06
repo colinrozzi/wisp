@@ -482,3 +482,147 @@ fn sealing_and_password_checks_need_no_keys() {
         assert!(got.contains("no key directory configured"), "{form}: {got}");
     }
 }
+
+/// `bytes` as a Wisp string literal, one `\xHH` escape per byte: the reader
+/// gives each as one raw byte.
+fn wisp_bytes(bytes: &[u8]) -> String {
+    let escaped: String = bytes.iter().map(|byte| format!("\\x{byte:02x}")).collect();
+    format!("\"{escaped}\"")
+}
+
+/// The RFC 4226 section 5.3 dynamic truncation of an HMAC-SHA1, to 8 digits.
+fn totp_code(mac_hex: &str) -> String {
+    let mac: Vec<u8> = (0..40)
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&mac_hex[at..at + 2], 16).unwrap())
+        .collect();
+    let offset = (mac[19] & 0x0f) as usize;
+    let word = u32::from_be_bytes(mac[offset..offset + 4].try_into().unwrap()) & 0x7fff_ffff;
+    format!("{:08}", word % 100_000_000)
+}
+
+#[test]
+fn hmac_and_random_bytes_need_no_keys() {
+    let root = workdir("hmac-random");
+    let config = root.join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    let daemon = Daemon::start(&root, &config);
+    let eval = daemon.session();
+    let hmac = |verb: &str, key: &[u8], data: &[u8]| {
+        eval(&format!(
+            "({verb} {} {})",
+            wisp_bytes(key),
+            wisp_bytes(data)
+        ))
+    };
+
+    // RFC 2202 section 3, HMAC-SHA1 test cases 1-7.
+    let aa80 = [0xaa; 80];
+    let key4: Vec<u8> = (1..=25).collect();
+    for (key, data, want) in [
+        (
+            &[0x0b; 20][..],
+            &b"Hi There"[..],
+            "b617318655057264e28bc0b6fb378c8ef146be00",
+        ),
+        (
+            b"Jefe",
+            b"what do ya want for nothing?",
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
+        ),
+        (
+            &[0xaa; 20],
+            &[0xdd; 50],
+            "125d7342b9ac11cd91a39af48aa17b4f63f175d3",
+        ),
+        (
+            &key4,
+            &[0xcd; 50],
+            "4c9007f4026250c6bc8414f9bf50c86c2d7235da",
+        ),
+        (
+            &[0x0c; 20],
+            b"Test With Truncation",
+            "4c1a03424b55e07fe7f27be1d58bb9324a9a5a04",
+        ),
+        (
+            &aa80,
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+            "aa4ae5e15272d00e95705637ce8a3b55ed402112",
+        ),
+        (
+            &aa80,
+            b"Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data",
+            "e8e99d0f45237d786d6bbaa7965c7808bbff1a91",
+        ),
+    ] {
+        assert_eq!(hmac("hmac-sha1", key, data), want, "{data:?}");
+    }
+    // Strings and bytes alike.
+    assert_eq!(
+        eval(
+            "(hmac-sha1 (string->bytes \"Jefe\") (string->bytes \"what do ya want for nothing?\"))"
+        ),
+        "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"
+    );
+
+    // RFC 6238 appendix B, the SHA-1 column: the 8-digit TOTP at each time, from
+    // hmac-sha1 over the count of 30-second steps.
+    let seed = b"12345678901234567890";
+    for (time, want) in [
+        (59u64, "94287082"),
+        (1111111109, "07081804"),
+        (1111111111, "14050471"),
+        (1234567890, "89005924"),
+        (2000000000, "69279037"),
+        (20000000000, "65353130"),
+    ] {
+        let mac = hmac("hmac-sha1", seed, &(time / 30).to_be_bytes());
+        assert_eq!(totp_code(&mac), want, "at {time}");
+    }
+
+    // RFC 4231 test cases 1 and 2, HMAC-SHA256.
+    assert_eq!(
+        hmac("hmac-sha256", &[0x0b; 20], b"Hi There"),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+    );
+    assert_eq!(
+        hmac("hmac-sha256", b"Jefe", b"what do ya want for nothing?"),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+
+    // random-bytes: the count asked for, 1 to 1024, fresh each call.
+    for n in [1, 16, 1024] {
+        assert_eq!(
+            eval(&format!("(list-len (match (random-bytes {n}) ((ok v) v)))")),
+            n.to_string()
+        );
+    }
+    eval("(define one (match (random-bytes 32) ((ok v) v)))");
+    eval("(define two (match (random-bytes 32) ((ok v) v)))");
+    let (one, two) = (printed_bytes(&eval("one")), printed_bytes(&eval("two")));
+    assert_eq!(one.len(), 32);
+    assert_ne!(one, two, "two calls gave the same bytes");
+    for (n, shown) in [("0", "0"), ("1025", "1025"), ("-1", "4294967295")] {
+        assert_eq!(
+            eval(&format!("(random-bytes {n})")),
+            format!("(err (list u8) string \"random-bytes takes 1 to 1024 bytes, not {shown}\")")
+        );
+    }
+
+    // Arguments of the wrong kind fail before reaching the host.
+    for (form, want) in [
+        ("(random-bytes \"8\")", "random-bytes expects"),
+        ("(random-bytes)", "random-bytes expects"),
+        ("(hmac-sha1 \"k\")", "hmac-sha1 expects"),
+        ("(hmac-sha1 1 \"d\")", "hmac-sha1 expects"),
+        ("(hmac-sha256 \"k\" 2)", "hmac-sha256 expects"),
+    ] {
+        let out = daemon.cli(&["eval", "crypto", form]);
+        assert!(text(&out.stderr).contains(want), "{form}: {out:?}");
+    }
+    let help = eval("(help)");
+    for verb in ["(random-bytes", "(hmac-sha1", "(hmac-sha256"] {
+        assert!(help.contains(verb), "{verb} not in (help)");
+    }
+}

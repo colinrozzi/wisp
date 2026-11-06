@@ -284,6 +284,9 @@
 (import wisp-crypto open ((name string) (sealed (list u8))) (result (list u8) string))
 (import wisp-crypto scrypt-hash ((password (list u8))) (result string string))
 (import wisp-crypto scrypt-check ((password (list u8)) (line string)) bool)
+(import wisp-crypto random-bytes ((n u32)) (result (list u8) string))
+(import wisp-crypto hmac-sha1 ((key (list u8)) (data (list u8))) string)
+(import wisp-crypto hmac-sha256 ((key (list u8)) (data (list u8))) string)
 
 ; message-server: inter-actor messaging. Clean string/list<u8>/result shapes; the
 ; message bodies cross as list<u8> via str->bytes. (send/request target ANOTHER
@@ -480,6 +483,9 @@
     ((string=? name "open") 1)
     ((string=? name "scrypt-hash") 1)
     ((string=? name "scrypt-check") 1)
+    ((string=? name "random-bytes") 1)
+    ((string=? name "hmac-sha1") 1)
+    ((string=? name "hmac-sha256") 1)
     ((string=? name "msg-register") 1)
     ((string=? name "msg-send") 1)
     ((string=? name "msg-request") 1)
@@ -909,6 +915,26 @@
     (unmarshal (raw-invoke "wisp-crypto" "scrypt-check"
       (marshal (sequence (list-push (list-push (list-new value) (str-to-bytes (list-get args 0))) (list-get args 1))))))
     (failure "scrypt-check expects (scrypt-check password line)")))
+
+; (random-bytes n) -> (ok bytes), n from 1 to 1024. (hmac-sha1 key data) /
+; (hmac-sha256 key data) -> lowercase hex, key and data each a string or bytes.
+(fn apply-random-bytes ((args (list value))) value
+  (if (if (i32.eq (list-len args) 1) (value-case (list-get args 0) ((integer n) 1) (else 0)) 0)
+    (unmarshal (raw-invoke "wisp-crypto" "random-bytes" (marshal (as-u32 (list-get args 0)))))
+    (failure "random-bytes expects (random-bytes count)")))
+(fn hmac-args? ((args (list value))) s32
+  (if (i32.eq (list-len args) 2)
+    (i32.and (crypto-data? (list-get args 0)) (crypto-data? (list-get args 1))) 0))
+(fn hmac-arg-tuple ((args (list value))) any
+  (marshal (sequence (list-push (list-push (list-new value) (str-to-bytes (list-get args 0))) (str-to-bytes (list-get args 1))))))
+(fn apply-hmac-sha1 ((args (list value))) value
+  (if (hmac-args? args)
+    (unmarshal (raw-invoke "wisp-crypto" "hmac-sha1" (hmac-arg-tuple args)))
+    (failure "hmac-sha1 expects (hmac-sha1 key data)")))
+(fn apply-hmac-sha256 ((args (list value))) value
+  (if (hmac-args? args)
+    (unmarshal (raw-invoke "wisp-crypto" "hmac-sha256" (hmac-arg-tuple args)))
+    (failure "hmac-sha256 expects (hmac-sha256 key data)")))
 
 ; --- chain recorder (wisp-chain) ---------------------------------------------
 ; (chain-watch id) starts recording actor id's chain; (chain-head id) ->
@@ -1890,7 +1916,7 @@
           (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n           durable: (fs-write-durable p text) replaces p all-or-nothing, on disk when it returns   (fs-sync p) (fs-sync-dir p) (fs-rename from to)\n"
-                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\ncrypto:    (sha256 string-or-bytes) -> 64 hex chars   (verify public-key-hex sig-hex text) -> true/false\n           (key-new name) (key-public name) -> (ok public-key-hex)   (key-list) -> (ok names)   (sign name text) -> (ok sig-hex); keys stay in the daemon, config.toml [keys] dir\n           (p256-key-new name) (p256-public name) -> (ok public-key-base64url)   (vapid-header name audience subject) -> (ok \"vapid t=..., k=...\")\n           (webpush-encrypt p256dh auth payload) -> (ok bytes)   RFC 8291 aes128gcm, for (http-req \"POST\" endpoint headers bytes)\n           (x25519-key-new name) (x25519-public name) -> (ok public-key-hex)   (seal public-key-hex text) -> (ok bytes)   (open name sealed) -> (ok bytes)\n           (scrypt-hash password) -> (ok \"scrypt$N$r$p$salt$hash\")   (scrypt-check password line) -> true/false\n"
+                (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\ncrypto:    (sha256 string-or-bytes) -> 64 hex chars   (verify public-key-hex sig-hex text) -> true/false\n           (key-new name) (key-public name) -> (ok public-key-hex)   (key-list) -> (ok names)   (sign name text) -> (ok sig-hex); keys stay in the daemon, config.toml [keys] dir\n           (p256-key-new name) (p256-public name) -> (ok public-key-base64url)   (vapid-header name audience subject) -> (ok \"vapid t=..., k=...\")\n           (webpush-encrypt p256dh auth payload) -> (ok bytes)   RFC 8291 aes128gcm, for (http-req \"POST\" endpoint headers bytes)\n           (x25519-key-new name) (x25519-public name) -> (ok public-key-hex)   (seal public-key-hex text) -> (ok bytes)   (open name sealed) -> (ok bytes)\n           (scrypt-hash password) -> (ok \"scrypt$N$r$p$salt$hash\")   (scrypt-check password line) -> true/false\n           (random-bytes n) -> (ok bytes), n 1-1024   (hmac-sha1 key data) (hmac-sha256 key data) -> lowercase hex\n"
                   (string-append "timer:     (now) (set-interval name ms) (clear-interval name)        terminal: (term-write s) (term-size) (term-raw bool) ...\n"
                     (string-append "tcp:       (tcp-connect addr) (tcp-send conn data) (tcp-receive conn max) (tcp-close conn) (tcp-listen addr) ...   see (help \"tcp\")\nudp:       (udp-bind addr) (udp-send-to sock peer data) (udp-recv-from sock max) (udp-send sock data) (udp-connect sock peer) (udp-close sock) (udp-set-recv-timeout sock ms) ...\n"
                       (string-append "process:   (process-run prog [args [input [cwd [env]]]]) one-shot -> run-output   (process-spawn prog [args [cwd [env]]]) -> id   (process-spawn-pty prog cols rows [args [cwd [env]]]) -> id\n           (process-read id max [ms]) (process-write-stdin id data) (process-close-stdin id) (process-set-active id mode) (process-resize id cols rows) (process-wait id [ms]) (process-status id) (process-signal id n) (process-kill id) (process-os-pid id) (process-list) (process-close id)\n           active output -> define on-output / on-exit, then (poll-events)\n"
@@ -1955,6 +1981,9 @@
     ((string=? name "open") (apply-open args))
     ((string=? name "scrypt-hash") (apply-scrypt-hash args))
     ((string=? name "scrypt-check") (apply-scrypt-check args))
+    ((string=? name "random-bytes") (apply-random-bytes args))
+    ((string=? name "hmac-sha1") (apply-hmac-sha1 args))
+    ((string=? name "hmac-sha256") (apply-hmac-sha256 args))
     ((string=? name "chain-watch") (apply-chain-watch args))
     ((string=? name "chain-unwatch") (apply-chain-unwatch args))
     ((string=? name "chain-head") (apply-chain-head args))

@@ -1,5 +1,5 @@
 interface wisp-crypto {
-    // Hashes, signatures and ed25519/x25519 keys are lowercase hex; P-256 public
+    // Hashes, HMACs, signatures and ed25519/x25519 keys are lowercase hex; P-256 public
     // keys are base64url. Private keys live in the daemon's key directory; no
     // function here returns one.
     exports {
@@ -19,5 +19,8 @@ interface wisp-crypto {
         open: func(name: string, sealed: list<u8>) -> result<list<u8>, string>
         scrypt-hash: func(password: list<u8>) -> result<string, string>
         scrypt-check: func(password: list<u8>, line: string) -> bool
+        random-bytes: func(n: u32) -> result<list<u8>, string>
+        hmac-sha1: func(key: list<u8>, data: list<u8>) -> string
+        hmac-sha256: func(key: list<u8>, data: list<u8>) -> string
     }
 }
