@@ -356,6 +356,9 @@ impl Guest {
             "open",
             "scrypt-hash",
             "scrypt-check",
+            "random-bytes",
+            "hmac-sha1",
+            "hmac-sha256",
         ] {
             mock_import(
                 &mut linker,

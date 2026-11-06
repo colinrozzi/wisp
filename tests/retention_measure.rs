@@ -401,6 +401,9 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
         "open",
         "scrypt-hash",
         "scrypt-check",
+        "random-bytes",
+        "hmac-sha1",
+        "hmac-sha256",
     ] {
         imports.define(
             "wisp-crypto",

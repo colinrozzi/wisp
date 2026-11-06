@@ -1,6 +1,6 @@
 //! The `wisp-crypto` interface: sha256, ed25519 verification, and signing with
 //! keys only the daemon holds; Web Push (VAPID and RFC 8291), sealed boxes
-//! (X25519), and scrypt password hashes. A key is a file in the configured
+//! (X25519), scrypt password hashes, HMAC, and random bytes. A key is a file in the configured
 //! directory: `<name>.key` an ed25519 seed as hex, `<name>.p256` a P-256 key as
 //! a PKCS#8 PEM, `<name>.x25519` an X25519 secret as hex. Each call reads the
 //! file it needs, so nothing is cached, and no function returns a private key:
@@ -14,8 +14,10 @@ use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -62,9 +64,27 @@ const BASE64URL: GeneralPurpose = GeneralPurpose::new(
         .with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
+fn fill_random(out: &mut [u8]) -> Result<(), String> {
+    getrandom::getrandom(out).map_err(|error| format!("no randomness: {error}"))
+}
+
 fn random<const N: usize>() -> Result<[u8; N], String> {
     let mut out = [0; N];
-    getrandom::getrandom(&mut out).map_err(|error| format!("no randomness: {error}"))?;
+    fill_random(&mut out)?;
+    Ok(out)
+}
+
+/// The most `random-bytes` gives in one call.
+const RANDOM_BYTES_MAX: u32 = 1024;
+
+fn random_bytes(n: u32) -> Result<Vec<u8>, String> {
+    if n == 0 || n > RANDOM_BYTES_MAX {
+        return Err(format!(
+            "random-bytes takes 1 to {RANDOM_BYTES_MAX} bytes, not {n}"
+        ));
+    }
+    let mut out = vec![0; n as usize];
+    fill_random(&mut out)?;
     Ok(out)
 }
 
@@ -78,6 +98,19 @@ fn hkdf<const N: usize>(salt: &[u8], secret: &[u8], info: &[u8]) -> [u8; N] {
 
 fn sha256(data: &[u8]) -> String {
     to_hex(&Sha256::digest(data))
+}
+
+// HMAC (RFC 2104) takes a key of any length.
+fn hmac_sha1(key: &[u8], data: &[u8]) -> String {
+    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("any key length");
+    mac.update(data);
+    to_hex(&mac.finalize().into_bytes())
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("any key length");
+    mac.update(data);
+    to_hex(&mac.finalize().into_bytes())
 }
 
 /// Strict: a low-order public key, which any signature can satisfy under the
@@ -627,6 +660,34 @@ fn call_scrypt_check(_: &KeyAccess, input: &Value) -> Value {
     })
 }
 
+fn call_random_bytes(_: &KeyAccess, input: &Value) -> Value {
+    bytes_result(match input {
+        Value::U32(n) => random_bytes(*n),
+        _ => Err("random-bytes expects a count".into()),
+    })
+}
+
+/// The actor checks the arguments; bad ones hash as empty, as for `sha256`.
+fn hmac_args(input: &Value) -> (Vec<u8>, Vec<u8>) {
+    match args(input) {
+        [key, data] => (
+            bytes(key).unwrap_or_default(),
+            bytes(data).unwrap_or_default(),
+        ),
+        _ => Default::default(),
+    }
+}
+
+fn call_hmac_sha1(_: &KeyAccess, input: &Value) -> Value {
+    let (key, data) = hmac_args(input);
+    Value::String(hmac_sha1(&key, &data))
+}
+
+fn call_hmac_sha256(_: &KeyAccess, input: &Value) -> Value {
+    let (key, data) = hmac_args(input);
+    Value::String(hmac_sha256(&key, &data))
+}
+
 type Verb = fn(&KeyAccess, &Value) -> Value;
 
 /// A verb run on the blocking pool: key files are read from disk, and scrypt
@@ -750,7 +811,7 @@ impl Handler for KeyAccess {
                 async move { Ok(string_result(sign(&keys, &input))) }
             }),
         );
-        let verbs: [(&str, Verb); 10] = [
+        let verbs: [(&str, Verb); 13] = [
             ("p256-key-new", call_p256_key_new),
             ("p256-public", call_p256_public),
             ("vapid-header", call_vapid_header),
@@ -761,6 +822,9 @@ impl Handler for KeyAccess {
             ("open", call_open),
             ("scrypt-hash", call_scrypt_hash),
             ("scrypt-check", call_scrypt_check),
+            ("random-bytes", call_random_bytes),
+            ("hmac-sha1", call_hmac_sha1),
+            ("hmac-sha256", call_hmac_sha256),
         ];
         for (name, call) in verbs {
             define(imports, self, name, call);

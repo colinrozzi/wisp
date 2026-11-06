@@ -44,6 +44,9 @@ tokio = { version = "1", features = ["full"] }
 ed25519-dalek = "2"
 getrandom = "0.2"
 sha2 = "0.10"
+# HMAC-SHA1 for TOTP (RFC 6238), HMAC-SHA256.
+hmac = "0.12"
+sha1 = "0.10"
 # Web Push (P-256, AES-128-GCM), sealed boxes (X25519, ChaCha20-Poly1305), scrypt.
 aes-gcm = "0.10"
 base64 = "0.21"

@@ -176,7 +176,8 @@ working. `(key-list)` lists the `.key` names only. No verb returns a private key
 signing and opening happen in the daemon. **Every session may use every key**;
 per-session grants come with the permissions rework (theater#240). Without a `[keys]`
 section the key verbs return `(err "no key directory configured")`; `sha256`,
-`verify`, `webpush-encrypt`, `seal` and the scrypt verbs need no keys and still work.
+`verify`, `webpush-encrypt`, `seal`, the scrypt verbs, `random-bytes` and the HMAC
+verbs need no keys and still work.
 
 **Web Push.** `(p256-public name)` is the key's uncompressed point (65 bytes,
 `04 || x || y`) as unpadded base64url: the `applicationServerKey` a page subscribes
@@ -230,6 +231,15 @@ matches. It is false for a wrong password and for a line that is malformed or wo
 cost too much: N not a power of two from 2 to 2^17, r below 1, p not 1-16, more than
 256 MiB of memory (128 * r * N bytes), or a hash not 16-64 bytes. One check at the
 default parameters takes about 0.1 s and 32 MiB; the crypto verbs run on the daemon's blocking pool, so a check does not hold up other sessions.
+
+**Random bytes and HMAC.** `(random-bytes n)` returns `(ok bytes)`: n bytes from the
+operating system's random source (`getrandom`), for salts, tokens and TOTP secrets.
+n is 1 to 1024; any other count is `(err "random-bytes takes 1 to 1024 bytes, not n")`.
+`(hmac-sha1 key data)` and `(hmac-sha256 key data)` are HMAC (RFC 2104) as lowercase
+hex, the key and the data each a string or bytes, the key of any length. TOTP
+(RFC 6238) is HMAC-SHA1 over the 8-byte big-endian count of 30-second steps since
+1970, keyed with the shared secret; the code is the dynamic truncation of that MAC
+(RFC 4226 section 5.3).
 
 For each service the daemon creates a session under its name and evaluates the
 start file in it, as `theater-repl new web && theater-repl eval web - < serve.wisp`
@@ -358,7 +368,7 @@ A library can return the same shape with `(ok v)` / `(err e)`; see
 | message-server | `(msg-register)` · `(msg-send id text)` · `(msg-request id text)` · `(msg-list-requests)` · `(msg-respond req text)` · `(msg-cancel req)` · `(msg-open id text)` · `(msg-send-channel cid text)` · `(msg-close-channel cid)` |
 | filesystem² | `(fs-read p)` (bytes) · `(fs-read-text p)` (a string) · `(fs-write p text)` · `(fs-exists p)` · `(fs-list p)` · `(fs-meta p)` · `(fs-append p text)` · `(fs-delete p)` · `(fs-mkdir p)` · `(fs-rmdir p)` · `(fs-write-durable p text)` (all-or-nothing, on disk when it returns) · `(fs-sync p)` · `(fs-sync-dir p)` · `(fs-rename from to)` |
 | http-client³ | `(http-get url)` · `(http-req method url [headers [body]])`, headers `((name value) …)`, body a string or bytes → `(ok (http-response status headers body))` |
-| crypto | `(sha256 x)`, x a string or bytes → 64 hex chars · `(key-new name)` · `(key-public name)` → `(ok public-key-hex)` · `(key-list)` → `(ok names)` · `(sign name text)` → `(ok sig-hex)` · `(verify public-key-hex sig-hex text)` → true/false, bad hex is false · Web Push: `(p256-key-new name)` · `(p256-public name)` → `(ok public-key-base64url)` · `(vapid-header name audience subject)` → `(ok "vapid t=..., k=...")` · `(webpush-encrypt p256dh auth payload)` → `(ok bytes)` · sealed boxes: `(x25519-key-new name)` · `(x25519-public name)` → `(ok public-key-hex)` · `(seal public-key-hex text)` → `(ok bytes)` · `(open name sealed)` → `(ok bytes)` or `(err "cannot open")` · passwords: `(scrypt-hash password)` → `(ok "scrypt$N$r$p$salt$hash")` · `(scrypt-check password line)` → true/false. Keys and formats: `[keys]` in the config (see Services, above) |
+| crypto | `(sha256 x)`, x a string or bytes → 64 hex chars · `(key-new name)` · `(key-public name)` → `(ok public-key-hex)` · `(key-list)` → `(ok names)` · `(sign name text)` → `(ok sig-hex)` · `(verify public-key-hex sig-hex text)` → true/false, bad hex is false · Web Push: `(p256-key-new name)` · `(p256-public name)` → `(ok public-key-base64url)` · `(vapid-header name audience subject)` → `(ok "vapid t=..., k=...")` · `(webpush-encrypt p256dh auth payload)` → `(ok bytes)` · sealed boxes: `(x25519-key-new name)` · `(x25519-public name)` → `(ok public-key-hex)` · `(seal public-key-hex text)` → `(ok bytes)` · `(open name sealed)` → `(ok bytes)` or `(err "cannot open")` · passwords: `(scrypt-hash password)` → `(ok "scrypt$N$r$p$salt$hash")` · `(scrypt-check password line)` → true/false · `(random-bytes n)`, n 1-1024 → `(ok bytes)` · `(hmac-sha1 key data)` · `(hmac-sha256 key data)` → lowercase hex. Keys and formats: `[keys]` in the config (see Services, above) |
 | assembler | `(wat-to-wasm wat-text)` → wasm bytes |
 | timer | `(now)` → ms · `(set-interval name ms)` · `(clear-interval name)` |
 | terminal | `(term-write s)` · `(term-write-err s)` · `(term-raw true\|false)` · `(term-size)` · `(term-input)` |
@@ -571,6 +581,6 @@ reclaim its heap. Validated against Theater rev
 | `actor.wisp` | The actor: includes the evaluator, declares ABI + inbound callbacks |
 | `actor.wasm` | Compiled actor, generated and not in git (interface-qualified exports + CGRF metadata) |
 | `manifest.toml` | Manifest; grants the `runtime` control capability |
-| `crypto.pact` | The `wisp-crypto` host interface (hashing, signing, Web Push, sealed boxes, scrypt) |
+| `crypto.pact` | The `wisp-crypto` host interface (hashing, HMAC, random bytes, signing, Web Push, sealed boxes, scrypt) |
 | `source.pact` / `sources.json` | The `wisp-source` host interface + example bundle |
 | `legacy-host/` | The local Theater runtime + socket server that hosts the REPL |
