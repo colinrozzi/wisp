@@ -38,6 +38,7 @@ async fn sessions_verb_lists_the_runtime_interpreters() -> anyhow::Result<()> {
         Note {
             source: "test".into(),
             since: Instant::now() - std::time::Duration::from_secs(5),
+            start: None,
         },
     );
     let ages = alice

@@ -516,6 +516,10 @@ async fn try_launch(
         Note {
             source: actor.origin,
             since: Instant::now(),
+            start: Some((
+                start.display().to_string(),
+                wisp_interpreter_actor::health::sha256_hex(source.as_bytes()),
+            )),
         },
     );
     let owned = daemon

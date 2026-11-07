@@ -25,6 +25,9 @@ pub struct Note {
     /// Where its actor came from (an `ActorSource` origin).
     pub source: String,
     pub since: Instant,
+    /// The start file evaluated in it (a boot-list service's), and the sha256
+    /// of the text that was evaluated.
+    pub start: Option<(String, String)>,
 }
 
 /// The runtime's command channel plus the daemon's notes. Cloning shares both.

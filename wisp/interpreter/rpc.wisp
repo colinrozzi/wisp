@@ -92,9 +92,16 @@
     (track-event handler event)
     (let (h (lookup handler (list-new binding)))
       (if (failed? h)
-        (begin (record-event handler event (text "no handler defined") 0) h)
+        (begin (record-event handler event (text "no handler defined") 0) (nil))
         (let (result (apply-value h (list-push (list-new value) event) (i32.const 0) ""))
           (begin (record-event handler event result (i32.eq (failed? result) 0)) result))))))
+
+; What a trigger export answers for a dispatch: "ok", or "error: MESSAGE" when the
+; handler ran and failed (an event with no handler is not a failure). The runtime
+; ignores the answer, but it is recorded on the actor's chain, where the daemon
+; counts failed calls for theater-repl inspect.
+(fn handler-answer ((result value)) string
+  (if (failed? result) (string-append "error: " (failure-message result)) "ok"))
 
 ; --- handles ---------------------------------------------------------------
 ; Host resources this session holds open, by kind ("timer", "listener",
@@ -1853,14 +1860,15 @@
 ; headers included): what is allocated and not yet freed, which still includes
 ; garbage nothing frees yet. heap-pages is the linear memory's size in 64 KiB
 ; pages (the stats record's +12): memory never shrinks, so it is the high-water
-; mark, and it is what runs into the session's memory limit.
+; mark, and it is what runs into the session's memory limit. steps-most is the
+; most steps a finished evaluation or handler call took; step-limit is (step-limit).
 (fn stat ((name string) (n s32)) value
   (sequence (list-push (list-push (list-new value) (text name)) (integer n))))
 (fn apply-memory-stats ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "memory-stats expects no arguments")
     (begin
       (trim-events)
-      (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
+      (sequence (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-push (list-new value)
         (stat "heap-bytes" (i32.load (heap-stats))))
         (stat "heap-pages" (i32.load (i32.add (heap-stats) 12))))
         (stat "bindings" (list-len (global.get $bindings))))
@@ -1871,7 +1879,9 @@
         (stat "events-dropped" (global.get $events-dropped)))
         (stat "handles" (list-len (global.get $handles))))
         (stat "event-seq" (i32.wrap_i64 (global.get $event-seq))))
-        (stat "cursors" (list-len (global.get $cursors))))))))
+        (stat "cursors" (list-len (global.get $cursors))))
+        (stat "steps-most" (global.get $steps-most)))
+        (stat "step-limit" (global.get $next-step-limit)))))))
 
 (fn text-mode? ((v value)) s32
   (if (string-arg? v) (string=? (as-string v) "text") 0))

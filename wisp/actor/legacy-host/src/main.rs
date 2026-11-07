@@ -13,6 +13,7 @@ use wisp_interpreter_actor::{
 };
 
 mod boot;
+mod inspect;
 
 /// The actor built into the binary (compiled by build.rs). A released
 /// theater-repl is self-contained: it carries its own actor + bundle.
@@ -149,6 +150,12 @@ enum Command {
     Cursors { id: String },
     /// Show a session (with id) or the daemon (without).
     Status { id: Option<String> },
+    /// What a session runs and how it is doing: start file and the sha256 of
+    /// every .wisp file it read, version, uptime, busy, messages in/out per
+    /// minute, errors, timers, sockets, heap and steps. Answered by the daemon,
+    /// so a busy session still reports (only heap and steps need the session).
+    /// Without an id, one line per session. Counts and hashes only.
+    Inspect { id: Option<String> },
     /// Stop a session's actor and reclaim its heap. A boot-list service stopped
     /// this way stays stopped until `start`.
     Stop { id: String },
@@ -491,6 +498,7 @@ struct Daemon {
     startup: ActorSource,
     services: boot::Services,
     shutdown: tokio::sync::Notify,
+    started: Instant,
 }
 
 async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
@@ -505,6 +513,7 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
         startup: loaded.actor,
         services: boot::Services::new(config.services, config.filesystem.root),
         shutdown: tokio::sync::Notify::new(),
+        started: Instant::now(),
     });
     boot::boot(&daemon);
     let hint = if port == 7777 {
@@ -712,6 +721,16 @@ async fn dispatch(request: &Value, daemon: &Arc<Daemon>) -> (bool, String) {
                 Err(error) => (false, format!("error: {error:#}")),
             },
         },
+        "inspect" => {
+            let answer = match request.get("id").and_then(Value::as_str) {
+                Some(target) => inspect::session(daemon, target).await,
+                None => inspect::all(daemon).await,
+            };
+            match answer {
+                Ok(text) => (true, text),
+                Err(error) => (false, error),
+            }
+        }
         "services" => match daemon.runtime.interpreters().await {
             Ok(interpreters) => (true, daemon.services.render(&interpreters)),
             Err(error) => (false, format!("error: {error:#}")),
@@ -773,6 +792,7 @@ async fn new_session(request: &Value, daemon: &Daemon) -> Result<String> {
         Note {
             source: actor.origin,
             since: Instant::now(),
+            start: None,
         },
     );
     let interpreters = daemon.runtime.interpreters().await?;
@@ -1039,6 +1059,7 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
         }
         Command::Read { id, from } => read(port, id, from).await,
         Command::Status { id } => send(port, json!({ "op": "status", "id": id })).await,
+        Command::Inspect { id } => send(port, json!({ "op": "inspect", "id": id })).await,
         Command::Stop { id } => send(port, json!({ "op": "stop", "id": id })).await,
         Command::Services => send(port, json!({ "op": "services" })).await,
         Command::Start { name } => send(port, json!({ "op": "start", "name": name })).await,
