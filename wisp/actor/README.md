@@ -139,6 +139,9 @@ session 96e5c6f5
 newest 64 host calls (at most 1 MiB of their events, a call over 64 KiB keeps
 only its size) and decodes them when asked. Strings are cut at 60 characters
 and bytes only counted, so file contents and message payloads do not show.
+A string's query string becomes `?…` and a path under `private/` stops at
+`private/…` (a URL's `?token=`, a session id as a file name), so the output
+is safe to paste or publish.
 It needs no `(chain-watch …)` first, unlike the `(chain-tail id n)` verb, which
 lists hashes and sizes of any actor's events.
 

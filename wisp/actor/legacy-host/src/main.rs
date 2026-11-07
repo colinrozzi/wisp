@@ -157,7 +157,8 @@ enum Command {
     /// Without an id, one line per session. Counts and hashes only.
     Inspect { id: Option<String> },
     /// A session's newest host calls (the daemon keeps 64), with arguments
-    /// and results in short: strings cut, bytes only counted. --kind picks
+    /// and results in short: strings cut, bytes only counted, query strings
+    /// and paths under private/ redacted. --kind picks
     /// fs, tcp, http, timer, msg or process.
     ChainTail {
         id: String,

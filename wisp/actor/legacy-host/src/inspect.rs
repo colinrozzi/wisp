@@ -252,13 +252,34 @@ fn list(items: &[Value]) -> String {
     shown.join(", ")
 }
 
-/// A value in short: strings cut, bytes counted, lists capped.
+/// A string with what may be a secret taken out: a query string (a URL's
+/// `?token=…`) becomes `?…`, and a path under `private/` (a session id as a
+/// file name under `private/sessions/`) stops at `private/…`. So chain-tail
+/// output is safe to paste or publish.
+fn redact(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Some(at) = out.find("private/") {
+        out.truncate(at + "private/".len());
+        out.push('…');
+    }
+    if let Some(at) = out.find('?') {
+        out.truncate(at + 1);
+        out.push('…');
+    }
+    out
+}
+
+/// A value in short: strings redacted and cut, bytes counted, lists capped.
 fn short(v: &Value) -> String {
     match v {
-        Value::String(s) if s.chars().count() > STRING_CHARS => {
-            format!("{:?}…", s.chars().take(STRING_CHARS).collect::<String>())
+        Value::String(s) => {
+            let s = redact(s);
+            if s.chars().count() > STRING_CHARS {
+                format!("{:?}…", s.chars().take(STRING_CHARS).collect::<String>())
+            } else {
+                format!("{s:?}")
+            }
         }
-        Value::String(s) => format!("{s:?}"),
         Value::List { items, .. }
             if items.iter().all(|i| matches!(i, Value::U8(_))) && !items.is_empty() =>
         {
@@ -391,6 +412,16 @@ mod tests {
         assert_eq!(short(&long), format!("{:?}…", "x".repeat(STRING_CHARS)));
         let input = Value::Tuple(vec![Value::String("m.wisp".into()), Value::U64(5)]);
         assert_eq!(args(&input), "(\"m.wisp\", 5)");
+    }
+
+    #[test]
+    fn redact_drops_query_strings_and_private_paths() {
+        assert_eq!(redact("https://a.b/c?token=s3cret&x=1"), "https://a.b/c?…");
+        assert_eq!(redact("private/sessions/abc123"), "private/…");
+        assert_eq!(redact("site/private/x: No such file"), "site/private/…");
+        assert_eq!(redact("m.wisp"), "m.wisp");
+        let call = Value::Tuple(vec![Value::String("private/sessions/tok".into())]);
+        assert_eq!(args(&call), "(\"private/…\")");
     }
 
     #[test]
