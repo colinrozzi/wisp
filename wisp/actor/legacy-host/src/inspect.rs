@@ -8,6 +8,7 @@
 use crate::{Daemon, VERSION};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
+use theater::pack_bridge::Value;
 use wisp_interpreter_actor::{Interpreter, health, resolve, short_id};
 
 /// How long the session has to answer `(memory-stats)`.
@@ -151,6 +152,175 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
     Ok(out)
 }
 
+/// What `chain-tail --kind` takes, and the event-type prefixes each covers.
+pub const KINDS: &[(&str, &[&str])] = &[
+    ("fs", &["theater:simple/filesystem/"]),
+    ("tcp", &["theater:simple/tcp/"]),
+    (
+        "http",
+        &[
+            "theater:simple/http-client/",
+            "theater:simple/http-framework/",
+        ],
+    ),
+    ("timer", &["theater:simple/timer/"]),
+    ("msg", &["theater:simple/message-server-host/"]),
+    ("process", &["theater:simple/process/"]),
+];
+
+/// `chain-tail ID [-n N] [--kind K]`: the session's newest host calls, with
+/// their arguments and results in short: a string is cut at
+/// [`STRING_CHARS`], bytes show only their count, so no file contents or
+/// message payloads.
+pub async fn chain_tail(
+    daemon: &Daemon,
+    target: &str,
+    n: usize,
+    kind: Option<&str>,
+) -> Result<String, String> {
+    let prefixes: Option<&[&str]> = match kind {
+        None | Some("all") => None,
+        Some(kind) => match KINDS.iter().find(|(name, _)| *name == kind) {
+            Some((_, prefixes)) => Some(prefixes),
+            None => {
+                let names: Vec<&str> = KINDS.iter().map(|(name, _)| *name).collect();
+                return Err(format!(
+                    "error: no kind {kind}; one of all, {}",
+                    names.join(", ")
+                ));
+            }
+        },
+    };
+    let interpreters = daemon
+        .runtime
+        .interpreters()
+        .await
+        .map_err(|e| format!("error: {e:#}"))?;
+    let interpreter = resolve(&interpreters, target).map_err(|e| e.to_string())?;
+    let actor = daemon
+        .runtime
+        .health
+        .get(&interpreter.id)
+        .unwrap_or_default();
+    let now = Instant::now();
+    let wanted: Vec<&health::HostCall> = actor
+        .tail
+        .iter()
+        .filter(|call| prefixes.is_none_or(|ps| ps.iter().any(|p| call.event_type.starts_with(p))))
+        .collect();
+    let mut lines = Vec::new();
+    for call in &wanted[wanted.len().saturating_sub(n)..] {
+        let shown = match call.decode() {
+            Some((input, output)) => format!("{} -> {}", args(&input), short(&output)),
+            None if call.data.is_none() => format!("({} bytes, too large to keep)", call.bytes),
+            None => "(not decodable)".into(),
+        };
+        lines.push(format!(
+            "{:>6} ago  {}{shown}",
+            ago(call.at, now),
+            call.event_type
+        ));
+    }
+    if lines.is_empty() {
+        return Ok(format!(
+            "no host calls{} kept for {}",
+            kind.map_or(String::new(), |k| format!(" of kind {k}")),
+            interpreter.name
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Characters of a string `chain-tail` shows.
+const STRING_CHARS: usize = 60;
+/// Items of a list `chain-tail` shows.
+const ITEMS: usize = 6;
+
+/// A host call's input, a tuple of its parameters, as `(a, b)`.
+fn args(input: &Value) -> String {
+    match input {
+        Value::Tuple(items) => format!("({})", list(items)),
+        other => format!("({})", short(other)),
+    }
+}
+
+fn list(items: &[Value]) -> String {
+    let mut shown: Vec<String> = items.iter().take(ITEMS).map(short).collect();
+    if items.len() > ITEMS {
+        shown.push(format!("… {} more", items.len() - ITEMS));
+    }
+    shown.join(", ")
+}
+
+/// A string with what may be a secret taken out: a query string (a URL's
+/// `?token=…`) becomes `?…`, and a path under `private/` (a session id as a
+/// file name under `private/sessions/`) stops at `private/…`. So chain-tail
+/// output is safe to paste or publish.
+fn redact(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Some(at) = out.find("private/") {
+        out.truncate(at + "private/".len());
+        out.push('…');
+    }
+    if let Some(at) = out.find('?') {
+        out.truncate(at + 1);
+        out.push('…');
+    }
+    out
+}
+
+/// A value in short: strings redacted and cut, bytes counted, lists capped.
+fn short(v: &Value) -> String {
+    match v {
+        Value::String(s) => {
+            let s = redact(s);
+            if s.chars().count() > STRING_CHARS {
+                format!("{:?}…", s.chars().take(STRING_CHARS).collect::<String>())
+            } else {
+                format!("{s:?}")
+            }
+        }
+        Value::List { items, .. }
+            if items.iter().all(|i| matches!(i, Value::U8(_))) && !items.is_empty() =>
+        {
+            format!("<{} bytes>", items.len())
+        }
+        Value::List { items, .. } => format!("[{}]", list(items)),
+        Value::Tuple(items) => format!("({})", list(items)),
+        Value::Option { value: None, .. } => "none".into(),
+        Value::Option { value: Some(v), .. } => format!("some({})", short(v)),
+        Value::Result { value: Ok(v), .. } => format!("ok({})", short(v)),
+        Value::Result { value: Err(v), .. } => format!("err({})", short(v)),
+        Value::Record { fields, .. } => {
+            let shown: Vec<String> = fields
+                .iter()
+                .take(ITEMS)
+                .map(|(name, v)| format!("{name}: {}", short(v)))
+                .collect();
+            format!("{{{}}}", shown.join(", "))
+        }
+        Value::Variant {
+            case_name, payload, ..
+        } if payload.is_empty() => case_name.clone(),
+        Value::Variant {
+            case_name, payload, ..
+        } => format!("{case_name}({})", list(payload)),
+        Value::Bool(b) => b.to_string(),
+        Value::U8(n) => n.to_string(),
+        Value::U16(n) => n.to_string(),
+        Value::U32(n) => n.to_string(),
+        Value::U64(n) => n.to_string(),
+        Value::S8(n) => n.to_string(),
+        Value::S16(n) => n.to_string(),
+        Value::S32(n) => n.to_string(),
+        Value::S64(n) => n.to_string(),
+        Value::F32(n) => n.to_string(),
+        Value::F64(n) => n.to_string(),
+        Value::Char(c) => format!("{c:?}"),
+        _ => "…".into(),
+    }
+}
+
 /// The heap and steps lines, from the session's `(memory-stats)`.
 async fn memory(daemon: &Daemon, interpreter: &Interpreter) -> String {
     let asked = async {
@@ -224,6 +394,34 @@ mod tests {
         assert_eq!(stat(printed, "heap-bytes"), Some(1234));
         assert_eq!(stat(printed, "step-limit"), Some(1000000));
         assert_eq!(stat(printed, "nope"), None);
+    }
+
+    #[test]
+    fn short_counts_bytes_and_cuts_strings() {
+        let bytes = Value::List {
+            elem_type: theater::pack_bridge::ValueType::U8,
+            items: vec![Value::U8(1); 300],
+        };
+        let ok = Value::Result {
+            ok_type: theater::pack_bridge::ValueType::U8,
+            err_type: theater::pack_bridge::ValueType::String,
+            value: Ok(Box::new(bytes)),
+        };
+        assert_eq!(short(&ok), "ok(<300 bytes>)");
+        let long = Value::String("x".repeat(100));
+        assert_eq!(short(&long), format!("{:?}…", "x".repeat(STRING_CHARS)));
+        let input = Value::Tuple(vec![Value::String("m.wisp".into()), Value::U64(5)]);
+        assert_eq!(args(&input), "(\"m.wisp\", 5)");
+    }
+
+    #[test]
+    fn redact_drops_query_strings_and_private_paths() {
+        assert_eq!(redact("https://a.b/c?token=s3cret&x=1"), "https://a.b/c?…");
+        assert_eq!(redact("private/sessions/abc123"), "private/…");
+        assert_eq!(redact("site/private/x: No such file"), "site/private/…");
+        assert_eq!(redact("m.wisp"), "m.wisp");
+        let call = Value::Tuple(vec![Value::String("private/sessions/tok".into())]);
+        assert_eq!(args(&call), "(\"private/…\")");
     }
 
     #[test]

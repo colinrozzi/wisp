@@ -359,3 +359,49 @@ fn inspect_reports_from_the_daemon_even_while_the_session_is_busy() {
     long.wait().unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn chain_tail_shows_host_calls_without_their_bytes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-tail", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("m.wisp"), "(module m (provide x) (define x 1))").unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[filesystem]\nroot = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start_with(&root, &["--config", config.to_str().unwrap()]);
+    daemon.ok(&["new", "b"]);
+    daemon.ok(&[
+        "eval",
+        "b",
+        "(begin (set-interval \"beat\" 100000) (fs-read-text \"m.wisp\") \
+         (fs-read-text \"nope.txt\") (msg-send (self) \"secret\"))",
+    ]);
+    let all = daemon.ok(&["chain-tail", "b"]);
+    for line in [
+        "theater:simple/timer/set-interval(\"beat\", 100000) -> ok(\"beat\")",
+        "theater:simple/filesystem/read-file(\"m.wisp\") -> ok(<35 bytes>)",
+        "<6 bytes>",
+    ] {
+        assert!(all.contains(line), "{line:?} not in\n{all}");
+    }
+    assert!(
+        !all.contains("secret") && !all.contains("module m"),
+        "{all}"
+    );
+    let fs = daemon.ok(&["chain-tail", "b", "--kind", "fs", "-n", "1"]);
+    assert_eq!(fs.lines().count(), 1, "{fs}");
+    assert!(fs.contains("read-file(\"nope.txt\") -> err("), "{fs}");
+    assert!(
+        daemon
+            .fails(&["chain-tail", "b", "--kind", "bogus"])
+            .contains("one of all")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

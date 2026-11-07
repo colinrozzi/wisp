@@ -62,6 +62,7 @@ LISP
 | `cursors <s>` | the session's event cursors: name, acknowledged seq, how far behind |
 | `status [s]` | show a session (with one) or the daemon and its services (without) |
 | `inspect [s]` | what a session runs and how it is doing (below); without one, a line per session |
+| `chain-tail [-n N] [--kind K] <s>` | the session's newest host calls with arguments and results in short; `K` is `fs`, `tcp`, `http`, `timer`, `msg` or `process` (below) |
 | `stop <s>` | stop the session's actor and reclaim its heap; a service stopped this way is not restarted |
 | `services` | each boot-list service: state, restarts, session id, last death |
 | `start <name>` | start a boot-list service that is stopped, exited or given up, with a fresh restart limit |
@@ -132,6 +133,22 @@ session 96e5c6f5
   steps:    busy
   files:    1
     experiment/field/peer.wisp  sha256 90d8…  4123 bytes  read 2h10m ago
+```
+
+**`chain-tail`** reads the same subscription: the daemon keeps each actor's
+newest 64 host calls (at most 1 MiB of their events, a call over 64 KiB keeps
+only its size) and decodes them when asked. Strings are cut at 60 characters
+and bytes only counted, so file contents and message payloads do not show.
+A string's query string becomes `?…` and a path under `private/` stops at
+`private/…` (a URL's `?token=`, a session id as a file name), so the output
+is safe to paste or publish.
+It needs no `(chain-watch …)` first, unlike the `(chain-tail id n)` verb, which
+lists hashes and sizes of any actor's events.
+
+```text
+$ theater-repl chain-tail b --kind fs
+    4s ago  theater:simple/filesystem/read-file("m.wisp") -> ok(<36 bytes>)
+    4s ago  theater:simple/filesystem/read-file("nope.txt") -> err(not-found("nope.txt: No such file or directory (os error 2)"))
 ```
 
 Every command takes **`-p PORT`** to pick a daemon (default `7777`, or

@@ -156,6 +156,18 @@ enum Command {
     /// so a busy session still reports (only heap and steps need the session).
     /// Without an id, one line per session. Counts and hashes only.
     Inspect { id: Option<String> },
+    /// A session's newest host calls (the daemon keeps 64), with arguments
+    /// and results in short: strings cut, bytes only counted, query strings
+    /// and paths under private/ redacted. --kind picks
+    /// fs, tcp, http, timer, msg or process.
+    ChainTail {
+        id: String,
+        /// At most this many calls.
+        #[arg(short, default_value_t = 20)]
+        n: usize,
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Stop a session's actor and reclaim its heap. A boot-list service stopped
     /// this way stays stopped until `start`.
     Stop { id: String },
@@ -731,6 +743,14 @@ async fn dispatch(request: &Value, daemon: &Arc<Daemon>) -> (bool, String) {
                 Err(error) => (false, error),
             }
         }
+        "chain-tail" => {
+            let n = request.get("n").and_then(Value::as_u64).unwrap_or(20) as usize;
+            let kind = request.get("kind").and_then(Value::as_str);
+            match inspect::chain_tail(daemon, field(request, "id"), n, kind).await {
+                Ok(text) => (true, text),
+                Err(error) => (false, error),
+            }
+        }
         "services" => match daemon.runtime.interpreters().await {
             Ok(interpreters) => (true, daemon.services.render(&interpreters)),
             Err(error) => (false, format!("error: {error:#}")),
@@ -1060,6 +1080,13 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
         Command::Read { id, from } => read(port, id, from).await,
         Command::Status { id } => send(port, json!({ "op": "status", "id": id })).await,
         Command::Inspect { id } => send(port, json!({ "op": "inspect", "id": id })).await,
+        Command::ChainTail { id, n, kind } => {
+            send(
+                port,
+                json!({ "op": "chain-tail", "id": id, "n": n, "kind": kind }),
+            )
+            .await
+        }
         Command::Stop { id } => send(port, json!({ "op": "stop", "id": id })).await,
         Command::Services => send(port, json!({ "op": "services" })).await,
         Command::Start { name } => send(port, json!({ "op": "start", "name": name })).await,

@@ -12,7 +12,7 @@
 //! (guest calls, messages sent, timers, TCP and `.wisp` file reads), keeps what
 //! it needs under a short lock, and never waits on anything else.
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use theater::TheaterId;
@@ -26,6 +26,12 @@ use tokio::sync::mpsc;
 pub const FILES: usize = 256;
 /// Open handles of one kind remembered per actor.
 pub const HANDLES: usize = 1024;
+/// Host calls kept per actor for `chain-tail`, and the most bytes of their
+/// events kept in all; a call whose event is larger than [`CALL_BYTES`] keeps
+/// only its size.
+pub const CALLS: usize = 64;
+pub const TAIL_BYTES: usize = 1 << 20;
+pub const CALL_BYTES: usize = 64 << 10;
 /// Characters of an error kept.
 const ERROR_CHARS: usize = 160;
 
@@ -85,6 +91,31 @@ pub struct Actor {
     pub handles: BTreeMap<&'static str, BTreeSet<String>>,
     /// `.wisp` files read, by path.
     pub files: BTreeMap<String, File>,
+    /// The newest host calls, oldest first, still encoded: they are decoded
+    /// only when read ([`HostCall::decode`]).
+    pub tail: VecDeque<HostCall>,
+    tail_bytes: usize,
+}
+
+/// One host call as its chain event holds it.
+#[derive(Clone, Debug)]
+pub struct HostCall {
+    /// `INTERFACE/FUNCTION`.
+    pub event_type: String,
+    /// The event's payload, or None when it was larger than [`CALL_BYTES`].
+    pub data: Option<Vec<u8>>,
+    pub bytes: usize,
+    pub at: Instant,
+}
+
+impl HostCall {
+    /// The call's input and output.
+    pub fn decode(&self) -> Option<(Value, Value)> {
+        match decode_chain_event_payload(self.data.as_deref()?) {
+            Some(ChainEventPayload::HostFunction(call)) => Some((call.input, call.output)),
+            _ => None,
+        }
+    }
 }
 
 impl Actor {
@@ -103,6 +134,17 @@ impl Actor {
     fn close(&mut self, kind: &'static str, id: &str) {
         if let Some(ids) = self.handles.get_mut(kind) {
             ids.remove(id);
+        }
+    }
+
+    fn called(&mut self, call: HostCall) {
+        self.tail_bytes += call.data.as_ref().map_or(0, Vec::len);
+        self.tail.push_back(call);
+        while self.tail.len() > CALLS || self.tail_bytes > TAIL_BYTES {
+            let Some(old) = self.tail.pop_front() else {
+                break;
+            };
+            self.tail_bytes -= old.data.as_ref().map_or(0, Vec::len);
         }
     }
 
@@ -164,10 +206,21 @@ impl Health {
             return;
         }
         let seen = Seen::of(event);
+        // Host calls are `INTERFACE/FUNCTION`; guest calls and lifecycle
+        // events have no slash.
+        let call = event.event_type.contains('/').then(|| HostCall {
+            event_type: event.event_type.clone(),
+            data: (event.data.len() <= CALL_BYTES).then(|| event.data.clone()),
+            bytes: event.data.len(),
+            at: now,
+        });
         let second = now.duration_since(self.epoch).as_secs();
         let mut table = self.table();
         let actor = table.entry(id).or_default();
         actor.events += 1;
+        if let Some(call) = call {
+            actor.called(call);
+        }
         match seen {
             Seen::Nothing => {}
             Seen::Call(function) => {
