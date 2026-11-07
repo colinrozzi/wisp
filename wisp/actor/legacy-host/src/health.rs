@@ -298,17 +298,12 @@ impl Seen {
                     params,
                 } => {
                     // A connection a listener accepted, or one closed by the peer.
-                    if function_name.ends_with("tcp-client.handle-connection")
-                        || function_name.ends_with("tcp-client.handle-connection-transfer")
+                    let opened = function_name.ends_with("tcp-client.handle-connection")
+                        || function_name.ends_with("tcp-client.handle-connection-transfer");
+                    if (opened || function_name.ends_with("tcp-client.on-close"))
+                        && let Some(id) = first_string(&params)
                     {
-                        if let Some(id) = first_string(&params) {
-                            return Seen::Connection(function_name, id, true);
-                        }
-                    }
-                    if function_name.ends_with("tcp-client.on-close") {
-                        if let Some(id) = first_string(&params) {
-                            return Seen::Connection(function_name, id, false);
-                        }
+                        return Seen::Connection(function_name, id, opened);
                     }
                     Seen::Call(function_name)
                 }
