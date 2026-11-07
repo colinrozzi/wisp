@@ -25,19 +25,20 @@
 ; the firing + result for (poll-events). handle-tick's arg is a bare timer-name
 ; string; the others arrive as a Tuple of args, so we take the raw CGRF as `any` and
 ; unmarshal it (the handler receives a (sequence ...) of the args). Returns are
-; ignored by the runtime (handle-request's reply is a future refinement).
+; ignored by the runtime (handle-request's reply is a future refinement); each
+; answers "ok" or "error: ..." (handler-answer) so the chain shows failed handlers.
 (export "theater:simple/timer.handle-tick"
   (fn handle-tick ((name string)) string
-    (begin (dispatch-event "on-tick" (text name)) "ok")))
+    (handler-answer (dispatch-event "on-tick" (text name)))))
 ; After (subscribe-spawns): on-spawn receives (sequence id name parent-option).
 (export "theater:simple/runtime-handlers.handle-actor-spawn"
   (fn handle-actor-spawn ((raw any)) string
-    (begin (dispatch-event "on-spawn" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-spawn" (unmarshal raw)))))
 ; After (msg-register): on-message receives a 1-element list (message-bytes);
 ; a handler reads the text with (bytes->string (car e)).
 (export "theater:simple/message-server-client.handle-send"
   (fn handle-send ((raw any)) string
-    (begin (dispatch-event "on-message" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-message" (unmarshal raw)))))
 ; Channel callbacks (same interface). After a peer (msg-open target initial-msg),
 ; Theater delivers the open/messages/close here — dispatched to on-channel-open /
 ; on-channel-message / on-channel-close for (poll-events). open/message arrive as a
@@ -53,10 +54,10 @@
       (tuple (bool 1) (none (list u8))))))
 (export "theater:simple/message-server-client.handle-channel-message"
   (fn handle-channel-message ((raw any)) string
-    (begin (dispatch-event "on-channel-message" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-channel-message" (unmarshal raw)))))
 (export "theater:simple/message-server-client.handle-channel-close"
   (fn handle-channel-close ((raw any)) string
-    (begin (dispatch-event "on-channel-close" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-channel-close" (unmarshal raw)))))
 
 ; TCP server callbacks (theater:simple/tcp-client). After (tcp-listen addr),
 ; Theater runs a background accept loop and delivers events by CALLING these
@@ -69,16 +70,16 @@
 ; so — like handle-tick/handle-send — we return a plain string.
 (export "theater:simple/tcp-client.handle-connection"
   (fn tcp-handle-connection ((connection-id string)) string
-    (begin (dispatch-event "on-connection" (text connection-id)) "ok")))
+    (handler-answer (dispatch-event "on-connection" (text connection-id)))))
 (export "theater:simple/tcp-client.handle-connection-transfer"
   (fn tcp-handle-transfer ((connection-id string)) string
-    (begin (dispatch-event "on-connection" (text connection-id)) "ok")))
+    (handler-answer (dispatch-event "on-connection" (text connection-id)))))
 (export "theater:simple/tcp-client.on-data"
   (fn tcp-on-data ((raw any)) string
-    (begin (dispatch-event "on-data" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-data" (unmarshal raw)))))
 (export "theater:simple/tcp-client.on-close"
   (fn tcp-on-close ((raw any)) string
-    (begin (dispatch-event "on-close" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-close" (unmarshal raw)))))
 
 ; Process callbacks (theater:simple/process-client). After (process-set-active id
 ; "active"|"once"), Theater pushes each output chunk here as on-output and the final
@@ -89,13 +90,13 @@
 ; `any` and unmarshalled to a sequence; handle-process-transfer gets a bare id.
 (export "theater:simple/process-client.on-output"
   (fn process-on-output ((raw any)) string
-    (begin (dispatch-event "on-output" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-output" (unmarshal raw)))))
 (export "theater:simple/process-client.on-exit"
   (fn process-on-exit ((raw any)) string
-    (begin (dispatch-event "on-exit" (unmarshal raw)) "ok")))
+    (handler-answer (dispatch-event "on-exit" (unmarshal raw)))))
 (export "theater:simple/process-client.handle-process-transfer"
   (fn process-on-transfer ((process-id string)) string
-    (begin (dispatch-event "on-process-transfer" (text process-id)) "ok")))
+    (handler-answer (dispatch-event "on-process-transfer" (text process-id)))))
 
 ; Lifecycle monitoring (theater:simple/lifecycle-handlers). After (monitor id),
 ; Theater delivers every chain event of the monitored actor here, dispatched to a

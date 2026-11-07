@@ -61,6 +61,7 @@ LISP
 | `wait [--timeout S] <s>` | block until there is a firing after the `wait` cursor, print all there are, move the cursor, exit (exit 2 on timeout). The wake-on-message monitor |
 | `cursors <s>` | the session's event cursors: name, acknowledged seq, how far behind |
 | `status [s]` | show a session (with one) or the daemon and its services (without) |
+| `inspect [s]` | what a session runs and how it is doing (below); without one, a line per session |
 | `stop <s>` | stop the session's actor and reclaim its heap; a service stopped this way is not restarted |
 | `services` | each boot-list service: state, restarts, session id, last death |
 | `start <name>` | start a boot-list service that is stopped, exited or given up, with a fresh restart limit |
@@ -100,6 +101,38 @@ no evaluation while idle: the session tells the daemon each new seq through the
 itself, so this works for any session, including ones the daemon did not spawn.
 A session whose actor predates cursors falls back to the old draining read. See
 `docs/proposals/SESSION-INBOX.md`.
+
+**`inspect`** answers from the daemon, so a session that is busy or stuck in a
+long evaluation still reports, and `busy` names the guest call and how long it
+has run. The daemon keeps each actor's counts from a global chain subscription
+(`legacy-host/src/health.rs`): guest calls, messages in and out (the last 60 s,
+and totals), failed calls (an evaluation or trigger handler that answered
+`error: …`, or a trap) with the last error's first line, open timers,
+listeners and connections, and the sha256 of every `.wisp` file the session
+read, taken from the bytes read (so it shows drift against the file on disk).
+A boot-list service also shows its start file and the sha256 of the text that
+was evaluated. Only `heap` and `steps` come from the session (its
+`(memory-stats)`): it gets one second, and shows `busy` if it does not answer.
+Counts, names and hashes only; no message payloads or file contents. The counts
+start when the daemon does. A connection the session never activates is never
+reported closed, so it stays counted.
+
+```text
+$ theater-repl inspect live
+session 96e5c6f5
+  name:     live
+  ...
+  busy:     1s in theater:simple/wisp.evaluate
+  calls:    4120
+  messages: in 2/min (310 total), out 0/min (0 total)
+  errors:   3, last 5m02s ago: error: car/cdr expects a nonempty list
+  timers:   2 (snap, tick)
+  sockets:  1 listening, 4 connected
+  heap:     busy (no answer in 1s)
+  steps:    busy
+  files:    1
+    experiment/field/peer.wisp  sha256 90d8…  4123 bytes  read 2h10m ago
+```
 
 Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
 `$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated

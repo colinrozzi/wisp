@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod deaths;
 pub mod eval_session;
 pub mod events;
+pub mod health;
 pub mod sessions;
 pub mod source;
 pub mod theater_host;
@@ -101,6 +102,9 @@ pub struct Runtime {
     /// Actors that have terminated, left out of the directory even while the
     /// runtime still lists them (see [`deaths`]).
     pub dead: deaths::Dead,
+    /// What every actor is doing, from a second global chain subscription
+    /// (see [`health`]), for `inspect`.
+    pub health: health::Health,
     /// The keepalive actor (see [`Runtime::new`]): in `(list-actors)`, never a
     /// session.
     pub keepalive: TheaterId,
@@ -237,6 +241,8 @@ impl Runtime {
         }
         let (subscriber, deaths) = deaths::subscription(dead.clone());
         runtime.add_global_subscription(subscriber);
+        let health = health::Health::default();
+        runtime.add_global_subscription(health.subscription());
         let task = tokio::spawn(async move { runtime.run().await });
         let runtime = Self {
             commands,
@@ -244,6 +250,7 @@ impl Runtime {
             events,
             deaths: std::sync::Mutex::new(Some(deaths)),
             dead,
+            health,
             keepalive: TheaterId::generate(),
             task,
         };

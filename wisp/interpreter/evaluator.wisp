@@ -29,9 +29,12 @@
 ; sets. start-steps copies one to the other, so a runaway loop cannot raise its own.
 (global $step-limit s32 mut 1000000)
 (global $next-step-limit s32 mut 1000000)
+; The most steps any finished evaluation or handler call took, for (memory-stats).
+(global $steps-most s32 mut 0)
 
 (fn start-steps () s32
   (begin
+    (if (i32.gt_s (global.get $steps) (global.get $steps-most)) (global.set $steps-most (global.get $steps)) 0)
     (global.set $steps 0)
     (global.set $step-limit (global.get $next-step-limit))
     0))

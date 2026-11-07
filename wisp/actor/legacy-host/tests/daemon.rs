@@ -15,13 +15,20 @@ struct Daemon {
 
 impl Daemon {
     fn start(work: &Path) -> Self {
+        Self::start_with(work, &[])
+    }
+
+    /// A daemon with these arguments before `serve` (such as `--config`).
+    fn start_with(work: &Path, args: &[&str]) -> Self {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
         let child = Command::new(BIN)
-            .args(["-p", &port.to_string(), "serve"])
+            .args(["-p", &port.to_string()])
+            .args(args)
+            .arg("serve")
             .current_dir(work)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -262,4 +269,93 @@ fn every_interpreter_in_the_runtime_is_a_session() {
     );
     daemon.ok(&["stop", &unnamed]);
     assert_eq!(daemon.ok(&["eval", "wisp-interpreter", "2"]), "2");
+}
+
+#[test]
+fn inspect_reports_from_the_daemon_even_while_the_session_is_busy() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-inspect", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let module = "(module m (provide x) (define x 1))";
+    std::fs::write(root.join("m.wisp"), module).unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[filesystem]\nroot = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start_with(&root, &["--config", config.to_str().unwrap()]);
+    daemon.ok(&["new", "a"]);
+    daemon.ok(&["new", "b"]);
+    let list = daemon.ok(&["list"]);
+    let b = list
+        .lines()
+        .find(|l| l.split_whitespace().nth(1) == Some("b"))
+        .and_then(|l| l.split_whitespace().nth(3))
+        .expect(&list)
+        .to_string();
+    daemon.ok(&[
+        "eval",
+        "b",
+        "(begin (msg-register) (define on-message (lambda (e) (car (list)))) \
+         (set-interval \"beat\" 100000) (require m \"m.wisp\"))",
+    ]);
+    for _ in 0..2 {
+        daemon.ok(&["eval", "a", &format!("(msg-send \"{b}\" \"hi\")")]);
+    }
+    daemon.fails(&["eval", "b", "(car (list))"]);
+
+    // Two failed handler calls and the failed evaluation; the file's hash is
+    // that of the text read.
+    let sha = wisp_interpreter_actor::health::sha256_hex(module.as_bytes());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let shown = loop {
+        let shown = daemon.ok(&["inspect", "b"]);
+        if shown.contains("errors:   3,") {
+            break shown;
+        }
+        assert!(Instant::now() < deadline, "{shown}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    for line in [
+        "busy:     no",
+        "messages: in 2/min (2 total), out 0/min (0 total)",
+        "error: car/cdr expects a nonempty list",
+        "timers:   1 (beat)",
+        "steps:    most ",
+        &format!("m.wisp  sha256 {sha}  {} bytes", module.len()),
+    ] {
+        assert!(shown.contains(line), "{line:?} not in\n{shown}");
+    }
+    assert!(daemon.ok(&["inspect", "a"]).contains("out 2/min (2 total)"));
+    let all = daemon.ok(&["inspect"]);
+    assert!(all.lines().count() == 4 && all.contains(" b "), "{all}");
+
+    // A long evaluation: the daemon still answers, and names the call.
+    daemon.ok(&[
+        "eval",
+        "b",
+        "(begin (step-limit 20000000) (define f (lambda (n) (if (= n 0) 0 (f (- n 1))))))",
+    ]);
+    let mut long = Command::new(BIN)
+        .args(["-p", &daemon.port.to_string(), "eval", "b", "(f 3000000)"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let shown = daemon.ok(&["inspect", "b"]);
+        if shown.contains("in theater:simple/wisp.evaluate") {
+            assert!(shown.contains("heap:     busy"), "{shown}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never busy: {shown}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    long.wait().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
 }
