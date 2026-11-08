@@ -19,6 +19,8 @@ impl Daemon {
     }
 
     /// A daemon with these arguments before `serve` (such as `--config`).
+    /// Its HOME is `work`, so a machine's own ~/.config/theater-repl/config.toml
+    /// (services, a filesystem root) doesn't change what the test sees.
     fn start_with(work: &Path, args: &[&str]) -> Self {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -30,6 +32,7 @@ impl Daemon {
             .args(args)
             .arg("serve")
             .current_dir(work)
+            .env("HOME", work)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
