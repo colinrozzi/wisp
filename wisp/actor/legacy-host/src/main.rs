@@ -345,6 +345,7 @@ struct ReplConfig {
     http: Option<HttpConfig>,
     keys: Option<KeysConfig>,
     tcp: Option<TcpConfig>,
+    inspect: Option<InspectConfig>,
     #[serde(rename = "service")]
     services: Vec<boot::ServiceConfig>,
 }
@@ -385,6 +386,20 @@ struct HttpConfig {
 struct KeysConfig {
     dir: PathBuf,
 }
+
+/// `[inspect]`: a second port, on 127.0.0.1 only, that answers just the ops
+/// that report ([`READ_ONLY_OPS`]): for a page that shows the daemon, so it
+/// needn't hold the control port, which also evaluates, stops and shuts down.
+/// No section: no such port.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectConfig {
+    port: u16,
+}
+
+/// What the `[inspect]` port answers. `inspect ID` asks the session for its
+/// `(memory-stats)`, which changes nothing.
+const READ_ONLY_OPS: &[&str] = &["inspect", "chain-tail", "status", "list"];
 
 /// `[tcp.server_tls]`: the certificate and key (PEM) for `(tcp-tls-server conn)`.
 /// Read once, when the daemon starts. A file that can't be read logs an error and
@@ -519,6 +534,17 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("binding {address} (is a daemon already on this port?)"))?;
+    let reports = match &config.inspect {
+        Some(inspect) => {
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], inspect.port));
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("binding the [inspect] port {address}"))?;
+            eprintln!("theater-repl inspect port (read-only) on {address}");
+            Some(listener)
+        }
+        None => None,
+    };
     let daemon = Arc::new(Daemon {
         runtime,
         default: Mutex::new(loaded.actor.clone()),
@@ -552,7 +578,16 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
                 let (stream, _) = accepted?;
                 let daemon = daemon.clone();
                 connections.spawn(async move {
-                    if let Err(error) = handle(stream, &daemon).await {
+                    if let Err(error) = handle(stream, &daemon, false).await {
+                        eprintln!("connection error: {error}");
+                    }
+                });
+            }
+            accepted = accept_on(&reports) => {
+                let (stream, _) = accepted?;
+                let daemon = daemon.clone();
+                connections.spawn(async move {
+                    if let Err(error) = handle(stream, &daemon, true).await {
                         eprintln!("connection error: {error}");
                     }
                 });
@@ -568,13 +603,37 @@ async fn serve(loaded: Loaded, config: ReplConfig, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn handle(stream: tokio::net::TcpStream, daemon: &Arc<Daemon>) -> Result<()> {
+/// The next connection on `listener`, or never when there is none.
+async fn accept_on(
+    listener: &Option<tokio::net::TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One request and its answer. `read_only`: the `[inspect]` port, which
+/// refuses every op but [`READ_ONLY_OPS`].
+async fn handle(
+    stream: tokio::net::TcpStream,
+    daemon: &Arc<Daemon>,
+    read_only: bool,
+) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let Some(line) = transport::read_line(&mut reader).await? else {
         return Ok(());
     };
     let request: Value = serde_json::from_str(&line).unwrap_or_else(|_| json!({}));
-    let (ok, text) = dispatch(&request, daemon).await;
+    let op = request.get("op").and_then(Value::as_str).unwrap_or("");
+    let (ok, text) = if read_only && !READ_ONLY_OPS.contains(&op) {
+        (
+            false,
+            format!("error: this port only answers {}", READ_ONLY_OPS.join(", ")),
+        )
+    } else {
+        dispatch(&request, daemon).await
+    };
     let mut stream = reader.into_inner();
     let response = json!({ "ok": ok, "text": text }).to_string();
     stream.write_all(response.as_bytes()).await?;
