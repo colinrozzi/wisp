@@ -186,16 +186,25 @@ impl Health {
         actor.per_minute(self.epoch, Instant::now())
     }
 
-    /// The channel to pass to `add_global_subscription`; its drain task keeps
-    /// the table. Needs a tokio runtime.
+    /// The channel to pass to `add_global_subscription`; a thread of its own
+    /// drains it into the table. Not a tokio task: an actor sends a guest
+    /// call's event and then runs the call on the same worker without
+    /// yielding, and a task that send wakes waits in that worker's LIFO slot,
+    /// which other workers don't steal from, until the call ends. Then a long
+    /// evaluation's start and end arrived together and it never showed as
+    /// busy (1 run in 5 on two cores; tests/daemon.rs
+    /// inspect_reports_from_the_daemon_even_while_the_session_is_busy).
     pub fn subscription(&self) -> mpsc::Sender<(TheaterId, ChainEvent)> {
         let (tx, mut rx) = mpsc::channel::<(TheaterId, ChainEvent)>(1024);
         let health = self.clone();
-        tokio::spawn(async move {
-            while let Some((id, event)) = rx.recv().await {
-                health.observe(id, &event, Instant::now());
-            }
-        });
+        std::thread::Builder::new()
+            .name("health".into())
+            .spawn(move || {
+                while let Some((id, event)) = rx.blocking_recv() {
+                    health.observe(id, &event, Instant::now());
+                }
+            })
+            .expect("spawn the health thread");
         tx
     }
 
