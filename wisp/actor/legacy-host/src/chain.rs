@@ -182,7 +182,7 @@ impl ChainRecorder {
             );
         }
         let error = |e: anyhow::Error| format!("{e:#}");
-        // SubscribeToActor has no reply, and ignores an actor that isn't running.
+        // Sent without a reply (response_tx: None); it ignores an actor that isn't running.
         // The runtime handles commands in order, so if the actor is still there
         // when the next command is answered, the subscription took, and its
         // `terminated` event will arrive.
@@ -190,6 +190,7 @@ impl ChainRecorder {
             .send(TheaterCommand::SubscribeToActor {
                 actor_id: id,
                 event_tx: self.events.clone(),
+                response_tx: None,
             })
             .map_err(|e| error(e.into()))?;
         if self.running(id).await.map_err(error)? {

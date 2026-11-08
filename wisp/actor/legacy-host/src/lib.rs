@@ -142,7 +142,15 @@ impl Runtime {
         handlers.register(events.clone());
         handlers.register(chain::ChainRecorder::new(commands.clone()));
         handlers.register(keys);
-        handlers.register(theater_handler_rpc::RpcHandler::new(commands.clone()));
+        // No actor may rpc a session, so only this host (the daemon, for the
+        // CLI) can run its evaluate. An actor a session spawns inherits the
+        // rule, so only that session can call it (theater #251, #252).
+        handlers.register(theater_handler_rpc::RpcHandler::with_config(
+            commands.clone(),
+            theater_handler_rpc::RpcHandlerConfig {
+                callers: Some(vec![]),
+            },
+        ));
         // Per-interface handlers the local runtime provides. Each is one line;
         // real Theater deployments enable handlers via the actor manifest.
         handlers.register(theater_handler_self::SelfHandler::new(
