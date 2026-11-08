@@ -151,6 +151,17 @@ $ theater-repl chain-tail b --kind fs
     4s ago  theater:simple/filesystem/read-file("nope.txt") -> err(not-found("nope.txt: No such file or directory (os error 2)"))
 ```
 
+**A read-only port** for something that shows the daemon (a status page),
+so it need not hold the control port, which also evaluates, stops and shuts
+down. Off unless the config names it; it listens on 127.0.0.1 only, speaks the
+same one-JSON-line protocol, and answers only `inspect`, `chain-tail`,
+`status` and `list` (anything else: `error: this port only answers …`):
+
+```toml
+[inspect]
+port = 7778
+```
+
 Every command takes **`-p PORT`** to pick a daemon (default `7777`, or
 `$THEATER_REPL_PORT`). Run `theater-repl serve -p 3333` for a second, isolated
 runtime and pass `-p 3333` to the others — nothing is remembered between commands,

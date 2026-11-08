@@ -405,3 +405,72 @@ fn chain_tail_shows_host_calls_without_their_bytes() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// One JSON request line to `port`, and the answer's `ok` and `text`.
+fn ask(port: u16, request: &str) -> (bool, String) {
+    use std::io::{BufRead, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.write_all(format!("{request}\n").as_bytes()).unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .unwrap();
+    let answer: serde_json::Value = serde_json::from_str(&line).expect(&line);
+    (
+        answer["ok"].as_bool().unwrap_or(false),
+        answer["text"].as_str().unwrap_or("").to_string(),
+    )
+}
+
+#[test]
+fn the_inspect_port_answers_only_what_reports() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-inspect-port", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[filesystem]\nroot = {:?}\n[inspect]\nport = {port}\n",
+            root.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start_with(&root, &["--config", config.to_str().unwrap()]);
+    daemon.ok(&["new", "b"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "no inspect port");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let (ok, text) = ask(port, r#"{"op":"inspect"}"#);
+    assert!(ok && text.contains(" b "), "{text}");
+    let (ok, text) = ask(port, r#"{"op":"inspect","id":"b"}"#);
+    assert!(ok && text.contains("name:     b"), "{text}");
+    assert!(ask(port, r#"{"op":"chain-tail","id":"b","n":5}"#).0);
+    assert!(ask(port, r#"{"op":"list"}"#).0);
+    for refused in [
+        r#"{"op":"eval","id":"b","form":"(define x 1)"}"#,
+        r#"{"op":"new","name":"c"}"#,
+        r#"{"op":"stop","id":"b"}"#,
+        r#"{"op":"shutdown"}"#,
+        r#"{}"#,
+    ] {
+        let (ok, text) = ask(port, refused);
+        assert!(!ok && text.contains("only answers"), "{refused}: {text}");
+    }
+    // Nothing above happened: b is still there, x undefined, the daemon up.
+    assert!(daemon.ok(&["list"]).contains(" b "));
+    assert!(!daemon.ok(&["list"]).contains(" c "));
+    assert!(daemon.fails(&["eval", "b", "x"]).contains("x"));
+    let _ = std::fs::remove_dir_all(&root);
+}
