@@ -66,6 +66,13 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
     let hashes = first.handle.get_export_hashes().await?;
     assert!(hashes.iter().any(|hash| hash.name == "theater:simple/wisp"));
 
+    for (source, expected) in [
+        ("(define triple (lambda (x) (* x 3)))", "#<closure>"),
+        ("(triple 14)", "42"),
+        ("(add-two 40)", "42"),
+    ] {
+        assert_eq!(first.evaluate(source).await?, expected);
+    }
     let caller = runtime.spawn(support::rpc_guest()).await?;
     let description = caller
         .handle
@@ -107,7 +114,7 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
             Value::Tuple(vec![
                 Value::String(first.id.to_string()),
                 Value::String(EVALUATE.into()),
-                Value::String("(define triple (lambda (x) (* x 3)))".into()),
+                Value::String("(define pwned 1)".into()),
                 Value::Option {
                     inner_type: ValueType::String,
                     value: None,
@@ -121,7 +128,8 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
     );
     assert!(message.contains("rpc refused"), "{message}");
     assert!(message.contains("no actor (only the host)"), "{message}");
-    assert!(first.evaluate("(triple 14)").await?.contains("unbound"));
+    assert!(first.evaluate("pwned").await?.contains("unbound"));
+    assert_eq!(first.evaluate("(triple 14)").await?, "42");
     runtime.shutdown().await?;
     Ok(())
 }
