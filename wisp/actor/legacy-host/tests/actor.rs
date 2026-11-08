@@ -67,29 +67,6 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
     assert!(hashes.iter().any(|hash| hash.name == "theater:simple/wisp"));
 
     let caller = runtime.spawn(support::rpc_guest()).await?;
-    for (source, expected) in [
-        ("(define triple (lambda (x) (* x 3)))", "#<closure>"),
-        ("(triple 14)", "42"),
-        ("(add-two 40)", "42"),
-    ] {
-        let result = caller
-            .handle
-            .call_function(
-                "test:rpc/relay.call".into(),
-                Value::Tuple(vec![
-                    Value::String(first.id.to_string()),
-                    Value::String(EVALUATE.into()),
-                    Value::String(source.into()),
-                    Value::Option {
-                        inner_type: ValueType::String,
-                        value: None,
-                    },
-                ]),
-            )
-            .await?;
-        // PackInstance unwraps the relay export's outer result at the host boundary.
-        assert_eq!(result, Value::String(expected.into()));
-    }
     let description = caller
         .handle
         .call_function(
@@ -119,7 +96,32 @@ async fn test_actor_session_imports_and_recovery() -> anyhow::Result<()> {
             matches!(ty, Value::Variant { case_name, payload, .. } if case_name == "scalar" && payload == &[Value::String("string".into())])
         );
     }
-    assert_eq!(first.evaluate("(triple 14)").await?, "42");
+    // Sessions take rpc calls from no actor, only the host (callers = []),
+    // so an actor's relay into a session's evaluate is refused (describe,
+    // above, is not a call). The refusal is a wasm error, which stops the
+    // relay actor, so this comes last.
+    let refused = caller
+        .handle
+        .call_function(
+            "test:rpc/relay.call".into(),
+            Value::Tuple(vec![
+                Value::String(first.id.to_string()),
+                Value::String(EVALUATE.into()),
+                Value::String("(define triple (lambda (x) (* x 3)))".into()),
+                Value::Option {
+                    inner_type: ValueType::String,
+                    value: None,
+                },
+            ]),
+        )
+        .await;
+    let message = format!(
+        "{:#}",
+        refused.expect_err("an actor may not call a session")
+    );
+    assert!(message.contains("rpc refused"), "{message}");
+    assert!(message.contains("no actor (only the host)"), "{message}");
+    assert!(first.evaluate("(triple 14)").await?.contains("unbound"));
     runtime.shutdown().await?;
     Ok(())
 }
