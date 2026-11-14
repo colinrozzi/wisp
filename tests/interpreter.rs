@@ -252,19 +252,19 @@ fn test_interpreter_and_or_cond_not() {
     );
     eval(&mut s, "(list (sign -5) (sign 0) (sign 8))", "(-1 0 1)");
     // The last and/or operand and the chosen cond body are tail positions, so a
-    // loop through them runs far past the 128-deep non-tail nesting guard.
+    // loop through them runs far past the 4096-deep non-tail nesting guard.
     eval(
         &mut s,
         "(define down (lambda (n) (cond ((= n 0) 0) (else (down (- n 1))))))",
         "#<closure>",
     );
-    eval(&mut s, "(down 5000)", "0");
+    eval(&mut s, "(down 10000)", "0");
     eval(
         &mut s,
         "(define all (lambda (n) (or (= n 0) (and (< 0 n) (all (- n 1))))))",
         "#<closure>",
     );
-    eval(&mut s, "(all 5000)", "1");
+    eval(&mut s, "(all 10000)", "1");
     // A session's own not (as lib code defines) still wins over the builtin.
     eval(&mut s, "(define not (lambda (b) (if b 0 1)))", "#<closure>");
     eval(&mut s, "(not 0)", "1");
@@ -283,6 +283,24 @@ fn test_interpreter_and_or_cond_not() {
         help.contains("(cond (test body ...) ... (else body ...)) (and a ...) (or a ...) (not x)"),
         "{help}"
     );
+}
+
+#[test]
+fn test_interpreter_non_tail_nesting() {
+    let mut s = session();
+    // Ordinary non-tail recursion over a few thousand levels works (the guard
+    // was 128 before the hosts' wasm stack went to 8 MiB).
+    eval(
+        &mut s,
+        "(define count (lambda (n) (if (= n 0) 0 (+ 1 (count (- n 1))))))",
+        "#<closure>",
+    );
+    eval(&mut s, "(count 3000)", "3000");
+    // Past the guard it is a clean error, not a stack overflow, and the session
+    // keeps its definitions.
+    let out = s.evaluate("(count 100000)").unwrap();
+    assert!(out.contains("evaluation nesting limit"), "{out}");
+    eval(&mut s, "(count 10)", "10");
 }
 
 #[test]

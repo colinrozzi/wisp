@@ -11,6 +11,10 @@ use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Memory, Module, Stor
 
 const FILE_LIMIT: usize = 65536;
 const SOURCE_LIMIT: usize = 1024 * 1024;
+/// The wasm stack the evaluator may use, as in Theater (packr-wasmtime 0.24.2).
+const WASM_STACK: usize = 8 << 20;
+/// The host thread a call runs on: the wasm stack plus room for host frames.
+const EVAL_THREAD_STACK: usize = 16 << 20;
 
 #[derive(Default)]
 struct SourceBudget {
@@ -146,6 +150,9 @@ impl InterpreterImage {
         config.wasm_tail_call(true);
         // Backstop for reader/printer work as well as evaluator execution.
         config.consume_fuel(true);
+        // Each level of non-tail nesting is a real wasm frame; the evaluator's
+        // 4096-deep guard needs more than the 512 KiB default (Theater uses 8 MiB).
+        config.max_wasm_stack(WASM_STACK);
         let engine = Engine::new(&config)?;
         let module = Module::from_file(&engine, path)?;
         let mut linker = Linker::new(&engine);
@@ -240,7 +247,7 @@ impl Interpreter {
             bytes: source.len(),
             files: usize::from(!base.is_empty()),
         };
-        // Backstop only: the evaluator's own step (1M) and nesting (128) guards
+        // Backstop only: the evaluator's own step (1M) and nesting (4096) guards
         // fire first. Must sit above the step budget's fuel cost so the graceful
         // "step limit" error wins over a hard fuel trap; scaled with the 1M budget.
         self.store.set_fuel(20_000_000_000)?;
@@ -251,9 +258,16 @@ impl Interpreter {
         let ptr = self.alloc.call(&mut self.store, input.len() as i32)?;
         let slots = self.alloc.call(&mut self.store, 8)?;
         self.memory.write(&mut self.store, ptr as usize, &input)?;
-        let status = self
-            .evaluate
-            .call(&mut self.store, (ptr, input.len() as i32, slots, slots + 4))?;
+        // Wasm runs on the calling thread's stack, which may be smaller than
+        // WASM_STACK (test threads get 2 MiB), so evaluate on a thread sized for it.
+        let (store, evaluate, len) = (&mut self.store, &self.evaluate, input.len() as i32);
+        let status = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(EVAL_THREAD_STACK)
+                .spawn_scoped(s, || evaluate.call(store, (ptr, len, slots, slots + 4)))?
+                .join()
+                .map_err(|_| anyhow::anyhow!("evaluator thread panicked"))?
+        })?;
         ensure!(status == 0, "interpreter ABI returned status {status}");
         let mut pointer_and_length = [0; 8];
         self.memory

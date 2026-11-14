@@ -8,7 +8,7 @@ resolver = "3"
 
 [workspace.dependencies]
 # Keep compiler metadata and both Rust runners on the same CGRF v3 implementation.
-pack = { package = "packr", version = "=0.24.1" }
+pack = { package = "packr", version = "=0.24.2" }
 
 [package]
 name = "granite"
@@ -33,8 +33,8 @@ pack.workspace = true
 [dev-dependencies]
 anyhow = "1.0"
 # Exercise the capture-based engine interface used by current Theater.
-packr-core = "=0.24.1"
-packr-wasmtime = "=0.24.1"
+packr-core = "=0.24.2"
+packr-wasmtime = "=0.24.2"
 tokio = { version = "1", features = ["rt"] }
 
 # The tests JIT-compile large wasm modules; an unoptimized Cranelift is the slow

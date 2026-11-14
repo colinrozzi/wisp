@@ -442,7 +442,7 @@ There is no garbage collection; the existing bump allocator
 retains allocations until the session is discarded. Interactive inputs are limited
 to 4096 bytes; files to 64 KiB each, with at most 256 files and 1 MiB of source per
 load graph. Include nesting and reader nesting are limited to 64, evaluator
-nesting to 128, and each evaluation or handler call to 1,000,000 steps. `(step-limit)` returns
+nesting to 4096 (non-tail levels; tail calls run flat), and each evaluation or handler call to 1,000,000 steps. `(step-limit)` returns
 that limit and `(step-limit N)` sets it for the session, from the next evaluation or handler
 call, between 1,000 and 20,000,000. A restarted session starts at the default again. Macro expansion allows at most
 100 nesting levels and 10,000 syntax/transformer visits per input. The local host also applies
