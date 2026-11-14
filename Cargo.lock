@@ -1062,9 +1062,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "packr"
-version = "0.24.1"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68b6f6e50db5b3a379bf474db47f0f8490509d17e070784215b255472838c0d9"
+checksum = "bf42ef412dda5fee304c56e51368ec3a53df0e17b39ecb16366280c501a9109e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1083,9 +1083,9 @@ dependencies = [
 
 [[package]]
 name = "packr-abi"
-version = "0.24.1"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37a3e818f64611d4141c33c5fa53cb1b2258e422fec6dd33579478d5370b971f"
+checksum = "82c9499faec8ce74ea4f264e7a504920124d9c6199b863957a1a38e754a75a78"
 dependencies = [
  "hashbrown 0.14.5",
  "serde",
@@ -1094,9 +1094,9 @@ dependencies = [
 
 [[package]]
 name = "packr-core"
-version = "0.24.1"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65918c3c36705e9917ec9d87ee5327ab754a956d19b4accb6ed0260e499edd42"
+checksum = "52a0b15d368f01f09d4cd28745c040b481dac563d04fac0593312c54af8850d9"
 dependencies = [
  "async-trait",
  "packr-abi",
@@ -1107,9 +1107,9 @@ dependencies = [
 
 [[package]]
 name = "packr-wasmtime"
-version = "0.24.1"
+version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b9e9ad05207ddefa660296d31ab96039352b2f9977cc511137dc26ac3f02f02"
+checksum = "e9757122418be4d23533a9435826a098d20ef655cf938342501d69aba296a4c7"
 dependencies = [
  "async-trait",
  "packr-core",

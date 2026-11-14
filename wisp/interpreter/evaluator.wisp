@@ -107,9 +107,11 @@
 ; compiles tail positions to return_call, so a tail-recursive loop runs at flat
 ; depth and is bounded only by the step budget, not this nesting guard. Callers pass
 ; depth+1 at non-tail sites; the tail chain (eval-form, if-branch, let/lambda body,
-; apply) carries depth unchanged.
+; apply) carries depth unchanged. Each level costs real wasm stack, so the guard
+; sits well inside the host's stack: hosts give the evaluator 8 MiB, where about
+; 25,000 levels fit, and 4096 leaves a wide margin for heavier frames.
 (fn eval-expected ((expr value) (env (list binding)) (depth s32) (top s32) (expected string)) value
-  (if (i32.ge_s depth 128) (failure "evaluation nesting limit")
+  (if (i32.ge_s depth 4096) (failure "evaluation nesting limit")
     (if (i32.ge_s (global.get $steps) (global.get $step-limit)) (failure "evaluation step limit")
       (begin
         (global.set $steps (i32.add (global.get $steps) 1))

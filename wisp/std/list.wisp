@@ -2,8 +2,8 @@
 ;
 ; Every walk goes by index (list-get) and builds with list-push, in a tail call:
 ; car/cdr/cons copy the whole list, so walking with them is quadratic, and the
-; evaluator caps non-tail nesting at 128, so a naive recursive map fails on a long
-; list. They take (list ...) and (list-new T) lists alike and return untyped lists.
+; evaluator caps non-tail nesting at 4096, so a naive recursive map fails on a very
+; long list. They take (list ...) and (list-new T) lists alike and return untyped lists.
 ; length, list-len and list-get are builtins; nth is here for the familiar name.
 (module list
   (provide map filter fold reverse append nth member sort)
