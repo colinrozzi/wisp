@@ -1556,6 +1556,43 @@ pub(crate) fn parse_expr(
                         value: Box::new(value),
                     })
                 }
+                SExpr::Sym(sym, _sym_span)
+                    if sym == "list-set!" || sym == "list-push!" || sym == "list-truncate!" =>
+                {
+                    let (arity, usage) = match sym.as_str() {
+                        "list-set!" => (4, "expected: (list-set! list index value)"),
+                        "list-push!" => (3, "expected: (list-push! list value)"),
+                        _ => (3, "expected: (list-truncate! list length)"),
+                    };
+                    if items.len() != arity {
+                        return Err(ctx.error_with_note(
+                            format!("invalid '{}' expression", sym),
+                            list_span,
+                            usage,
+                        ));
+                    }
+                    let mut args = Vec::new();
+                    for item in &items[1..] {
+                        args.push(Box::new(parse_expr(
+                            item, vars, functions, records, variants, ctx,
+                        )?));
+                    }
+                    let mut args = args.into_iter();
+                    let list = args.next().unwrap();
+                    let second = args.next().unwrap();
+                    Ok(match sym.as_str() {
+                        "list-set!" => Expr::ListSetInPlace {
+                            list,
+                            index: second,
+                            value: args.next().unwrap(),
+                        },
+                        "list-push!" => Expr::ListPushInPlace {
+                            list,
+                            value: second,
+                        },
+                        _ => Expr::ListTruncateInPlace { list, len: second },
+                    })
+                }
                 SExpr::Sym(sym, _sym_span) if sym == "list-get" => {
                     if items.len() != 3 {
                         return Err(ctx.error_with_note(

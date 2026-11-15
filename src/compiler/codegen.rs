@@ -1230,7 +1230,9 @@ pub(crate) fn gen_expr(
         }
         // List: push - in place, amortized: when len == cap, grow the data
         // buffer by doubling; then store into spare capacity.
-        Expr::ListPush { list, value } => {
+        Expr::ListPush { list, value } | Expr::ListPushInPlace { list, value } => {
+            let in_place = matches!(expr_node, Expr::ListPushInPlace { .. });
+            let borrowed = in_place && rc_borrow_read(list, &[value], &|n| env.is_borrowed(n));
             let list_ty = gen_expr(
                 list, out, indent, env, signatures, globals, records, variants, false,
             );
@@ -1252,7 +1254,8 @@ pub(crate) fn gen_expr(
 
             // RC (§3.4): write in place only when this is the list's only
             // reference; otherwise push into a copy (see emit_list_copy).
-            if rc_on() {
+            // list-push! writes in place whatever the count.
+            if rc_on() && !in_place {
                 out.push_str(&format!(
                     "{pad}local.get {list_local}\n{pad}i32.const 8\n{pad}i32.sub\n{pad}i32.load\n{pad}i32.const 1\n{pad}i32.ne\n{pad}if\n"
                 ));
@@ -1358,9 +1361,125 @@ pub(crate) fn gen_expr(
             out.push_str(&format!("{}i32.add\n", pad));
             out.push_str(&format!("{}i32.store\n", pad));
 
+            if in_place {
+                // list-push! gives the new length and drops its operand.
+                if rc_on() && !borrowed {
+                    emit_drop_local(out, &pad, list_local, &list_ty);
+                }
+                out.push_str(&format!(
+                    "{pad}local.get {len_local}\n{pad}i32.const 1\n{pad}i32.add\n"
+                ));
+                return Type::S32;
+            }
+
             // Return the list pointer
             out.push_str(&format!("{}local.get {}\n", pad, list_local));
             list_ty
+        }
+        // list-set!: store over element `index` in place, whatever the list's
+        // count, and drop the element it replaces. Traps when `index` is out
+        // of range. Gives the list's length.
+        Expr::ListSetInPlace { list, index, value } => {
+            let borrowed = rc_borrow_read(list, &[index, value], &|n| env.is_borrowed(n));
+            let list_ty = gen_expr(
+                list, out, indent, env, signatures, globals, records, variants, false,
+            );
+            let elem_type = match &list_ty {
+                Type::List(inner) => inner.as_ref().clone(),
+                _ => panic!("list-set! expects a list"),
+            };
+            let elem_size = type_size(&elem_type);
+            let list_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{pad}local.set {list_local}\n"));
+            gen_expr(
+                index, out, indent, env, signatures, globals, records, variants, false,
+            );
+            let index_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{pad}local.set {index_local}\n"));
+            gen_expr(
+                value, out, indent, env, signatures, globals, records, variants, false,
+            );
+            let value_local = env.declare_local(elem_type.clone());
+            out.push_str(&format!("{pad}local.set {value_local}\n"));
+
+            // Unsigned: a negative index is out of range too.
+            out.push_str(&format!(
+                "{pad}local.get {index_local}\n{pad}local.get {list_local}\n{pad}i32.load\n{pad}i32.ge_u\n{pad}if\n{pad}  unreachable\n{pad}end\n"
+            ));
+            let addr_local = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{pad}local.get {list_local}\n{pad}i32.load offset=8\n{pad}local.get {index_local}\n{pad}i32.const {elem_size}\n{pad}i32.mul\n{pad}i32.add\n{pad}local.set {addr_local}\n"
+            ));
+            let (load_instr, store_instr) = match &elem_type {
+                Type::S64 => ("i64.load", "i64.store"),
+                Type::F32 => ("f32.load", "f32.store"),
+                Type::F64 => ("f64.load", "f64.store"),
+                _ => ("i32.load", "i32.store"),
+            };
+            let counted = rc_on() && is_counted(&elem_type);
+            let old_local = env.declare_local(elem_type.clone());
+            if counted {
+                out.push_str(&format!(
+                    "{pad}local.get {addr_local}\n{pad}{load_instr}\n{pad}local.set {old_local}\n"
+                ));
+            }
+            out.push_str(&format!(
+                "{pad}local.get {addr_local}\n{pad}local.get {value_local}\n{pad}{store_instr}\n"
+            ));
+            if counted {
+                emit_drop_local(out, &pad, old_local, &elem_type);
+            }
+            out.push_str(&format!("{pad}local.get {list_local}\n{pad}i32.load\n"));
+            if rc_on() && !borrowed {
+                emit_drop_local(out, &pad, list_local, &list_ty);
+            }
+            Type::S32
+        }
+        // list-truncate!: drop the elements from `len` on and shorten the list
+        // in place, whatever its count. A `len` at or past the end changes
+        // nothing; a negative one counts as 0. Gives the list's length.
+        Expr::ListTruncateInPlace { list, len } => {
+            let borrowed = rc_borrow_read(list, &[len], &|n| env.is_borrowed(n));
+            let list_ty = gen_expr(
+                list, out, indent, env, signatures, globals, records, variants, false,
+            );
+            let elem_type = match &list_ty {
+                Type::List(inner) => inner.as_ref().clone(),
+                _ => panic!("list-truncate! expects a list"),
+            };
+            let elem_size = type_size(&elem_type);
+            let list_local = env.declare_local(Type::S32);
+            out.push_str(&format!("{pad}local.set {list_local}\n"));
+            gen_expr(
+                len, out, indent, env, signatures, globals, records, variants, false,
+            );
+            let new_len = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{pad}local.set {new_len}\n{pad}i32.const 0\n{pad}local.get {new_len}\n{pad}local.get {new_len}\n{pad}i32.const 0\n{pad}i32.lt_s\n{pad}select\n{pad}local.set {new_len}\n"
+            ));
+            let cur = env.declare_local(Type::S32);
+            out.push_str(&format!(
+                "{pad}local.get {list_local}\n{pad}i32.load\n{pad}local.set {cur}\n"
+            ));
+            out.push_str(&format!(
+                "{pad}local.get {new_len}\n{pad}local.get {cur}\n{pad}i32.lt_u\n{pad}if\n"
+            ));
+            if rc_on() && is_counted(&elem_type) {
+                // Drop the last element while cur > new_len.
+                out.push_str(&format!(
+                    "{pad}  block\n{pad}    loop\n{pad}      local.get {cur}\n{pad}      local.get {new_len}\n{pad}      i32.le_u\n{pad}      br_if 1\n                     {pad}      local.get {cur}\n{pad}      i32.const 1\n{pad}      i32.sub\n{pad}      local.set {cur}\n                     {pad}      local.get {list_local}\n{pad}      i32.load offset=8\n{pad}      local.get {cur}\n{pad}      i32.const {elem_size}\n{pad}      i32.mul\n{pad}      i32.add\n{pad}      i32.load\n"
+                ));
+                emit_drop(out, &format!("{pad}      "), &elem_type);
+                out.push_str(&format!("{pad}      br 0\n{pad}    end\n{pad}  end\n"));
+            }
+            out.push_str(&format!(
+                "{pad}  local.get {list_local}\n{pad}  local.get {new_len}\n{pad}  i32.store\n{pad}end\n"
+            ));
+            out.push_str(&format!("{pad}local.get {list_local}\n{pad}i32.load\n"));
+            if rc_on() && !borrowed {
+                emit_drop_local(out, &pad, list_local, &list_ty);
+            }
+            Type::S32
         }
         // List: get - load element at index
         Expr::ListGet { list, index } => {

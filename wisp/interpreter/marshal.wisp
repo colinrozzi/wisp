@@ -279,6 +279,9 @@
           (enc-record name (schema-field-names (named-type.schema nt) 0 (list-new value)) fields))))
     ; A foreign variant carries its own identity (name, case, tag) inline.
     ((open-variant tn cn tag fields) (enc-open-variant tn cn tag fields))
+    ; A vector marshals as a list from (list ...) does; a map as its (k v) pairs.
+    ((vector-value items) (enc-tuple-node (enc-children items 0 (list-new s32))))
+    ((map-value t) (enc-value (map-pairs t)))
     (else
       ; Unmarshalable (closures, etc.): emit an empty tuple as a placeholder.
       (let (cur (global.get $enc-cur))
@@ -387,6 +390,8 @@
         (if (named-type.variant? nt) (variant-bound name case-name fields)
           (record-bound name (schema-names-bound (named-type.schema nt) 0 0) fields))))
     ((open-variant tn cn tag fields) (variant-bound tn cn fields))
+    ((vector-value items) (children-bound (i32.const 12) items))
+    ((map-value t) (enc-bound (map-pairs t)))
     (else (i32.const 16))))                 ; a scalar or the empty-tuple placeholder
 
 ; ---------------------------------------------------------------------------
