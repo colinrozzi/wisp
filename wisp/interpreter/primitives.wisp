@@ -113,7 +113,13 @@
     (i32.or (string=? name "string-append")
       (i32.or (string=? name "string=?")
         (i32.or (string=? name "substring")
-          (i32.or (string=? name "bytes->string") (string=? name "string->bytes")))))))
+          (i32.or (string=? name "bytes->string")
+            (i32.or (string=? name "string->bytes") (text-primitive? name))))))))
+
+(fn text-primitive? ((name string)) s32
+  (i32.or (i32.or (string=? name "utf8-length") (string=? name "utf8-offset"))
+    (i32.or (string=? name "utf8-substring")
+      (i32.or (string=? name "string->s32") (string=? name "hex?")))))
 
 ; A byte element carries its code as either a dedicated byte-value or a plain
 ; integer (host arrays unmarshal to byte-value; REPL-built lists may hold integer).
@@ -229,7 +235,89 @@
             (else (failure "string-index expects an integer start")))))
       (else (failure "string-index expects a string to search")))))
 
+; Code points (ticket 0131). Positions elsewhere count bytes; these count UTF-8
+; code points, each loop a native byte scan rather than one Wisp call per byte.
+; Code point 0 starts at byte 0 and each later one at a byte that is not a
+; continuation byte (10xxxxxx). Ill-formed bytes never fail: a stray continuation
+; byte belongs to the code point before it.
+(fn continuation? ((s string) (i s32)) s32
+  (i32.eq (i32.and (string-ref s i) 192) 128))
+
+(fn utf8-starts ((s string) (i s32) (n s32)) s32
+  (if (i32.ge_s i (string-len s)) n
+    (utf8-starts s (i32.add i 1) (if (continuation? s i) n (i32.add n 1)))))
+
+(fn utf8-length ((s string)) s32
+  (if (i32.eq (string-len s) 0) 0 (utf8-starts s 1 1)))
+
+; The byte where the Kth code point start at or after byte I is (K >= 1); the
+; string's length when there are exactly K - 1 of them; -1 when fewer.
+(fn utf8-skip ((s string) (i s32) (k s32)) s32
+  (if (i32.ge_s i (string-len s)) (if (i32.eq k 1) i -1)
+    (if (continuation? s i) (utf8-skip s (i32.add i 1) k)
+      (if (i32.eq k 1) i (utf8-skip s (i32.add i 1) (i32.sub k 1))))))
+
+; The byte K code points after the code point starting at byte I, or -1.
+(fn utf8-advance ((s string) (i s32) (k s32)) s32
+  (if (i32.lt_s k 0) -1
+    (if (i32.eq k 0) i
+      (if (i32.ge_s i (string-len s)) -1 (utf8-skip s (i32.add i 1) k)))))
+
+(fn apply-utf8-substring ((s string) (from s32) (to s32)) value
+  (let (a (if (i32.lt_s to from) -1 (utf8-advance s 0 from)))
+    (let (b (if (i32.lt_s a 0) -1 (utf8-advance s a (i32.sub to from))))
+      (if (i32.lt_s b 0) (failure "utf8-substring bounds out of range")
+        (text (substring s a b))))))
+
+; Decimal digits from byte I, kept as a negative s32 so -2147483648 fits; 1 when
+; a byte is not a digit or the number leaves the s32 range.
+(fn digits-negative ((s string) (i s32) (acc s32)) s32
+  (if (i32.ge_s i (string-len s)) acc
+    (let (d (i32.sub (string-ref s i) 48))
+      (if (i32.gt_u d 9) 1
+        (if (i32.or (i32.lt_s acc -214748364) (i32.and (i32.eq acc -214748364) (i32.gt_s d 8))) 1
+          (digits-negative s (i32.add i 1) (i32.sub (i32.mul acc 10) d)))))))
+
+; (string->s32 s): (some n) when S is an optional "-" and one or more decimal
+; digits whose value fits an s32, else (none). No "+", spaces or other bytes.
+(fn string-to-s32 ((s string)) value
+  (let (start (if (i32.eq (string-len s) 0) 0 (i32.eq (string-ref s 0) 45)))
+    (if (i32.ge_s start (string-len s)) (none-value)
+      (let (acc (digits-negative s start 0))
+        (if (i32.eq acc 1) (none-value)
+          (if start (some-value (integer acc))
+            (if (i32.eq acc -2147483648) (none-value) (some-value (integer (i32.sub 0 acc))))))))))
+
+; (hex? s): 1 when S is one or more lowercase hex digits (0-9 a-f, as sha256 and
+; key ids print them), else 0.
+(fn hex-from ((s string) (i s32)) s32
+  (if (i32.ge_s i (string-len s)) 1
+    (let (c (string-ref s i))
+      (if (i32.or (i32.le_u (i32.sub c 48) 9) (i32.le_u (i32.sub c 97) 5))
+        (hex-from s (i32.add i 1)) 0))))
+
+(fn apply-text ((name string) (args (list value))) value
+  (let (arity (if (string=? name "utf8-substring") 3 (if (string=? name "utf8-offset") 2 1)))
+    (if (i32.ne (list-len args) arity)
+      (failure (string-append name (if (i32.eq arity 3) " expects (utf8-substring s from to)" (if (i32.eq arity 2) " expects (utf8-offset s k)" " expects one string"))))
+      (value-case (list-get args 0)
+        ((text s)
+          (if (string=? name "utf8-length") (integer (utf8-length s))
+            (if (string=? name "string->s32") (string-to-s32 s)
+              (if (string=? name "hex?") (integer (if (i32.eq (string-len s) 0) 0 (hex-from s 0)))
+                (value-case (list-get args 1)
+                  ((integer from)
+                    (if (string=? name "utf8-offset")
+                      (let (at (utf8-advance s 0 from))
+                        (if (i32.lt_s at 0) (failure "utf8-offset index out of range") (integer at)))
+                      (value-case (list-get args 2)
+                        ((integer to) (apply-utf8-substring s from to))
+                        (else (failure "utf8-substring expects s32 bounds")))))
+                  (else (failure (string-append name " expects an s32 index"))))))))
+        (else (failure (string-append name " expects a string")))))))
+
 (fn apply-string ((name string) (args (list value))) value
+  (if (text-primitive? name) (apply-text name args)
   (if (string=? name "string-index") (apply-string-index args)
   (if (string=? name "bytes->string") (apply-bytes-to-string args)
     (if (string=? name "string->bytes") (apply-string-to-bytes args)
@@ -255,4 +343,4 @@
                           (text (substring s start end)) (failure "substring bounds out of range")))
                       (else (failure "expected s32 bounds")))))
                 (else (failure "expected s32 index"))))))
-        (else (failure "expected string argument"))))))))))
+        (else (failure "expected string argument")))))))))))

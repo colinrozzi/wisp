@@ -1140,6 +1140,87 @@ fn test_interpreter_string_index() {
     }
 }
 
+#[test]
+fn test_interpreter_utf8_number_and_hex_helpers() {
+    let mut s = session();
+    for (source, expected) in [
+        // "aé€😀b": code points of 1, 2, 3, 4 and 1 bytes.
+        (r#"(define t "aé€😀b")"#, r#""aé€😀b""#),
+        (r#"(string-len t)"#, "11"),
+        (r#"(utf8-length t)"#, "5"),
+        (r#"(utf8-length "")"#, "0"),
+        (r#"(utf8-length "abc")"#, "3"),
+        (r#"(utf8-offset t 0)"#, "0"),
+        (r#"(utf8-offset t 2)"#, "3"),
+        (r#"(utf8-offset t 4)"#, "10"),
+        (r#"(utf8-offset t 5)"#, "11"),
+        (r#"(utf8-offset "" 0)"#, "0"),
+        (r#"(utf8-substring t 1 3)"#, r#""é€""#),
+        (r#"(utf8-substring t 3 4)"#, r#""😀""#),
+        (r#"(utf8-substring t 0 5)"#, r#""aé€😀b""#),
+        (r#"(utf8-substring t 5 5)"#, r#""""#),
+        (r#"(utf8-substring t 2 2)"#, r#""""#),
+        // Ill-formed bytes count, never fail: a stray continuation byte joins the
+        // code point before it, and a leading one is part of code point 0.
+        (r#"(utf8-length "a\x80b")"#, "2"),
+        (r#"(utf8-length "\x80\x80")"#, "1"),
+        (r#"(utf8-offset "a\x80b" 1)"#, "2"),
+        (
+            r#"(utf8-offset t 6)"#,
+            "error: utf8-offset index out of range",
+        ),
+        (
+            r#"(utf8-offset t -1)"#,
+            "error: utf8-offset index out of range",
+        ),
+        (
+            r#"(utf8-substring t 3 2)"#,
+            "error: utf8-substring bounds out of range",
+        ),
+        (
+            r#"(utf8-substring t 4 6)"#,
+            "error: utf8-substring bounds out of range",
+        ),
+        (
+            r#"(utf8-substring t 1)"#,
+            "error: utf8-substring expects (utf8-substring s from to)",
+        ),
+        (r#"(utf8-length 5)"#, "error: utf8-length expects a string"),
+        // string->s32 takes an optional "-" and digits, nothing else.
+        (r#"(string->s32 "0")"#, "(some s32 0)"),
+        (r#"(string->s32 "42")"#, "(some s32 42)"),
+        (r#"(string->s32 "007")"#, "(some s32 7)"),
+        (r#"(string->s32 "-17")"#, "(some s32 -17)"),
+        (r#"(string->s32 "2147483647")"#, "(some s32 2147483647)"),
+        (r#"(string->s32 "-2147483648")"#, "(some s32 -2147483648)"),
+        (r#"(string->s32 "2147483648")"#, "(none (tuple))"),
+        (r#"(string->s32 "-2147483649")"#, "(none (tuple))"),
+        (r#"(string->s32 "99999999999")"#, "(none (tuple))"),
+        (r#"(string->s32 "")"#, "(none (tuple))"),
+        (r#"(string->s32 "-")"#, "(none (tuple))"),
+        (r#"(string->s32 "+1")"#, "(none (tuple))"),
+        (r#"(string->s32 " 1")"#, "(none (tuple))"),
+        (r#"(string->s32 "1a")"#, "(none (tuple))"),
+        (r#"(string->s32 "1-")"#, "(none (tuple))"),
+        (r#"(string->s32 "１")"#, "(none (tuple))"),
+        (
+            r#"(match (string->s32 "12") ((some n) (+ n 1)) ((none) -1))"#,
+            "13",
+        ),
+        // hex? wants lowercase hex digits, at least one.
+        (r#"(hex? "0123456789abcdef")"#, "1"),
+        (r#"(hex? "")"#, "0"),
+        (r#"(hex? "ABC")"#, "0"),
+        (r#"(hex? "abg")"#, "0"),
+        (r#"(hex? "ab:")"#, "0"),
+        (r#"(hex? "a/")"#, "0"),
+        (r#"(hex? "a`")"#, "0"),
+        (r#"(hex? 'x)"#, "error: hex? expects a string"),
+    ] {
+        eval(&mut s, source, expected);
+    }
+}
+
 /// The smallest step limit SOURCE succeeds under.
 /// A limit below the 1000 floor can't be set, so callers pad SOURCE past it.
 fn steps_needed(s: &mut Interpreter, source: &str) -> i32 {
