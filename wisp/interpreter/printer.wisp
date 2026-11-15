@@ -168,6 +168,8 @@
     ((builtin name) (string-append "#<builtin " (string-append name ">")))
     ((open-variant tn cn tag fields)
       (show-list-at fields 0 (string-append "(" (string-append cn (if (list-len fields) " " ""))) depth))
+    ((vector-value items) (string-append (show-list-at items 0 "#<vector (" depth) ">"))
+    ((map-value t) (string-append (show-list-at (items-of (map-pairs t)) 0 "#<map (" depth) ">"))
     ((boolean b) (if b "true" "false"))
     ; wide-digits divides unsigned, so this prints the full u64 range correctly.
     ((u64-value n) (string-append (if (i64.eq n 0) "0" (wide-digits n "")) "u64"))

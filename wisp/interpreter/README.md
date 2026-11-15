@@ -190,6 +190,70 @@ Typed lists display as `#<list TYPE (...)>`; this is a display format, not sourc
 syntax. Recursive printing stops at depth 64 with `#<depth-limit>`, allowing
 cyclic records and lists to be inspected without unbounded recursion.
 
+## Vectors and hash maps
+
+Vectors and hash maps are mutable containers with reference semantics, as in
+Scheme: `(define b a)` shares one vector, and a verb ending in `!` changes it
+for every holder. They are the O(1) structures that lists are not: a list is
+immutable, and the evaluator's environment always holds a second reference, so
+an update would copy it.
+
+```lisp
+(define v (vector 1 2 3))          ; #<vector (1 2 3)>
+(vector-set! v 0 9)                ; 9, O(1)
+(vector-ref v 0)                   ; 9, O(1)
+(define m (hash-map "a" 1))        ; #<map (("a" 1))>
+(map-set! m "b" 2)                 ; 2, O(1) on average
+(map-get m "b")                    ; (some s32 2)
+(map-get m "z")                    ; (none (tuple))
+```
+
+| verb | gives |
+|---|---|
+| `(vector a ...)`, `(make-vector n fill)`, `(list->vector xs)` | a new vector (from a copy of `xs`) |
+| `(vector-ref v i)`, `(vector-length v)` | item `i` (an s32; an error out of range), the length |
+| `(vector-set! v i x)`, `(vector-push! v x)` | `x` |
+| `(vector-pop! v)` | the last item, removed (an error when empty) |
+| `(vector->list v)`, `(vector-copy v)` | a copy as a Lisp list, a new vector |
+| `(hash-map k v ...)` | a new map |
+| `(map-get m k)` | `(some v)` or `(none)` |
+| `(map-has? m k)`, `(map-delete! m k)` | 1 or 0 (`map-delete!`: whether it removed one) |
+| `(map-set! m k v)` | `v` (adds the key, or replaces its value in place) |
+| `(map-count m)` | the number of keys |
+| `(map-keys m)`, `(map-values m)`, `(map->list m)` | Lisp lists, `map->list` of `(k v)` pairs |
+| `(map-copy m)` | a new map |
+| `(equal? a b)` | 1 when `a` and `b` have the same structure, else 0 |
+
+- **Keys** are integers of every width, strings, symbols, bytes, booleans, and
+  lists, tuples, options, records and variants of these. Each kind is
+  distinct: `1` and `1s64` are two keys. A float, function, vector or map as a
+  key is an error.
+- **Order:** a map lists its entries in insertion order; replacing a value
+  keeps its place, and a key removed and added again goes to the end.
+- **`equal?`** needs numbers of the same type, compares vectors item by item
+  and maps as sets of entries (in any order), and finds no two functions
+  equal. A container that holds itself makes it an error (4096 levels).
+- **Lists out are copies.** `vector->list`, `map-keys`, `map-values`,
+  `map->list` and the copies never share a container's storage, and the
+  constructors copy what they are given, so a list never changes after the
+  fact.
+- **Printing:** `#<vector (...)>` and `#<map ((k v) ...)>`, display forms like
+  `#<u8 255>` (there are no literals), cut at 64 items as lists are.
+- **Host calls and `marshal`:** a vector goes as the Lisp list of its items,
+  and a map as the list of its `(k v)` pairs. Host results are never vectors
+  or maps.
+- **Memory:** a container is a heap value like any other: `define` keeps it
+  across evaluations, and reference counting frees it when the last holder
+  goes. A container that holds itself, directly or through a closure, is never
+  freed.
+
+Inside, a vector is a `(list value)` the container owns, changed with
+Granite's in-place `list-set!`, `list-push!` and `list-truncate!`. A map
+(`containers.wisp`) keeps its entries in insertion order in parallel lists and
+finds them through an open-addressing table of entry indices, sized to a power
+of two and rebuilt at 3/4 full; a removed entry keeps its place until removed
+entries outnumber live ones and the map compacts.
+
 Local bindings are lexical. Closures see current top-level definitions, so
 recursive functions and top-level redefinition work. Each call extends a copy
 of its captured environment. `define` is currently top-level only and publishes

@@ -28,9 +28,13 @@
   (u64-value s64)
   (u32-value s32)
   (u16-value s32)
-  (open-variant string string s32 (list value)))
+  (open-variant string string s32 (list value))
+  (vector-value (list value))
+  (map-value hash-table))
 
 (record binding (name string) (item value))
+; A hash map's state (containers.wisp). Its lists change in place.
+(record hash-table (keys (list value)) (vals (list value)) (hashes (list s32)) (slots (list s32)) (counts (list s32)))
 (record read-result (item value) (next s32))
 (record named-type (name string) (id s32) (variant? s32) (schema (list value)))
 
@@ -67,7 +71,9 @@
         ((u64-value ignored-u64) fallback)
         ((u32-value ignored-u32) fallback)
         ((u16-value ignored-u16) fallback)
-        ((open-variant ignored-tn ignored-cn ignored-tag ignored-fields) fallback)))))
+        ((open-variant ignored-tn ignored-cn ignored-tag ignored-fields) fallback)
+        ((vector-value ignored-vector) fallback)
+        ((map-value ignored-map) fallback)))))
 
 (fn failed? ((v value)) s32
   (value-case v ((failure message) 1) (else 0)))

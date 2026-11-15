@@ -491,3 +491,71 @@ fn a_unique_match_reuses_its_block() {
         "make {make_only} bytes, make+incr {mapped}"
     );
 }
+
+/// `$a` and `$b` hold the same list of strings: the in-place writes show through
+/// both, and the elements they replace or cut are dropped.
+const IN_PLACE: &str = r#"
+(global $a (list string) mut 0)
+(global $b (list string) mut 0)
+(export (fn setup ((n s32)) s32
+  (begin
+    (global.set $a (list-push (list-push (list-new string) (string-append "a" "1")) (string-append "b" "2")))
+    (global.set $b (global.get $a))
+    0)))
+(export (fn set-first ((n s32)) s32 (list-set! (global.get $a) 0 (string-append "c" "3"))))
+(export (fn push-one ((n s32)) s32 (list-push! (global.get $a) (string-append "d" "4"))))
+(export (fn truncate-to ((n s32)) s32 (list-truncate! (global.get $a) n)))
+(export (fn set-at ((n s32)) s32 (list-set! (global.get $a) n "x")))
+(export (fn b-len ((n s32)) s32 (list-len (global.get $b))))
+(export (fn b-first ((n s32)) s32 (string-ref (list-get (global.get $b) 0) 0)))
+(export (fn b-last ((n s32)) s32 (string-ref (list-get (global.get $b) (i32.sub (list-len (global.get $b)) 1)) 0)))
+(fn fill ((xs (list s32)) (i s32)) s32
+  (if (i32.ge_s i (list-len xs)) (list-len xs)
+    (begin (list-set! xs i (i32.mul i i)) (fill xs (i32.add i 1)))))
+(export (fn squares ((n s32)) s32
+  (let (xs (list-push (list-push (list-push (list-new s32) 0) 0) 0))
+    (begin (fill xs 0) (list-get xs n)))))
+"#;
+
+#[test]
+fn in_place_list_writes_are_shared_and_counted() {
+    let mut g = Guest::new(&compile(IN_PLACE, true));
+    assert_eq!(g.call("setup", 0), 0);
+    let blocks = g.live_blocks();
+    assert_eq!(g.call("set-first", 0), 2, "list-set! gives the length");
+    assert_eq!(
+        g.call("b-first", 0),
+        b'c' as i32,
+        "the other reference sees it"
+    );
+    assert_eq!(g.live_blocks(), blocks, "the replaced string was freed");
+    assert_eq!(g.call("push-one", 0), 3);
+    assert_eq!(g.call("b-len", 0), 3);
+    assert_eq!(g.call("b-last", 0), b'd' as i32);
+    assert_eq!(g.call("truncate-to", 5), 3, "past the end changes nothing");
+    assert_eq!(g.call("truncate-to", 1), 1);
+    assert_eq!(g.call("b-len", 0), 1);
+    assert_eq!(
+        g.live_blocks(),
+        blocks - 1,
+        "the two cut strings were freed"
+    );
+    assert_eq!(
+        g.call("truncate-to", -1),
+        0,
+        "a negative length counts as 0"
+    );
+    assert_eq!(g.verify().unwrap(), 0);
+    assert_eq!(g.call("squares", 2), 4, "a local list of scalars");
+}
+
+#[test]
+fn list_set_out_of_range_traps() {
+    let mut g = Guest::new(&compile(IN_PLACE, true));
+    assert_eq!(g.call("setup", 0), 0);
+    assert_eq!(g.call("set-at", 1), 2);
+    assert!(g.try_call("set-at", 2).is_err());
+    let mut g = Guest::new(&compile(IN_PLACE, true));
+    assert_eq!(g.call("setup", 0), 0);
+    assert!(g.try_call("set-at", -1).is_err());
+}

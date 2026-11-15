@@ -658,6 +658,25 @@ pub enum Expr {
     ListLen {
         list: Box<Expr>,
     },
+    /// In-place list writes: `(list-set! xs i v)`, `(list-push! xs v)`,
+    /// `(list-truncate! xs n)`. Unlike `list-push`, they never copy, whatever
+    /// the list's count: every reference sees the change. Each gives the
+    /// list's length after it. For containers that own their list outright
+    /// (the Wisp interpreter's vectors and maps); a list handed out must be
+    /// copied first.
+    ListSetInPlace {
+        list: Box<Expr>,
+        index: Box<Expr>,
+        value: Box<Expr>,
+    },
+    ListPushInPlace {
+        list: Box<Expr>,
+        value: Box<Expr>,
+    },
+    ListTruncateInPlace {
+        list: Box<Expr>,
+        len: Box<Expr>,
+    },
     /// String operations
     StringLen {
         string: Box<Expr>,

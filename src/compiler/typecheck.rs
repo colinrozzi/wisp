@@ -122,6 +122,9 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
         }
         Expr::ListPush { list, value } => vec![list, value],
         Expr::ListGet { list, index } => vec![list, index],
+        Expr::ListSetInPlace { list, index, value } => vec![list, index, value],
+        Expr::ListPushInPlace { list, value } => vec![list, value],
+        Expr::ListTruncateInPlace { list, len } => vec![list, len],
         Expr::StringRef { string, index } => vec![string, index],
         Expr::Substring { string, start, end } => vec![string, start, end],
         Expr::StringAppend { left, right } | Expr::StringEq { left, right } => vec![left, right],
@@ -966,6 +969,45 @@ pub(crate) fn check_expr(
                 bail!("list-get index must be s32, got {:?}", index_ty);
             }
             Ok(elem_type)
+        }
+        Expr::ListSetInPlace { list, value, .. } | Expr::ListPushInPlace { list, value } => {
+            let name = if matches!(expr, Expr::ListSetInPlace { .. }) {
+                "list-set!"
+            } else {
+                "list-push!"
+            };
+            let list_ty = check_expr(list, env, signatures, globals, records, variants)?;
+            let elem_type = match &list_ty {
+                Type::List(inner) => inner.as_ref().clone(),
+                _ => bail!("{} expects a list, got {:?}", name, list_ty),
+            };
+            if let Expr::ListSetInPlace { index, .. } = expr {
+                let index_ty = check_expr(index, env, signatures, globals, records, variants)?;
+                if index_ty != Type::S32 {
+                    bail!("list-set! index must be s32, got {:?}", index_ty);
+                }
+            }
+            let value_ty = check_expr(value, env, signatures, globals, records, variants)?;
+            if value_ty != elem_type && !(elem_type == Type::U8 && value_ty == Type::S32) {
+                bail!(
+                    "{} value type mismatch: expected {:?}, got {:?}",
+                    name,
+                    elem_type,
+                    value_ty
+                );
+            }
+            Ok(Type::S32)
+        }
+        Expr::ListTruncateInPlace { list, len } => {
+            let list_ty = check_expr(list, env, signatures, globals, records, variants)?;
+            if !matches!(list_ty, Type::List(_)) {
+                bail!("list-truncate! expects a list, got {:?}", list_ty);
+            }
+            let len_ty = check_expr(len, env, signatures, globals, records, variants)?;
+            if len_ty != Type::S32 {
+                bail!("list-truncate! length must be s32, got {:?}", len_ty);
+            }
+            Ok(Type::S32)
         }
         Expr::ListLen { list } => {
             let list_ty = check_expr(list, env, signatures, globals, records, variants)?;

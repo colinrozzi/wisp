@@ -456,7 +456,8 @@ impl<'a> Lowering<'a> {
                     "list-new" => {
                         return Some(format!("(list {})", canonical_type(items.get(1)?)?));
                     }
-                    "list-len" | "string-len" | "string-ref" => return Some("s32".to_string()),
+                    "list-len" | "string-len" | "string-ref" | "list-set!" | "list-push!"
+                    | "list-truncate!" => return Some("s32".to_string()),
                     "list-push" => return self.infer_type(items.get(1)?, env),
                     "list-get" => {
                         let lt = self.infer_type(items.get(1)?, env)?;

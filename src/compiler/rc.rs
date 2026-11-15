@@ -658,6 +658,16 @@ impl BorrowWalk<'_> {
                 self.expr(list, true, false);
                 self.expr(index, false, false);
             }
+            Expr::ListSetInPlace { list, index, value } => {
+                self.expr(list, true, false);
+                self.expr(index, false, false);
+                self.expr(value, false, false);
+            }
+            Expr::ListPushInPlace { list, value: x }
+            | Expr::ListTruncateInPlace { list, len: x } => {
+                self.expr(list, true, false);
+                self.expr(x, false, false);
+            }
             Expr::StringRef { string, index } => {
                 self.expr(string, true, false);
                 self.expr(index, false, false);

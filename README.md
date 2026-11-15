@@ -96,6 +96,14 @@ and grows as the heap needs it. For a program this means:
   never frees a cycle. Such a feature must refer back *by name* through a table a
   global owns (as top-level recursion does today), or bring its own cycle
   collector.
+- **In-place list writes are the one exception.** `(list-set! xs i v)`,
+  `(list-push! xs v)` and `(list-truncate! xs n)` change a list in place whatever
+  its count, so every reference sees the change, and each gives the new length.
+  `list-set!` traps on an index out of range; `list-truncate!` drops the cut
+  elements. They are for a container that owns its list outright and copies it
+  on the way out (Wisp's vectors and maps). Their cycle plan is none: a list
+  that comes to hold itself is never freed. The tree-walking `granite eval` has
+  no shared lists and refuses them.
 - **Raw memory is manual.** `heap-alloc` returns a block the program frees with
   `heap-free`; raw blocks are never counted. `string-addr`/`any-addr` give the
   address of a counted object, valid until the end of the enclosing `let` (or the
@@ -132,6 +140,9 @@ directives resolved from each file's directory.
 
 Wisp values are immutable like Granite's: `(list-push xs v)` returns the longer
 list and leaves `xs` as it was, so use the result.
+The exceptions are vectors and hash maps, which change in place and are
+shared, as in Scheme (`vector-set!`, `map-set!`; see
+[wisp/interpreter/README.md](wisp/interpreter/README.md#vectors-and-hash-maps)).
 
 Wisp is deliberately *not* a full Scheme: no `set!`, `call/cc`, `letrec`/named-let,
 varargs/`apply`, or numeric tower (fixed-width numerics only). It is closures + macros

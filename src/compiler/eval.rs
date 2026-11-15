@@ -419,6 +419,14 @@ fn eval_inner(ctx: &EvalCtx, expr: &Expr, env: &Env) -> Result<Value> {
                 .cloned()
                 .ok_or_else(|| anyhow!("eval: list index {} out of bounds", i))
         }
+        // The tree-walker's lists are values, so there is nothing to share a write.
+        Expr::ListSetInPlace { .. }
+        | Expr::ListPushInPlace { .. }
+        | Expr::ListTruncateInPlace { .. } => {
+            bail!(
+                "eval: in-place list writes (list-set!, list-push!, list-truncate!) need the compiled back-end"
+            )
+        }
         Expr::ListLen { list } => Ok(Value::Int(as_list(eval_expr(ctx, list, env)?)?.len() as i64)),
         Expr::StringLen { string } => Ok(Value::Int(
             as_str(eval_expr(ctx, string, env)?)?.len() as i64
