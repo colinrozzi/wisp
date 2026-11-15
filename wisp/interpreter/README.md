@@ -51,6 +51,19 @@ operations are available. Comparisons return s32. String operations are `string-
 `string-append` (any number of strings; none gives `""`), `string=?`, `substring`, and
 `(string-index s byte-or-string [from])`, the position of the next match or -1, which costs
 one evaluation step at any length; positions and lengths count bytes.
+Five more are native byte scans, one evaluation step each, for text that would
+otherwise be walked a byte at a time in Wisp (ticket 0131):
+
+- `(utf8-length s)` counts code points, `(utf8-offset s k)` is the byte where code
+  point `k` starts (`k` from 0 to the length; the length gives `(string-len s)`), and
+  `(utf8-substring s from to)` takes code points `from` up to `to`. A code point
+  starts at byte 0 and at every byte that is not a continuation byte (`10xxxxxx`);
+  ill-formed bytes never fail, they join the code point before them.
+- `(string->s32 s)` is `(some n)` when `s` is an optional `-` and one or more
+  decimal digits that fit an s32, and `(none)` for anything else (`""`, `"+1"`,
+  `" 1"`, `"1a"`, out of range). `string->number` in `std/str` is the lax one.
+- `(hex? s)` is 1 when `s` is one or more lowercase hex digits (`0-9a-f`, as
+  `sha256` prints them), else 0.
 
 A string literal is written in double quotes and accepts these escapes:
 
