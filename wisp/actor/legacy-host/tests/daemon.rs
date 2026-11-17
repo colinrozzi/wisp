@@ -173,6 +173,55 @@ fn sessions_start_from_a_manifest_and_the_default_can_change() {
     daemon.fails(&["set-default"]);
 }
 
+/// `fs-read-text` takes a file's bytes as one string, never as a list of boxed
+/// bytes: reading 4 MB grows the session's wasm memory by a few times that, not
+/// by about 47 times (0157). The memory is theater's GetActorUsage, as inspect
+/// shows it.
+#[test]
+fn fs_read_text_holds_a_big_file_as_one_string() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-bigtext", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let text: String = (0..4 * 1024 * 1024)
+        .map(|i| (b'a' + (i % 26) as u8) as char)
+        .collect();
+    std::fs::write(root.join("big.txt"), &text).unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[filesystem]\nroot = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start_with(&root, &["--config", config.to_str().unwrap()]);
+    let s = daemon.ok(&["new", "reader"]);
+    assert_eq!(
+        daemon.ok(&[
+            "eval",
+            &s,
+            "(match (fs-read-text \"big.txt\") ((ok t) (string-len t)) ((err e) e))"
+        ]),
+        (4 * 1024 * 1024).to_string()
+    );
+    let shown = daemon.ok(&["inspect", &s]);
+    let mem = shown
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("usage:"))
+        .and_then(|u| u.split_whitespace().next())
+        .expect(&shown)
+        .to_string();
+    let mib: f64 = match mem.strip_suffix('M') {
+        Some(m) => m.parse().unwrap(),
+        None => 0.0, // K or B: well under the bound
+    };
+    assert!(
+        mib < 32.0,
+        "4 MB read as text took the session to {mem} of wasm memory\n{shown}"
+    );
+}
+
 /// `inspect` shows every actor: a session's spawned interpreter as a session
 /// with that session as its parent, and an actor that isn't wisp in a table
 /// of its own, which `inspect ID` and `chain-tail` also reach.

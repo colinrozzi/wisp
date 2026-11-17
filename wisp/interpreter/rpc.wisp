@@ -1099,13 +1099,18 @@
     (if (string-arg? (list-get args 0)) (unmarshal (raw-invoke "theater:simple/filesystem" "read-file" (marshal (list-get args 0))))
       (failure "fs-read expects a string path"))))
 ; fs-read-text is fs-read with the bytes decoded: (ok "text") or the same (err ...).
+; The file's bytes arrive as one string (unmarshal-text), never as a list.
 (fn apply-fs-read-text ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "fs-read-text expects (fs-read-text path)")
-    (let (res (apply-fs-read args))
+    (let (res (if (string-arg? (list-get args 0))
+                (unmarshal-text (raw-invoke "theater:simple/filesystem" "read-file" (marshal (list-get args 0))))
+                (failure "fs-read-text expects a string path")))
       (value-case res
         ((compound ty case-name fields)
           (if (i32.and (string=? case-name "ok") (i32.eq (list-len fields) 1))
-            (let (decoded (apply-bytes-to-string fields))
+            (let (decoded (value-case (list-get fields 0)
+                            ((text s) (list-get fields 0))
+                            (else (apply-bytes-to-string fields))))
               (if (failed? decoded) decoded
                 (compound (result-type (symbol "string") (list-get (items-of ty) 2)) "ok"
                   (list-push (list-new value) decoded))))
