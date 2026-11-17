@@ -418,6 +418,7 @@
 (global $dec-bad s32 mut 0)            ; 1 once a check has failed
 (global $dec-why string mut 0)         ; the first failure's reason
 (global $dec-max-depth s32 const 256)
+(global $dec-u8-text s32 mut 0)        ; 1: a u8 array decodes to one string (unmarshal-text)
 
 (fn dec-fail ((why string)) s32
   (begin
@@ -563,7 +564,11 @@
     (let (p (global.get $tag-end))
       (let (count (rd32 p))
         (if (dec-has (i32.add p (i32.const 4)) count)
-          (typed-list elem (read-bytes (i32.add p (i32.const 4)) count 0 (list-new value)))
+          ; [count:u32][bytes] is a Pack string's layout, so text wanted from
+          ; u8 data is read in one piece: no boxed byte per byte (0157)
+          (if (i32.and (global.get $dec-u8-text) (i32.eq (rd8 payload) (i32.const 12)))
+            (text (rdstr p))
+            (typed-list elem (read-bytes (i32.add p (i32.const 4)) count 0 (list-new value))))
           (nil))))))
 
 ; Result node (0x14): [ok-type-tag][err-type-tag][tag:u32][has:u8][child:u32].
@@ -624,6 +629,14 @@
       (if (i32.eq len (i32.const 0))
         (host-call-failed)
         (decode-cgrf cgrf len)))))
+; unmarshal, with every u8 array as one string instead of a list of bytes:
+; for a caller that wants the text anyway (fs-read-text). A 10 MB read as a
+; list held a boxed value per byte, about 47 times its size (0157).
+(fn unmarshal-text ((x any)) value
+  (begin
+    (global.set $dec-u8-text 1)
+    (let (v (unmarshal x))
+      (begin (global.set $dec-u8-text 0) v))))
 
 ; ---------------------------------------------------------------------------
 ; record register-on-arrival (nominal). The codec now lives in the interpreter,
