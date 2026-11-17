@@ -8,7 +8,7 @@
 on = ["tag"]
 runs-on = "desktop"
 timeout = 3600
-job-timeout = 3600
+job-timeout = 4000
 
 [[step]]
 name = "theater-repl"
