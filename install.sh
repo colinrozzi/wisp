@@ -13,7 +13,9 @@
 # against the approver keys below, which are in this script and not taken from
 # any server, and checks the download's size and sha256 against it. It needs
 # openssl 3 (for Ed25519). THEATER_REPL_UNVERIFIED=1 skips all of that and takes
-# GitHub's latest as it is (the old behaviour).
+# GitHub's latest as it is (the old behaviour). "Approved" means one of these keys
+# signed it, no more: the script does not repeat the server's other checks, so it
+# is as strong as the weakest key listed (see release.rs).
 set -eu
 
 REPO="colinrozzi/wisp"
@@ -41,8 +43,17 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$DEST"
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -c1-64; else shasum -a 256 "$1" | cut -c1-64; fi; }
-# hex on stdin -> the bytes, with nothing but awk (no xxd)
-unhex() { LC_ALL=C awk '{ for (i = 1; i < length($0); i += 2) printf "%c", (index("0123456789abcdef", substr($0, i, 1)) - 1) * 16 + index("0123456789abcdef", substr($0, i + 1, 1)) - 1 }'; }
+# hex -> the bytes, in the shell alone (no xxd, no awk: an awk can't be trusted to
+# print a byte, and the key always holds a 0x00; lux). Each pair becomes an octal
+# escape and one printf writes them. The input is checked hex.
+unhex() {
+  h=$1 f=""
+  while [ -n "$h" ]; do
+    f="$f$(printf '\\%03o' "$((0x${h%"${h#??}"}))")"
+    h=${h#??}
+  done
+  printf "$f"
+}
 ishex() { printf '%s' "$1" | grep -Eq "^[0-9a-f]{$2}\$"; }
 
 # APPROVAL -> "tag sha256 size" of $asset on stdout, or exit
@@ -62,10 +73,10 @@ check_approval() {
   ishex "$author" 64 || die "the approval names no author key"
   case " $APPROVERS " in *" $author "*) ;; *) die "the approval is signed by $author, which is not an approver in this script" ;; esac
   # the author's key as PEM (an Ed25519 SubjectPublicKeyInfo is this prefix + the 32 bytes)
-  printf '%s\n' "302a300506032b6570032100$author" | unhex > "$work/pub.der"
+  unhex "302a300506032b6570032100$author" > "$work/pub.der"
   openssl pkey -pubin -inform DER -in "$work/pub.der" -out "$work/pub.pem" 2>/dev/null ||
     die "openssl 3 is needed to check the release (or THEATER_REPL_UNVERIFIED=1)"
-  printf '%s\n' "$sig" | unhex > "$work/sig"
+  unhex "$sig" > "$work/sig"
   printf '%s' "$id" > "$work/id"
   openssl pkeyutl -verify -pubin -inkey "$work/pub.pem" -rawin -in "$work/id" -sigfile "$work/sig" >/dev/null 2>&1 ||
     die "the approval's signature does not check"

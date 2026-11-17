@@ -8,6 +8,15 @@
 //! into this binary (so the server it came from is not trusted), and returns the
 //! tag, sha256 and size of the artifact asked for. The caller then checks the
 //! downloaded bytes against those.
+//!
+//! What "verified" means, honestly (lux): a binary is installed if one of the
+//! keys below signed an approval naming its sha256, and nothing more. The client
+//! does not repeat the server's other checks (the builder's key, the tag at its
+//! commit, GitHub's build matching). Today any agent on the desktop can sign as
+//! tova, and a key built into the binary can't be revoked by a route an attacker
+//! can't also use. So the client is as strong as the weakest approver key here:
+//! no worse than GitHub's releases before it, and stronger once the approvers are
+//! the phone alone.
 
 use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::{Signature, VerifyingKey};
