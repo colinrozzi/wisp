@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The next release tag for commit $1, or nothing (lib/release, field/SPEC-release.md 1):
+# the same rule GitHub's release workflow used, v0.1.N above the last tag.
+exec bash .github/next-release-tag.sh "$1"
