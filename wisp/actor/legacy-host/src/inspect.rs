@@ -4,10 +4,15 @@
 //! heap and steps are the session's own `(memory-stats)`, asked with a short
 //! deadline: a busy session shows `busy` there instead.
 //!
+//! Every actor shows, not only interpreters: an actor that isn't wisp (one a
+//! session spawned from another package) has the daemon's side of it, and
+//! its parent, from the runtime's spawn notifications ([`crate::lineage`]).
+//!
 //! Counts, names and hashes only: no message payloads, no file contents.
 use crate::{Daemon, VERSION};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
+use theater::TheaterId;
 use theater::pack_bridge::Value;
 use wisp_interpreter_actor::{Interpreter, health, resolve, short_id};
 
@@ -16,12 +21,9 @@ const ASK: Duration = Duration::from_secs(1);
 
 /// `inspect ID`: one session in full.
 pub async fn session(daemon: &Daemon, target: &str) -> Result<String, String> {
-    let interpreters = daemon
-        .runtime
-        .interpreters()
-        .await
-        .map_err(|e| format!("error: {e:#}"))?;
+    let (interpreters, wisp) = everyone(daemon).await?;
     let interpreter = resolve(&interpreters, target).map_err(|e| e.to_string())?;
+    let is_wisp = wisp.contains(&interpreter.id);
     let now = Instant::now();
     let note = daemon.runtime.sessions.noted(&interpreter.id);
     let actor = daemon
@@ -38,6 +40,12 @@ pub async fn session(daemon: &Daemon, target: &str) -> Result<String, String> {
         interpreter.id,
         ago(daemon.started, now),
     );
+    let _ = writeln!(
+        out,
+        "  kind:     {}\n  parent:   {}",
+        if is_wisp { "wisp" } else { "not wisp" },
+        parent(daemon, &interpreters, &interpreter.id),
+    );
     match &note {
         Some(note) => {
             let _ = writeln!(
@@ -53,7 +61,13 @@ pub async fn session(daemon: &Daemon, target: &str) -> Result<String, String> {
                 None => out.push_str("  start:    -\n"),
             }
         }
-        None => out.push_str("  age:      -\n  source:   -\n  start:    -\n"),
+        None => {
+            let _ = writeln!(
+                out,
+                "  age:      {}\n  source:   -\n  start:    -",
+                age(daemon, &interpreter.id, now)
+            );
+        }
     }
     let _ = writeln!(out, "  busy:     {}", busy(&actor, now));
     let (min_in, min_out) = daemon.runtime.health.per_minute(&actor);
@@ -82,7 +96,11 @@ pub async fn session(daemon: &Daemon, target: &str) -> Result<String, String> {
         count(&actor, "listener"),
         count(&actor, "connection"),
     );
-    out.push_str(&memory(daemon, interpreter).await);
+    if is_wisp {
+        out.push_str(&memory(daemon, interpreter).await);
+    } else {
+        out.push_str("  heap:     - (not wisp)\n  steps:    -\n");
+    }
     let _ = write!(out, "  files:    {}", actor.files.len());
     for (path, file) in &actor.files {
         let _ = write!(
@@ -96,8 +114,9 @@ pub async fn session(daemon: &Daemon, target: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// `inspect` with no id: the daemon, and one line per session, from the
-/// daemon's side only (no session is asked anything).
+/// `inspect` with no id: the daemon, one line per session (an interpreter
+/// actor), then one per actor that isn't wisp, from the daemon's side only (no
+/// actor is asked anything).
 pub async fn all(daemon: &Daemon) -> Result<String, String> {
     let interpreters = daemon
         .runtime
@@ -105,9 +124,10 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
         .list()
         .await
         .map_err(|e| format!("error: {e:#}"))?;
+    let (everyone, wisp) = everyone(daemon).await?;
     let now = Instant::now();
     let mut out = format!(
-        "theater-repl {VERSION}, daemon up {}, {} session(s)\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5}  BUSY",
+        "theater-repl {VERSION}, daemon up {}, {} session(s)\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5}  {:<9} BUSY",
         ago(daemon.started, now),
         interpreters.len(),
         "ID",
@@ -120,6 +140,7 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
         "TIMERS",
         "SOCKETS",
         "FILES",
+        "PARENT",
     );
     for interpreter in &interpreters {
         let actor = daemon
@@ -128,17 +149,12 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
             .get(&interpreter.id)
             .unwrap_or_default();
         let (min_in, min_out) = daemon.runtime.health.per_minute(&actor);
-        let age = daemon
-            .runtime
-            .sessions
-            .noted(&interpreter.id)
-            .map_or("-".into(), |note| ago(note.since, now));
         let _ = write!(
             out,
-            "\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5}  {}",
-            short_id(&interpreters, &interpreter.id),
+            "\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5}  {:<9} {}",
+            short_id(&everyone, &interpreter.id),
             interpreter.name,
-            age,
+            age(daemon, &interpreter.id, now),
             actor.calls,
             min_in,
             min_out,
@@ -146,10 +162,85 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
             count(&actor, "timer"),
             count(&actor, "listener") + count(&actor, "connection"),
             actor.files.len(),
+            parent(daemon, &everyone, &interpreter.id),
             busy(&actor, now),
         );
     }
+    let others: Vec<&Interpreter> = everyone.iter().filter(|a| !wisp.contains(&a.id)).collect();
+    if !others.is_empty() {
+        let _ = write!(
+            out,
+            "\n\n{} other actor(s), not wisp\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6}  {:<9} BUSY",
+            others.len(),
+            "ID",
+            "NAME",
+            "AGE",
+            "CALLS",
+            "IN/MIN",
+            "OUT/MIN",
+            "ERRORS",
+            "PARENT",
+        );
+        for other in others {
+            let actor = daemon.runtime.health.get(&other.id).unwrap_or_default();
+            let (min_in, min_out) = daemon.runtime.health.per_minute(&actor);
+            let _ = write!(
+                out,
+                "\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6}  {:<9} {}",
+                short_id(&everyone, &other.id),
+                other.name,
+                age(daemon, &other.id, now),
+                actor.calls,
+                min_in,
+                min_out,
+                actor.errors,
+                parent(daemon, &everyone, &other.id),
+                busy(&actor, now),
+            );
+        }
+    }
     Ok(out)
+}
+
+/// Every live actor (but the keepalive), and which of them are interpreters.
+/// Births of actors no longer listed are forgotten on the way.
+async fn everyone(daemon: &Daemon) -> Result<(Vec<Interpreter>, Vec<TheaterId>), String> {
+    let found = daemon
+        .runtime
+        .actors()
+        .await
+        .map_err(|e| format!("error: {e:#}"))?;
+    let ids: Vec<TheaterId> = found.iter().map(|(a, _)| a.id).collect();
+    daemon.runtime.lineage.prune(&ids);
+    let wisp = found
+        .iter()
+        .filter(|(_, w)| *w)
+        .map(|(a, _)| a.id)
+        .collect();
+    Ok((found.into_iter().map(|(a, _)| a).collect(), wisp))
+}
+
+/// How long ago the daemon spawned it (its note), else since its birth was
+/// seen, else `-`.
+fn age(daemon: &Daemon, id: &TheaterId, now: Instant) -> String {
+    match daemon.runtime.sessions.noted(id) {
+        Some(note) => ago(note.since, now),
+        None => daemon
+            .runtime
+            .lineage
+            .get(id)
+            .map_or("-".into(), |b| ago(b.at, now)),
+    }
+}
+
+/// The actor that spawned it, by the short id `inspect` shows it with: `-`
+/// for one the daemon spawned, `gone` for a parent that has stopped.
+fn parent(daemon: &Daemon, everyone: &[Interpreter], id: &TheaterId) -> String {
+    match daemon.runtime.lineage.get(id).and_then(|b| b.parent) {
+        None => "-".into(),
+        Some(p) if everyone.iter().any(|a| a.id == p) => short_id(everyone, &p),
+        Some(_) => "gone".into(),
+    }
 }
 
 /// What `chain-tail --kind` takes, and the event-type prefixes each covers.
@@ -191,11 +282,7 @@ pub async fn chain_tail(
             }
         },
     };
-    let interpreters = daemon
-        .runtime
-        .interpreters()
-        .await
-        .map_err(|e| format!("error: {e:#}"))?;
+    let (interpreters, _) = everyone(daemon).await?;
     let interpreter = resolve(&interpreters, target).map_err(|e| e.to_string())?;
     let actor = daemon
         .runtime

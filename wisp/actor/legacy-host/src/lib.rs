@@ -4,6 +4,7 @@ pub mod deaths;
 pub mod eval_session;
 pub mod events;
 pub mod health;
+pub mod lineage;
 pub mod sessions;
 pub mod source;
 pub mod theater_host;
@@ -105,6 +106,9 @@ pub struct Runtime {
     /// What every actor is doing, from a second global chain subscription
     /// (see [`health`]), for `inspect`.
     pub health: health::Health,
+    /// Who spawned each actor and when, from the runtime's spawn
+    /// notifications (see [`lineage`]), for `inspect`.
+    pub lineage: lineage::Lineage,
     /// The keepalive actor (see [`Runtime::new`]): in `(list-actors)`, never a
     /// session.
     pub keepalive: TheaterId,
@@ -251,6 +255,8 @@ impl Runtime {
         runtime.add_global_subscription(subscriber);
         let health = health::Health::default();
         runtime.add_global_subscription(health.subscription());
+        // (queued before the loop runs, so before the first spawn)
+        let lineage = lineage::Lineage::watch(&commands)?;
         let task = tokio::spawn(async move { runtime.run().await });
         let runtime = Self {
             commands,
@@ -259,6 +265,7 @@ impl Runtime {
             deaths: std::sync::Mutex::new(Some(deaths)),
             dead,
             health,
+            lineage,
             keepalive: TheaterId::generate(),
             task,
         };
@@ -322,6 +329,14 @@ impl Runtime {
         interpreters(&self.commands, &self.dead).await
     }
 
+    /// Every live actor but the keepalive, interpreters or not, in id order,
+    /// each with whether it is an interpreter.
+    pub async fn actors(&self) -> Result<Vec<(Interpreter, bool)>> {
+        let mut found = actors(&self.commands, &self.dead).await?;
+        found.retain(|(actor, _)| actor.id != self.keepalive);
+        Ok(found)
+    }
+
     /// The interpreter actor `target` names: a full actor id, an id prefix, or a
     /// runtime actor name (`new NAME` gives that name; `spawn-actor` gives the
     /// manifest's). A name or prefix that matches several actors is an error.
@@ -371,6 +386,19 @@ pub async fn interpreters(
     commands: &mpsc::UnboundedSender<TheaterCommand>,
     dead: &deaths::Dead,
 ) -> Result<Vec<Interpreter>> {
+    Ok(actors(commands, dead)
+        .await?
+        .into_iter()
+        .filter_map(|(actor, wisp)| wisp.then_some(actor))
+        .collect())
+}
+
+/// Every actor in the runtime, apart from those `dead` says have terminated,
+/// in id order, each with whether it is an interpreter.
+pub async fn actors(
+    commands: &mpsc::UnboundedSender<TheaterCommand>,
+    dead: &deaths::Dead,
+) -> Result<Vec<(Interpreter, bool)>> {
     let (response_tx, response_rx) = oneshot::channel();
     commands.send(TheaterCommand::GetActors { response_tx })?;
     let actors = response_rx.await??;
@@ -388,13 +416,11 @@ pub async fn interpreters(
             response_tx,
         })?;
         // None: the actor stopped between the two questions.
-        if let Some(metadata) = response_rx.await?
-            && exports_evaluate(&metadata.arena)
-        {
-            found.push(Interpreter { id, name });
+        if let Some(metadata) = response_rx.await? {
+            found.push((Interpreter { id, name }, exports_evaluate(&metadata.arena)));
         }
     }
-    found.sort_by_key(|interpreter| interpreter.id.to_string());
+    found.sort_by_key(|(actor, _)| actor.id.to_string());
     Ok(found)
 }
 
