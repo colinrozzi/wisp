@@ -128,6 +128,13 @@ timers, sockets, files, heap or steps. `inspect ID` and `chain-tail ID` take
 any actor's id; for one that isn't wisp, `inspect` says `kind: not wisp` and
 asks it nothing.
 
+`MEM` and `TIME` (and `inspect ID`'s `usage:` line) come from Theater's
+`GetActorUsage`, read from the runtime without asking the actor: its wasm
+linear memory as of its latest call, and the wall time of every call the
+runtime made into it (init, messages, handler callbacks), host calls it
+awaited included. Wall time, not CPU: a session waiting on a slow `process-run`
+counts that wait.
+
 ```text
 $ theater-repl inspect live
 session 96e5c6f5
