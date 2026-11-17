@@ -154,7 +154,9 @@ enum Command {
     /// every .wisp file it read, version, uptime, busy, messages in/out per
     /// minute, errors, timers, sockets, heap and steps. Answered by the daemon,
     /// so a busy session still reports (only heap and steps need the session).
-    /// Without an id, one line per session. Counts and hashes only.
+    /// Without an id, one line per session with the actor that spawned it,
+    /// then one per actor that isn't wisp (any actor's id works here and in
+    /// chain-tail). Counts and hashes only.
     Inspect { id: Option<String> },
     /// A session's newest host calls (the daemon keeps 64), with arguments
     /// and results in short: strings cut, bytes only counted, query strings

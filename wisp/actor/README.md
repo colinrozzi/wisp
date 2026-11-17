@@ -61,7 +61,7 @@ LISP
 | `wait [--timeout S] <s>` | block until there is a firing after the `wait` cursor, print all there are, move the cursor, exit (exit 2 on timeout). The wake-on-message monitor |
 | `cursors <s>` | the session's event cursors: name, acknowledged seq, how far behind |
 | `status [s]` | show a session (with one) or the daemon and its services (without) |
-| `inspect [s]` | what a session runs and how it is doing (below); without one, a line per session |
+| `inspect [s]` | what a session runs and how it is doing (below); without one, a line per actor |
 | `chain-tail [-n N] [--kind K] <s>` | the session's newest host calls with arguments and results in short; `K` is `fs`, `tcp`, `http`, `timer`, `msg` or `process` (below) |
 | `stop <s>` | stop the session's actor and reclaim its heap; a service stopped this way is not restarted |
 | `services` | each boot-list service: state, restarts, session id, last death |
@@ -117,6 +117,16 @@ was evaluated. Only `heap` and `steps` come from the session (its
 Counts, names and hashes only; no message payloads or file contents. The counts
 start when the daemon does. A connection the session never activates is never
 reported closed, so it stays counted.
+
+Without an id, `inspect` lists every actor in the runtime, not only sessions.
+Each session's line has a `PARENT` column: the short id of the actor that
+spawned it (`-` for one the daemon spawned, `gone` once the parent has
+stopped), from the runtime's spawn notifications (`legacy-host/src/lineage.rs`;
+the runtime keeps no lineage itself). Actors that aren't wisp follow after a
+blank line, under `N other actor(s), not wisp`, with the same counts but no
+timers, sockets, files, heap or steps. `inspect ID` and `chain-tail ID` take
+any actor's id; for one that isn't wisp, `inspect` says `kind: not wisp` and
+asks it nothing.
 
 ```text
 $ theater-repl inspect live

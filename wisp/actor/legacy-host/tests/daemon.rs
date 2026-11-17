@@ -173,6 +173,80 @@ fn sessions_start_from_a_manifest_and_the_default_can_change() {
     daemon.fails(&["set-default"]);
 }
 
+/// `inspect` shows every actor: a session's spawned interpreter as a session
+/// with that session as its parent, and an actor that isn't wisp in a table
+/// of its own, which `inspect ID` and `chain-tail` also reach.
+#[test]
+fn inspect_shows_every_actor_and_its_parent() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-every", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // spawn-actor does not resolve a relative `package`, so name it absolutely.
+    let package = std::fs::canonicalize(here.join("../actor.wasm")).unwrap();
+    let manifest = std::fs::read_to_string(here.join("../manifest.toml"))
+        .unwrap()
+        .replace(
+            "package = \"./actor.wasm\"",
+            &format!("package = \"{}\"", package.display()),
+        )
+        .replace("name = \"wisp-interpreter\"", "name = \"child\"");
+    std::fs::write(root.join("child.toml"), manifest).unwrap();
+    let hello = std::fs::canonicalize(here.join("tests/fixtures/not-wisp.wasm")).unwrap();
+    std::fs::write(
+        root.join("hello.toml"),
+        format!(
+            "name = \"hello\"\nversion = \"0.1.0\"\npackage = \"{}\"\n",
+            hello.display()
+        ),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start(&root);
+    let host = daemon.ok(&["new", "host"]);
+    for m in ["child.toml", "hello.toml"] {
+        let spawned = daemon.ok(&[
+            "eval",
+            &host,
+            &format!("(spawn-actor \"{}\")", root.join(m).display()),
+        ]);
+        assert!(!spawned.contains("error"), "{spawned}");
+    }
+
+    let all = daemon.ok(&["inspect"]);
+    let row = |name: &str| -> Vec<String> {
+        all.lines()
+            .find(|l| l.split_whitespace().nth(1) == Some(name))
+            .expect(&all)
+            .split_whitespace()
+            .map(String::from)
+            .collect()
+    };
+    // a session: ID NAME AGE CALLS IN OUT ERRORS TIMERS SOCKETS FILES PARENT BUSY
+    let child = row("child");
+    assert_eq!(child[10], host, "{all}");
+    assert_ne!(child[2], "-", "the child's age comes from its birth: {all}");
+    assert_eq!(row("host")[10], "-", "{all}");
+    // not wisp: ID NAME AGE CALLS IN OUT ERRORS PARENT BUSY
+    assert!(all.contains("\n\n1 other actor(s), not wisp\n"), "{all}");
+    let other = row("hello");
+    assert_eq!(other[7], host, "{all}");
+    assert!(!all.contains("keepalive"), "{all}");
+
+    let shown = daemon.ok(&["inspect", "hello"]);
+    for line in [
+        "kind:     not wisp",
+        &format!("parent:   {host}"),
+        "heap:     - (not wisp)",
+    ] {
+        assert!(shown.contains(line), "{line:?} not in\n{shown}");
+    }
+    assert!(daemon.ok(&["inspect", "child"]).contains("kind:     wisp"));
+    daemon.ok(&["chain-tail", "hello"]);
+}
+
 /// An interpreter the daemon did not make (here, `spawn-actor` inside a session)
 /// is a session like any other: `list` shows it, and `eval`/`read`/`status`/`stop`
 /// reach it by full id, id prefix, or name. The runtime is the directory.
