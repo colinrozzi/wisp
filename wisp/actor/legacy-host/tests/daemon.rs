@@ -224,15 +224,21 @@ fn inspect_shows_every_actor_and_its_parent() {
             .map(String::from)
             .collect()
     };
-    // a session: ID NAME AGE CALLS IN OUT ERRORS TIMERS SOCKETS FILES PARENT BUSY
+    // a session: ID NAME AGE CALLS IN OUT ERRORS TIMERS SOCKETS FILES MEM TIME PARENT BUSY
     let child = row("child");
-    assert_eq!(child[10], host, "{all}");
+    assert_eq!(child[12], host, "{all}");
     assert_ne!(child[2], "-", "the child's age comes from its birth: {all}");
-    assert_eq!(row("host")[10], "-", "{all}");
-    // not wisp: ID NAME AGE CALLS IN OUT ERRORS PARENT BUSY
+    assert_eq!(row("host")[12], "-", "{all}");
+    // MEM and TIME come from theater's GetActorUsage: wasm memory is whole 64 KiB pages
+    assert!(
+        child[10].ends_with('K') || child[10].ends_with('M'),
+        "{all}"
+    );
+    assert!(child[11].ends_with('s'), "{all}");
+    // not wisp: ID NAME AGE CALLS IN OUT ERRORS MEM TIME PARENT BUSY
     assert!(all.contains("\n\n1 other actor(s), not wisp\n"), "{all}");
     let other = row("hello");
-    assert_eq!(other[7], host, "{all}");
+    assert_eq!(other[9], host, "{all}");
     assert!(!all.contains("keepalive"), "{all}");
 
     let shown = daemon.ok(&["inspect", "hello"]);
@@ -240,6 +246,7 @@ fn inspect_shows_every_actor_and_its_parent() {
         "kind:     not wisp",
         &format!("parent:   {host}"),
         "heap:     - (not wisp)",
+        "of linear memory, ",
     ] {
         assert!(shown.contains(line), "{line:?} not in\n{shown}");
     }

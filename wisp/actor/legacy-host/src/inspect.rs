@@ -96,6 +96,18 @@ pub async fn session(daemon: &Daemon, target: &str) -> Result<String, String> {
         count(&actor, "listener"),
         count(&actor, "connection"),
     );
+    match daemon.runtime.usage(interpreter.id).await {
+        Some(u) => {
+            let _ = writeln!(
+                out,
+                "  usage:    {} of linear memory, {} calls taking {} in all",
+                bytes(u.memory_bytes),
+                u.calls,
+                secs(u.call_time),
+            );
+        }
+        None => out.push_str("  usage:    -\n"),
+    }
     if is_wisp {
         out.push_str(&memory(daemon, interpreter).await);
     } else {
@@ -127,7 +139,7 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
     let (everyone, wisp) = everyone(daemon).await?;
     let now = Instant::now();
     let mut out = format!(
-        "theater-repl {VERSION}, daemon up {}, {} session(s)\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5}  {:<9} BUSY",
+        "theater-repl {VERSION}, daemon up {}, {} session(s)\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5} {:>7} {:>8}  {:<9} BUSY",
         ago(daemon.started, now),
         interpreters.len(),
         "ID",
@@ -140,6 +152,8 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
         "TIMERS",
         "SOCKETS",
         "FILES",
+        "MEM",
+        "TIME",
         "PARENT",
     );
     for interpreter in &interpreters {
@@ -149,9 +163,10 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
             .get(&interpreter.id)
             .unwrap_or_default();
         let (min_in, min_out) = daemon.runtime.health.per_minute(&actor);
+        let (mem, time) = usage_cols(daemon, &interpreter.id).await;
         let _ = write!(
             out,
-            "\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5}  {:<9} {}",
+            "\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>5} {:>7} {:>8}  {:<9} {}",
             short_id(&everyone, &interpreter.id),
             interpreter.name,
             age(daemon, &interpreter.id, now),
@@ -162,6 +177,8 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
             count(&actor, "timer"),
             count(&actor, "listener") + count(&actor, "connection"),
             actor.files.len(),
+            mem,
+            time,
             parent(daemon, &everyone, &interpreter.id),
             busy(&actor, now),
         );
@@ -170,7 +187,7 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
     if !others.is_empty() {
         let _ = write!(
             out,
-            "\n\n{} other actor(s), not wisp\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6}  {:<9} BUSY",
+            "\n\n{} other actor(s), not wisp\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>7} {:>8}  {:<9} BUSY",
             others.len(),
             "ID",
             "NAME",
@@ -179,14 +196,17 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
             "IN/MIN",
             "OUT/MIN",
             "ERRORS",
+            "MEM",
+            "TIME",
             "PARENT",
         );
         for other in others {
             let actor = daemon.runtime.health.get(&other.id).unwrap_or_default();
             let (min_in, min_out) = daemon.runtime.health.per_minute(&actor);
+            let (mem, time) = usage_cols(daemon, &other.id).await;
             let _ = write!(
                 out,
-                "\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6}  {:<9} {}",
+                "\n{:<9} {:<16} {:>6} {:>8} {:>7} {:>7} {:>6} {:>7} {:>8}  {:<9} {}",
                 short_id(&everyone, &other.id),
                 other.name,
                 age(daemon, &other.id, now),
@@ -194,6 +214,8 @@ pub async fn all(daemon: &Daemon) -> Result<String, String> {
                 min_in,
                 min_out,
                 actor.errors,
+                mem,
+                time,
                 parent(daemon, &everyone, &other.id),
                 busy(&actor, now),
             );
@@ -230,6 +252,42 @@ fn age(daemon: &Daemon, id: &TheaterId, now: Instant) -> String {
             .lineage
             .get(id)
             .map_or("-".into(), |b| ago(b.at, now)),
+    }
+}
+
+/// The MEM and TIME columns: linear memory and the wall time of the calls
+/// made into it, from theater (`-` once it has stopped).
+async fn usage_cols(daemon: &Daemon, id: &TheaterId) -> (String, String) {
+    match daemon.runtime.usage(*id).await {
+        Some(u) => (bytes(u.memory_bytes), secs(u.call_time)),
+        None => ("-".into(), "-".into()),
+    }
+}
+
+/// Bytes the way `ls -h` shows them: 64K, 12.5M, 1.2G.
+fn bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if f < K {
+        format!("{n}B")
+    } else if f < K * K {
+        format!("{:.0}K", f / K)
+    } else if f < K * K * K {
+        format!("{:.1}M", f / (K * K))
+    } else {
+        format!("{:.1}G", f / (K * K * K))
+    }
+}
+
+/// A duration in seconds with a tenth, then minutes and hours: 0.4s, 12.0s, 3m02s, 2h05m.
+fn secs(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{:.1}s", d.as_secs_f64())
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, s % 3600 / 60)
     }
 }
 
@@ -509,6 +567,16 @@ mod tests {
         assert_eq!(redact("m.wisp"), "m.wisp");
         let call = Value::Tuple(vec![Value::String("private/sessions/tok".into())]);
         assert_eq!(args(&call), "(\"private/…\")");
+    }
+
+    #[test]
+    fn bytes_and_secs_read_short() {
+        assert_eq!(bytes(512), "512B");
+        assert_eq!(bytes(65536), "64K");
+        assert_eq!(bytes(13 * 1024 * 1024 + 512 * 1024), "13.5M");
+        assert_eq!(secs(Duration::from_millis(400)), "0.4s");
+        assert_eq!(secs(Duration::from_secs(182)), "3m02s");
+        assert_eq!(secs(Duration::from_secs(7500)), "2h05m");
     }
 
     #[test]

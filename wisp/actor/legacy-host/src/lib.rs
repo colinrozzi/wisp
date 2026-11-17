@@ -329,6 +329,20 @@ impl Runtime {
         interpreters(&self.commands, &self.dead).await
     }
 
+    /// What actor `id` uses (theater's `GetActorUsage`: its linear memory,
+    /// the calls made into it and their wall time), read from the runtime
+    /// without asking the actor. None once it has stopped.
+    pub async fn usage(&self, id: TheaterId) -> Option<theater::actor::usage::ActorUsage> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.commands
+            .send(TheaterCommand::GetActorUsage {
+                actor_id: id,
+                response_tx,
+            })
+            .ok()?;
+        response_rx.await.ok().flatten()
+    }
+
     /// Every live actor but the keepalive, interpreters or not, in id order,
     /// each with whether it is an interpreter.
     pub async fn actors(&self) -> Result<Vec<(Interpreter, bool)>> {
