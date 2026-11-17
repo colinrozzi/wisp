@@ -184,8 +184,14 @@ enum Command {
     Repl,
     /// Print the installed version.
     Version,
-    /// Download the latest release and replace this binary in place.
-    Upgrade,
+    /// Download the latest approved release and replace this binary in place,
+    /// after checking its approval (signed by a key built into this binary) and
+    /// its sha256. From colinrozzi.com, else GitHub's release if it carries one.
+    Upgrade {
+        /// Skip the check: run the old installer (GitHub's latest, unverified).
+        #[arg(long)]
+        unverified: bool,
+    },
 }
 
 /// Where a reader (read, follow, wait) starts, and how it prints.
@@ -248,26 +254,120 @@ async fn main() -> Result<()> {
             println!("{VERSION}");
             Ok(())
         }
-        Command::Upgrade => upgrade(),
+        Command::Upgrade { unverified } => upgrade(unverified).await,
         client => run_client(client, port).await,
     }
 }
 
-/// Re-run the installer, targeting this binary's own location so the running
-/// `theater-repl` is replaced in place with the latest published release.
-fn upgrade() -> Result<()> {
+/// Where a release can come from, in order: each serves `APPROVAL` (the signed
+/// release.approve event) beside the artifact (experiment field/SPEC-release.md 4, 6).
+const RELEASE_SOURCES: &[(&str, &str)] = &[
+    (
+        "colinrozzi.com",
+        "https://colinrozzi.com/releases/wisp/latest",
+    ),
+    (
+        "GitHub",
+        "https://github.com/colinrozzi/wisp/releases/latest/download",
+    ),
+];
+const RELEASE_ASSET: &str = "theater-repl-linux-x86_64";
+
+/// Replace this binary with the latest approved release. A source that can't be
+/// reached is skipped; one that answers with an approval that fails a check is
+/// an error, never a reason to try the next.
+async fn upgrade(unverified: bool) -> Result<()> {
+    use wisp_interpreter_actor::release;
     let exe = std::env::current_exe()?;
     let dir = exe.parent().context("binary has no parent directory")?;
     eprintln!("current version: {VERSION}");
-    eprintln!("upgrading {} ...", exe.display());
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("curl -fsSL https://raw.githubusercontent.com/colinrozzi/wisp/main/install.sh | sh")
-        .env("THEATER_REPL_BIN", dir)
-        .status()
-        .context("running the installer (is curl installed?)")?;
-    anyhow::ensure!(status.success(), "upgrade failed");
-    Ok(())
+    if unverified {
+        eprintln!(
+            "upgrading {} with the old installer (GitHub's latest, NOT verified) ...",
+            exe.display()
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("curl -fsSL https://raw.githubusercontent.com/colinrozzi/wisp/main/install.sh | THEATER_REPL_UNVERIFIED=1 sh")
+            .env("THEATER_REPL_BIN", dir)
+            .status()
+            .context("running the installer (is curl installed?)")?;
+        anyhow::ensure!(status.success(), "upgrade failed");
+        return Ok(());
+    }
+    let keys: Vec<&str> = release::APPROVERS.iter().map(|(_, k)| *k).collect();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    for (label, base) in RELEASE_SOURCES {
+        let approval = match client
+            .get(format!("{base}/APPROVAL"))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(r) => r.text().await?,
+            Err(e) => {
+                eprintln!("{label}: no approval there ({e}); trying the next source");
+                continue;
+            }
+        };
+        let a = release::check_approval(&approval, "wisp", RELEASE_ASSET, &keys)
+            .with_context(|| format!("{label}'s release approval"))?;
+        let who = release::APPROVERS
+            .iter()
+            .find(|(_, k)| *k == a.approver)
+            .map_or("?", |(n, _)| n);
+        eprintln!(
+            "{label}: {} approved by {who}: {RELEASE_ASSET} {} ({} bytes)",
+            a.tag,
+            &a.sha256[..16],
+            a.size
+        );
+        match (release::version(VERSION), release::version(&a.tag)) {
+            (Some(cur), Some(new)) if new == cur => {
+                eprintln!("already at {VERSION}");
+                return Ok(());
+            }
+            (Some(cur), Some(new)) if new < cur => {
+                anyhow::bail!("{} is older than {VERSION}: not a downgrade", a.tag)
+            }
+            _ => {}
+        }
+        let bytes = client
+            .get(format!("{base}/{RELEASE_ASSET}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        release::check_bytes(&bytes, &a).with_context(|| format!("{label}'s {RELEASE_ASSET}"))?;
+        // beside the binary, so the rename is atomic; checked by running it before it replaces this one
+        let tmp = dir.join(format!(".theater-repl.upgrade.{}", std::process::id()));
+        std::fs::write(&tmp, &bytes)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        let out = std::process::Command::new(&tmp).arg("version").output();
+        let reported = out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if reported != a.tag {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::bail!("the new binary reports {reported:?}, not {}", a.tag);
+        }
+        std::fs::rename(&tmp, &exe)?;
+        eprintln!(
+            "upgraded {} to {} (sha256 {})",
+            exe.display(),
+            a.tag,
+            a.sha256
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no source has a release approval; `theater-repl upgrade --unverified` runs the old installer"
+    )
 }
 
 // ---- actor artifacts ------------------------------------------------------
@@ -1155,7 +1255,7 @@ async fn run_client(command: Command, port: u16) -> Result<()> {
         Command::Follow { id, from, from_now } => follow(port, id, from, from_now).await,
         Command::Wait { id, from, timeout } => wait_once(port, id, from, timeout).await,
         Command::Cursors { id } => send(port, json!({ "op": "cursors", "id": id })).await,
-        Command::Serve | Command::Repl | Command::Version | Command::Upgrade => {
+        Command::Serve | Command::Repl | Command::Version | Command::Upgrade { .. } => {
             unreachable!("handled in main")
         }
     }
