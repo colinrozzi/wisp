@@ -286,6 +286,10 @@ enum Seen {
     File(String, File),
 }
 
+/// The largest read-file event decoded for a .wisp file's hash: bigger reads
+/// are left alone, since decoding one holds a Value per byte read (0157).
+const WISP_FILE_MAX: usize = 1 << 20;
+
 /// Guest exports a message arrives through.
 fn is_inbound_message(function: &str) -> bool {
     ["handle-send", "handle-request", "handle-channel-message"]
@@ -310,6 +314,11 @@ impl Seen {
             | "theater:simple/tcp/transfer"
             | "theater:simple/tcp/transfer-async"
             | "theater:simple/filesystem/read-file" => {
+                // A read is decoded only to hash a .wisp file, and those are
+                // small; decoding a big one builds a Value per byte (0157).
+                if ty == "theater:simple/filesystem/read-file" && event.data.len() > WISP_FILE_MAX {
+                    return Seen::Nothing;
+                }
                 match decode_chain_event_payload(&event.data) {
                     Some(ChainEventPayload::HostFunction(call)) => call,
                     _ => return Seen::Nothing,
