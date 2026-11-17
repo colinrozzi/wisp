@@ -1,0 +1,25 @@
+# release — a tag pushed to server3 builds theater-repl on the desktop runner
+# (experiment lib/actions-runner; field/SPEC-release.md). The binary is the
+# flake's theater-repl-static, pinned by flake.lock and Cargo.lock, so
+# GitHub's release workflow builds the same bytes from the same tag and the
+# two sha256s can be compared before the release is made latest.
+# Tags come from `lib/release ME tag wisp` (.actions/next-tag picks the name).
+
+on = ["tag"]
+runs-on = "desktop"
+timeout = 3600
+job-timeout = 3600
+
+[[step]]
+name = "theater-repl"
+run = '''
+set -euo pipefail
+ref="${ACTIONS_REF:-}"
+if [ -n "$ref" ]; then tag="${ref#refs/tags/}"; else tag="$(git describe --exact-match --tags HEAD)"; fi
+# anyone can push a tag to server3, and git allows $ ; ( ) in names (lux): only vN.N.N builds
+[[ "$tag" =~ ^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] || { echo "not a release tag: $tag" >&2; exit 1; }
+THEATER_REPL_VERSION="$tag" nix build --impure .#theater-repl-static --option cores 6 --max-jobs 1
+./result/bin/theater-repl-linux-x86_64 version | grep -F "$tag"
+sha256sum result/bin/theater-repl-linux-x86_64
+'''
+artifacts = ["result/bin/theater-repl-linux-x86_64"]
