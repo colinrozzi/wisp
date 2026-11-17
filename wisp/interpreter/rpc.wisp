@@ -671,16 +671,14 @@
 ; so marshal routes it to the packed Array node (tag-of-type reads symbol-name,
 ; which is "" for a bare byte-value, so the template must be the symbol). The
 ; string is byte-indexed; length is the u32 at the head of its [len][bytes] buffer.
-(fn str-bytes ((s string) (i s32) (n s32) (acc (list value))) (list value)
-  (if (i32.ge_s i n) acc
-    (str-bytes s (i32.add i (i32.const 1)) n (list-push acc (byte-value (string-ref s i))))))
 (fn str-to-bytes ((v value)) value
   (value-case v
-    ((text s) (typed-list (symbol "u8")
-                (str-bytes s (i32.const 0) (i32.load (string-addr s)) (list-new value))))
+    ; packed: a string already has the [len][data] layout (0157)
+    ((text s) (bytes s))
     ; An existing byte list passes through, so the very bytes an on-data event
     ; delivered can be relayed without a lossy round-trip through a string.
     ((typed-list element items) (typed-list (symbol "u8") items))
+    ((bytes b) v)
     (else (typed-list (symbol "u8") (list-new value)))))
 
 
@@ -835,6 +833,7 @@
   (value-case v
     ((text s) 1)
     ((typed-list element items) (all-bytes? items 0))
+    ((bytes b) 1)
     (else 0)))
 (fn apply-sha256 ((args (list value))) value
   (if (if (i32.eq (list-len args) 1) (crypto-data? (list-get args 0)) 0)
@@ -1034,8 +1033,7 @@
 (fn apply-marshal ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "marshal expects (marshal value)")
     (let (addr (any-addr (marshal (list-get args 0))))
-      (typed-list (symbol "u8")
-        (read-bytes addr (i32.add (i32.const 4) (i32.load addr)) (i32.const 0) (list-new value))))))
+      (bytes (bytes-of-region addr (i32.add (i32.const 4) (i32.load addr)))))))
 ; The blob's [len:u32] prefix says how much to copy, so it must not claim more
 ; bytes than the list holds; the rest is checked by unmarshal.
 (fn unmarshal-bytevals ((items (list value))) value
@@ -1052,6 +1050,7 @@
     (value-case (list-get args 0)
       ((typed-list elem items) (unmarshal-bytevals items))
       ((sequence items) (unmarshal-bytevals items))
+      ((bytes b) (unmarshal-bytevals (bytes-items b)))
       (else (failure "unmarshal expects a list<u8> (bytes)")))))
 
 ; --- timer -----------------------------------------------------------------
@@ -1214,7 +1213,7 @@
       body)))
 (fn http-request-blob ((method string) (url string)) any
   (http-request-full method url (list-new value) (compound (http-body-type) "none" (list-new value))))
-(fn bytes-arg? ((v value)) s32 (value-case v ((typed-list element items) 1) (else 0)))
+(fn bytes-arg? ((v value)) s32 (value-case v ((typed-list element items) 1) ((bytes b) 1) (else 0)))
 ; (http-req method url [headers [body]]): headers ((name value) ...), body a string
 ; or bytes.
 (fn apply-http-req ((args (list value))) value
@@ -1274,7 +1273,7 @@
 ; The WIT send takes (connection-id string) (data (list u8)), so data may be a
 ; string (sugar) or a byte list — e.g. the bytes an on-data event just delivered.
 (fn tcp-data-arg? ((v value)) s32
-  (value-case v ((text s) 1) ((typed-list element items) 1) (else 0)))
+  (value-case v ((text s) 1) ((typed-list element items) 1) ((bytes b) 1) (else 0)))
 (fn apply-tcp-send ((args (list value))) value
   (if (i32.ne (list-len args) 2) (failure "tcp-send expects (tcp-send conn-id data)")
     (if (i32.and (string-arg? (list-get args 0)) (tcp-data-arg? (list-get args 1)))

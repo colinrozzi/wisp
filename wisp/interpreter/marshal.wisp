@@ -196,6 +196,25 @@
         (write-bytes (i32.add cur (i32.const 13)) items 0)
         (take-node (i32.add (i32.const 13) count))))))
 
+; Packed bytes -> the same Array node, its data copied in one block.
+(fn enc-array-u8-bytes ((b string)) s32
+  (let (count (bytes-len b))
+    (let (cur (global.get $enc-cur))
+      (begin
+        (i32.store cur (i32.const 21))                                 ; kind=Array 0x15
+        (i32.store (i32.add cur (i32.const 4)) (i32.add (i32.const 5) count)) ; payload_len
+        (i32.store8 (i32.add cur (i32.const 8)) (i32.const 12))        ; elem tag = u8
+        (i32.store (i32.add cur (i32.const 9)) count)
+        (blit (i32.add cur (i32.const 13)) (i32.add (string-addr b) (i32.const 4)) count)
+        (take-node (i32.add (i32.const 13) count))))))
+; N bytes at ADDR as a new packed buffer.
+(fn bytes-of-region ((addr s32) (n s32)) string
+  (let (buf (heap-alloc (i32.add n (i32.const 4))))
+    (begin
+      (i32.store buf n)
+      (blit (i32.add buf (i32.const 4)) addr n)
+      (let (s (string-from-addr buf)) (begin (heap-free buf) s)))))
+
 ; Non-fixed-element list (string/compound) -> List node (0x07):
 ; [elem-type-tag (variable)][count:u32][child-indices]. Children emitted first.
 (fn enc-list-node ((elem value) (items (list value))) s32
@@ -258,6 +277,7 @@
     ((typed-list element items)
       (if (i32.eq (tag-of-type element) (i32.const 12)) (enc-array-u8 items)
         (enc-list-node element items)))
+    ((bytes b) (enc-array-u8-bytes b))
     ; Typed compound values: tuple -> Tuple, some/none -> Option, ok/err -> Result.
     ; `ty` is the type descriptor; its inner/ok/err types (possibly compound) are
     ; written by write-type-tag.
@@ -383,6 +403,7 @@
     ((typed-list element items)
       (if (i32.eq (tag-of-type element) (i32.const 12)) (i32.add (i32.const 13) (list-len items))
         (children-bound (i32.add (i32.const 12) (tag-bound element)) items)))
+    ((bytes b) (i32.add (i32.const 13) (bytes-len b)))
     ((compound ty case fields)
       (children-bound (i32.add (i32.const 24) (tag-bound ty)) fields))
     ((aggregate name id case-name fields)
@@ -564,10 +585,11 @@
     (let (p (global.get $tag-end))
       (let (count (rd32 p))
         (if (dec-has (i32.add p (i32.const 4)) count)
-          ; [count:u32][bytes] is a Pack string's layout, so text wanted from
-          ; u8 data is read in one piece: no boxed byte per byte (0157)
-          (if (i32.and (global.get $dec-u8-text) (i32.eq (rd8 payload) (i32.const 12)))
-            (text (rdstr p))
+          ; [count:u32][bytes] is a Pack string's layout, so u8 data is read in
+          ; one piece, as text if that is wanted, else as packed bytes: no boxed
+          ; byte per byte (0157)
+          (if (i32.eq (rd8 payload) (i32.const 12))
+            (if (global.get $dec-u8-text) (text (rdstr p)) (bytes (rdstr p)))
             (typed-list elem (read-bytes (i32.add p (i32.const 4)) count 0 (list-new value))))
           (nil))))))
 

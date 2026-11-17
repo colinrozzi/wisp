@@ -151,6 +151,9 @@
     ((typed-list element items)
       (string-append "#<list " (string-append (show element)
         (string-append " " (string-append (show-list-at items 0 "(" depth) ">")))))
+    ; packed bytes print as the (list u8) they are
+    ((bytes b)
+      (string-append "#<list u8 " (string-append (show-list-at (bytes-items b) 0 "(" depth) ">")))
     ((compound ty case-name fields) (show-compound ty case-name fields depth))
     ((text s) (string-append "\"" (string-append (escape-text s 0 "") "\"")))
     ((symbol s) s)
