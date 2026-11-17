@@ -396,6 +396,7 @@
   (value-case v
     ((sequence items) (list-len items))
     ((typed-list element items) (list-len items))
+    ((bytes b) (bytes-len b))
     (else -1)))
 
 (fn apply-list-query ((name string) (args (list value))) value
@@ -431,6 +432,9 @@
             (if (i32.eq (list-len items) 0) (failure "car/cdr expects a nonempty list")
               (if (string=? name "car") (list-get items 0)
                 (typed-list element (copy-list items 1 (list-new value))))))
+          ((bytes b)
+            (if (i32.eq (bytes-len b) 0) (failure "car/cdr expects a nonempty list")
+              (if (string=? name "car") (bytes-ref b 0) (bytes (bytes-from b 1)))))
           (else (failure "car/cdr expects a list"))))
       (if (i32.ne (list-len args) 2) (failure "expected two arguments")
         (if (string=? name "cons")

@@ -155,6 +155,8 @@
     (value-case (list-get args 0)
       ((typed-list element items) (byte-values->string items))
       ((sequence items) (byte-values->string items))
+      ; packed: the buffer is already a string's layout
+      ((bytes b) (text b))
       (else (failure "bytes->string expects a byte list")))))
 
 ; string->bytes: encode a string to a (list u8) of byte-values (str-to-bytes is
