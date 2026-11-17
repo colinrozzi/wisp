@@ -419,6 +419,7 @@ fn ok_bytes(v: &Value) -> Option<Vec<u8>> {
         Value::Result { value: Ok(v), .. } => ok_bytes(v),
         Value::Result { value: Err(_), .. } => None,
         Value::Tuple(items) if items.len() == 1 => ok_bytes(&items[0]),
+        Value::Bytes(b) => Some(b.clone()),
         Value::List { items, .. } => items
             .iter()
             .map(|item| match item {
