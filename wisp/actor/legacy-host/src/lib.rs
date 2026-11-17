@@ -5,6 +5,7 @@ pub mod eval_session;
 pub mod events;
 pub mod health;
 pub mod lineage;
+pub mod release;
 pub mod sessions;
 pub mod source;
 pub mod theater_host;
