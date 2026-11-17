@@ -33,6 +33,18 @@ works too. The reader itself accepts multiline source through `evaluate`.
 The initial language has s32/s64 integers, f32/f64 floats, strings, symbols, lists, closures,
 u8 bytes, unit, named records and variants, typed lists, options, results, tuples,
 and built-in functions.
+
+A byte list (`(list u8)`) has two representations that behave the same: a typed
+list of `u8` values (what `list-push` onto `(list-new u8)` builds), and **packed
+bytes**, one `[len][data]` buffer in the layout of a string (values.wisp
+`bytes`). Packed bytes are what a host byte array decodes to (`fs-read`, tcp
+data, message payloads), what `string->bytes` and `marshal` return, and what
+marshals back out as one CGRF Array node in a single copy. Every list primitive,
+`equal?` (across the two forms), map keys, the printer and type checks treat
+them alike; `list-push` and `list->vector` unpack. A boxed value per byte cost
+about 47 times the data in wasm memory, kept for the session's life (ticket 0157,
+tests/daemon.rs `packed_bytes_behave_like_a_typed_list_of_u8`). `fs-read-text`
+reads a file straight into a string, with no byte list at all.
 Forms include `define`, `lambda`,
 `let`, `if`, `begin`, `quote` (also `'`), typed `fn`, `record`, `variant`, `match`,
 `global`, `global.get`, `global.set`, `include`, `trait`, `instance`, `derive`, `defmacro`, `define-syntax`, `quasiquote`, and

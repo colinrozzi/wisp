@@ -66,6 +66,16 @@ impl Daemon {
         text(&out.stdout)
     }
 
+    /// Run a command either way: "ok: <stdout>" or "err: <stderr>".
+    fn run(&self, args: &[&str]) -> String {
+        let out = self.cli(args);
+        if out.status.success() {
+            format!("ok: {}", text(&out.stdout))
+        } else {
+            format!("err: {}", text(&out.stderr))
+        }
+    }
+
     /// Run a command that must fail; its stderr.
     fn fails(&self, args: &[&str]) -> String {
         let out = self.cli(args);
@@ -173,9 +183,124 @@ fn sessions_start_from_a_manifest_and_the_default_can_change() {
     daemon.fails(&["set-default"]);
 }
 
-/// `fs-read-text` takes a file's bytes as one string, never as a list of boxed
-/// bytes: reading 4 MB grows the session's wasm memory by a few times that, not
-/// by about 47 times (0157). The memory is theater's GetActorUsage, as inspect
+/// Packed bytes (what a host byte array decodes to, and what string->bytes
+/// gives) are a (list u8) to every list primitive: each one gives the same
+/// printed answer on them as on the same bytes built as a typed list with
+/// list-push (0157). The byte strings cover empty, one byte, 0x00 and 0xff,
+/// and 300 pseudo-random bytes.
+#[test]
+fn packed_bytes_behave_like_a_typed_list_of_u8() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-packed", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut seed: u32 = 2463534242;
+    let random: Vec<u8> = (0..300)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let cases: Vec<Vec<u8>> = vec![
+        vec![],
+        vec![7],
+        vec![0, 255, 0, 128, 1],
+        b"h\xc3\xa9y".to_vec(),
+        random,
+    ];
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[filesystem]\nroot = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let daemon = Daemon::start_with(&root, &["--config", config.to_str().unwrap()]);
+    let s = daemon.ok(&["new", "packed"]);
+    // a typed list from a quoted list of numbers, one list-push at a time
+    daemon.ok(&[
+        "eval",
+        &s,
+        "(define mk (lambda (xs acc) (if (null? xs) acc (mk (cdr xs) (list-push acc (car xs))))))",
+    ]);
+    let exprs = [
+        "X",
+        "(length X)",
+        "(null? X)",
+        "(list-len X)",
+        "(car X)",
+        "(cdr X)",
+        "(car (cdr X))",
+        "(list-get X 0)",
+        "(list-get X 2)",
+        "(list-get X -1)",
+        "(list-get X 100000)",
+        "(list-push X 9)",
+        "(bytes->string X)",
+        "(equal? X X)",
+        "(equal? X P)",
+        "(equal? X T)",
+        "(equal? X (list-push X 1))",
+        "(list->vector X)",
+        "(sha256 X)",
+        "(marshal X)",
+        "(unmarshal (marshal X))",
+        "(equal? (unmarshal (marshal X)) T)",
+        "(begin (define hm (hash-map)) (map-set! hm X 1) (map-get hm P))",
+        "(begin (define hm2 (hash-map)) (map-set! hm2 X 1) (map-get hm2 T))",
+        "(begin (define hm3 (hash-map)) (map-set! hm3 X 1) (map-count hm3))",
+    ];
+    for (n, bytes) in cases.iter().enumerate() {
+        let file = format!("b{n}.bin");
+        std::fs::write(root.join(&file), bytes).unwrap();
+        let nums: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+        // P: packed (read from a file); T: the same bytes as a typed list
+        daemon.ok(&[
+            "eval",
+            &s,
+            &format!("(define P (match (fs-read \"{file}\") ((ok b) b) ((err e) e)))"),
+        ]);
+        daemon.ok(&[
+            "eval",
+            &s,
+            &format!("(define T (mk (quote ({})) (list-new u8)))", nums.join(" ")),
+        ]);
+        // the comparisons below mean something: both forms are the bytes, and
+        // equal, and one map key
+        assert_eq!(
+            daemon.run(&["eval", &s, "(length P)"]),
+            format!("ok: {}", bytes.len())
+        );
+        assert_eq!(
+            daemon.run(&["eval", &s, "(length T)"]),
+            format!("ok: {}", bytes.len())
+        );
+        assert_eq!(daemon.run(&["eval", &s, "(equal? P T)"]), "ok: 1");
+        assert_eq!(
+            daemon.run(&[
+                "eval",
+                &s,
+                "(begin (define hk (hash-map)) (map-set! hk P 1) (map-get hk T))"
+            ]),
+            "ok: (some s32 1)",
+            "a map keyed by the packed bytes finds the typed list"
+        );
+        for e in exprs {
+            let on = |x: &str| {
+                let form = e.replace('X', x);
+                daemon.run(&["eval", &s, &form])
+            };
+            let (packed, typed) = (on("P"), on("T"));
+            assert_eq!(packed, typed, "case {n} ({} bytes): {e}", bytes.len());
+        }
+    }
+}
+
+/// `fs-read-text` takes a file's bytes as one string, and `fs-read` as packed
+/// bytes, never as a list of boxed bytes: reading 4 MB grows the session's wasm
+/// memory by a few times that, not by about 47 times (0157). The memory is theater's GetActorUsage, as inspect
 /// shows it.
 #[test]
 fn fs_read_text_holds_a_big_file_as_one_string() {
@@ -219,6 +344,29 @@ fn fs_read_text_holds_a_big_file_as_one_string() {
     assert!(
         mib < 32.0,
         "4 MB read as text took the session to {mem} of wasm memory\n{shown}"
+    );
+
+    // and fs-read: the bytes arrive packed, not as a boxed value per byte
+    let r = daemon.ok(&["new", "rawreader"]);
+    assert_eq!(
+        daemon.ok(&[
+            "eval",
+            &r,
+            "(match (fs-read \"big.txt\") ((ok b) (length b)) ((err e) e))"
+        ]),
+        (4 * 1024 * 1024).to_string()
+    );
+    let shown = daemon.ok(&["inspect", &r]);
+    let mem = shown
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("usage:"))
+        .and_then(|u| u.split_whitespace().next())
+        .expect(&shown)
+        .to_string();
+    let mib: f64 = mem.strip_suffix('M').map_or(0.0, |m| m.parse().unwrap());
+    assert!(
+        mib < 32.0,
+        "4 MB read as bytes took the session to {mem} of wasm memory\n{shown}"
     );
 }
 

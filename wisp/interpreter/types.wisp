@@ -29,6 +29,7 @@
         ((single n) (string=? name "f32"))
         ((double n) (string=? name "f64"))
         ((typed-list element items) (same-type? (unary-type "list" element) ty))
+        ((bytes b) (same-type? (unary-type "list" (symbol "u8")) ty))
         ((compound actual case-name fields) (same-type? actual ty))
         ((text s) (string=? name "string"))
         ((aggregate type-name id case-name fields)
