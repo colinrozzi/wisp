@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod deaths;
 pub mod eval_session;
 pub mod events;
+pub mod gate;
 pub mod health;
 pub mod lineage;
 pub mod sessions;
@@ -87,6 +88,8 @@ pub struct Grants {
     pub http: HttpAccess,
     pub keys: crypto::KeyAccess,
     pub tcp: theater_handler_tcp::TcpHandlerConfig,
+    /// Whether actors may use podman (config.toml `[podman]`); off by default.
+    pub podman: bool,
 }
 
 pub struct Runtime {
@@ -135,6 +138,7 @@ impl Runtime {
             http,
             keys,
             tcp,
+            podman,
         } = grants;
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
@@ -228,14 +232,29 @@ impl Runtime {
         handlers.register(theater_handler_process::ProcessHandler::new(
             theater_handler_process::ProcessHandlerConfig::default(),
         ));
-        handlers.register(theater_handler_podman::PodmanHandler::new(
-            theater_handler_podman::PodmanHandlerConfig {},
+        // Podman can bind-mount any host path the daemon's user can read (keys,
+        // secrets), so it is off unless config.toml has [podman], and a child
+        // can be given enabled = false under one that has it (0156).
+        handlers.register(gate::Gated::new(
+            theater_handler_podman::PodmanHandler::new(
+                theater_handler_podman::PodmanHandlerConfig {},
+            ),
+            "enabled",
+            "theater:simple/podman",
+            &["run", "stop", "rm", "list"],
+            podman,
         ));
         // Lifecycle relationships: link (fate-sharing) + monitor (watch another
         // actor's chain, delivered to handle-actor-event). Self-service — the
         // runtime forces subscriber = caller.
-        handlers.register(theater_handler_lifecycle::LifecycleHandler::new(
-            commands.clone(),
+        // monitor names any actor and hears how it ended, so a child can be given
+        // monitor = false (0156); link only ever stops the linker.
+        handlers.register(gate::Gated::new(
+            theater_handler_lifecycle::LifecycleHandler::new(commands.clone()),
+            "monitor",
+            "theater:simple/lifecycle",
+            &["link", "unlink", "monitor", "monitor-filtered", "unmonitor"],
+            true,
         ));
         sessions.set_types(
             handlers
