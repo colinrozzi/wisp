@@ -853,8 +853,29 @@ fn a_spawned_interpreter_runs_its_start_file_and_reports() {
     assert!(!gone.contains("error"), "{gone}");
     assert!(wait_for("cannot read").contains("svc/none.wisp"));
 
+    // with a token on the report line, the report carries it after the id
+    let token = "0123456789abcdef0123456789abcdef";
+    let tok = spawn("tok", &format!("start svc/good.wisp\\nreport {me} {token}"));
+    assert!(!tok.contains("error"), "{tok}");
+    let seen = wait_for(token);
+    assert!(
+        seen.lines()
+            .any(|l| l.contains("start ready ") && l.trim_end_matches('"').ends_with(token)),
+        "{seen}"
+    );
+
     // anything malformed fails the spawn itself, naming why (lux's rules)
     for (name, state, why) in [
+        (
+            "shorttoken",
+            format!("start svc/good.wisp\\nreport {me} abc123"),
+            "report token",
+        ),
+        (
+            "hextoken",
+            format!("start svc/good.wisp\\nreport {me} 0123456789ABCDEF0123"),
+            "report token",
+        ),
         ("up", format!("start ../x.wisp\\nreport {me}"), "'..' part"),
         (
             "abs",

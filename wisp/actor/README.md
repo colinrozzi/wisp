@@ -370,6 +370,14 @@ follow the report line. Anything else makes `init` fail, so `spawn-actor`
 returns the reason (`start: the path has a '..' part`), rather than starting an
 empty session. With no `initial_state`, an interpreter starts empty, as before.
 
+The report line may carry a token, `report <id> <token>` (16 to 64 lowercase hex
+digits), and the messages then carry it after the child's id: `start ready <id>
+<token>`, `start failed <id> <token> <why>`. A message doesn't say who sent it, so
+a spawner that gives each child its own secret token (the supervisor does) can
+tell that child's report from one a sibling forged. It stays secret only while no
+child can read another's manifest or state, i.e. while children have no runtime
+grant (`actor-manifest`, `actor-state`).
+
 How it works: this is the userland supervisor of theater#235's supervision
 design; the runtime itself neither restarts nor owns actors. Before spawning
 anything the daemon subscribes to every actor's chain

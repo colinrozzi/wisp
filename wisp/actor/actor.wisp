@@ -20,8 +20,15 @@
 ; Theater's spawn waits for the child's init, so a start file that hangs must
 ; not hang its spawner (lux, tova 2026-11-19). Any other string is refused, so
 ; spawn-actor fails, rather than ignored.
+;
+; The report line may also carry a token, `report ACTOR-ID TOKEN` (16 to 64 of
+; [0-9a-f]); the messages then carry it after SELF: "start ready SELF TOKEN",
+; "start failed SELF TOKEN REASON". A message doesn't say who sent it, so a
+; spawner that gives each child its own secret token can tell that child's
+; report from one a sibling forged (lux, 2026-11-19).
 (global $start-path string mut 0)
 (global $start-report string mut 0)
+(global $start-token string mut 0)
 
 (export "theater:simple/actor.init"
   (fn actor-init ((state any))
@@ -63,13 +70,32 @@
                 (let (nl2 (start-line-end rest 0))
                   (let (second (substring rest 0 nl2))
                     (if (i32.eq (string-prefix? second "report ") 0) "the second line must be 'report ACTOR-ID'"
-                      (let (id (substring second 7 (string-len second)))
-                        (if (i32.eq (start-id-ok id 0) 0) "the report id must be 1 to 64 of [0-9a-f-]"
-                          (if (i32.lt_s (i32.add nl2 1) (string-len rest)) "nothing may follow the report line"
-                            (begin
-                              (global.set $start-path path)
-                              (global.set $start-report id)
-                              "")))))))))))))))
+                      (let (words (substring second 7 (string-len second)))
+                        (let (sp (start-space words 0))
+                          (let (id (substring words 0 sp))
+                            (let (token (if (i32.lt_s sp (string-len words)) (substring words (i32.add sp 1) (string-len words)) ""))
+                              (if (i32.eq (start-id-ok id 0) 0) "the report id must be 1 to 64 of [0-9a-f-]"
+                                (if (i32.and (i32.lt_s sp (string-len words)) (i32.eq (start-token-ok token 0) 0))
+                                  "the report token must be 16 to 64 of [0-9a-f]"
+                                  (if (i32.lt_s (i32.add nl2 1) (string-len rest)) "nothing may follow the report line"
+                                    (begin
+                                      (global.set $start-path path)
+                                      (global.set $start-report id)
+                                      (global.set $start-token token)
+                                      "")))))))))))))))))))
+
+(fn start-space ((s string) (i s32)) s32
+  (if (i32.ge_s i (string-len s)) i
+    (if (i32.eq (string-ref s i) 32) i (start-space s (i32.add i 1)))))
+
+; 16 to 64 lowercase hex digits
+(fn start-token-ok ((t string) (i s32)) s32
+  (if (i32.lt_s (string-len t) 16) 0
+    (if (i32.gt_s (string-len t) 64) 0
+      (if (i32.ge_s i (string-len t)) 1
+        (let (c (string-ref t i))
+          (if (i32.or (i32.and (i32.ge_s c 48) (i32.le_s c 57)) (i32.and (i32.ge_s c 97) (i32.le_s c 102)))
+            (start-token-ok t (i32.add i 1)) 0))))))
 
 (fn start-line-end ((s string) (i s32)) s32
   (if (i32.ge_s i (string-len s)) i
@@ -116,13 +142,16 @@
           (let (out (value-case src
                       ((text s) (evaluate-from s path))
                       (else (string-append "error: cannot read " path))))
-            (let (msg (if (string-prefix? out "error:")
-                        (string-append "start failed " (string-append (self) (string-append " " (substring out 0 (if (i32.gt_s (string-len out) 200) 200 (string-len out))))))
-                        (string-append "start ready " (self))))
+            (let (who (if (string-len (global.get $start-token))
+                        (string-append (self) (string-append " " (global.get $start-token)))
+                        (self)))
+              (let (msg (if (string-prefix? out "error:")
+                        (string-append "start failed " (string-append who (string-append " " (substring out 0 (if (i32.gt_s (string-len out) 200) 200 (string-len out))))))
+                        (string-append "start ready " who)))
               (begin
                 (unmarshal (raw-invoke "theater:simple/message-server-host" "send"
                   (str-bytes-tuple (text (global.get $start-report)) (text msg))))
-                "ok"))))))))
+                "ok")))))))))
 
 ; The public evaluation operation, reachable through rpc.call and discoverable
 ; through rpc.describe. Source in, printed value (or "error:" diagnostic) out.
