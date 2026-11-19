@@ -237,6 +237,13 @@ impl Runtime {
         handlers.register(theater_handler_lifecycle::LifecycleHandler::new(
             commands.clone(),
         ));
+        sessions.set_types(
+            handlers
+                .get_handlers()
+                .iter()
+                .map(|handler| handler.name().to_string())
+                .collect(),
+        );
         if let Some(events) = replay {
             handlers.set_replay_chain(events);
         }

@@ -9,5 +9,8 @@ interface wisp-sessions {
 
     exports {
         list-sessions: func() -> list<session-info>
+        // The handler types the daemon gives its actors, sorted: what a spawner must
+        // write a [[handler]] block for, so a child never inherits one unnarrowed.
+        handler-types: func() -> list<string>
     }
 }
