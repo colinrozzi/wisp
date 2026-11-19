@@ -425,6 +425,11 @@ fn short(v: &Value) -> String {
                 format!("{s:?}")
             }
         }
+        // a list<u8> as one buffer (packr Value::Bytes): counted, never shown,
+        // as a List of U8 is, so a payload (a secret on stdin) stays out of
+        // chain-tail
+        Value::Bytes(b) if !b.is_empty() => format!("<{} bytes>", b.len()),
+        Value::Bytes(_) => "[]".into(),
         Value::List { items, .. }
             if items.iter().all(|i| matches!(i, Value::U8(_))) && !items.is_empty() =>
         {
@@ -553,6 +558,10 @@ mod tests {
             value: Ok(Box::new(bytes)),
         };
         assert_eq!(short(&ok), "ok(<300 bytes>)");
+        // the same for a list<u8> held as one buffer: counted, never shown
+        let packed = Value::Bytes(b"secret value".to_vec());
+        assert_eq!(short(&packed), "<12 bytes>");
+        assert_eq!(short(&Value::Bytes(vec![])), "[]");
         let long = Value::String("x".repeat(100));
         assert_eq!(short(&long), format!("{:?}…", "x".repeat(STRING_CHARS)));
         let input = Value::Tuple(vec![Value::String("m.wisp".into()), Value::U64(5)]);

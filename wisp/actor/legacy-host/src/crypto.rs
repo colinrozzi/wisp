@@ -409,16 +409,8 @@ fn result(ok_type: ValueType, value: Result<Value, String>) -> Value {
 }
 
 fn bytes(value: &Value) -> Option<Vec<u8>> {
-    let Value::List { items, .. } = value else {
-        return None;
-    };
-    items
-        .iter()
-        .map(|item| match item {
-            Value::U8(byte) => Some(*byte),
-            _ => None,
-        })
-        .collect()
+    // a list<u8> in either form (a guest's bytes arrive as Value::Bytes)
+    value.as_bytes().map(|b| b.into_owned())
 }
 
 fn name_of(input: &Value) -> Result<&str, String> {
@@ -448,10 +440,8 @@ fn args(input: &Value) -> &[Value] {
 }
 
 fn bytes_result(value: Result<Vec<u8>, String>) -> Value {
-    let list = value.map(|bytes| Value::List {
-        elem_type: ValueType::U8,
-        items: bytes.into_iter().map(Value::U8).collect(),
-    });
+    // one buffer, the same list<u8> on the wire (packr Value::Bytes)
+    let list = value.map(Value::Bytes);
     result(ValueType::List(Box::new(ValueType::U8)), list)
 }
 
