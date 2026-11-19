@@ -1,0 +1,66 @@
+# checks — wisp's checks on our own runner (experiment lib/actions-runner,
+# field/SPEC-actions.md), for when wisp's primary is server3 git: the quick
+# checks GitHub CI runs on a PR (Format, Clippy, Build, each for the root
+# workspace and the theater-repl daemon in wisp/actor/legacy-host), and a few
+# targeted tests chosen by the files a push changes. Never the full suites:
+# GitHub runs those on main, as now.
+#
+# Each step goes through experiment's cargo shim (one shared build lock for
+# the desktop, docs/environment.md). Target directories live in the runner's
+# $ACTIONS_CACHE: branch jobs share one, kept between jobs, so only their first
+# build is cold; a job on main or a tag gets an empty one of its own, so it never
+# builds on what a branch job left there (lux).
+# Its results go out as check.* too, which pr-merge reads (SPEC-pr 3).
+
+on = ["push"]
+runs-on = "desktop"
+memory = "8G"
+timeout = 3600
+job-timeout = 10800
+syntax = false
+
+[[step]]
+name = "format"
+run = 'nix develop -c cargo fmt --all -- --check && nix develop -c cargo fmt --manifest-path wisp/actor/legacy-host/Cargo.toml -- --check'
+
+[[step]]
+name = "clippy"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" clippy --locked --workspace --all-targets --all-features -- -D warnings'
+
+[[step]]
+name = "clippy-daemon"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/daemon-target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" clippy --locked --manifest-path wisp/actor/legacy-host/Cargo.toml --all-targets -- -D warnings'
+
+[[step]]
+name = "build"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" build --locked --workspace --all-targets'
+
+[[step]]
+name = "build-daemon"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/daemon-target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" build --locked --manifest-path wisp/actor/legacy-host/Cargo.toml --all-targets'
+
+# Targeted tests: one test file each, when the code it covers changes.
+[[step]]
+name = "test-crypto"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/daemon-target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" test --locked --manifest-path wisp/actor/legacy-host/Cargo.toml --test crypto'
+paths = ["wisp/actor/legacy-host/src/crypto.rs", "wisp/actor/legacy-host/tests/crypto.rs", "wisp/actor/crypto.pact"]
+
+[[step]]
+name = "test-tokenizer-parser"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" test --locked --test tokenizer --test parser'
+paths = ["src/compiler/tokenizer.rs", "src/compiler/parser.rs", "tests/tokenizer.rs", "tests/parser.rs"]
+
+[[step]]
+name = "test-typecheck"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" test --locked --test linearity --test type_state --test generics --test capabilities'
+paths = ["src/compiler/typecheck.rs", "src/compiler/lower.rs", "tests/linearity.rs", "tests/type_state.rs", "tests/generics.rs", "tests/capabilities.rs"]
+
+[[step]]
+name = "test-codegen"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" test --locked --test codegen --test string_ops --test cgrf'
+paths = ["src/compiler/codegen.rs", "src/compiler/heap.rs", "src/compiler/rc.rs", "tests/codegen.rs", "tests/string_ops.rs", "tests/cgrf.rs"]
+
+[[step]]
+name = "test-eval-repl"
+run = 'CARGO_TARGET_DIR="$ACTIONS_CACHE/target" nix develop -c "$HOME/work/experiment/lib/shims/cargo" test --locked --test eval --test repl'
+paths = ["src/compiler/eval.rs", "src/compiler/repl.rs", "tests/eval.rs", "tests/repl.rs"]

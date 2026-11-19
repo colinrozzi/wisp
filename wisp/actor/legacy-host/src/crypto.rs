@@ -5,6 +5,13 @@
 //! a PKCS#8 PEM, `<name>.x25519` an X25519 secret as hex. Each call reads the
 //! file it needs, so nothing is cached, and no function returns a private key:
 //! sessions name keys.
+//!
+//! Which names an actor may use is its grant: a `[[handler]] type = "wisp-crypto"`
+//! block with `keys = [...]`, each an exact name or a prefix ending in `*`. An
+//! actor started by the host with no block may use every key; a spawned child's
+//! list must be covered by its spawner's (`check_child_config`), and a child with
+//! no block keeps its spawner's grant, so a supervisor writes the block for every
+//! child (`keys = []` for none).
 use aes_gcm::Aes128Gcm;
 use anyhow::Result;
 use base64::Engine;
@@ -26,11 +33,40 @@ use std::path::{Path, PathBuf};
 use theater::handler::{Handler, HandlerContext};
 use theater::pack_bridge::{HostImports, InterfaceImpl, Value, ValueType, host_fn, parse_pact};
 
-/// Where the signing keys live. With no directory the key verbs return an error;
-/// `sha256` and `verify` need none.
+/// Where the signing keys live, and which of them this actor may use. With no
+/// directory the key verbs return an error; `sha256` and `verify` need none.
 #[derive(Clone, Default)]
 pub struct KeyAccess {
     pub dir: Option<PathBuf>,
+    /// The names granted: `None` every key, otherwise exact names and `prefix*`.
+    pub grant: Option<Vec<String>>,
+}
+
+/// A `[[handler]] type = "wisp-crypto"` block: only `keys`, so a child can't
+/// name its own directory.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyGrant {
+    keys: Vec<String>,
+}
+
+/// A grant entry: a key name, or a prefix of one followed by `*` (`*` alone is
+/// every key).
+fn valid_entry(entry: &str) -> bool {
+    match entry.strip_suffix('*') {
+        Some("") => true,
+        Some(prefix) => valid_name(prefix),
+        None => valid_name(entry),
+    }
+}
+
+/// Whether grant entry `held` covers `asked`, an entry or a key name: an exact
+/// name only itself, a prefix every name and prefix that starts with it.
+fn covers(held: &str, asked: &str) -> bool {
+    match held.strip_suffix('*') {
+        Some(prefix) => asked.starts_with(prefix),
+        None => held == asked,
+    }
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -181,6 +217,45 @@ fn x25519_public(secret: &x25519_dalek::StaticSecret) -> String {
 }
 
 impl KeyAccess {
+    /// Whether this actor's grant covers `asked`, a key name or a grant entry.
+    fn allows(&self, asked: &str) -> bool {
+        self.grant
+            .as_ref()
+            .is_none_or(|grant| grant.iter().any(|held| covers(held, asked)))
+    }
+
+    /// An actor's instance: a block's `keys` become its grant. A list this
+    /// instance doesn't cover (only a caller skipping `check_child_config` could
+    /// pass one) or a malformed block grants nothing, never more.
+    fn instance(&self, config: Option<&theater::config::actor_manifest::HandlerConfig>) -> Self {
+        let mut instance = self.clone();
+        if let Some(config) = config {
+            instance.grant = Some(self.child_grant(config).unwrap_or_default());
+        }
+        instance
+    }
+
+    /// A child's `keys`, checked: each entry well formed and covered by this
+    /// (the spawner's) grant. The error names the first entry that isn't.
+    fn child_grant(
+        &self,
+        config: &theater::config::actor_manifest::HandlerConfig,
+    ) -> Result<Vec<String>, String> {
+        let KeyGrant { keys } = config.parse().map_err(|error| format!("{error}"))?;
+        for entry in &keys {
+            if !valid_entry(entry) {
+                return Err(format!(
+                    "keys: bad entry '{entry}': a key name (1-64 of A-Z a-z 0-9 . _ -), \
+                     optionally ending in *"
+                ));
+            }
+            if !self.allows(entry) {
+                return Err(format!("keys: '{entry}' is not in the spawner's keys"));
+            }
+        }
+        Ok(keys)
+    }
+
     fn dir(&self) -> Result<&Path, String> {
         self.dir
             .as_deref()
@@ -193,6 +268,9 @@ impl KeyAccess {
             return Err(format!(
                 "bad key name '{name}': use 1-64 of A-Z a-z 0-9 . _ -"
             ));
+        }
+        if !self.allows(name) {
+            return Err(format!("key '{name}' is not granted to this actor"));
         }
         Ok(dir.join(format!("{name}.{}", kind.suffix())))
     }
@@ -291,7 +369,7 @@ impl KeyAccess {
         Ok(public)
     }
 
-    /// The key names, sorted. A directory not made yet just has no keys.
+    /// The granted key names, sorted. A directory not made yet just has no keys.
     fn list(&self) -> Result<Vec<String>, String> {
         let entries = match fs::read_dir(self.dir()?) {
             Ok(entries) => entries,
@@ -306,6 +384,7 @@ impl KeyAccess {
                 .to_str()
                 .and_then(|f| f.strip_suffix(".key"))
                 && valid_name(name)
+                && self.allows(name)
             {
                 names.push(name.to_string());
             }
@@ -701,9 +780,15 @@ fn define(imports: &mut HostImports, keys: &KeyAccess, name: &str, call: Verb) {
 impl Handler for KeyAccess {
     fn create_instance(
         &self,
-        _: Option<&theater::config::actor_manifest::HandlerConfig>,
+        config: Option<&theater::config::actor_manifest::HandlerConfig>,
     ) -> Box<dyn Handler> {
-        Box::new(self.clone())
+        Box::new(self.instance(config))
+    }
+    fn check_child_config(
+        &self,
+        config: &theater::config::actor_manifest::HandlerConfig,
+    ) -> Result<(), String> {
+        self.child_grant(config).map(|_| ())
     }
     fn name(&self) -> &str {
         "wisp-crypto"
@@ -838,6 +923,180 @@ mod tests {
 
     fn p256_key(text: &str) -> p256::SecretKey {
         p256::SecretKey::from_slice(&b64(text)).unwrap()
+    }
+
+    use theater::config::actor_manifest::HandlerConfig;
+    use theater::handler::HandlerRegistry;
+
+    /// A wisp-crypto block granting `keys`.
+    fn grant(keys: &[&str]) -> HandlerConfig {
+        let mut table = toml::Table::new();
+        table.insert(
+            "keys".into(),
+            keys.iter()
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        HandlerConfig::new("wisp-crypto", table)
+    }
+
+    /// A key directory of its own, removed when dropped.
+    struct KeyDir(PathBuf);
+
+    impl KeyDir {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("wisp-crypto-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for KeyDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A spawn, the way Theater does it: `spawner`'s registry narrowed by the
+    /// child's config, refused or not; then the child's instance.
+    fn spawn(spawner: &KeyAccess, keys: &[&str]) -> Result<KeyAccess, String> {
+        let mut registry = HandlerRegistry::new();
+        registry.register(spawner.clone());
+        registry.narrow_with_configs(&[grant(keys)], None)?;
+        Ok(spawner.instance(Some(&grant(keys))))
+    }
+
+    #[test]
+    fn a_child_never_gets_more_keys_than_its_spawner() {
+        let dir = KeyDir::new("narrow");
+        let host = KeyAccess {
+            dir: Some(dir.0.clone()),
+            grant: None,
+        };
+        for name in ["id.colin", "id.transit", "id.tova", "login"] {
+            host.create(name).unwrap();
+        }
+        // The host's actors keep every key, as before.
+        assert_eq!(
+            host.list().unwrap(),
+            ["id.colin", "id.tova", "id.transit", "login"]
+        );
+
+        // The supervisor, granted id.* by the host; transit, narrowed to its own.
+        let supervisor = spawn(&host, &["id.*"]).unwrap();
+        let transit = spawn(&supervisor, &["id.transit"]).unwrap();
+        assert!(transit.load("id.transit").is_ok());
+        assert_eq!(transit.list().unwrap(), ["id.transit"]);
+        for name in ["id.colin", "login"] {
+            assert_eq!(
+                transit.load(name).err().unwrap(),
+                format!("key '{name}' is not granted to this actor")
+            );
+        }
+        // Every key verb goes through the same check, creating one included.
+        assert!(
+            transit
+                .create("id.new")
+                .err()
+                .unwrap()
+                .contains("not granted")
+        );
+        assert!(
+            transit
+                .load_p256("login")
+                .err()
+                .unwrap()
+                .contains("not granted")
+        );
+        assert!(
+            transit
+                .load_x25519("login")
+                .err()
+                .unwrap()
+                .contains("not granted")
+        );
+        assert!(
+            sign(
+                &transit,
+                &Value::Tuple(vec![
+                    Value::String("id.colin".into()),
+                    Value::List {
+                        elem_type: ValueType::U8,
+                        items: vec![Value::U8(1)]
+                    },
+                ])
+            )
+            .err()
+            .unwrap()
+            .contains("not granted")
+        );
+
+        // Widening is refused at spawn, naming the entry: from the supervisor, and
+        // from transit for its own grandchild.
+        let refused = |spawner: &KeyAccess, keys: &[&str]| spawn(spawner, keys).err().unwrap();
+        assert_eq!(
+            refused(&supervisor, &["id.transit", "login"]),
+            "[[handler]] 'wisp-crypto': keys: 'login' is not in the spawner's keys"
+        );
+        assert!(refused(&supervisor, &["*"]).contains("'*' is not in the spawner's keys"));
+        assert!(refused(&transit, &["id.*"]).contains("'id.*' is not in the spawner's keys"));
+        assert!(refused(&transit, &["id.tova"]).contains("'id.tova' is not in the spawner's keys"));
+
+        // Narrowing works at every level, down to nothing.
+        assert_eq!(
+            spawn(&transit, &["id.transit"]).unwrap().list().unwrap(),
+            ["id.transit"]
+        );
+        let none = spawn(&transit, &[]).unwrap();
+        assert!(none.list().unwrap().is_empty());
+        assert!(
+            none.load("id.transit")
+                .err()
+                .unwrap()
+                .contains("not granted")
+        );
+    }
+
+    #[test]
+    fn a_child_block_names_only_keys() {
+        let host = KeyAccess::default();
+        let mut table = toml::Table::new();
+        table.insert("dir".into(), "/".into());
+        table.insert("keys".into(), toml::Value::Array(Vec::new()));
+        let mut registry = HandlerRegistry::new();
+        registry.register(host.clone());
+        let widened =
+            registry.narrow_with_configs(&[HandlerConfig::new("wisp-crypto", table)], None);
+        assert!(widened.err().unwrap().contains("unknown field `dir`"));
+        assert!(
+            spawn(&host, &["../x"])
+                .err()
+                .unwrap()
+                .contains("bad entry '../x'")
+        );
+        // Even without the check, a block the spawner doesn't cover grants nothing.
+        let unchecked = spawn(&host, &["id.*"])
+            .unwrap()
+            .instance(Some(&grant(&["login"])));
+        assert_eq!(unchecked.grant, Some(Vec::new()));
+    }
+
+    #[test]
+    fn grant_entries_and_cover() {
+        for entry in ["id.transit", "id.*", "*", "push", "a-b_c.d"] {
+            assert!(valid_entry(entry), "{entry}");
+        }
+        for entry in ["", "**", "id*x", "../x", "id.t*a*", "a b"] {
+            assert!(!valid_entry(entry), "{entry}");
+        }
+        assert!(covers("id.*", "id.transit") && covers("id.*", "id.t*") && covers("*", "login"));
+        assert!(
+            !covers("id.*", "login")
+                && !covers("id.transit", "id.*")
+                && !covers("id.t", "id.transit")
+        );
     }
 
     // RFC 8291 section 5 and appendix A.

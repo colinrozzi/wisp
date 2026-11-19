@@ -75,6 +75,8 @@
         ((boolean b) (finish-hash (mix-hash (hash-start 9) b)))
         ((sequence items) (hash-items items 0 (hash-start 10) d))
         ((typed-list element items) (hash-items items 0 (hash-start 11) d))
+        ; packed bytes hash as the (list u8) they stand for, so the two are one key
+        ((bytes b) (hash-items (bytes-items b) 0 (hash-start 11) d))
         ((compound ty case-name fields) (hash-items fields 0 (hash-bytes case-name 0 (hash-start 12)) d))
         ((aggregate name id case-name fields)
           (hash-items fields 0 (hash-bytes case-name 0 (mix-hash (hash-start 13) id)) d))
@@ -117,6 +119,14 @@
           (value-case b
             ((typed-list other-element other)
               (if (same-type? element other-element) (items-equal items other 0 d) 0))
+            ((bytes other) (if (string=? (symbol-name element) "u8") (items-equal items (bytes-items other) 0 d) 0))
+            (else 0)))
+        ; packed bytes equal the same bytes packed or as a (list u8)
+        ((bytes s)
+          (value-case b
+            ((bytes t) (string=? s t))
+            ((typed-list other-element other)
+              (if (string=? (symbol-name other-element) "u8") (items-equal (bytes-items s) other 0 d) 0))
             (else 0)))
         ((compound ty case-name fields)
           (value-case b
@@ -365,6 +375,7 @@
       (value-case (list-get args 0)
         ((sequence items) (vector-value (copy-values items 0 (list-new value))))
         ((typed-list element items) (vector-value (copy-values items 0 (list-new value))))
+        ((bytes b) (vector-value (bytes-items b)))
         (else (failure "list->vector expects a list"))))
   (if (i32.eq (list-len args) 0) (failure (string-append name " expects a container first"))
     (if (string-prefix? name "vector")

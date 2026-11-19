@@ -488,6 +488,7 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
         http,
         keys: wisp_interpreter_actor::crypto::KeyAccess {
             dir: config.keys.as_ref().map(|keys| keys.dir.clone()),
+            grant: None,
         },
         tcp: theater_handler_tcp::TcpHandlerConfig {
             server_tls: config

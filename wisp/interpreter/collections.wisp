@@ -43,6 +43,7 @@
     ((text s) (symbol "string"))
     ((aggregate name id case-name fields) (symbol name))
     ((typed-list element items) (unary-type "list" element))
+    ((bytes b) (unary-type "list" (symbol "u8")))
     ((typed-function params result body) (callable-type v))
     ((checked-function target params result) (callable-type v))
     ((compound ty case-name fields) ty)
@@ -106,6 +107,7 @@
       (if (i32.and (string=? name "list-push") (i32.eq index 1))
         (value-case (list-get args 0)
           ((typed-list element items) (symbol-name element))
+          ((bytes b) "u8")
           (else ""))
         (argument-type callee index)))
     (else (argument-type callee index))))
@@ -122,6 +124,18 @@
               (let (checked (list-element (list-get args 1) element))
                 (if (failed? checked) checked (typed-list element (list-push items checked))))
               (list-index items (list-get args 1)))))
+        ; Packed bytes: list-len and list-get read the buffer; list-push unpacks
+        ; to a typed list first (a push copies the list either way).
+        ((bytes b)
+          (if (string=? name "list-len") (integer (bytes-len b))
+            (if (string=? name "list-push")
+              (let (checked (list-element (list-get args 1) (symbol "u8")))
+                (if (failed? checked) checked (typed-list (symbol "u8") (list-push (bytes-items b) checked))))
+              (value-case (list-get args 1)
+                ((integer index)
+                  (if (i32.and (i32.ge_s index 0) (i32.lt_s index (bytes-len b)))
+                    (bytes-ref b index) (failure "list index out of bounds")))
+                (else (failure "list index must be s32"))))))
         ; An untyped list from (list ...) or a quote has no element type to check.
         ; list-push leaves the original (maybe a quoted literal) unchanged.
         ((sequence items)

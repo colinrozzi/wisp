@@ -84,6 +84,40 @@
 
         packages.wisp = self.packages.${system}.default;
 
+        # The released theater-repl: a static musl binary, built from the
+        # pinned flake.lock and Cargo.lock so that any builder (the desktop's
+        # runner, GitHub's Actions) makes the same bytes, and a release can be
+        # checked by comparing sha256s (experiment field/SPEC-release.md).
+        # The version stamp comes from THEATER_REPL_VERSION, the release tag:
+        #   THEATER_REPL_VERSION=v0.1.N nix build --impure .#theater-repl-static
+        packages.theater-repl-static = let
+          version = let v = builtins.getEnv "THEATER_REPL_VERSION"; in if v == "" then "v0.0.0-dev" else v;
+          spkgs = pkgs.pkgsStatic;
+        in spkgs.rustPlatform.buildRustPackage {
+          pname = "theater-repl";
+          inherit version;
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = path: type:
+              pkgs.lib.cleanSourceFilter path type
+              && !(builtins.elem (builtins.baseNameOf path)
+                [ "target" "compiled" ".direnv" ".jj" "result" ]);
+          };
+          buildAndTestSubdir = "wisp/actor/legacy-host";
+          cargoRoot = "wisp/actor/legacy-host";
+          cargoLock = {
+            lockFile = ./wisp/actor/legacy-host/Cargo.lock;
+            allowBuiltinFetchGit = true;
+          };
+          nativeBuildInputs = with pkgs; [ cmake perl pkg-config ];
+          THEATER_REPL_VERSION = version;
+          doCheck = false;
+          postInstall = ''
+            mv $out/bin/theater-repl $out/bin/theater-repl-linux-x86_64
+          '';
+          meta.mainProgram = "theater-repl-linux-x86_64";
+        };
+
         packages.theater = theater.packages.${system}.theater;
 
         apps.theater = {
