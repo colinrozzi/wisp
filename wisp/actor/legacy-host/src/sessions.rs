@@ -13,7 +13,7 @@
 use crate::{Interpreter, deaths::Dead, interpreters, short_id};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use theater::TheaterId;
 use theater::handler::{Handler, HandlerContext};
@@ -42,6 +42,8 @@ pub struct Sessions {
     notes: Arc<Mutex<HashMap<TheaterId, Note>>>,
     /// Whether this actor may read the directory.
     list: bool,
+    /// The daemon's handler types, set once every handler is registered.
+    types: Arc<OnceLock<Vec<String>>>,
 }
 
 /// A `[[handler]] type = "wisp-sessions"` block: only `list`.
@@ -58,7 +60,15 @@ impl Sessions {
             dead,
             notes: Arc::default(),
             list: true,
+            types: Arc::default(),
         }
+    }
+
+    /// Record the daemon's handler types (every clone sees them). The first call wins.
+    pub fn set_types(&self, mut names: Vec<String>) {
+        names.sort();
+        names.dedup();
+        let _ = self.types.set(names);
     }
 
     /// An actor's instance: a block's `list`, never more than this instance's.
@@ -191,6 +201,26 @@ impl Handler for Sessions {
                         .to_value()
                         .await
                         .map_err(|error| HostError(format!("{error:#}")))
+                }
+            }),
+        );
+        let types = self.types.clone();
+        imports.define(
+            "wisp-sessions",
+            "handler-types",
+            host_fn(move |_input| {
+                let types = types.clone();
+                async move {
+                    Ok(Value::List {
+                        elem_type: ValueType::String,
+                        items: types
+                            .get()
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                            .map(Value::String)
+                            .collect(),
+                    })
                 }
             }),
         );

@@ -260,6 +260,7 @@
 ; takes), and age in seconds (0 if the daemon did not spawn it).
 (record session-info (id string) (name string) (actor string) (age-secs u64))
 (import wisp-sessions list-sessions () (list session-info))
+(import wisp-sessions handler-types () (list string))
 
 ; wisp-chain: the theater-repl daemon's chain recorder (chain.pact). It keeps the
 ; newest 256 events of each actor it watches, as hashes, types and payload sizes
@@ -470,6 +471,7 @@
     ((string=? name "shutdown-runtime") 1)
     ((string=? name "spawn-actor") 1)
     ((string=? name "sessions") 1)
+    ((string=? name "handler-types") 1)
     ((string=? name "chain-watch") 1)
     ((string=? name "chain-unwatch") 1)
     ((string=? name "chain-head") 1)
@@ -820,6 +822,13 @@
 (fn apply-sessions ((args (list value))) value
   (if (i32.ne (list-len args) 0) (failure "sessions expects no arguments")
     (unmarshal (raw-invoke "wisp-sessions" "list-sessions" (arg-tuple (list-new value))))))
+
+; (handler-types) -> ("filesystem" "process" ...), the handler types the daemon gives
+; its actors, sorted. A spawner writes a [[handler]] block for each one, since a child
+; with no block gets the spawner's own grant (0156). Can't fail.
+(fn apply-handler-types ((args (list value))) value
+  (if (i32.ne (list-len args) 0) (failure "handler-types expects no arguments")
+    (unmarshal (raw-invoke "wisp-sessions" "handler-types" (arg-tuple (list-new value))))))
 
 ; --- crypto (wisp-crypto) ----------------------------------------------------
 ; (sha256 x) -> 64 hex chars, x a string or bytes. (key-new name) / (key-public name)
@@ -1939,7 +1948,7 @@
     (text (string-append "Wisp REPL — a live session that drives and observes Theater.\nDefinitions accumulate: (define x ...) / (define f (lambda ...)) persist.\n\n"
       (string-append "self/rpc:  (self) (log msg) (describe id) (exports id) (implements id iface) (call id fn arg...)\n"
         (string-append "store:     (store-new) (store-put id text) (store-get id ref) (store-label id lbl ref)\n           (store-get-by-label id lbl) (store-list-labels id) (store-exists id ref) (store-size id) (store-put-at id lbl text)\n"
-          (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n"
+          (string-append "runtime:   (spawn-actor manifest-path [wasm-bytes]) -> actor-id   (list-actors) (actor-status id) (actor-state id) (actor-manifest id)\n           (stop-actor id) (kill-actor id) (subscribe-spawns) (unsubscribe-spawns) (shutdown-runtime)\nsessions:  (sessions) -> typed list of (session-info id name actor age-secs), one per REPL session;\n           actor is the address msg-send takes. Read one: (match (list-get (sessions) 0) ((session-info id name actor age) actor))\n           (handler-types) -> the daemon's handler types, sorted: a spawner writes a [[handler]] block for each\n"
             (string-append "messaging: (msg-register) (msg-send id text) (msg-request id text) (msg-list-requests)\n           (msg-respond req text) (msg-cancel req) (msg-open id text) (msg-send-channel cid text) (msg-close-channel cid)\n"
               (string-append "files:     (fs-read p) -> (ok bytes)   (fs-read-text p) -> (ok \"text\")   (fs-write p text) (fs-exists p) (fs-list p) (fs-meta p) (fs-append p text) (fs-delete p) (fs-mkdir p) (fs-rmdir p)\n           durable: (fs-write-durable p text) replaces p all-or-nothing, on disk when it returns   (fs-sync p) (fs-sync-dir p) (fs-rename from to)\n"
                 (string-append "http:      (http-get url) (http-req method url [headers [body]])  headers=((name value)...) body=string|bytes\n           -> (ok (http-response status headers body)); hosts are allowed by config.toml [http] allowed_hosts\nassembler: (wat-to-wasm wat-text)\ncrypto:    (sha256 string-or-bytes) -> 64 hex chars   (verify public-key-hex sig-hex text) -> true/false\n           (key-new name) (key-public name) -> (ok public-key-hex)   (key-list) -> (ok names)   (sign name text) -> (ok sig-hex); keys stay in the daemon, config.toml [keys] dir\n           (p256-key-new name) (p256-public name) -> (ok public-key-base64url)   (vapid-header name audience subject) -> (ok \"vapid t=..., k=...\")\n           (webpush-encrypt p256dh auth payload) -> (ok bytes)   RFC 8291 aes128gcm, for (http-req \"POST\" endpoint headers bytes)\n           (x25519-key-new name) (x25519-public name) -> (ok public-key-hex)   (seal public-key-hex text) -> (ok bytes)   (open name sealed) -> (ok bytes)\n           (scrypt-hash password) -> (ok \"scrypt$N$r$p$salt$hash\")   (scrypt-check password line) -> true/false\n           (random-bytes n) -> (ok bytes), n 1-1024   (hmac-sha1 key data) (hmac-sha256 key data) -> lowercase hex\n"
@@ -1992,6 +2001,7 @@
     ((string=? name "shutdown-runtime") (apply-runtime-shutdown args))
     ((string=? name "spawn-actor") (apply-spawn-actor args))
     ((string=? name "sessions") (apply-sessions args))
+    ((string=? name "handler-types") (apply-handler-types args))
     ((string=? name "sha256") (apply-sha256 args))
     ((string=? name "key-new") (apply-key-new args))
     ((string=? name "key-public") (apply-key-public args))
