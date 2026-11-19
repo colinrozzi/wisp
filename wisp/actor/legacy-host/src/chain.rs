@@ -117,6 +117,9 @@ pub struct ChainRecorder {
     table: Arc<Mutex<Table>>,
     /// Every watched chain sends here; the drain task receives.
     events: mpsc::Sender<(TheaterId, ChainEvent)>,
+    /// Whether this actor may use the verbs: `[[handler]] type = "wisp-chain"`
+    /// with `chain = false` refuses them all, since each names any actor (0156).
+    granted: bool,
 }
 
 impl ChainRecorder {
@@ -144,7 +147,16 @@ impl ChainRecorder {
             commands,
             table,
             events,
+            granted: true,
         }
+    }
+
+    /// This recorder as an actor with `chain` granted or not (for tests).
+    #[cfg(test)]
+    pub(crate) fn instance_for_test(&self, granted: bool) -> Box<Self> {
+        let mut instance = self.clone();
+        instance.granted = granted;
+        Box::new(instance)
     }
 
     fn table(&self) -> std::sync::MutexGuard<'_, Table> {
@@ -302,6 +314,16 @@ fn tail_value(r: &Recording, n: usize) -> Value {
     }
 }
 
+/// The actor a call names, if this actor is granted the verbs at all.
+fn granted_actor(granted: bool, input: &Value) -> Result<TheaterId, Value> {
+    if !granted {
+        return Err(Value::String(
+            "wisp-chain is not granted to this actor".into(),
+        ));
+    }
+    actor_arg(input)
+}
+
 /// A single-string call arrives bare or as a one-element tuple.
 fn actor_arg(input: &Value) -> Result<TheaterId, Value> {
     let text = match input {
@@ -332,9 +354,17 @@ fn n_arg(input: &Value) -> Result<usize, Value> {
 impl Handler for ChainRecorder {
     fn create_instance(
         &self,
-        _: Option<&theater::config::actor_manifest::HandlerConfig>,
+        config: Option<&theater::config::actor_manifest::HandlerConfig>,
     ) -> Box<dyn Handler> {
-        Box::new(self.clone())
+        let mut instance = self.clone();
+        instance.granted = crate::gate::instance("chain", self.granted, config);
+        Box::new(instance)
+    }
+    fn check_child_config(
+        &self,
+        config: &theater::config::actor_manifest::HandlerConfig,
+    ) -> Result<(), String> {
+        crate::gate::child("chain", self.granted, config).map(|_| ())
     }
     fn name(&self) -> &str {
         "wisp-chain"
@@ -362,6 +392,7 @@ impl Handler for ChainRecorder {
             return Ok(());
         }
         let unit = || Value::Tuple(vec![]);
+        let granted = self.granted;
         let recorder = self.clone();
         imports.define(
             "wisp-chain",
@@ -369,7 +400,7 @@ impl Handler for ChainRecorder {
             pact_result_host_fn(move |input| {
                 let recorder = recorder.clone();
                 async move {
-                    let id = actor_arg(&input)?;
+                    let id = granted_actor(granted, &input)?;
                     recorder.watch(id).await.map_err(Value::String)?;
                     Ok(unit())
                 }
@@ -380,7 +411,7 @@ impl Handler for ChainRecorder {
             "wisp-chain",
             "unwatch",
             pact_result_host_fn(move |input| {
-                let result = actor_arg(&input)
+                let result = granted_actor(granted, &input)
                     .and_then(|id| recorder.unwatch(id).map_err(Value::String))
                     .map(|_| unit());
                 async move { result }
@@ -391,7 +422,7 @@ impl Handler for ChainRecorder {
             "wisp-chain",
             "head",
             pact_result_host_fn(move |input| {
-                let result = actor_arg(&input)
+                let result = granted_actor(granted, &input)
                     .and_then(|id| recorder.with(id, head_value).map_err(Value::String));
                 async move { result }
             }),
@@ -401,7 +432,7 @@ impl Handler for ChainRecorder {
             "wisp-chain",
             "tail",
             pact_result_host_fn(move |input| {
-                let result = actor_arg(&input).and_then(|id| {
+                let result = granted_actor(granted, &input).and_then(|id| {
                     let n = n_arg(&input)?;
                     recorder
                         .with(id, |r| tail_value(r, n))
@@ -415,7 +446,7 @@ impl Handler for ChainRecorder {
             "wisp-chain",
             "verify",
             pact_result_host_fn(move |input| {
-                let result = actor_arg(&input)
+                let result = granted_actor(granted, &input)
                     .and_then(|id| recorder.with(id, check_value).map_err(Value::String));
                 async move { result }
             }),

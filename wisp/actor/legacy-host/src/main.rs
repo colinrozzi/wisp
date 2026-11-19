@@ -348,6 +348,7 @@ struct ReplConfig {
     keys: Option<KeysConfig>,
     tcp: Option<TcpConfig>,
     inspect: Option<InspectConfig>,
+    podman: Option<PodmanConfig>,
     #[serde(rename = "service")]
     services: Vec<boot::ServiceConfig>,
 }
@@ -392,6 +393,12 @@ struct KeysConfig {
 /// `[inspect]`: a second port, on 127.0.0.1 only, that answers just the ops
 /// that report ([`READ_ONLY_OPS`]): for a page that shows the daemon, so it
 /// needn't hold the control port, which also evaluates, stops and shuts down.
+/// `[podman]`, empty: actors may run containers. No section: podman's verbs
+/// refuse, since a container can mount any path the daemon's user reads (0156).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PodmanConfig {}
+
 /// No section: no such port.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -512,6 +519,7 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
             }),
             ..Default::default()
         },
+        podman: config.podman.is_some(),
     };
     Runtime::new(SourceBundle::new(sources)?, grants).await
 }
