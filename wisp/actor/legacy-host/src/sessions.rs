@@ -6,6 +6,10 @@
 //! What the runtime does not know, when an actor started and which manifest the
 //! daemon loaded it from, the daemon notes here for the actors it spawns. Notes
 //! are for display only; finding a session never reads them.
+//!
+//! Listing is a grant: `[[handler]] type = "wisp-sessions"` with `list = false`
+//! gives an actor an empty directory, and a spawned child can't turn it back on
+//! (`check_child_config`). Actors the host starts list everything, as before.
 use crate::{Interpreter, deaths::Dead, interpreters, short_id};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -36,6 +40,15 @@ pub struct Sessions {
     commands: UnboundedSender<TheaterCommand>,
     dead: Dead,
     notes: Arc<Mutex<HashMap<TheaterId, Note>>>,
+    /// Whether this actor may read the directory.
+    list: bool,
+}
+
+/// A `[[handler]] type = "wisp-sessions"` block: only `list`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionsGrant {
+    list: bool,
 }
 
 impl Sessions {
@@ -44,7 +57,22 @@ impl Sessions {
             commands,
             dead,
             notes: Arc::default(),
+            list: true,
         }
+    }
+
+    /// An actor's instance: a block's `list`, never more than this instance's.
+    /// A malformed block (only a caller skipping `check_child_config` could pass
+    /// one) lists nothing.
+    fn instance(&self, config: Option<&theater::config::actor_manifest::HandlerConfig>) -> Self {
+        let mut instance = self.clone();
+        if let Some(config) = config {
+            instance.list = self.list
+                && config
+                    .parse::<SessionsGrant>()
+                    .is_ok_and(|grant| grant.list);
+        }
+        instance
     }
 
     fn notes(&self) -> std::sync::MutexGuard<'_, HashMap<TheaterId, Note>> {
@@ -74,7 +102,11 @@ impl Sessions {
     /// The directory as `list<session-info>`, in id order. `age-secs` is 0 for a
     /// session the daemon did not spawn (the runtime does not record start times).
     async fn to_value(&self) -> Result<Value> {
-        let found = self.list().await?;
+        let found = if self.list {
+            self.list().await?
+        } else {
+            Vec::new()
+        };
         let items = found
             .iter()
             .map(|interpreter| Value::Record {
@@ -109,9 +141,19 @@ impl Sessions {
 impl Handler for Sessions {
     fn create_instance(
         &self,
-        _: Option<&theater::config::actor_manifest::HandlerConfig>,
+        config: Option<&theater::config::actor_manifest::HandlerConfig>,
     ) -> Box<dyn Handler> {
-        Box::new(self.clone())
+        Box::new(self.instance(config))
+    }
+    fn check_child_config(
+        &self,
+        config: &theater::config::actor_manifest::HandlerConfig,
+    ) -> Result<(), String> {
+        let grant: SessionsGrant = config.parse().map_err(|error| format!("{error}"))?;
+        if grant.list && !self.list {
+            return Err("list = true is not allowed: the spawner can't list sessions".into());
+        }
+        Ok(())
     }
     fn name(&self) -> &str {
         "wisp-sessions"
@@ -154,5 +196,65 @@ impl Handler for Sessions {
         );
         ctx.mark_satisfied("wisp-sessions");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use theater::config::actor_manifest::HandlerConfig;
+    use theater::handler::HandlerRegistry;
+
+    fn block(fields: &[(&str, toml::Value)]) -> HandlerConfig {
+        let table: toml::Table = fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        HandlerConfig::new("wisp-sessions", table)
+    }
+
+    /// A spawn, the way Theater does it: refused, or the child's instance.
+    fn spawn(spawner: &Sessions, config: &HandlerConfig) -> Result<Sessions, String> {
+        let mut registry = HandlerRegistry::new();
+        registry.register(spawner.clone());
+        registry.narrow_with_configs(std::slice::from_ref(config), None)?;
+        Ok(spawner.instance(Some(config)))
+    }
+
+    #[tokio::test]
+    async fn a_child_lists_sessions_only_if_granted_and_never_more_than_its_spawner() {
+        let (commands, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = Sessions::new(commands, Dead::default());
+        assert!(host.list);
+        // The supervisor may list; a service is given list = false.
+        let supervisor = spawn(&host, &block(&[("list", true.into())])).unwrap();
+        let service = spawn(&supervisor, &block(&[("list", false.into())])).unwrap();
+        assert!(supervisor.list && !service.list);
+        // Its directory is empty without asking the runtime (the channel is gone).
+        match service.to_value().await.unwrap() {
+            Value::List { items, .. } => assert!(items.is_empty()),
+            other => panic!("not a list: {other:?}"),
+        }
+        // A grandchild can't turn it back on, and only `list` may be named.
+        let refused = spawn(&service, &block(&[("list", true.into())]))
+            .err()
+            .unwrap();
+        assert_eq!(
+            refused,
+            "[[handler]] 'wisp-sessions': list = true is not allowed: the spawner can't list sessions"
+        );
+        assert!(spawn(&service, &block(&[("list", false.into())])).is_ok());
+        let unknown = spawn(
+            &host,
+            &block(&[("list", true.into()), ("all", true.into())]),
+        );
+        assert!(unknown.err().unwrap().contains("unknown field `all`"));
+        // Even without the check, a block never gives more than its spawner had.
+        assert!(
+            !service
+                .instance(Some(&block(&[("list", true.into())])))
+                .list
+        );
+        assert!(!host.instance(Some(&block(&[("lst", true.into())]))).list);
     }
 }
