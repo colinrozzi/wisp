@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use theater::TheaterId;
@@ -59,6 +60,13 @@ pub struct ServiceConfig {
     /// The Wisp file evaluated in each fresh session, relative to the
     /// filesystem root. Read again at every start, so edits take effect.
     pub start: PathBuf,
+    /// A manifest to start this service's session from, instead of the daemon's
+    /// default actor: an absolute path, its `package` resolved beside it, read
+    /// again at every start like the start file. For a service whose handlers
+    /// need config the default doesn't give, such as the root supervisor's
+    /// store `base_path`, which its children's must lie inside (0156).
+    #[serde(default)]
+    pub manifest: Option<PathBuf>,
     #[serde(default)]
     pub restart: Restart,
     /// At most this many restarts within `period_secs`; one more death and the
@@ -75,6 +83,64 @@ fn default_max_restarts() -> u32 {
 
 fn default_period_secs() -> u64 {
     60
+}
+
+/// Whether the daemon's own user can write config.toml, set once when the config
+/// loads. A service's manifest may be no easier to write than the config that
+/// names it (lux, 0156): where config.toml is the daemon's own (the desktop,
+/// where any agent can already edit [[service]]), a manifest the daemon owns
+/// adds nothing; where it is root's (server3's /etc/theater-repl), the
+/// manifest must be too.
+static CONFIG_WRITABLE: OnceLock<bool> = OnceLock::new();
+
+/// Record whether the daemon's user can write the config file (load_config).
+pub fn note_config(path: &Path) {
+    let _ = CONFIG_WRITABLE.set(writable_by_daemon(path).unwrap_or(true));
+}
+
+/// The daemon's effective uid: /proc/self belongs to it (Linux). None elsewhere,
+/// and then only the mode is checked.
+fn daemon_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+/// Whether the daemon's user can write `path`: group- or world-writable, or its own.
+fn writable_by_daemon(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok(meta.mode() & 0o022 != 0 || Some(meta.uid()) == daemon_uid())
+}
+
+/// Refuse a service manifest, its directory or the package it names, that is
+/// easier to write than config.toml: group- or world-writable anywhere, or the
+/// daemon's own where config.toml isn't. Daemon code that could rewrite it
+/// could give the service, and everything it spawns, wider rights at its next
+/// start (lux, 0156).
+fn check_manifest(manifest: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let text = std::fs::read_to_string(manifest)
+        .with_context(|| format!("reading manifest {}", manifest.display()))?;
+    let parsed = theater::ManifestConfig::from_toml_str(&text)
+        .with_context(|| format!("parsing manifest {}", manifest.display()))?;
+    let dir = manifest.parent().unwrap_or(Path::new("/"));
+    let package = dir.join(&parsed.package);
+    let config_writable = *CONFIG_WRITABLE.get().unwrap_or(&false);
+    for path in [manifest, dir, package.as_path()] {
+        let meta =
+            std::fs::metadata(path).with_context(|| format!("checking {}", path.display()))?;
+        anyhow::ensure!(
+            meta.mode() & 0o022 == 0,
+            "{} is group- or world-writable, so the daemon could change what this service may do",
+            path.display()
+        );
+        anyhow::ensure!(
+            config_writable || Some(meta.uid()) != daemon_uid(),
+            "{} belongs to the daemon's user, but config.toml doesn't: keep it with config.toml (root's)",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Check a boot list against the filesystem root its start files live under.
@@ -101,6 +167,13 @@ pub fn validate(services: &[ServiceConfig], root: Option<&Path>) -> Result<()> {
             "service {name}: start {} must be a path under the filesystem root",
             service.start.display()
         );
+        if let Some(manifest) = &service.manifest {
+            anyhow::ensure!(
+                manifest.is_absolute(),
+                "service {name}: manifest {} must be an absolute path",
+                manifest.display()
+            );
+        }
     }
     Ok(())
 }
@@ -478,7 +551,10 @@ async fn try_launch(
     name: &str,
     generation: u64,
 ) -> Result<Option<TheaterId>> {
-    let Some(start) = daemon.services.with(name, |s| s.spec.start.clone()) else {
+    let Some((start, manifest)) = daemon
+        .services
+        .with(name, |s| (s.spec.start.clone(), s.spec.manifest.clone()))
+    else {
         return Ok(None);
     };
     // The dead session leaves the runtime's list a little after its death.
@@ -505,7 +581,13 @@ async fn try_launch(
     if !current(daemon, name, generation) {
         return Ok(None);
     }
-    let actor = daemon.default.lock().await.clone();
+    let actor = match &manifest {
+        Some(path) => {
+            check_manifest(path)?;
+            crate::ActorSource::from_manifest(path)?
+        }
+        None => daemon.default.lock().await.clone(),
+    };
     let session = daemon
         .runtime
         .spawn_named((*actor.wasm).clone(), actor.manifest.clone(), name.into())
@@ -578,6 +660,7 @@ mod tests {
         ServiceConfig {
             name: "web".into(),
             start: "serve.wisp".into(),
+            manifest: None,
             restart,
             max_restarts,
             period_secs,

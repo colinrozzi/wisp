@@ -458,6 +458,7 @@ fn load_config(explicit: &Option<PathBuf>) -> Result<ReplConfig> {
     }
     boot::validate(&config.services, config.filesystem.root.as_deref())
         .with_context(|| format!("in config {}", path.display()))?;
+    boot::note_config(&path);
     Ok(config)
 }
 

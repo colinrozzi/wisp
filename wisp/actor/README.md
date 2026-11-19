@@ -220,6 +220,8 @@ dir = "/var/lib/theater-repl/keys"
 [[service]]
 name = "web"                 # the session's name
 start = "serve.wisp"         # evaluated in each fresh session; relative to root
+# manifest = "/abs/super.toml"  # optional: start from this manifest (package beside it),
+                               #   not the default actor; read again at every start
 # Optional, with their defaults:
 restart = "permanent"        # permanent | transient | temporary
 max_restarts = 5             # more restarts than this within period_secs,
