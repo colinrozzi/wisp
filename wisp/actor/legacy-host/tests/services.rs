@@ -305,3 +305,46 @@ fn a_manifest_the_daemon_could_rewrite_is_refused() {
     let last = row[4..].join(" ");
     assert!(last.contains("world-writable"), "{last}");
 }
+
+/// A service with `roster = PATH` gets that file's lines as `service-roster`,
+/// a vector of strings defined before its start file runs, with quotes,
+/// backslashes and tabs intact (0156: the supervisor's roster, checked by the
+/// daemon like a manifest instead of read from the fs root). A world-writable
+/// roster fails the start, and says why.
+#[test]
+fn a_service_gets_its_roster_before_its_start_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/services-test")
+        .join(format!("{}-roster-file", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let roster = dir.join("roster");
+    std::fs::write(&roster, "service web\nsays \"hi\" \\ there\tok\n").unwrap();
+    let loose = dir.join("loose");
+    std::fs::write(&loose, "service web\n").unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    // the start file uses the roster, so it must exist by then
+    let start = "(define lines (vector-length service-roster))\n";
+    let daemon = Daemon::start(
+        "roster",
+        &[("svc/start.wisp", start)],
+        &format!(
+            "[[service]]\nname = \"rostered\"\nstart = \"svc/start.wisp\"\nroster = {:?}\n\n\
+             [[service]]\nname = \"loose\"\nstart = \"svc/start.wisp\"\nroster = {:?}\n",
+            roster.display().to_string(),
+            loose.display().to_string()
+        ),
+    );
+    daemon.until("rostered", "ran", |row| row[1] == "running");
+    assert_eq!(daemon.ok(&["eval", "rostered", "lines"]), "2");
+    assert_eq!(
+        daemon.ok(&["eval", "rostered", "(vector-ref service-roster 1)"]),
+        "says \"hi\" \\ there\tok"
+    );
+    let row = daemon.until("loose", "was refused", |row| {
+        row[1] != "starting" && row.len() > 4
+    });
+    assert_ne!(row[1], "running", "{row:?}");
+    assert!(row[4..].join(" ").contains("world-writable"), "{row:?}");
+}

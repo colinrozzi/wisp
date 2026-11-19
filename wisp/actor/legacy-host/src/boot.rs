@@ -67,6 +67,14 @@ pub struct ServiceConfig {
     /// store `base_path`, which its children's must lie inside (0156).
     #[serde(default)]
     pub manifest: Option<PathBuf>,
+    /// A file whose lines the session gets as `service-roster`, a vector of
+    /// strings defined before the start file runs: an absolute path, it and its
+    /// directory checked like `manifest` at every start. For the root
+    /// supervisor's roster (0156), the ceiling for every child's grants, so the
+    /// supervisor reads it only from what the daemon checked, never from its own
+    /// fs root (lux, tova).
+    #[serde(default)]
+    pub roster: Option<PathBuf>,
     #[serde(default)]
     pub restart: Restart,
     /// At most this many restarts within `period_secs`; one more death and the
@@ -118,29 +126,78 @@ fn writable_by_daemon(path: &Path) -> std::io::Result<bool> {
 /// could give the service, and everything it spawns, wider rights at its next
 /// start (lux, 0156).
 fn check_manifest(manifest: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
     let text = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading manifest {}", manifest.display()))?;
     let parsed = theater::ManifestConfig::from_toml_str(&text)
         .with_context(|| format!("parsing manifest {}", manifest.display()))?;
     let dir = manifest.parent().unwrap_or(Path::new("/"));
     let package = dir.join(&parsed.package);
-    let config_writable = *CONFIG_WRITABLE.get().unwrap_or(&false);
     for path in [manifest, dir, package.as_path()] {
-        let meta =
-            std::fs::metadata(path).with_context(|| format!("checking {}", path.display()))?;
-        anyhow::ensure!(
-            meta.mode() & 0o022 == 0,
-            "{} is group- or world-writable, so the daemon could change what this service may do",
-            path.display()
-        );
-        anyhow::ensure!(
-            config_writable || Some(meta.uid()) != daemon_uid(),
-            "{} belongs to the daemon's user, but config.toml doesn't: keep it with config.toml (root's)",
-            path.display()
-        );
+        check_protected(path)?;
     }
     Ok(())
+}
+
+/// One path that must be no easier to write than config.toml: never group- or
+/// world-writable, and not the daemon's own where config.toml isn't.
+fn check_protected(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let config_writable = *CONFIG_WRITABLE.get().unwrap_or(&false);
+    let meta = std::fs::metadata(path).with_context(|| format!("checking {}", path.display()))?;
+    anyhow::ensure!(
+        meta.mode() & 0o022 == 0,
+        "{} is group- or world-writable, so the daemon could change what this service may do",
+        path.display()
+    );
+    anyhow::ensure!(
+        config_writable || Some(meta.uid()) != daemon_uid(),
+        "{} belongs to the daemon's user, but config.toml doesn't: keep it with config.toml (root's)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// A roster's lines, each as a Wisp string literal, after checking the file and
+/// its directory like a manifest. At most 64 KiB, and 1 KiB a line, since each
+/// line is one evaluation, under the interpreter's 4 KiB input limit. A control
+/// character other than tab is refused; quotes, backslashes and tabs are escaped.
+fn read_roster(path: &Path) -> Result<Vec<String>> {
+    check_protected(path)?;
+    check_protected(path.parent().unwrap_or(Path::new("/")))?;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading roster {}", path.display()))?;
+    anyhow::ensure!(
+        text.len() <= 64 * 1024,
+        "roster {} is over 64 KiB",
+        path.display()
+    );
+    let mut lines = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        anyhow::ensure!(
+            line.len() <= 1024,
+            "roster {} line {} is over 1 KiB",
+            path.display(),
+            i + 1
+        );
+        let mut literal = String::with_capacity(line.len() + 2);
+        literal.push('"');
+        for c in line.chars() {
+            match c {
+                '"' => literal.push_str("\\\""),
+                '\\' => literal.push_str("\\\\"),
+                '\t' => literal.push_str("\\t"),
+                c if c.is_control() => anyhow::bail!(
+                    "roster {} line {} has a control character",
+                    path.display(),
+                    i + 1
+                ),
+                c => literal.push(c),
+            }
+        }
+        literal.push('"');
+        lines.push(literal);
+    }
+    Ok(lines)
 }
 
 /// Check a boot list against the filesystem root its start files live under.
@@ -167,12 +224,14 @@ pub fn validate(services: &[ServiceConfig], root: Option<&Path>) -> Result<()> {
             "service {name}: start {} must be a path under the filesystem root",
             service.start.display()
         );
-        if let Some(manifest) = &service.manifest {
-            anyhow::ensure!(
-                manifest.is_absolute(),
-                "service {name}: manifest {} must be an absolute path",
-                manifest.display()
-            );
+        for (key, path) in [("manifest", &service.manifest), ("roster", &service.roster)] {
+            if let Some(path) = path {
+                anyhow::ensure!(
+                    path.is_absolute(),
+                    "service {name}: {key} {} must be an absolute path",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())
@@ -551,10 +610,13 @@ async fn try_launch(
     name: &str,
     generation: u64,
 ) -> Result<Option<TheaterId>> {
-    let Some((start, manifest)) = daemon
-        .services
-        .with(name, |s| (s.spec.start.clone(), s.spec.manifest.clone()))
-    else {
+    let Some((start, manifest, roster)) = daemon.services.with(name, |s| {
+        (
+            s.spec.start.clone(),
+            s.spec.manifest.clone(),
+            s.spec.roster.clone(),
+        )
+    }) else {
         return Ok(None);
     };
     // The dead session leaves the runtime's list a little after its death.
@@ -581,6 +643,7 @@ async fn try_launch(
     if !current(daemon, name, generation) {
         return Ok(None);
     }
+    let roster = roster.as_deref().map(read_roster).transpose()?;
     let actor = match &manifest {
         Some(path) => {
             check_manifest(path)?;
@@ -618,11 +681,28 @@ async fn try_launch(
         let _ = session.stop().await;
         return Ok(None);
     }
-    let result = match session.evaluate(&source).await {
-        Ok(output) if output.starts_with("error:") => Err(anyhow::anyhow!("{output}")),
-        Ok(_) => Ok(()),
-        Err(error) => Err(error),
-    };
+    // The roster first, a line an evaluation, then the start file, which reads it.
+    let mut forms = Vec::new();
+    if let Some(lines) = &roster {
+        forms.push("(define service-roster (vector))".to_string());
+        forms.extend(
+            lines
+                .iter()
+                .map(|line| format!("(vector-push! service-roster {line})")),
+        );
+    }
+    forms.push(source.clone());
+    let mut result = Ok(());
+    for form in &forms {
+        result = match session.evaluate(form).await {
+            Ok(output) if output.starts_with("error:") => Err(anyhow::anyhow!("{output}")),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            break;
+        }
+    }
     if let Err(error) = result {
         // Forget the actor before stopping it, so its death is not a second one.
         daemon.services.with(name, |s| s.actor = None);
@@ -661,6 +741,7 @@ mod tests {
             name: "web".into(),
             start: "serve.wisp".into(),
             manifest: None,
+            roster: None,
             restart,
             max_restarts,
             period_secs,
