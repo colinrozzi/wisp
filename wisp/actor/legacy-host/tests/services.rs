@@ -265,3 +265,43 @@ fn a_service_can_start_from_its_own_manifest() {
         listen("narrow")
     );
 }
+
+/// A manifest the daemon could rewrite is refused at start (lux, 0156): here it
+/// is group- and world-writable, so the service never starts, and its last
+/// death says why. (The test's config is the test user's own, so a manifest the
+/// same user owns is fine, as above; on server3 config.toml is root's, and then
+/// a manifest the daemon's user owns is refused as well.)
+#[test]
+fn a_manifest_the_daemon_could_rewrite_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let package = std::fs::canonicalize(actor.join("actor.wasm")).unwrap();
+    let manifest = std::fs::read_to_string(actor.join("manifest.toml"))
+        .unwrap()
+        .replace(
+            "package = \"./actor.wasm\"",
+            &format!("package = \"{}\"", package.display()),
+        );
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/services-test")
+        .join(format!("{}-manifest-loose", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("loose.toml");
+    std::fs::write(&path, manifest).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let daemon = Daemon::start(
+        "loose",
+        &[("svc/start.wisp", GOOD)],
+        &format!(
+            "[[service]]\nname = \"loose\"\nstart = \"svc/start.wisp\"\nmanifest = {:?}\n",
+            path.display().to_string()
+        ),
+    );
+    let row = daemon.until("loose", "was refused", |row| {
+        row[1] != "starting" && row.len() > 4
+    });
+    assert_ne!(row[1], "running", "{row:?}");
+    let last = row[4..].join(" ");
+    assert!(last.contains("world-writable"), "{last}");
+}
