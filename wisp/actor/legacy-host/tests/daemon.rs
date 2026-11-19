@@ -755,3 +755,149 @@ fn the_inspect_port_answers_only_what_reports() {
     assert!(daemon.fails(&["eval", "b", "x"]).contains("x"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A spawned interpreter whose manifest's initial_state is "start PATH\nreport
+/// ID" runs PATH (under its fs root) after init, then tells ID "start ready
+/// SELF" or "start failed SELF REASON"; a malformed initial_state fails the
+/// spawn, naming why (0156, the root supervisor).
+#[test]
+fn a_spawned_interpreter_runs_its_start_file_and_reports() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/daemon-test")
+        .join(format!("{}-start", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("svc")).unwrap();
+    std::fs::write(root.join("svc/good.wisp"), "(define started 42)\n").unwrap();
+    std::fs::write(root.join("svc/bad.wisp"), "(no-such-function 1)\n").unwrap();
+    let config = root.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[filesystem]\nroot = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let package = std::fs::canonicalize(actor.join("actor.wasm")).unwrap();
+    let stock = std::fs::read_to_string(actor.join("manifest.toml"))
+        .unwrap()
+        .replace(
+            "package = \"./actor.wasm\"",
+            &format!("package = \"{}\"", package.display()),
+        );
+    // a manifest named `name` whose initial_state is `state` (a TOML basic string)
+    let manifest = |name: &str, state: &str| {
+        let path = root.join(format!("{name}.toml"));
+        let text = stock.replace(
+            "name = \"wisp-interpreter\"",
+            &format!("name = \"{name}\"\ninitial_state = \"{state}\""),
+        );
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+
+    let daemon = Daemon::start_with(&root, &["--config", config.to_str().unwrap()]);
+    let host = daemon.ok(&["new", "host"]);
+    daemon.ok(&["eval", &host, "(msg-register)"]);
+    daemon.ok(&[
+        "eval",
+        &host,
+        "(define on-message (lambda (e) (bytes->string (car e))))",
+    ]);
+    let me = daemon
+        .ok(&["eval", &host, "(self)"])
+        .trim_matches('"')
+        .to_string();
+    let spawn = |name: &str, state: &str| {
+        daemon.run(&[
+            "eval",
+            &host,
+            &format!("(spawn-actor \"{}\")", manifest(name, state).display()),
+        ])
+    };
+    // the host's firings until one holds `want`
+    let wait_for = |want: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = String::new();
+        loop {
+            seen.push_str(&daemon.ok(&["read", &host]));
+            if seen.contains(want) {
+                return seen;
+            }
+            assert!(Instant::now() < deadline, "no {want:?} in: {seen}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+
+    // a good start file: spawn returns at once, the file runs, the child reports ready
+    let good = spawn("good", &format!("start svc/good.wisp\\nreport {me}\\n"));
+    assert!(!good.contains("error"), "{good}");
+    let seen = wait_for("start ready ");
+    assert!(
+        good.contains(
+            seen.split("start ready ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_matches('"')
+        ),
+        "{good} / {seen}"
+    );
+    assert_eq!(daemon.ok(&["eval", "good", "started"]), "42");
+
+    // a start file that fails, and one that isn't there: each reports failed, with why
+    let bad = spawn("bad", &format!("start svc/bad.wisp\\nreport {me}"));
+    assert!(!bad.contains("error"), "{bad}");
+    assert!(wait_for("start failed ").contains("no-such-function"));
+    let gone = spawn("gone", &format!("start svc/none.wisp\\nreport {me}"));
+    assert!(!gone.contains("error"), "{gone}");
+    assert!(wait_for("cannot read").contains("svc/none.wisp"));
+
+    // anything malformed fails the spawn itself, naming why (lux's rules)
+    for (name, state, why) in [
+        ("up", format!("start ../x.wisp\\nreport {me}"), "'..' part"),
+        (
+            "abs",
+            format!("start /etc/x.wisp\\nreport {me}"),
+            "relative",
+        ),
+        (
+            "dot",
+            format!("start svc/./x.wisp\\nreport {me}"),
+            "'.' part",
+        ),
+        (
+            "empty",
+            format!("start svc//x.wisp\\nreport {me}"),
+            "empty part",
+        ),
+        (
+            "verb",
+            format!("run svc/good.wisp\\nreport {me}"),
+            "start PATH",
+        ),
+        (
+            "noreport",
+            "start svc/good.wisp".to_string(),
+            "report ACTOR-ID",
+        ),
+        (
+            "badid",
+            "start svc/good.wisp\\nreport ZZ".to_string(),
+            "report id",
+        ),
+        (
+            "extra",
+            format!("start svc/good.wisp\\nreport {me}\\nmore"),
+            "nothing may follow",
+        ),
+    ] {
+        let out = spawn(name, &state);
+        assert!(
+            out.contains("error") || out.contains("err"),
+            "{name}: {out}"
+        );
+        assert!(out.contains(why), "{name}: {out}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
