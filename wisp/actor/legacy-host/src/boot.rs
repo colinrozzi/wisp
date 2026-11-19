@@ -59,6 +59,13 @@ pub struct ServiceConfig {
     /// The Wisp file evaluated in each fresh session, relative to the
     /// filesystem root. Read again at every start, so edits take effect.
     pub start: PathBuf,
+    /// A manifest to start this service's session from, instead of the daemon's
+    /// default actor: an absolute path, its `package` resolved beside it, read
+    /// again at every start like the start file. For a service whose handlers
+    /// need config the default doesn't give, such as the root supervisor's
+    /// store `base_path`, which its children's must lie inside (0156).
+    #[serde(default)]
+    pub manifest: Option<PathBuf>,
     #[serde(default)]
     pub restart: Restart,
     /// At most this many restarts within `period_secs`; one more death and the
@@ -101,6 +108,13 @@ pub fn validate(services: &[ServiceConfig], root: Option<&Path>) -> Result<()> {
             "service {name}: start {} must be a path under the filesystem root",
             service.start.display()
         );
+        if let Some(manifest) = &service.manifest {
+            anyhow::ensure!(
+                manifest.is_absolute(),
+                "service {name}: manifest {} must be an absolute path",
+                manifest.display()
+            );
+        }
     }
     Ok(())
 }
@@ -478,7 +492,10 @@ async fn try_launch(
     name: &str,
     generation: u64,
 ) -> Result<Option<TheaterId>> {
-    let Some(start) = daemon.services.with(name, |s| s.spec.start.clone()) else {
+    let Some((start, manifest)) = daemon
+        .services
+        .with(name, |s| (s.spec.start.clone(), s.spec.manifest.clone()))
+    else {
         return Ok(None);
     };
     // The dead session leaves the runtime's list a little after its death.
@@ -505,7 +522,10 @@ async fn try_launch(
     if !current(daemon, name, generation) {
         return Ok(None);
     }
-    let actor = daemon.default.lock().await.clone();
+    let actor = match &manifest {
+        Some(path) => crate::ActorSource::from_manifest(path)?,
+        None => daemon.default.lock().await.clone(),
+    };
     let session = daemon
         .runtime
         .spawn_named((*actor.wasm).clone(), actor.manifest.clone(), name.into())
@@ -578,6 +598,7 @@ mod tests {
         ServiceConfig {
             name: "web".into(),
             start: "serve.wisp".into(),
+            manifest: None,
             restart,
             max_restarts,
             period_secs,

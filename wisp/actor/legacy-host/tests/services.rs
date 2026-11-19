@@ -202,3 +202,66 @@ fn a_stopped_service_stays_stopped_until_started() {
     assert!(!daemon.cli(&["start", "svc"]).status.success());
     assert!(!daemon.cli(&["start", "nobody"]).status.success());
 }
+
+/// A service with `manifest = PATH` starts from that manifest instead of the
+/// daemon's default actor (0156: the root supervisor needs a store base_path
+/// that its children's lie inside). Here the manifest narrows tcp to no
+/// listening, which the default doesn't: the same start file listens in one
+/// service and is refused in the other, and status names the manifest.
+#[test]
+fn a_service_can_start_from_its_own_manifest() {
+    let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let package = std::fs::canonicalize(actor.join("actor.wasm")).unwrap();
+    let manifest = std::fs::read_to_string(actor.join("manifest.toml"))
+        .unwrap()
+        .replace(
+            "package = \"./actor.wasm\"",
+            &format!("package = \"{}\"", package.display()),
+        )
+        + "\n[[handler]]\ntype = \"tcp\"\nallowed_listen = []\nallowed_connect = []\n";
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/services-test")
+        .join(format!("{}-manifest-file", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("narrow.toml");
+    std::fs::write(&path, manifest).unwrap();
+
+    let daemon = Daemon::start(
+        "manifest",
+        &[("svc/start.wisp", GOOD)],
+        &format!(
+            "[[service]]\nname = \"plain\"\nstart = \"svc/start.wisp\"\n\n\
+             [[service]]\nname = \"narrow\"\nstart = \"svc/start.wisp\"\nmanifest = {:?}\n",
+            path.display().to_string()
+        ),
+    );
+    daemon.until("plain", "ran", |row| row[1] == "running");
+    daemon.until("narrow", "ran", |row| row[1] == "running");
+    // both ran the start file
+    assert_eq!(daemon.ok(&["eval", "narrow", "booted"]), "42");
+    assert!(
+        daemon
+            .ok(&["status", "narrow"])
+            .contains(&path.display().to_string())
+    );
+    assert!(
+        !daemon
+            .ok(&["status", "plain"])
+            .contains(&path.display().to_string())
+    );
+    // the default listens; the manifest's tcp block refuses it
+    let listen = |name: &str| {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        daemon.ok(&["eval", name, &format!("(tcp-listen \"127.0.0.1:{port}\")")])
+    };
+    assert!(listen("plain").starts_with("(ok"), "{}", listen("plain"));
+    assert!(
+        listen("narrow").contains("not allowed"),
+        "{}",
+        listen("narrow")
+    );
+}
