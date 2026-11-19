@@ -22,7 +22,100 @@ fn source_result(result: Result<String, String>) -> Value {
 // change a library between reads; consulted before the fixed greet module.
 type Files = Arc<Mutex<HashMap<String, String>>>;
 
-fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
+/// Stub every host import `wasm` declares that `imports` doesn't define, each
+/// returning a string that names it, so a verb added to the interpreter can't
+/// break these tests (it did twice: tcp set-read-timeout, then handler-types).
+/// Test host only: the real daemon must keep failing instantiation on a
+/// missing import, since that is what keeps a gated interface closed (lux).
+fn stub_the_rest(mut imports: HostImports, wasm: &[u8]) -> HostImports {
+    let defined: std::collections::HashSet<(String, String)> = imports
+        .imports()
+        .iter()
+        .map(|import| (import.interface.clone(), import.function.clone()))
+        .collect();
+    for (interface, function) in function_imports(wasm) {
+        // packr-wasmtime links pack:alloc itself
+        if interface == "pack:alloc" || defined.contains(&(interface.clone(), function.clone())) {
+            continue;
+        }
+        let text = format!("{interface}::{function} not exercised");
+        imports.define(
+            &interface,
+            &function,
+            host_fn(move |_input| {
+                let text = text.clone();
+                async move { Ok(Value::String(text)) }
+            }),
+        );
+    }
+    imports
+}
+
+/// The (module, name) of each function import in a wasm binary's import section.
+fn function_imports(wasm: &[u8]) -> Vec<(String, String)> {
+    fn leb(wasm: &[u8], at: &mut usize) -> usize {
+        let (mut value, mut shift) = (0usize, 0);
+        loop {
+            let byte = wasm[*at];
+            *at += 1;
+            value |= ((byte & 0x7f) as usize) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+    fn name(wasm: &[u8], at: &mut usize) -> String {
+        let len = leb(wasm, at);
+        let text = String::from_utf8_lossy(&wasm[*at..*at + len]).into_owned();
+        *at += len;
+        text
+    }
+    let mut found = Vec::new();
+    let mut at = 8; // magic and version
+    while at < wasm.len() {
+        let id = wasm[at];
+        at += 1;
+        let size = leb(wasm, &mut at);
+        let end = at + size;
+        if id == 2 {
+            for _ in 0..leb(wasm, &mut at) {
+                let module = name(wasm, &mut at);
+                let field = name(wasm, &mut at);
+                match wasm[at] {
+                    0x00 => {
+                        at += 1;
+                        leb(wasm, &mut at);
+                        found.push((module, field));
+                    }
+                    0x01 => {
+                        // table: reftype, then limits
+                        at += 2;
+                        let flags = leb(wasm, &mut at);
+                        leb(wasm, &mut at);
+                        if flags & 1 == 1 {
+                            leb(wasm, &mut at);
+                        }
+                    }
+                    0x02 => {
+                        at += 1;
+                        let flags = leb(wasm, &mut at);
+                        leb(wasm, &mut at);
+                        if flags & 1 == 1 {
+                            leb(wasm, &mut at);
+                        }
+                    }
+                    _ => at += 3, // global: valtype, mutability
+                }
+            }
+            return found;
+        }
+        at = end;
+    }
+    found
+}
+
+fn imports(wasm: &[u8], calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
     let mut imports = HostImports::new();
     // Clone before the read-source closure moves `calls`; the filesystem read-file
     // mock (what `require` loads through) logs its reads here too.
@@ -402,7 +495,7 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("crypto not exercised".into())) }),
         );
     }
-    imports
+    stub_the_rest(imports, wasm)
 }
 
 async fn evaluate(instance: &mut WasmtimeInstance, source: &str) -> String {
@@ -460,7 +553,7 @@ async fn engine_session() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let files = Files::default();
     let mut first = engine
-        .instantiate(&module, imports(calls.clone(), files.clone()))
+        .instantiate(&module, imports(&wasm, calls.clone(), files.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -520,7 +613,7 @@ async fn engine_session() {
             .contains(&"GET https://example.test/netmod.wisp".to_string())
     );
     let mut second = engine
-        .instantiate(&module, imports(calls.clone(), Files::default()))
+        .instantiate(&module, imports(&wasm, calls.clone(), Files::default()))
         .await
         .unwrap();
     assert!(
@@ -969,7 +1062,7 @@ async fn rc_session_memory() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let files = Files::default();
         let mut s = engine
-            .instantiate(&module, imports(calls, files))
+            .instantiate(&module, imports(&wasm, calls, files))
             .await
             .unwrap();
         // The debug build verifies the whole heap after each call: fewer rounds.

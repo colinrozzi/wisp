@@ -367,11 +367,13 @@ fn imports(calls: Arc<Mutex<Vec<String>>>, files: Files) -> HostImports {
             host_fn(|_input| async move { Ok(Value::String("lifecycle not exercised".into())) }),
         );
     }
-    imports.define(
-        "wisp-sessions",
-        "list-sessions",
-        host_fn(|_input| async move { Ok(Value::String("sessions not exercised".into())) }),
-    );
+    for name in ["list-sessions", "handler-types"] {
+        imports.define(
+            "wisp-sessions",
+            name,
+            host_fn(|_input| async move { Ok(Value::String("sessions not exercised".into())) }),
+        );
+    }
     imports.define(
         "wisp-events",
         "event-recorded",
