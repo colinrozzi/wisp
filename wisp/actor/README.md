@@ -347,6 +347,25 @@ file, not from what the old one held. A service that wants state across restarts
 keeps it in a file or `store` and loads it from its start file. Peers holding
 the old actor id must look the service up again (by name: `list`, the registry).
 
+An interpreter spawned by another actor can run a start file too, without the
+daemon (0156: what the root supervisor spawns its services with). Its manifest's
+`initial_state` names the file and who to tell:
+
+```toml
+initial_state = "start svc/transit/9/start.wisp\nreport 1f0c…(the spawner's actor id)"
+```
+
+The file runs on a 1 ms timer after `init` returns, never inside it, because
+`spawn-actor` waits for the child's `init`: a start file that hangs must not hang
+its spawner. When it has run, the child sends the `report` actor one message,
+`start ready <its id>`, or `start failed <its id> <why>` (the `error:` text, cut to
+200 bytes); the spawner decides what a failure means (the supervisor counts it as
+a death). The path is relative to the child's fs root, 1 to 256 bytes, with no
+empty, `.` or `..` part; the report id is 1 to 64 of `[0-9a-f-]`; and nothing may
+follow the report line. Anything else makes `init` fail, so `spawn-actor`
+returns the reason (`start: the path has a '..' part`), rather than starting an
+empty session. With no `initial_state`, an interpreter starts empty, as before.
+
 How it works: this is the userland supervisor of theater#235's supervision
 design; the runtime itself neither restarts nor owns actors. Before spawning
 anything the daemon subscribes to every actor's chain

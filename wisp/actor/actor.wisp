@@ -6,13 +6,123 @@
 ; session that owns its own bindings, closures, types, macros, and heap.
 (include "../interpreter/evaluator.wisp")
 
-; Theater lifecycle. Config is ignored: a fresh module is an empty session, so
-; init is not a reset. State is the standard option<list<u8>> the runtime
-; threads through handlers; we carry nothing in it.
+; Theater lifecycle. A fresh module is an empty session, so init is not a reset,
+; and we carry nothing in the state we hand back.
+;
+; A start file (0156, the root supervisor). With no initial state, or none, the
+; session starts empty, as before. A manifest's initial_state (a string) of
+;   start PATH
+;   report ACTOR-ID
+; makes it run PATH (relative to this actor's fs root) as its start file, the
+; way the boot list runs one, and send the actor named by report a message:
+; "start ready SELF" when the file evaluates, "start failed SELF REASON" when it
+; doesn't. The file runs on a 1 ms timer after init returns, never inside it:
+; Theater's spawn waits for the child's init, so a start file that hangs must
+; not hang its spawner (lux, tova 2026-11-19). Any other string is refused, so
+; spawn-actor fails, rather than ignored.
+(global $start-path string mut 0)
+(global $start-report string mut 0)
+
 (export "theater:simple/actor.init"
-  (fn actor-init ((state (option (list u8))))
+  (fn actor-init ((state any))
     (result (tuple (option (list u8))) string)
-    (ok (tuple (option (list u8))) string (tuple (none (list u8))))))
+    (value-case (start-state (unmarshal state))
+      ((text s)
+        (let (why (start-parse s))
+          (if (string-len why)
+            (err (tuple (option (list u8))) string (string-append "start: " why))
+            (value-case (unmarshal (raw-invoke "theater:simple/timer" "set-interval"
+                          (marshal (sequence (list-push (list-push (list-new value)
+                            (text (start-timer))) (u64-value (i64.const 1)))))))
+              ((compound ty case-name fields)
+                (if (string=? case-name "ok")
+                  (ok (tuple (option (list u8))) string (tuple (none (list u8))))
+                  (err (tuple (option (list u8))) string "start: no timer (the start file needs the timer handler)")))
+              (else (err (tuple (option (list u8))) string "start: no timer (the start file needs the timer handler)"))))))
+      (else (ok (tuple (option (list u8))) string (tuple (none (list u8))))))))
+
+; init's `any` is the argument tuple, a one-element sequence: its element is
+; the state (none, or a manifest's initial_state as text)
+(fn start-state ((args value)) value
+  (value-case args
+    ((sequence items) (if (i32.eq (list-len items) 1) (list-get items 0) (nil)))
+    (else args)))
+
+(fn start-timer () string "wisp.start")
+
+; "" when s is exactly "start PATH\nreport ID\n" (the last newline optional),
+; with PATH and ID valid, setting the globals; else why it isn't.
+(fn start-parse ((s string)) string
+  (let (nl (start-line-end s 0))
+    (let (first (substring s 0 nl))
+      (if (i32.eq (string-prefix? first "start ") 0) "the first line must be 'start PATH'"
+        (let (path (substring first 6 (string-len first)))
+          (let (why (start-path-why path))
+            (if (string-len why) why
+              (let (rest (if (i32.lt_s nl (string-len s)) (substring s (i32.add nl 1) (string-len s)) ""))
+                (let (nl2 (start-line-end rest 0))
+                  (let (second (substring rest 0 nl2))
+                    (if (i32.eq (string-prefix? second "report ") 0) "the second line must be 'report ACTOR-ID'"
+                      (let (id (substring second 7 (string-len second)))
+                        (if (i32.eq (start-id-ok id 0) 0) "the report id must be 1 to 64 of [0-9a-f-]"
+                          (if (i32.lt_s (i32.add nl2 1) (string-len rest)) "nothing may follow the report line"
+                            (begin
+                              (global.set $start-path path)
+                              (global.set $start-report id)
+                              "")))))))))))))))
+
+(fn start-line-end ((s string) (i s32)) s32
+  (if (i32.ge_s i (string-len s)) i
+    (if (i32.eq (string-ref s i) 10) i (start-line-end s (i32.add i 1)))))
+
+; a path of 1 to 256 bytes, relative, each /-separated part non-empty and
+; neither "." nor ".." (lux)
+(fn start-path-why ((p string)) string
+  (if (i32.eq (string-len p) 0) "the path is empty"
+    (if (i32.gt_s (string-len p) 256) "the path is over 256 bytes"
+      (if (i32.eq (string-ref p 0) 47) "the path must be relative to the fs root"
+        (start-parts-why p 0 0)))))
+
+(fn start-parts-why ((p string) (from s32) (i s32)) string
+  (if (i32.lt_s i (string-len p))
+    (if (i32.eq (string-ref p i) 47)
+      (let (why (start-part-why (substring p from i))) (if (string-len why) why (start-parts-why p (i32.add i 1) (i32.add i 1))))
+      (start-parts-why p from (i32.add i 1)))
+    (start-part-why (substring p from i))))
+
+(fn start-part-why ((part string)) string
+  (if (i32.eq (string-len part) 0) "the path has an empty part"
+    (if (string=? part ".") "the path has a '.' part"
+      (if (string=? part "..") "the path has a '..' part" ""))))
+
+(fn start-id-ok ((id string) (i s32)) s32
+  (if (i32.eq (string-len id) 0) 0
+    (if (i32.gt_s (string-len id) 64) 0
+      (if (i32.ge_s i (string-len id)) 1
+        (let (c (string-ref id i))
+          (if (i32.or (i32.and (i32.ge_s c 48) (i32.le_s c 57))
+                (i32.or (i32.and (i32.ge_s c 97) (i32.le_s c 102)) (i32.eq c 45)))
+            (start-id-ok id (i32.add i 1)) 0))))))
+
+; The start timer's tick: clear it, run the file once, and report. A report
+; is "start ready SELF" or "start failed SELF REASON", REASON cut to 200 bytes.
+(fn start-run () string
+  (begin
+    (unmarshal (raw-invoke "theater:simple/timer" "clear-interval" (marshal (text (start-timer)))))
+    (let (path (global.get $start-path))
+      (begin
+        (global.set $start-path "")
+        (let (src (read-source-from-path path))
+          (let (out (value-case src
+                      ((text s) (evaluate-from s path))
+                      (else (string-append "error: cannot read " path))))
+            (let (msg (if (string-prefix? out "error:")
+                        (string-append "start failed " (string-append (self) (string-append " " (substring out 0 (if (i32.gt_s (string-len out) 200) 200 (string-len out))))))
+                        (string-append "start ready " (self))))
+              (begin
+                (unmarshal (raw-invoke "theater:simple/message-server-host" "send"
+                  (str-bytes-tuple (text (global.get $start-report)) (text msg))))
+                "ok"))))))))
 
 ; The public evaluation operation, reachable through rpc.call and discoverable
 ; through rpc.describe. Source in, printed value (or "error:" diagnostic) out.
@@ -29,7 +139,9 @@
 ; answers "ok" or "error: ..." (handler-answer) so the chain shows failed handlers.
 (export "theater:simple/timer.handle-tick"
   (fn handle-tick ((name string)) string
-    (handler-answer (dispatch-event "on-tick" (text name)))))
+    (if (i32.and (string=? name (start-timer)) (i32.ne (string-len (global.get $start-path)) 0))
+      (start-run)
+      (handler-answer (dispatch-event "on-tick" (text name))))))
 ; After (subscribe-spawns): on-spawn receives (sequence id name parent-option).
 (export "theater:simple/runtime-handlers.handle-actor-spawn"
   (fn handle-actor-spawn ((raw any)) string
