@@ -240,6 +240,65 @@ fn a_manifest_can_name_the_built_in_interpreter() {
     assert!(listened.contains("not allowed"), "{listened}");
 }
 
+/// A child an actor spawns can name the built-in interpreter too (theater #263,
+/// registered by the daemon): its manifest says `package = "built-in"`, with no
+/// file of that name anywhere, and it runs the daemon's own interpreter. Its
+/// blocks still narrow it, as a file package's would: its start file's
+/// tcp-listen is refused, and it writes what it got where the test reads it.
+#[test]
+fn a_spawned_child_can_name_the_built_in_interpreter() {
+    let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let fs = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/services-test")
+        .join(format!("{}-spawn-built-in", std::process::id()))
+        .join("fs");
+    let child = std::fs::read_to_string(actor.join("manifest.toml"))
+        .unwrap()
+        .replace("package = \"./actor.wasm\"", "package = \"built-in\"")
+        + &format!(
+            "\n[[handler]]\ntype = \"filesystem\"\npath = {:?}\n\n\
+             [[handler]]\ntype = \"tcp\"\nallowed_listen = []\nallowed_connect = []\n",
+            fs.display().to_string()
+        );
+    assert!(child.contains("package = \"built-in\""));
+    // the parent names its start file and itself as the one it reports to, then
+    // spawns it (a start file must report, wisp #143)
+    let parent = format!(
+        "(msg-register)\n(define on-message (lambda (e) (bytes->string (car e))))\n\
+         (define base (match (fs-read-text \"child-base.toml\") ((ok t) t) ((err e) \"\")))\n\
+         (fs-write \"child.toml\" (string-append \"initial_state = '''start child.wisp\nreport \" (self) \"'''\n\" base))\n\
+         (define kid (spawn-actor {:?}))\n",
+        fs.join("child.toml").display().to_string()
+    );
+    let daemon = Daemon::start(
+        "spawn-built-in",
+        &[
+            ("child-base.toml", &child),
+            (
+                "child.wisp",
+                "(fs-write \"child-out\" (match (tcp-listen \"127.0.0.1:0\") ((ok l) \"listened\") ((err e) e)))\n",
+            ),
+            ("svc/start.wisp", &parent),
+        ],
+        "[[service]]\nname = \"parent\"\nstart = \"svc/start.wisp\"\n",
+    );
+    daemon.until("parent", "ran", |row| row[1] == "running");
+    assert!(!fs.join("built-in").exists() && !fs.parent().unwrap().join("built-in").exists());
+    let kid = daemon.ok(&["eval", "parent", "kid"]);
+    assert!(kid.starts_with("(ok"), "spawn-actor: {kid}");
+    let out = fs.join("child-out");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !out.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the child never ran its start file: {kid}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let got = std::fs::read_to_string(&out).unwrap();
+    assert!(got.contains("not allowed"), "the child's tcp-listen: {got}");
+}
+
 #[test]
 fn a_service_can_start_from_its_own_manifest() {
     let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");

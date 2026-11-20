@@ -124,7 +124,7 @@ fn writable_by_daemon(path: &Path) -> std::io::Result<bool> {
 /// rather than a file beside it: a service narrowed by its own manifest (0156)
 /// still runs the interpreter this daemon was built with, so upgrading the
 /// daemon upgrades it too, and nothing on disk can go stale or be swapped.
-pub const BUILT_IN_PACKAGE: &str = "built-in";
+pub const BUILT_IN_PACKAGE: &str = wisp_interpreter_actor::BUILT_IN_PACKAGE;
 
 /// Refuse a service manifest, its directory or the package it names, that is
 /// easier to write than config.toml: group- or world-writable anywhere, or the
