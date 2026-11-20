@@ -208,6 +208,7 @@ impl Runtime {
                 allowed_commands: None,
                 new_dir: Some(fs_ephemeral),
                 allowed_paths: Some(vec!["/".to_string()]),
+                write_paths: None,
             }),
         ));
         // Terminal stdio + tty control.
