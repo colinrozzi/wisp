@@ -120,6 +120,12 @@ fn writable_by_daemon(path: &Path) -> std::io::Result<bool> {
     Ok(meta.mode() & 0o022 != 0 || Some(meta.uid()) == daemon_uid())
 }
 
+/// A manifest's `package` that means the daemon's own built-in interpreter,
+/// rather than a file beside it: a service narrowed by its own manifest (0156)
+/// still runs the interpreter this daemon was built with, so upgrading the
+/// daemon upgrades it too, and nothing on disk can go stale or be swapped.
+pub const BUILT_IN_PACKAGE: &str = "built-in";
+
 /// Refuse a service manifest, its directory or the package it names, that is
 /// easier to write than config.toml: group- or world-writable anywhere, or the
 /// daemon's own where config.toml isn't. Daemon code that could rewrite it
@@ -131,9 +137,11 @@ fn check_manifest(manifest: &Path) -> Result<()> {
     let parsed = theater::ManifestConfig::from_toml_str(&text)
         .with_context(|| format!("parsing manifest {}", manifest.display()))?;
     let dir = manifest.parent().unwrap_or(Path::new("/"));
-    let package = dir.join(&parsed.package);
-    for path in [manifest, dir, package.as_path()] {
+    for path in [manifest, dir] {
         check_protected(path)?;
+    }
+    if parsed.package != BUILT_IN_PACKAGE {
+        check_protected(&dir.join(&parsed.package))?;
     }
     Ok(())
 }

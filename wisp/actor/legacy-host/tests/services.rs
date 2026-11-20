@@ -208,6 +208,38 @@ fn a_stopped_service_stays_stopped_until_started() {
 /// that its children's lie inside). Here the manifest narrows tcp to no
 /// listening, which the default doesn't: the same start file listens in one
 /// service and is refused in the other, and status names the manifest.
+/// `package = "built-in"`: a service's own manifest runs the daemon's built-in
+/// interpreter, with no wasm file beside it to keep in step with upgrades, and
+/// its blocks still narrow it (0156).
+#[test]
+fn a_manifest_can_name_the_built_in_interpreter() {
+    let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let manifest = std::fs::read_to_string(actor.join("manifest.toml"))
+        .unwrap()
+        .replace("package = \"./actor.wasm\"", "package = \"built-in\"")
+        + "\n[[handler]]\ntype = \"tcp\"\nallowed_listen = []\nallowed_connect = []\n";
+    assert!(manifest.contains("package = \"built-in\""));
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/services-test")
+        .join(format!("{}-manifest-built-in", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("narrow.toml");
+    std::fs::write(&path, manifest).unwrap();
+
+    let daemon = Daemon::start(
+        "built-in",
+        &[("svc/start.wisp", GOOD)],
+        &format!(
+            "[[service]]\nname = \"narrow\"\nstart = \"svc/start.wisp\"\nmanifest = {:?}\n",
+            path.display().to_string()
+        ),
+    );
+    daemon.until("narrow", "ran", |row| row[1] == "running");
+    assert_eq!(daemon.ok(&["eval", "narrow", "booted"]), "42");
+    let listened = daemon.ok(&["eval", "narrow", "(tcp-listen \"127.0.0.1:0\")"]);
+    assert!(listened.contains("not allowed"), "{listened}");
+}
+
 #[test]
 fn a_service_can_start_from_its_own_manifest() {
     let actor = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");

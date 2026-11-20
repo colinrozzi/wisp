@@ -291,12 +291,20 @@ impl ActorSource {
     }
 
     /// Read a manifest and the package it names, resolved against the manifest's
-    /// directory (so `package = "./actor.wasm"` means the file beside it).
+    /// directory (so `package = "./actor.wasm"` means the file beside it), or
+    /// `package = "built-in"` for this daemon's own interpreter.
     fn from_manifest(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading manifest {}", path.display()))?;
         let manifest = theater::ManifestConfig::from_toml_str(&text)
             .with_context(|| format!("parsing manifest {}", path.display()))?;
+        if manifest.package == boot::BUILT_IN_PACKAGE {
+            return Ok(Self {
+                manifest,
+                wasm: Arc::new(EMBEDDED_WASM.to_vec()),
+                origin: format!("{} (built-in {VERSION})", path.display()),
+            });
+        }
         let package = path
             .parent()
             .unwrap_or(Path::new("."))
