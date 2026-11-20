@@ -90,7 +90,16 @@ pub struct Grants {
     pub tcp: theater_handler_tcp::TcpHandlerConfig,
     /// Whether actors may use podman (config.toml `[podman]`); off by default.
     pub podman: bool,
+    /// The daemon's own interpreter wasm. When set, an actor that spawns a child
+    /// whose manifest says `package = "built-in"` gets these bytes (theater
+    /// #263's `with_built_in`), not a file: the child runs the interpreter this
+    /// daemon was built with. Only the host sets it.
+    pub built_in: Option<Arc<Vec<u8>>>,
 }
+
+/// A manifest's `package` that means the daemon's own interpreter: for a
+/// boot-list service (wisp #151) and for a child an actor spawns.
+pub const BUILT_IN_PACKAGE: &str = "built-in";
 
 pub struct Runtime {
     pub commands: mpsc::UnboundedSender<TheaterCommand>,
@@ -139,6 +148,7 @@ impl Runtime {
             keys,
             tcp,
             podman,
+            built_in,
         } = grants;
         let (commands, rx) = mpsc::unbounded_channel();
         let mut handlers = HandlerRegistry::new();
@@ -171,13 +181,17 @@ impl Runtime {
             None,
         ));
         // Grant the REPL full runtime control so it can manage other actors.
-        handlers.register(theater_handler_runtime::RuntimeHandler::new(
+        let mut runtime_handler = theater_handler_runtime::RuntimeHandler::new(
             theater_handler_runtime::RuntimeHostConfig {},
             Some(theater::config::permissions::RuntimePermissions {
                 inspect: true,
                 mutate: true,
             }),
-        ));
+        );
+        if let Some(wasm) = built_in {
+            runtime_handler = runtime_handler.with_built_in(BUILT_IN_PACKAGE, wasm);
+        }
+        handlers.register(runtime_handler);
         // Inter-actor messaging (shares one background router across actors).
         handlers.register(theater_handler_message_server::MessageServerHandler::new(
             Some(theater::config::permissions::MessageServerPermissions),

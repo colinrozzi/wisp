@@ -529,6 +529,8 @@ async fn new_runtime(loaded: &Loaded, config: &ReplConfig) -> Result<Runtime> {
             ..Default::default()
         },
         podman: config.podman.is_some(),
+        // a child spawned with package = "built-in" runs this daemon's interpreter
+        built_in: Some(Arc::new(EMBEDDED_WASM.to_vec())),
     };
     Runtime::new(SourceBundle::new(sources)?, grants).await
 }
