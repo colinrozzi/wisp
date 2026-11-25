@@ -37,15 +37,22 @@ async fn a_send_gives_up_after_the_write_timeout() -> anyhow::Result<()> {
         .await?;
     assert!(!conn.contains("error"), "connect: {conn}");
     // 16 MiB, far more than both sockets' buffers
-    session.evaluate(r#"(define big "0123456789abcdef")"#).await?;
+    session
+        .evaluate(r#"(define big "0123456789abcdef")"#)
+        .await?;
     for _ in 0..20 {
-        session.evaluate("(define big (string-append big big))").await?;
+        session
+            .evaluate("(define big (string-append big big))")
+            .await?;
     }
 
     let started = Instant::now();
     let got = session.evaluate("(tcp-send c big)").await?;
     let took = started.elapsed();
-    assert!(got.contains("timeout"), "expected a timeout error, got {got}");
+    assert!(
+        got.contains("timeout"),
+        "expected a timeout error, got {got}"
+    );
     assert!(took < Duration::from_secs(10), "the send took {took:?}");
 
     assert_eq!(session.evaluate("(+ 40 2)").await?, "42");
