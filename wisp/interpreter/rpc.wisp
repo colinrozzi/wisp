@@ -371,6 +371,7 @@
 (import theater:simple/tcp send ((connection-id string) (data (list u8))) (result u64 string))
 (import theater:simple/tcp receive ((connection-id string) (max-bytes u32)) (result (list u8) string))
 (import theater:simple/tcp set-read-timeout ((timeout-ms u64)) (result unit string))
+(import theater:simple/tcp set-write-timeout ((timeout-ms u64)) (result unit string))
 (import theater:simple/tcp close ((connection-id string)) (result unit string))
 (import theater:simple/tcp close-listener ((listener-id string)) (result unit string))
 (import theater:simple/tcp upgrade-to-tls-server ((connection-id string)) (result unit string))
@@ -584,6 +585,7 @@
     ((string=? name "tcp-send") 1)
     ((string=? name "tcp-receive") 1)
     ((string=? name "tcp-set-read-timeout") 1)
+    ((string=? name "tcp-set-write-timeout") 1)
     ((string=? name "tcp-close") 1)
     ((string=? name "tcp-close-listener") 1)
     ((string=? name "tcp-tls-server") 1)
@@ -1299,12 +1301,22 @@
 
 ;; (tcp-set-read-timeout ms): every pull receive of this actor (tcp-receive)
 ;; returns err "timeout: no data within <ms>ms" when no data arrives in ms; 0
-;; turns it off (the default). Actor-wide, as theater's set-read-timeout is: a
-;; synchronous client (field's peer) can't wait forever on a half-open
-;; connection.
+;; turns it off (the default). This actor's only (theater #266; before it,
+;; theater kept one value for every actor in the daemon): a synchronous client
+;; (field's peer) can't wait forever on a half-open connection.
 (fn apply-tcp-set-read-timeout ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "tcp-set-read-timeout expects (tcp-set-read-timeout ms)")
     (unmarshal (raw-invoke "theater:simple/tcp" "set-read-timeout"
+      (marshal (as-u64 (list-get args 0)))))))
+
+;; (tcp-set-write-timeout ms): every tcp-send of this actor returns err
+;; "timeout: ..." when the peer takes no bytes in ms (it stopped reading, or the
+;; connection is half-open, as a sleeping browser tab holding a zero window,
+;; which the kernel never times out), and theater closes that connection; 0
+;; turns it off (the default). This actor's only (theater #266).
+(fn apply-tcp-set-write-timeout ((args (list value))) value
+  (if (i32.ne (list-len args) 1) (failure "tcp-set-write-timeout expects (tcp-set-write-timeout ms)")
+    (unmarshal (raw-invoke "theater:simple/tcp" "set-write-timeout"
       (marshal (as-u64 (list-get args 0)))))))
 
 ; --- udp -------------------------------------------------------------------
@@ -1936,7 +1948,7 @@
 (fn help-topic ((topic string)) string
   (cond
     ((string=? topic "tcp")
-      "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-set-read-timeout ms)    ; pull receives give up after ms (0: never)\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (conn-id bytes): (car e), (car (cdr e))\n    (define on-close      (lambda (e) e))       ; e = (conn-id reason): (car e), (car (cdr e))\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
+      "TCP (theater:simple/tcp) — works both directions.\n\nCLIENT (outbound):\n  (tcp-connect \"host:port\")    -> (ok ... conn-id)\n  (tcp-send conn \"text\")       -> bytes sent\n  (tcp-receive conn max-bytes) -> (ok (list u8) ...)   ; pull\n  (tcp-set-read-timeout ms)    ; pull receives give up after ms (0: never); this actor's only\n  (tcp-set-write-timeout ms)   ; a send the peer doesn't take within ms errs and closes (0: never)\n  (tcp-close conn)\n\nSERVER (inbound, event-driven — you do NOT call tcp-accept):\n  Define handlers, then listen:\n    (define on-connection (lambda (cid) cid))   ; a new PENDING connection id\n    (define on-data       (lambda (e) e))       ; e = (conn-id bytes): (car e), (car (cdr e))\n    (define on-close      (lambda (e) e))       ; e = (conn-id reason): (car e), (car (cdr e))\n    (tcp-listen \"127.0.0.1:9000\")             ; starts a background accept loop\n  Theater calls on-connection when a client connects. To read that connection:\n    (tcp-activate cid)              ; PENDING -> active (required first)\n    (tcp-set-active cid \"active\")  ; push mode: on-data fires per read\n    ;; or leave it activated and (tcp-receive cid max) to pull.\n  Drain firings with (poll-events).  See also: (help \"triggers\")")
     ((string=? topic "triggers")
       "Inbound triggers — Theater calls back into this live session by invoking a\nhandler you DEFINE by name. Defining it is all it takes; firings buffer and are\nread with theater-repl read / follow / wait <id> (or (events-after N) here).\n\n  on-tick       (lambda (name) ...)   after (set-interval name ms)\n  on-spawn      (lambda (e) ...)      after (subscribe-spawns); e=(seq id name parent)\n  on-message    (lambda (e) ...)      after (msg-register); e=(bytes) 1-elt list: (bytes->string (car e))\n  on-connection (lambda (cid) ...)    after (tcp-listen ...)\n  on-data       (lambda (e) ...)      TCP active mode; e=(conn-id bytes) 2-elt list, use car/cdr\n  on-close      (lambda (e) ...)      TCP closed; e=(conn-id reason) 2-elt list, use car/cdr\n  on-actor-event (lambda (e) ...)     after (monitor id); e=(seq subject event-type data)\n\nEach firing records (handler-name handler-result), or (handler-name event\nhandler-result) when the event was not handled (no handler, or it failed);\n(poll-events) returns those lists. (poll-events \"text\") returns one\n\"handler: result\" line per firing instead (event left out, a string result raw);\ntheater-repl read/follow print that, and read --full / follow --full print the\nlists. Scripts should parse --full: a raw result can span lines.\nBytes that are not UTF-8 show as \\xHH, in any result; in --full they read back as the byte.\n\nThe buffer keeps the newest 256 firings and drops older ones. After drops,\n(poll-events) puts the count first, (N firing ...), and the text form starts with\n\"(N earlier firings dropped)\". (event-buffer N) sets the limit (0 = keep none;\nhandlers still run) and returns the old one.\n\nReading never removes firings. Each has a seq (1, 2, 3, ...):\n  (events-after N [max] [\"text\"])  firings after seq N: (next lost (seq handler result) ...)\n  (event-read NAME [max] [\"text\"])  the same, after cursor NAME (new cursors start at 0)\n  (event-ack NAME SEQ)    NAME has handled up to SEQ (never moves back)\n  (event-cursors) (event-cursor NAME) (event-cursor-drop NAME) (event-head)\nlost counts firings after N that the limit dropped. Acknowledge NEXT once handled.\ntheater-repl read, follow and wait use cursors \"read\", \"follow\" and \"wait\";\n(poll-events) uses \"poll\", so none of them takes firings from another. Redefine any handler mid-stream to change behavior.  See also: (help \"tcp\")")
     ((string=? topic "modules")
@@ -2114,6 +2126,7 @@
     ((string=? name "tcp-send") (apply-tcp-send args))
     ((string=? name "tcp-receive") (apply-tcp-receive args))
     ((string=? name "tcp-set-read-timeout") (apply-tcp-set-read-timeout args))
+    ((string=? name "tcp-set-write-timeout") (apply-tcp-set-write-timeout args))
     ((string=? name "tcp-close") (apply-tcp-close args))
     ((string=? name "tcp-close-listener") (apply-tcp-close-listener args))
     ((string=? name "tcp-tls-server") (apply-tcp-tls-server args))
