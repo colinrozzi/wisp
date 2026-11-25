@@ -1301,7 +1301,7 @@
 
 ;; (tcp-set-read-timeout ms): every pull receive of this actor (tcp-receive)
 ;; returns err "timeout: no data within <ms>ms" when no data arrives in ms; 0
-;; turns it off (the default). This actor's only (theater #265; before it,
+;; turns it off (the default). This actor's only (theater #266; before it,
 ;; theater kept one value for every actor in the daemon): a synchronous client
 ;; (field's peer) can't wait forever on a half-open connection.
 (fn apply-tcp-set-read-timeout ((args (list value))) value
@@ -1313,7 +1313,7 @@
 ;; "timeout: ..." when the peer takes no bytes in ms (it stopped reading, or the
 ;; connection is half-open, as a sleeping browser tab holding a zero window,
 ;; which the kernel never times out), and theater closes that connection; 0
-;; turns it off (the default). This actor's only (theater #265).
+;; turns it off (the default). This actor's only (theater #266).
 (fn apply-tcp-set-write-timeout ((args (list value))) value
   (if (i32.ne (list-len args) 1) (failure "tcp-set-write-timeout expects (tcp-set-write-timeout ms)")
     (unmarshal (raw-invoke "theater:simple/tcp" "set-write-timeout"

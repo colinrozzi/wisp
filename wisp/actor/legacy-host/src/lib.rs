@@ -186,7 +186,6 @@ impl Runtime {
             Some(theater::config::permissions::RuntimePermissions {
                 inspect: true,
                 mutate: true,
-                children: true,
             }),
         );
         if let Some(wasm) = built_in {
